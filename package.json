@@ -1,0 +1,11 @@
+{
+  "name": "piikey",
+  "private": true,
+  "description": "Dev tooling only (git hooks). The project itself is Rust; see Cargo.toml.",
+  "scripts": {
+    "prepare": "husky"
+  },
+  "devDependencies": {
+    "husky": "^9.1.7"
+  }
+}

@@ -1,0 +1,28 @@
+# Build output and dev tooling
+/target
+/node_modules
+
+# Local scratch (playground, experiments)
+/.tmp
+
+# piikey vaults hold (encrypted) PII mappings: never commit them
+*.pkv
+
+# Logs and temp files
+*.log
+*.tmp
+*.bak
+*.swp
+*~
+
+# Editors
+.vscode/
+.idea/
+*.code-workspace
+
+# OS
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store

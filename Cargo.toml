@@ -1,0 +1,64 @@
+[package]
+name = "piikey"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+
+[dependencies]
+# Multi-pattern lazy-DFA scan; Unicode tables off (all patterns are ASCII).
+regex-automata = { version = "0.4.18", default-features = false, features = [
+    "std",
+    "syntax",
+    "perf",
+    "meta",
+    "nfa-pikevm",
+    "nfa-backtrack",
+    "hybrid",
+    "dfa-onepass",
+] }
+rayon = "1.12.0"
+# Keyed hash: proxy derivation, watermark, key derivation.
+blake3 = "1.8.7"
+# Vault record encryption (XChaCha20-Poly1305; fast without AES-NI).
+chacha20poly1305 = { version = "0.11.0", features = ["zeroize"] }
+getrandom = "0.4.3"
+zeroize = "1.9.1"
+# Safe DPAPI wrapper: the vault master key is bound to the Windows user.
+windows-dpapi = "0.2.0"
+# WinRT OCR + PDF rendering, shipped with Windows.
+windows = { version = "0.62.2", features = [
+    "Media_Ocr",
+    "Graphics_Imaging",
+    "Storage_Streams",
+    "Data_Pdf",
+    "Foundation",
+    "Foundation_Collections",
+    "Globalization",
+] }
+# Named-pipe server.
+tokio = { version = "1.53.3", default-features = false, features = ["rt", "net", "io-util"] }
+# Document formats.
+zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
+quick-xml = "0.42.0"
+lopdf = "0.45.0"
+mail-parser = "0.11.9"
+cfb = "0.15.0"
+lexopt = "0.3.2"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+dbg_macro = "warn"
+todo = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
