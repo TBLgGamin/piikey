@@ -1,0 +1,73 @@
+name: release
+
+# release-plz keeps one "chore: release vX.Y.Z" pull request open. Merging it tags vX.Y.Z, publishes
+# the GitHub Release and builds its assets (release-assets.yml). See CONTRIBUTING.md#releases.
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  release:
+    # Only releases of the upstream repository: forks have no release to make.
+    if: github.repository_owner == 'TBLgGamin'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # rust-toolchain.toml selects the version; rustup installs it on first use.
+      - run: rustup show active-toolchain
+      - uses: release-plz/action@6caa8d34f74d82b0dc76a18edd1cc3d6801c9baf # v0.5.143
+        id: plz
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Tag of the release that was just made
+        id: tag
+        env:
+          RELEASES: ${{ steps.plz.outputs.releases }}
+        run: |
+          tag=$(jq -r '[.[] | select(.package_name == "piikey")][0].tag // empty' <<< "${RELEASES:-[]}")
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  release-pr:
+    if: github.repository_owner == 'TBLgGamin'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # rust-toolchain.toml selects the version; rustup installs it on first use.
+      - run: rustup show active-toolchain
+      - uses: release-plz/action@6caa8d34f74d82b0dc76a18edd1cc3d6801c9baf # v0.5.143
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  assets:
+    needs: release
+    if: needs.release.outputs.tag != ''
+    uses: ./.github/workflows/release-assets.yml
+    with:
+      tag: ${{ needs.release.outputs.tag }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write

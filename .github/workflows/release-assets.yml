@@ -1,0 +1,99 @@
+name: release-assets
+
+# Builds the portable zip, the per-user installer and SHA256SUMS.txt from source, tests them, and
+# uploads them to a release. release.yml calls it right after release-plz tags a release (a tag made
+# with GITHUB_TOKEN starts no other workflow). By hand:
+#   gh workflow run release-assets.yml --ref main            dry run: build and test, upload nothing
+#   gh workflow run release-assets.yml -f tag=v0.1.0         rebuild a release's assets and replace them
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Existing release tag to build and upload; empty = dry run from the calling ref
+        type: string
+        default: ""
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build and upload; empty = dry run from the selected ref
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.sha }}
+          persist-credentials: false
+      # rust-toolchain.toml selects the version; rustup installs it on first use.
+      - run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: release
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-about
+      - name: Install Inno Setup
+        # The runner image has it (6.7.1 on windows-2025); this is only a fallback, pinned.
+        run: |
+          if (!(Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup --version 6.7.1 --no-progress -y
+          }
+      - name: Read the version
+        id: version
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          $v = (cargo metadata --format-version 1 --no-deps | ConvertFrom-Json).packages |
+            Where-Object name -eq 'piikey-app' |
+            ForEach-Object version
+          if (-not $v) {
+            throw 'cannot read the version of piikey-app from cargo metadata'
+          }
+          if ($env:TAG -and $env:TAG -ne "v$v") {
+            throw "tag $env:TAG does not match Cargo version $v"
+          }
+          "version=$v" >> $env:GITHUB_OUTPUT
+      - run: cargo build --release --workspace --locked
+      - name: Package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: ./packaging/windows/package.ps1 -Version $env:VERSION
+      - name: Smoke test the zip, the installer and the uninstaller
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: ./packaging/windows/smoke.ps1 -Version $env:VERSION
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: piikey-${{ steps.version.outputs.version }}
+          path: |
+            dist/piikey-${{ steps.version.outputs.version }}-windows-x64.zip
+            dist/piikey-${{ steps.version.outputs.version }}-setup-x64.exe
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
+      - name: Attest build provenance
+        if: inputs.tag != ''
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/piikey-${{ steps.version.outputs.version }}-windows-x64.zip
+            dist/piikey-${{ steps.version.outputs.version }}-setup-x64.exe
+      - name: Upload to the release
+        if: inputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $files = "dist/piikey-$env:VERSION-windows-x64.zip", "dist/piikey-$env:VERSION-setup-x64.exe", 'dist/SHA256SUMS.txt'
+          gh release upload $env:TAG @files --clobber --repo $env:GITHUB_REPOSITORY
