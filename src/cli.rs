@@ -26,6 +26,7 @@ usage:
   piikey-cli anonymize   [--vault PATH] [--out DIR] [PATH...]
   piikey-cli deanonymize [--vault PATH] [--tolerant] [--out DIR] [PATH...]
   piikey-cli serve       [--vault PATH] [--pipe NAME]      (default \\\\.\\pipe\\piikey)
+  piikey-cli --version
 
 With no PATH, stdin is processed and the result goes to stdout.
 With PATHs, --out DIR is required; directories are walked recursively.
@@ -37,6 +38,7 @@ With PATHs, --out DIR is required; directories are walked recursively.
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     Help,
+    Version,
     /// Process stdin to stdout.
     Stdin {
         mode: Mode,
@@ -94,6 +96,7 @@ where
     while let Some(arg) = parser.next()? {
         match arg {
             Arg::Short('h') | Arg::Long("help") => return Ok(Command::Help),
+            Arg::Short('V') | Arg::Long("version") => return Ok(Command::Version),
             Arg::Long("vault") => vault = Some(PathBuf::from(parser.value()?)),
             Arg::Long("out") => out = Some(PathBuf::from(parser.value()?)),
             Arg::Long("pipe") => pipe = Some(parser.value()?.string()?),
@@ -174,6 +177,10 @@ pub fn main() -> ExitCode {
     match parse(std::env::args_os().skip(1)) {
         Ok(Command::Help) => {
             println!("{USAGE}");
+            ExitCode::SUCCESS
+        }
+        Ok(Command::Version) => {
+            println!("piikey-cli {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
         Ok(command) => execute(command),
@@ -268,7 +275,7 @@ fn tolerate(restorer: Option<&Restorer>, output: Output, label: &dyn Display) ->
 
 fn execute(command: Command) -> ExitCode {
     match command {
-        Command::Help => ExitCode::SUCCESS,
+        Command::Help | Command::Version => ExitCode::SUCCESS,
         Command::Stdin {
             mode,
             vault,
@@ -678,6 +685,12 @@ mod tests {
     fn help_wins() {
         assert_eq!(args(&["--help"]), Ok(Command::Help));
         assert_eq!(args(&["anonymize", "-h"]), Ok(Command::Help));
+    }
+
+    #[test]
+    fn version_wins() {
+        assert_eq!(args(&["--version"]), Ok(Command::Version));
+        assert_eq!(args(&["anonymize", "-V"]), Ok(Command::Version));
     }
 
     #[test]
