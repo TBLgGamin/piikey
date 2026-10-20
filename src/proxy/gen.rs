@@ -12,16 +12,19 @@
 //! mistakes them for a kind that outranks them. A bare nine-digit run is claimed by `UsSsn`
 //! first, so a bare `NlBsn` proxy always has an area number in 900-999, and a bare nine-digit
 //! `Phone` proxy has group `00`; both are rejected as SSNs. See [`bsn`] and [`phone`].
+//!
+//! A `Person` keeps its particles and shape and takes every other word from the name lists.
+//! See [`person`].
 
 use std::net::Ipv6Addr;
 
 use blake3::{BLOCK_LEN, Hasher, OutputReader};
 
 use super::{
-    ProxyKeys,
+    ProxyKeys, model,
     words::{FIRST, FREEMAIL, LAST, WORDS},
 };
-use crate::detect::EntityKind;
+use crate::detect::{EntityKind, validate::accepts};
 
 /// Fresh derivations tried when a candidate is unusable or equals the original. Each retry is
 /// an independent stream, so the odds of needing more than a few are negligible.
@@ -30,11 +33,17 @@ const ROUNDS: u8 = 32;
 /// BSN 11-proof weights. The last digit counts as -1, which is 10 modulo 11.
 const BSN_WEIGHTS: [u32; 9] = [9, 8, 7, 6, 5, 4, 3, 2, 10];
 
+/// Attempts after which a candidate space is widened one step (see [`model`]). A value with
+/// few free characters (a year, a two-digit id) has only a handful of candidates, and the vault
+/// hands each original its own; later attempts get more room instead of running out.
+const WIDEN_EVERY: u32 = 1024;
+
 /// A proxy candidate for `original`, never equal to it unless no other value exists.
 pub(super) fn generate(keys: &ProxyKeys, kind: EntityKind, original: &str, attempt: u32) -> String {
+    let widen = attempt / WIDEN_EVERY;
     for round in 0..ROUNDS {
         let mut xof = Xof::new(keys, kind, original, attempt, round);
-        if let Some(candidate) = build(kind, original, &mut xof)
+        if let Some(candidate) = build(kind, original, &mut xof, widen)
             && candidate != original
         {
             return candidate;
@@ -46,7 +55,7 @@ pub(super) fn generate(keys: &ProxyKeys, kind: EntityKind, original: &str, attem
 }
 
 /// One candidate, or `None` when this derivation is unusable and the next round should run.
-fn build(kind: EntityKind, original: &str, xof: &mut Xof) -> Option<String> {
+fn build(kind: EntityKind, original: &str, xof: &mut Xof, widen: u32) -> Option<String> {
     match kind {
         EntityKind::Secret => Some(secret(original, xof)),
         EntityKind::UrlCredential => Some(url_credential(original, xof)),
@@ -59,12 +68,51 @@ fn build(kind: EntityKind, original: &str, xof: &mut Xof) -> Option<String> {
         EntityKind::UsSsn => Some(ssn(original, xof)),
         EntityKind::NlBsn => bsn(original, xof),
         EntityKind::Phone => phone(original, xof),
+        EntityKind::Person => person(original, xof),
+        EntityKind::PersonAlias => {
+            if accepts(EntityKind::Person, original) {
+                person(original, xof)
+            } else {
+                model::shape_all(kind, original, xof, widen)
+            }
+        }
+        EntityKind::PersonIdentifier
+        | EntityKind::ContactHandle
+        | EntityKind::DeviceId
+        | EntityKind::AccountId
+        | EntityKind::AuthSecret
+        | EntityKind::BankAccount
+        | EntityKind::DocumentId
+        | EntityKind::DocumentReference
+        | EntityKind::VehicleId
+        | EntityKind::OrganizationId => model::shape_all(kind, original, xof, widen),
+        EntityKind::PhoneNumber
+        | EntityKind::GeoLocation
+        | EntityKind::PaymentCard
+        | EntityKind::CardSecurity
+        | EntityKind::FinancialAmount => model::shape_digits(kind, original, xof, widen),
+        EntityKind::DateOfBirth => model::date(kind, original, xof, widen),
+        EntityKind::PostalAddress => model::address(kind, original, xof),
+        EntityKind::Location => model::place(kind, original, xof),
+        EntityKind::IdentifyingLink => model::link(kind, original, xof),
+        EntityKind::OrganizationName => model::organization(kind, original, xof),
+        EntityKind::ProperName => model::brand(kind, original, xof),
+        EntityKind::PersonAttribute => model::tag(kind, "Trait", xof),
+        EntityKind::PersonRole => model::tag(kind, "Role", xof),
+        EntityKind::HealthData => model::tag(kind, "Health", xof),
+        EntityKind::BiometricData => model::tag(kind, "Biometric", xof),
+        EntityKind::EthnicOrigin => model::tag(kind, "Origin", xof),
+        EntityKind::PoliticalOpinion => model::tag(kind, "Opinion", xof),
+        EntityKind::ReligionOrBelief => model::tag(kind, "Belief", xof),
+        EntityKind::SexualOrientation => model::tag(kind, "Orientation", xof),
+        EntityKind::TradeUnion => model::tag(kind, "Union", xof),
+        EntityKind::CriminalOffence => model::tag(kind, "Record", xof),
     }
 }
 
 /// The random stream behind one candidate: a keyed BLAKE3 XOF. `OutputReader` does not
 /// buffer, so bytes are served from one block at a time instead of recompressing per byte.
-struct Xof {
+pub(super) struct Xof {
     reader: OutputReader,
     block: [u8; BLOCK_LEN],
     next: usize,
@@ -100,7 +148,7 @@ impl Xof {
     /// Uniform in `0..n` by rejection sampling over the narrowest big-endian word that
     /// covers `n`. The first `2^bits mod n` values are rejected so that the rest divide
     /// evenly into runs of `n`.
-    fn below(&mut self, n: u32) -> u32 {
+    pub(super) fn below(&mut self, n: u32) -> u32 {
         let n = n.max(1);
         let (width, reject) = if n <= 1 << 8 {
             (1, (1 << 8) % n)
@@ -117,7 +165,7 @@ impl Xof {
         }
     }
 
-    fn digit(&mut self) -> u32 {
+    pub(super) fn digit(&mut self) -> u32 {
         self.below(10)
     }
 
@@ -126,14 +174,14 @@ impl Xof {
     }
 
     /// A uniformly chosen entry; `""` only for an empty list.
-    fn pick(&mut self, items: &[&'static str]) -> &'static str {
+    pub(super) fn pick(&mut self, items: &[&'static str]) -> &'static str {
         let len = u32::try_from(items.len()).unwrap_or(u32::MAX);
         let index = usize::try_from(self.below(len)).unwrap_or_default();
         items.get(index).copied().unwrap_or("")
     }
 
     /// A random character of the same class as `c`; anything but a letter or digit stays.
-    fn alnum_like(&mut self, c: char) -> char {
+    pub(super) fn alnum_like(&mut self, c: char) -> char {
         let base = match c {
             'A'..='Z' => 'A',
             'a'..='z' => 'a',
@@ -142,10 +190,24 @@ impl Xof {
         };
         char::from_u32(u32::from(base) + self.below(26)).unwrap_or(base)
     }
+
+    /// A random ASCII letter in the case of `c`, different from `c` itself.
+    fn other_letter(&mut self, c: char) -> char {
+        let base = if c.is_uppercase() { 'A' } else { 'a' };
+        let own = c
+            .is_ascii_alphabetic()
+            .then(|| u32::from(c) - u32::from(base));
+        // Another letter of the 26 means one of the other 25.
+        let mut index = self.below(if own.is_some() { 25 } else { 26 });
+        if own.is_some_and(|own| index >= own) {
+            index += 1;
+        }
+        char::from_u32(u32::from(base) + index).unwrap_or(base)
+    }
 }
 
 /// `d` as an ASCII digit; `d` is always below 10.
-fn digit_char(d: u32) -> char {
+pub(super) fn digit_char(d: u32) -> char {
     char::from_digit(d, 10).unwrap_or('0')
 }
 
@@ -198,7 +260,7 @@ fn secret_literal_len(s: &str) -> usize {
 /// classes.
 fn url_credential(original: &str, xof: &mut Xof) -> String {
     let mut out = String::with_capacity(original.len() + 8);
-    out.push_str(xof.pick(&FIRST));
+    out.push_str(fresh_word(xof, &FIRST, original, &mut Vec::new()));
     out.push(digit_char(xof.digit()));
     out.push(digit_char(xof.digit()));
     if let Some((_, password)) = original.split_once(':') {
@@ -221,9 +283,10 @@ fn email(original: &str, xof: &mut Xof) -> String {
         ""
     };
     let mut out = String::with_capacity(48);
-    out.push_str(xof.pick(&FIRST));
+    let mut placed = Vec::new();
+    out.push_str(fresh_word(xof, &FIRST, local, &mut placed));
     out.push_str(sep);
-    out.push_str(xof.pick(&LAST));
+    out.push_str(fresh_word(xof, &LAST, local, &mut placed));
     out.push(digit_char(xof.digit()));
     out.push(digit_char(xof.digit()));
     out.push('@');
@@ -551,10 +614,194 @@ fn country_code_len(digits: &[u32]) -> usize {
     }
 }
 
+/// Name particles. A proxy keeps them: they say nothing about who the person is, and they
+/// make `Jeroen de Vries` read as `Haley de Zessen`. Compared ignoring ASCII case.
+const PARTICLES: [&str; 21] = [
+    "van", "de", "der", "den", "het", "von", "zu", "du", "da", "la", "le", "di", "del", "bin",
+    "ibn", "al", "el", "ter", "ten", "'t", "op",
+];
+
+/// One token more than a valid name has. Longer originals fail the validator anyway, so a huge
+/// string is not rewritten token by token.
+const TOKEN_CAP: usize = 7;
+
+/// Draws made for one word in search of a list word that the original and the proxy do not
+/// use yet.
+const FRESH_TRIES: u32 = 16;
+
+/// How one whitespace-separated token of a name is rewritten.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Part {
+    /// Kept as it is.
+    Particle,
+    /// `J.` or `J.R.`: every letter becomes another letter.
+    Initials,
+    /// Replaced by a word from the lists.
+    Word,
+}
+
+/// The list a word is drawn from.
+#[derive(Clone, Copy)]
+enum Role {
+    Given,
+    Family,
+}
+
+/// The letter case of a token, which the words that replace it copy.
+#[derive(Clone, Copy)]
+pub(super) enum Case {
+    Upper,
+    Lower,
+    Title,
+}
+
+/// A name in the shape of `original`: tokens joined by single spaces, particles kept, initials
+/// swapped for other initials and every other token swapped for a name from the lists, in the
+/// letter case of the token it replaces. Words never repeat and never reuse a word of the
+/// original, which would give part of the real name away.
+///
+/// The first word is a given name unless a particle or initials come before it (`de Vries`,
+/// `J. Jansen`); every later word is a family name.
+///
+/// An original with exactly one word and no initials (`Jeroen`, `de Vries`) gets a hyphenated
+/// pair (`Haley-Marian`) in place of that word. Only one candidate in sixteen carries the
+/// watermark, so of the 200 words in a list about a dozen can ever be a proxy and the thirteenth
+/// single-word name would find none; the 200 x 200 pairs leave room for thousands.
+///
+/// `None` when the result is not a valid name (the original has too many tokens, or it has none).
+fn person(original: &str, xof: &mut Xof) -> Option<String> {
+    let tokens: Vec<&str> = original.split_whitespace().take(TOKEN_CAP).collect();
+    // Particles are only kept next to something else: a name made of nothing but particles
+    // (`Al`) would otherwise have nothing to change.
+    let anchored = tokens.iter().any(|t| !is_particle(t));
+    let part = |token: &str| {
+        if anchored && is_particle(token) {
+            Part::Particle
+        } else if is_initials(token) {
+            Part::Initials
+        } else {
+            Part::Word
+        }
+    };
+    let words = tokens.iter().filter(|t| part(t) == Part::Word).count();
+    let has_initials = tokens.iter().any(|t| part(t) == Part::Initials);
+    let pair = words == 1 && !has_initials;
+
+    let mut role = Role::Given;
+    let mut placed: Vec<&'static str> = Vec::new();
+    let mut out = String::with_capacity(original.len() + 8);
+    for token in tokens {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        match part(token) {
+            Part::Particle => out.push_str(token),
+            Part::Initials => out.extend(token.chars().map(|c| {
+                if c.is_alphabetic() {
+                    xof.other_letter(c)
+                } else {
+                    c
+                }
+            })),
+            Part::Word => {
+                let pool: &[&'static str] = match role {
+                    Role::Given => &FIRST,
+                    Role::Family => &LAST,
+                };
+                let case = case_of(token);
+                let word = fresh_word(xof, pool, original, &mut placed);
+                out.push_str(&restyle(word, case));
+                if pair {
+                    out.push('-');
+                    let second = fresh_word(xof, pool, original, &mut placed);
+                    out.push_str(&restyle(second, case));
+                }
+            }
+        }
+        role = Role::Family;
+    }
+    accepts(EntityKind::Person, &out).then_some(out)
+}
+
+/// True for a particle, also in its `\u{2019}t` spelling that word processors produce.
+fn is_particle(token: &str) -> bool {
+    if let Some(rest) = token.strip_prefix(['\u{2018}', '\u{2019}']) {
+        return rest.eq_ignore_ascii_case("t");
+    }
+    PARTICLES.iter().any(|p| p.eq_ignore_ascii_case(token))
+}
+
+/// True for initials: letters that are each followed by a dot, as in `J.` or `J.R.`.
+fn is_initials(token: &str) -> bool {
+    let mut chars = token.chars();
+    let mut any = false;
+    while let Some(letter) = chars.next() {
+        if !letter.is_alphabetic() || chars.next() != Some('.') {
+            return false;
+        }
+        any = true;
+    }
+    any
+}
+
+/// A word of `pool` that is neither a word of `original` nor in `placed` yet, when one of the
+/// first [`FRESH_TRIES`] draws is such a word, else the last draw. The word is added to `placed`.
+fn fresh_word(
+    xof: &mut Xof,
+    pool: &[&'static str],
+    original: &str,
+    placed: &mut Vec<&'static str>,
+) -> &'static str {
+    let mut word = xof.pick(pool);
+    for _ in 1..FRESH_TRIES {
+        let taken = placed.contains(&word)
+            || original
+                .split(|c: char| !c.is_alphabetic())
+                .any(|part| part.eq_ignore_ascii_case(word));
+        if !taken {
+            break;
+        }
+        word = xof.pick(pool);
+    }
+    placed.push(word);
+    word
+}
+
+/// All capitals (two letters or more), all lower case, or anything else, which reads as title
+/// case (`McDonald` and `O'Brien` included).
+pub(super) fn case_of(token: &str) -> Case {
+    let upper = token.chars().filter(|c| c.is_uppercase()).count();
+    let lower = token.chars().filter(|c| c.is_lowercase()).count();
+    if upper == 0 && lower > 0 {
+        Case::Lower
+    } else if upper >= 2 && lower == 0 {
+        Case::Upper
+    } else {
+        Case::Title
+    }
+}
+
+/// `word`, a lower-case list word, in `case`.
+pub(super) fn restyle(word: &str, case: Case) -> String {
+    match case {
+        Case::Lower => word.to_owned(),
+        Case::Upper => word.to_ascii_uppercase(),
+        Case::Title => {
+            let (head, tail) = word.split_at(word.len().min(1));
+            format!("{}{tail}", head.to_ascii_uppercase())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Xof, country_code_len};
-    use crate::{detect::EntityKind, proxy::ProxyKeys};
+    use std::collections::HashSet;
+
+    use super::{Case, FIRST, LAST, PARTICLES, Xof, country_code_len, generate, restyle};
+    use crate::{
+        detect::{EntityKind, validate::accepts},
+        proxy::{ProxyKeys, watermark_ok},
+    };
 
     fn xof() -> Xof {
         let keys = ProxyKeys::new([3; 32], [4; 32]);
@@ -626,5 +873,304 @@ mod tests {
         assert_eq!(country_code_len(&[3, 5, 8]), 3);
         assert_eq!(country_code_len(&[9, 7, 1]), 3);
         assert_eq!(country_code_len(&[]), 3);
+    }
+
+    /// The proxy of `original` under fixed keys.
+    fn make(original: &str, attempt: u32) -> String {
+        let keys = ProxyKeys::new([3; 32], [4; 32]);
+        generate(&keys, EntityKind::Person, original, attempt)
+    }
+
+    fn in_list(list: &[&str], word: &str) -> bool {
+        list.iter().any(|w| w.eq_ignore_ascii_case(word))
+    }
+
+    /// First letter upper case, every other letter lower case.
+    fn is_title(token: &str) -> bool {
+        let mut letters = token.chars().filter(|c| c.is_alphabetic());
+        letters.next().is_some_and(char::is_uppercase) && letters.all(char::is_lowercase)
+    }
+
+    #[test]
+    fn person_keeps_particles_in_place_and_changes_every_other_token() {
+        for (original, kept) in [
+            ("Jeroen de Vries", vec![1]),
+            ("Jan van der Berg", vec![1, 2]),
+            ("Jan 't Hart", vec![1]),
+            ("Jan \u{2019}t Hart", vec![1]),
+            ("de Vries", vec![0]),
+            ("Maria VAN DEN Berg", vec![1, 2]),
+            ("Piet op de Beeck", vec![1, 2]),
+            ("Jeroen Vries", vec![]),
+            ("Jan Willem Karel Pieter Hendrik Jansen", vec![]),
+        ] {
+            let before: Vec<&str> = original.split(' ').collect();
+            for attempt in 0..16 {
+                let proxy = make(original, attempt);
+                let after: Vec<&str> = proxy.split(' ').collect();
+                assert_eq!(before.len(), after.len(), "{original} -> {proxy}");
+                for (i, (b, a)) in before.iter().zip(&after).enumerate() {
+                    if kept.contains(&i) {
+                        assert_eq!(a, b, "{original} -> {proxy}");
+                    } else {
+                        assert!(!a.eq_ignore_ascii_case(b), "{original} -> {proxy}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn person_takes_a_given_name_first_and_family_names_after_it() {
+        for attempt in 0..32 {
+            let proxy = make("Jan Willem Jansen", attempt);
+            let words: Vec<&str> = proxy.split(' ').collect();
+            assert_eq!(words.len(), 3, "{proxy}");
+            assert!(in_list(&FIRST, words[0]), "{proxy}");
+            assert!(
+                in_list(&LAST, words[1]) && in_list(&LAST, words[2]),
+                "{proxy}"
+            );
+        }
+    }
+
+    #[test]
+    fn person_leading_particles_or_initials_make_the_next_word_a_family_name() {
+        for attempt in 0..32 {
+            let proxy = make("de Vries Jansen", attempt);
+            let words: Vec<&str> = proxy.split(' ').collect();
+            assert_eq!(words[0], "de", "{proxy}");
+            assert!(
+                in_list(&LAST, words[1]) && in_list(&LAST, words[2]),
+                "{proxy}"
+            );
+
+            let proxy = make("J. Jansen", attempt);
+            let words: Vec<&str> = proxy.split(' ').collect();
+            assert!(in_list(&LAST, words[1]), "{proxy}");
+        }
+    }
+
+    #[test]
+    fn person_case_follows_each_original_token() {
+        for attempt in 0..16 {
+            for token in make("jeroen de vries", attempt).split(' ') {
+                assert_eq!(token, token.to_lowercase());
+            }
+            for token in make("JEROEN DE VRIES", attempt).split(' ') {
+                assert_eq!(token, token.to_uppercase());
+            }
+            let mixed = make("Jeroen DE vries", attempt);
+            let tokens: Vec<&str> = mixed.split(' ').collect();
+            assert!(is_title(tokens[0]), "{mixed}");
+            assert_eq!(tokens[1], "DE");
+            assert_eq!(tokens[2], tokens[2].to_lowercase(), "{mixed}");
+            let double = make("MARIA LOPEZ-GARCIA", attempt);
+            assert_eq!(double, double.to_uppercase());
+            // Mixed case inside a token reads as title case.
+            for token in make("McDonald O'Brien", attempt).split(' ') {
+                assert!(is_title(token), "{token}");
+            }
+        }
+        assert_eq!(restyle("haley", Case::Title), "Haley");
+        assert_eq!(restyle("haley", Case::Upper), "HALEY");
+        assert_eq!(restyle("haley", Case::Lower), "haley");
+        assert_eq!(restyle("", Case::Title), "");
+    }
+
+    #[test]
+    fn person_initials_become_other_initials_in_the_same_case() {
+        for attempt in 0..64 {
+            let proxy = make("J. Jansen", attempt);
+            let (initial, family) = proxy.split_once(' ').unwrap_or_default();
+            let mut letters = initial.chars();
+            let (letter, dot) = (letters.next(), letters.next());
+            assert!(
+                letter.is_some_and(|l| l.is_ascii_uppercase() && l != 'J'),
+                "{proxy}"
+            );
+            assert_eq!(dot, Some('.'), "{proxy}");
+            assert_eq!(letters.next(), None, "{proxy}");
+            assert!(is_title(family) && in_list(&LAST, family), "{proxy}");
+
+            let lower = make("j. jansen", attempt);
+            assert!(
+                lower.starts_with(|c: char| c.is_ascii_lowercase() && c != 'j'),
+                "{lower}"
+            );
+            assert!(lower[1..].starts_with(". "), "{lower}");
+
+            let several = make("J.R.R. Tolkien", attempt);
+            let first = several.split(' ').next().unwrap_or_default();
+            assert_eq!(first.chars().count(), 6, "{several}");
+            for (got, want) in first.chars().zip("J.R.R.".chars()) {
+                if want == '.' {
+                    assert_eq!(got, '.', "{several}");
+                } else {
+                    assert!(got.is_ascii_uppercase() && got != want, "{several}");
+                }
+            }
+
+            // A middle initial in a longer name.
+            let middle = make("Jeroen J. de Vries", attempt);
+            let words: Vec<&str> = middle.split(' ').collect();
+            assert_eq!(words.len(), 4, "{middle}");
+            assert_eq!(words[2], "de", "{middle}");
+            assert!(words[1].len() == 2 && words[1].ends_with('.'), "{middle}");
+
+            // Initials with an accent: any ASCII letter of the same case will do.
+            let accented = make("\u{c9}. Garc\u{ed}a", attempt);
+            assert!(accented.is_ascii(), "{accented}");
+            assert!(
+                accented.starts_with(|c: char| c.is_ascii_uppercase()),
+                "{accented}"
+            );
+        }
+    }
+
+    #[test]
+    fn person_with_one_word_gets_one_hyphenated_pair() {
+        for (original, pool, prefix) in [
+            ("Jeroen", &FIRST, ""),
+            ("de Vries", &LAST, "de "),
+            ("van der Berg", &LAST, "van der "),
+            ("'t Hart", &LAST, "'t "),
+            ("Al", &FIRST, ""),
+        ] {
+            for attempt in 0..32 {
+                let proxy = make(original, attempt);
+                let rest = proxy.strip_prefix(prefix).unwrap_or_default();
+                let (a, b) = rest.split_once('-').unwrap_or_default();
+                assert!(is_title(a) && is_title(b), "{original} -> {proxy}");
+                assert!(
+                    in_list(pool, a) && in_list(pool, b),
+                    "{original} -> {proxy}"
+                );
+                assert!(!a.eq_ignore_ascii_case(b), "{original} -> {proxy}");
+                assert!(!rest.contains(' '), "{original} -> {proxy}");
+            }
+        }
+        let upper = make("MARIA", 0);
+        assert_eq!(upper, upper.to_uppercase());
+        assert!(upper.contains('-'));
+        // Two words, or a word and initials, stay a single word each.
+        for original in ["Jeroen Vries", "J. Jansen", "Jan 't Hart"] {
+            assert!(!make(original, 0).contains('-'), "{original}");
+        }
+    }
+
+    #[test]
+    fn person_made_of_particles_only_still_changes() {
+        for original in ["Al", "De", "van der", "Op"] {
+            for attempt in 0..8 {
+                let proxy = make(original, attempt);
+                assert!(
+                    !proxy.eq_ignore_ascii_case(original),
+                    "{original} -> {proxy}"
+                );
+                assert!(accepts(EntityKind::Person, &proxy), "{original} -> {proxy}");
+            }
+        }
+    }
+
+    #[test]
+    fn person_proxy_reuses_no_word_of_the_original_and_repeats_none() {
+        let first = restyle(FIRST[0], Case::Title);
+        let last = restyle(LAST[0], Case::Title);
+        let originals = [
+            format!("{first} {last}"),
+            format!("{last} {first}"),
+            format!("{first} van {last}"),
+            format!("{first}-{last}"),
+            first.clone(),
+            format!("{first} {first} {last} {last}"),
+        ];
+        for original in &originals {
+            let own: Vec<String> = original
+                .split(|c: char| !c.is_alphabetic())
+                .map(str::to_lowercase)
+                .collect();
+            for attempt in 0..400 {
+                let proxy = make(original, attempt);
+                let words: Vec<String> = proxy
+                    .split(|c: char| !c.is_alphabetic())
+                    .filter(|w| !w.is_empty() && !in_list(&PARTICLES, w))
+                    .map(str::to_lowercase)
+                    .collect();
+                for word in &words {
+                    assert!(!own.contains(word), "{original} -> {proxy}");
+                }
+                let distinct: HashSet<&String> = words.iter().collect();
+                assert_eq!(distinct.len(), words.len(), "{original} -> {proxy}");
+            }
+        }
+    }
+
+    #[test]
+    fn person_proxies_are_valid_ascii_names_and_never_the_original() {
+        for original in [
+            "Jeroen de Vries",
+            "Aa Bb Cc Dd Ee Ff",
+            "Zo\u{eb} de Vries",
+            "Jos\u{e9}",
+            "\u{c9}. Garc\u{ed}a",
+            "Patrick O\u{2019}Brien",
+            "Anne-Marie",
+            "Al",
+        ] {
+            for attempt in 0..200 {
+                let proxy = make(original, attempt);
+                assert!(accepts(EntityKind::Person, &proxy), "{original} -> {proxy}");
+                assert!(proxy.is_ascii(), "{original} -> {proxy}");
+                assert_ne!(proxy, original);
+            }
+        }
+    }
+
+    #[test]
+    fn person_without_a_name_or_with_too_many_tokens_has_no_candidate() {
+        for original in ["", " ", "\t\n", "a b c d e f g", "a b c d e f g h i j"] {
+            assert_eq!(make(original, 0), original, "{original:?}");
+        }
+    }
+
+    #[test]
+    fn single_word_names_have_proxies_to_spare() {
+        // The vault takes the first candidate that carries the watermark and is unused. One
+        // list word per name would give out after about a dozen names; the pairs do not.
+        let keys = ProxyKeys::new([3; 32], [4; 32]);
+        let passing = FIRST
+            .iter()
+            .filter(|w| watermark_ok(&keys, EntityKind::Person, w))
+            .count();
+        assert!(
+            (1..40).contains(&passing),
+            "{passing} of 200 words pass the watermark"
+        );
+
+        let mut used = HashSet::new();
+        for i in 0..400u32 {
+            let letters: String = (0..4)
+                .map(|d| char::from(b'a' + u8::try_from(i / 26u32.pow(d) % 26).unwrap_or(0)))
+                .collect();
+            let original = format!("Zq{letters}");
+            let found = (0..4096)
+                .map(|attempt| generate(&keys, EntityKind::Person, &original, attempt))
+                .find(|p| watermark_ok(&keys, EntityKind::Person, p) && !used.contains(p));
+            let Some(found) = found else {
+                panic!("no proxy left for name number {i}");
+            };
+            used.insert(found);
+        }
+    }
+
+    #[test]
+    fn names_in_the_lists_are_not_particles() {
+        // A list word that is a particle would be kept as it is when a proxy is read as a name.
+        for (name, list) in [("FIRST", &FIRST), ("LAST", &LAST)] {
+            for word in list {
+                assert!(!in_list(&PARTICLES, word), "{name}: {word} is a particle");
+            }
+        }
     }
 }

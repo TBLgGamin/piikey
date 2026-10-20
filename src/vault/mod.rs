@@ -3,8 +3,8 @@
 //! The file is the source of truth and the in-memory `State` a cache of it.
 //! [`Vault::resolve`] is the only writer: under the in-process mutex and the
 //! cross-process file lock it merges the records other processes appended,
-//! picks proxies that collide with nothing, appends them in one write and
-//! syncs.
+//! picks proxies that collide with nothing (and that the caller does not
+//! turn down, see `resolve`), appends them in one write and syncs.
 //!
 //! No lock is ever held across a rayon call. A rayon worker that waits for its
 //! own parallel work runs other queued jobs meanwhile, and one of those may
@@ -58,17 +58,32 @@ fn slot(kind: EntityKind) -> usize {
 }
 
 /// Everything the file holds, indexed for lookup.
-#[derive(Default)]
 struct State {
     /// original → proxy, per kind, so lookups by `&str` allocate nothing.
     by_original: [HashMap<Arc<str>, Arc<str>>; KINDS],
-    /// proxy → original. Keyed without the kind so a proxy is unique across
-    /// kinds and deanonymizing needs no kind.
-    by_proxy: HashMap<Arc<str>, Arc<str>>,
+    /// proxy → (kind, original). Keyed without the kind so a proxy is unique
+    /// across kinds and deanonymizing needs no kind.
+    by_proxy: HashMap<Arc<str>, (EntityKind, Arc<str>)>,
     /// Every original of every kind: no proxy may equal one of them.
     originals: HashSet<Arc<str>>,
     /// Records in the file, which is also the next record's index.
     count: u64,
+    /// Proxies in file order: the order they were issued in.
+    order: Vec<Arc<str>>,
+}
+
+// Hand-written: `Default` is only derived for arrays of up to 32 elements, and there is one map
+// per kind.
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            by_original: std::array::from_fn(|_| HashMap::new()),
+            by_proxy: HashMap::new(),
+            originals: HashSet::new(),
+            count: 0,
+            order: Vec::new(),
+        }
+    }
 }
 
 impl State {
@@ -81,6 +96,7 @@ impl State {
             map.reserve(extra);
         }
         self.by_proxy.reserve(entries.len());
+        self.order.reserve(entries.len());
         self.originals.reserve(entries.len());
         for Entry {
             kind,
@@ -89,7 +105,8 @@ impl State {
         } in entries
         {
             self.by_original[slot(kind)].insert(Arc::clone(&original), Arc::clone(&proxy));
-            self.by_proxy.insert(proxy, Arc::clone(&original));
+            self.order.push(Arc::clone(&proxy));
+            self.by_proxy.insert(proxy, (kind, Arc::clone(&original)));
             self.originals.insert(original);
             self.count += 1;
         }
@@ -202,9 +219,20 @@ impl Vault {
     /// Issues proxies for every `(kind, original)` not yet mapped, merging
     /// records appended by other processes first. The only writer.
     ///
+    /// A proxy equals no issued proxy, no known original, no original in `new`
+    /// and no proxy issued by this call, and none for which `avoid(kind,
+    /// proxy)` holds: that is how a caller keeps a proxy from reading like
+    /// text it is about to leave as it is. `avoid` is asked about each
+    /// candidate in turn while the vault's write lock is held, so it must be
+    /// cheap and must not call back into the vault.
+    ///
     /// # Errors
     /// `Io`, `VaultCorrupt`, `ProxyExhausted`, `Poisoned`.
-    pub fn resolve(&self, mut new: Vec<(EntityKind, Box<str>)>) -> Result<()> {
+    pub fn resolve(
+        &self,
+        mut new: Vec<(EntityKind, Box<str>)>,
+        avoid: &dyn Fn(EntityKind, &str) -> bool,
+    ) -> Result<()> {
         new.par_sort_unstable();
         new.dedup();
         let mut pending = self.unresolved(new)?;
@@ -217,7 +245,7 @@ impl Vault {
         pending
             .par_iter_mut()
             .for_each(|p| p.first = watermarked(keys, p.kind, &p.original, 0));
-        self.locked_append(|state| choose(keys, state, pending))
+        self.locked_append(|state| choose(keys, state, pending, avoid))
     }
 
     /// The requests that have no proxy yet, with their originals shared.
@@ -339,7 +367,9 @@ struct Pending {
 }
 
 /// The first attempt at or after `from` whose candidate differs from
-/// `original` and carries the watermark. Depends on the keys only.
+/// `original` and, for kinds that are found by watermark, carries it. Kinds
+/// found by exact vault match need none (and short values would run out of
+/// candidates). Depends on the keys only.
 fn watermarked(
     keys: &ProxyKeys,
     kind: EntityKind,
@@ -348,7 +378,7 @@ fn watermarked(
 ) -> Option<(String, u32)> {
     (from..MAX_ATTEMPTS).find_map(|attempt| {
         let candidate = generate(keys, kind, original, attempt);
-        (candidate != original && watermark_ok(keys, kind, &candidate))
+        (candidate != original && (!kind.is_watermarked() || watermark_ok(keys, kind, &candidate)))
             .then_some((candidate, attempt))
     })
 }
@@ -356,9 +386,14 @@ fn watermarked(
 /// Picks a proxy for every pending value that is still unresolved in
 /// `state`: the first watermarked candidate that equals no issued proxy, no
 /// known original, no original in this batch and no proxy chosen earlier in
-/// it. Values are taken in their sorted order, so the outcome does not depend
-/// on how the caller ordered them.
-fn choose(keys: &ProxyKeys, state: &State, pending: Vec<Pending>) -> Result<Vec<Entry>> {
+/// it, and that `avoid` does not turn down. Values are taken in their sorted
+/// order, so the outcome does not depend on how the caller ordered them.
+fn choose(
+    keys: &ProxyKeys,
+    state: &State,
+    pending: Vec<Pending>,
+    avoid: &dyn Fn(EntityKind, &str) -> bool,
+) -> Result<Vec<Entry>> {
     // Another process may have issued some since they were queued.
     let pending: Vec<Pending> = pending
         .into_iter()
@@ -374,6 +409,7 @@ fn choose(keys: &ProxyKeys, state: &State, pending: Vec<Pending>) -> Result<Vec<
             !state.by_proxy.contains_key(candidate)
                 && !state.originals.contains(candidate)
                 && !reserved.contains(candidate)
+                && !avoid(p.kind, candidate)
         };
         let proxy = first_free(keys, p.kind, &p.original, p.first, free)?;
         let proxy: Arc<str> = Arc::from(proxy);
@@ -416,7 +452,57 @@ impl VaultView<'_> {
     /// Original behind an issued proxy.
     #[must_use]
     pub fn original_for(&self, proxy: &str) -> Option<&str> {
-        self.state.by_proxy.get(proxy).map(|original| &**original)
+        self.state
+            .by_proxy
+            .get(proxy)
+            .map(|(_, original)| &**original)
+    }
+
+    /// Kind of an issued proxy.
+    #[must_use]
+    pub fn kind_of(&self, proxy: &str) -> Option<EntityKind> {
+        self.state.by_proxy.get(proxy).map(|(kind, _)| *kind)
+    }
+
+    /// Every issued proxy of `kind`.
+    pub fn proxies_of(&self, kind: EntityKind) -> impl Iterator<Item = &str> {
+        self.state.by_original[slot(kind)].values().map(|p| &**p)
+    }
+
+    /// How many proxies of `kind` were issued.
+    #[must_use]
+    pub fn count_of(&self, kind: EntityKind) -> usize {
+        self.state.by_original[slot(kind)].len()
+    }
+
+    /// Every record as `(kind, original, proxy)`, the newest first.
+    pub fn newest_first(&self) -> impl Iterator<Item = (EntityKind, &str, &str)> {
+        self.state.order.iter().rev().filter_map(|proxy| {
+            self.state
+                .by_proxy
+                .get(proxy)
+                .map(|(kind, original)| (*kind, &**original, &**proxy))
+        })
+    }
+
+    /// Every proxy issued as the `from`-th record or after, with its kind, in the order they
+    /// were issued: the vault's growth since it had `from` records, see
+    /// [`VaultView::record_count`].
+    pub fn issued_since(&self, from: u64) -> impl Iterator<Item = (EntityKind, &str)> {
+        let from = usize::try_from(from).unwrap_or(usize::MAX);
+        let proxies = self.state.order.get(from..).unwrap_or_default();
+        proxies.iter().filter_map(|proxy| {
+            self.state
+                .by_proxy
+                .get(proxy)
+                .map(|(kind, _)| (*kind, &**proxy))
+        })
+    }
+
+    /// Records in the vault; changes whenever a proxy is issued.
+    #[must_use]
+    pub fn record_count(&self) -> u64 {
+        self.state.count
     }
 }
 
@@ -451,6 +537,9 @@ mod tests {
     }
 
     type Row = (EntityKind, String, String);
+
+    /// Nothing for a proxy to stay away from.
+    const FREE: &dyn Fn(EntityKind, &str) -> bool = &|_, _| false;
 
     /// Appends records with the given proxies, bypassing proxy generation.
     fn append(vault: &Vault, rows: &[(EntityKind, &str, &str)]) -> Result<()> {
@@ -611,6 +700,39 @@ mod tests {
         );
         assert_eq!(view.original_for("x3@example.net"), Some("c@example.org"));
         assert_eq!(view.original_for("c@example.org"), None);
+        Ok(())
+    }
+
+    #[test]
+    fn records_come_newest_first_and_keep_their_order_across_reopen() -> Result<()> {
+        let dir = TempDir::new()?;
+        let vault = Vault::open(&dir.vault_path())?;
+        three(&vault)?;
+        append(
+            &vault,
+            &[(EntityKind::Phone, "+31612345678", "+31687654321")],
+        )?;
+        let newest = |vault: &Vault| -> Result<Vec<String>> {
+            Ok(vault
+                .read()?
+                .newest_first()
+                .map(|(_, original, _)| original.to_owned())
+                .collect())
+        };
+        let expected = [
+            "+31612345678",
+            "c@example.org",
+            "b@example.org",
+            "a@example.org",
+        ];
+        assert_eq!(newest(&vault)?, expected);
+        drop(vault);
+        let vault = Vault::open(&dir.vault_path())?;
+        assert_eq!(newest(&vault)?, expected);
+        let view = vault.read()?;
+        assert_eq!(view.count_of(EntityKind::Email), 3);
+        assert_eq!(view.count_of(EntityKind::Phone), 1);
+        assert_eq!(view.count_of(EntityKind::Iban), 0);
         Ok(())
     }
 
@@ -943,7 +1065,7 @@ mod tests {
     fn resolve_issues_distinct_watermarked_proxies_that_differ_from_originals() -> Result<()> {
         let dir = TempDir::new()?;
         let vault = Vault::open(&dir.vault_path())?;
-        vault.resolve(corpus())?;
+        vault.resolve(corpus(), FREE)?;
         let view = vault.read()?;
         let mut seen = HashSet::new();
         for (kind, original) in corpus() {
@@ -959,18 +1081,50 @@ mod tests {
     }
 
     #[test]
+    fn listed_model_kinds_get_proxies_without_a_watermark() -> Result<()> {
+        let dir = TempDir::new()?;
+        let vault = Vault::open(&dir.vault_path())?;
+        let values: Vec<(EntityKind, Box<str>)> = [
+            (
+                EntityKind::PostalAddress,
+                "Keizersgracht 123, 1015 CJ Amsterdam",
+            ),
+            (EntityKind::HealthData, "diabetes"),
+            (EntityKind::OrganizationName, "Acme B.V."),
+            (EntityKind::PersonRole, "CEO"),
+        ]
+        .into_iter()
+        .map(|(kind, original)| (kind, original.into()))
+        .collect();
+        vault.resolve(values.clone(), FREE)?;
+        let view = vault.read()?;
+        for (kind, original) in values {
+            let proxy = view
+                .proxy_for(kind, &original)
+                .ok_or(Error::ProxyExhausted { kind })?;
+            assert_ne!(proxy, &*original, "{kind:?}");
+            assert!(
+                crate::detect::validate::accepts(kind, proxy),
+                "{kind:?}: {proxy}"
+            );
+            assert_eq!(view.original_for(proxy), Some(&*original), "{kind:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn the_same_original_gets_the_same_proxy_across_reopen() -> Result<()> {
         let dir = TempDir::new()?;
         let first = {
             let vault = Vault::open(&dir.vault_path())?;
-            vault.resolve(corpus())?;
+            vault.resolve(corpus(), FREE)?;
             dump(&vault)?
         };
         assert_eq!(first.len(), corpus().len());
         let vault = Vault::open(&dir.vault_path())?;
         assert_eq!(dump(&vault)?, first);
         let len = std::fs::metadata(dir.vault_path())?.len();
-        vault.resolve(corpus())?;
+        vault.resolve(corpus(), FREE)?;
         assert_eq!(dump(&vault)?, first, "resolving again changed a proxy");
         assert_eq!(
             std::fs::metadata(dir.vault_path())?.len(),
@@ -985,7 +1139,7 @@ mod tests {
         let dir = TempDir::new()?;
         let proxies: Vec<(EntityKind, Box<str>, String)> = {
             let vault = Vault::open(&dir.vault_path())?;
-            vault.resolve(corpus())?;
+            vault.resolve(corpus(), FREE)?;
             let view = vault.read()?;
             corpus()
                 .into_iter()
@@ -1012,7 +1166,7 @@ mod tests {
         let mut batch = corpus();
         batch.extend(corpus());
         batch.push((EntityKind::Email, "jan.jansen@example.org".into()));
-        vault.resolve(batch)?;
+        vault.resolve(batch, FREE)?;
         assert_eq!(dump(&vault)?.len(), corpus().len());
         drop(vault);
         let vault = Vault::open(&dir.vault_path())?;
@@ -1024,10 +1178,13 @@ mod tests {
     fn the_same_text_under_two_kinds_gets_two_proxies() -> Result<()> {
         let dir = TempDir::new()?;
         let vault = Vault::open(&dir.vault_path())?;
-        vault.resolve(vec![
-            (EntityKind::NlBsn, "111222333".into()),
-            (EntityKind::UsSsn, "111222333".into()),
-        ])?;
+        vault.resolve(
+            vec![
+                (EntityKind::NlBsn, "111222333".into()),
+                (EntityKind::UsSsn, "111222333".into()),
+            ],
+            FREE,
+        )?;
         let bsn = proxy_of(&vault, EntityKind::NlBsn, "111222333")?;
         let ssn = proxy_of(&vault, EntityKind::UsSsn, "111222333")?;
         assert!(bsn.is_some() && ssn.is_some());
@@ -1041,11 +1198,11 @@ mod tests {
         let a = Vault::open(&dir.vault_path())?;
         let b = Vault::open(&dir.vault_path())?;
         let all = corpus();
-        a.resolve(all[..7].to_vec())?;
-        b.resolve(all[4..].to_vec())?;
+        a.resolve(all[..7].to_vec(), FREE)?;
+        b.resolve(all[4..].to_vec(), FREE)?;
         // `a` learns what `b` added the next time it writes, or reopens.
-        a.resolve(all.clone())?;
-        b.resolve(all.clone())?;
+        a.resolve(all.clone(), FREE)?;
+        b.resolve(all.clone(), FREE)?;
         assert_eq!(dump(&a)?, dump(&b)?);
         assert_eq!(dump(&a)?.len(), all.len());
         let live = dump(&a)?;
@@ -1084,7 +1241,7 @@ mod tests {
         for round in 0..rounds {
             let mut batch = emails("shared", 20);
             batch.extend(emails(&format!("t{t}r{round}"), 10));
-            vault.resolve(batch)?;
+            vault.resolve(batch, FREE)?;
             // Readers run alongside the writers.
             let _ = vault
                 .read()?
@@ -1135,8 +1292,116 @@ mod tests {
         (0..96).into_par_iter().try_for_each(|i| {
             let mut batch = emails("shared", 30);
             batch.extend(emails(&format!("file{i}"), 30));
-            vault.resolve(batch)
+            vault.resolve(batch, FREE)
         })?;
         assert_consistent(&vault, 30 + 96 * 30)
+    }
+
+    /// The candidates the vault tries for `original`, in order: those that differ from it and
+    /// carry the watermark.
+    fn watermarked_candidates(vault: &Vault, kind: EntityKind, original: &str) -> Vec<String> {
+        let keys = vault.proxy_keys();
+        (0..MAX_ATTEMPTS)
+            .map(|attempt| generate(keys, kind, original, attempt))
+            .filter(|c| c != original && watermark_ok(keys, kind, c))
+            .collect()
+    }
+
+    #[test]
+    fn resolve_skips_the_candidates_the_caller_avoids() -> Result<()> {
+        let dir = TempDir::new()?;
+        let vault = Vault::open(&dir.vault_path())?;
+        let email = "jan.jansen@example.org";
+        let phone = "+31 6 12345678";
+        let emails = watermarked_candidates(&vault, EntityKind::Email, email);
+        let phones = watermarked_candidates(&vault, EntityKind::Phone, phone);
+        assert!(emails.len() > 2 && !phones.is_empty());
+        // The first two email candidates are turned down. The phone number is not affected:
+        // `avoid` is asked with the kind.
+        let avoid = |kind: EntityKind, candidate: &str| {
+            kind == EntityKind::Email && (candidate == emails[0] || candidate == emails[1])
+        };
+        vault.resolve(
+            vec![
+                (EntityKind::Email, email.into()),
+                (EntityKind::Phone, phone.into()),
+            ],
+            &avoid,
+        )?;
+        assert_eq!(
+            proxy_of(&vault, EntityKind::Email, email)?.as_deref(),
+            Some(emails[2].as_str())
+        );
+        assert_eq!(
+            proxy_of(&vault, EntityKind::Phone, phone)?.as_deref(),
+            Some(phones[0].as_str())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_gives_up_when_every_candidate_is_avoided() -> Result<()> {
+        let dir = TempDir::new()?;
+        let vault = Vault::open(&dir.vault_path())?;
+        let refused = vault.resolve(
+            vec![(EntityKind::Email, "jan.jansen@example.org".into())],
+            &|_, _| true,
+        );
+        assert!(
+            matches!(
+                refused,
+                Err(Error::ProxyExhausted {
+                    kind: EntityKind::Email
+                })
+            ),
+            "{refused:?}"
+        );
+        // Nothing was written, and a later call without the constraint succeeds.
+        assert_eq!(vault.read()?.record_count(), 0);
+        vault.resolve(
+            vec![(EntityKind::Email, "jan.jansen@example.org".into())],
+            FREE,
+        )?;
+        assert_eq!(vault.read()?.record_count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn issued_since_lists_the_records_added_after_a_count_in_issue_order() -> Result<()> {
+        let dir = TempDir::new()?;
+        let vault = Vault::open(&dir.vault_path())?;
+        append(
+            &vault,
+            &[
+                (EntityKind::Email, "a@example.org", "x1@example.net"),
+                (EntityKind::Person, "Jan", "Haley"),
+            ],
+        )?;
+        append(
+            &vault,
+            &[(EntityKind::HealthData, "diabetes", "Health-7KQX")],
+        )?;
+        let view = vault.read()?;
+        assert_eq!(view.record_count(), 3);
+        let since = |n: u64| -> Vec<(EntityKind, String)> {
+            view.issued_since(n)
+                .map(|(kind, proxy)| (kind, proxy.to_owned()))
+                .collect()
+        };
+        assert_eq!(
+            since(0),
+            [
+                (EntityKind::Email, "x1@example.net".to_owned()),
+                (EntityKind::Person, "Haley".to_owned()),
+                (EntityKind::HealthData, "Health-7KQX".to_owned()),
+            ]
+        );
+        assert_eq!(
+            since(2),
+            [(EntityKind::HealthData, "Health-7KQX".to_owned())]
+        );
+        assert!(since(3).is_empty());
+        assert!(since(u64::MAX).is_empty());
+        Ok(())
     }
 }

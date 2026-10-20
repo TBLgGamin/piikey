@@ -31,6 +31,8 @@ pub enum Error {
     Mail(String),
     /// A named-pipe client sent a malformed request.
     Protocol(&'static str),
+    /// The detection model is missing or failed to load or run.
+    Model(String),
     /// A lock was poisoned by a panicking thread.
     Poisoned,
 }
@@ -52,6 +54,7 @@ impl fmt::Display for Error {
             Self::Ocr(e) => write!(f, "ocr: {e}"),
             Self::Mail(e) => write!(f, "mail: {e}"),
             Self::Protocol(e) => write!(f, "protocol: {e}"),
+            Self::Model(e) => write!(f, "detection model: {e}"),
             Self::Poisoned => f.write_str("internal lock poisoned"),
         }
     }

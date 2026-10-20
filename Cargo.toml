@@ -1,9 +1,16 @@
+[workspace]
+members = [".", "app"]
+
 [package]
 name = "piikey"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 publish = false
+
+[[bin]]
+name = "piikey-cli"
+path = "src/main.rs"
 
 [dependencies]
 # Multi-pattern lazy-DFA scan; Unicode tables off (all patterns are ASCII).
@@ -45,12 +52,42 @@ lopdf = "0.45.0"
 mail-parser = "0.11.9"
 cfb = "0.15.0"
 lexopt = "0.3.2"
+# Known-name detection and tolerant restore: multi-pattern exact matching.
+aho-corasick = "1.1.5"
+# Tolerant restore: edit distance for typo'd proxies.
+strsim = "0.11.1"
+# On-device PII model runtime: ONNX Runtime with the DirectML GPU backend (CPU fallback) behind safe
+# wrappers, so our own code stays free of `unsafe`. The prebuilt runtime is linked statically;
+# `copy-dylibs` places DirectML.dll next to the executables.
+ort = { version = "=2.0.0-rc.15", default-features = false, features = [
+    "std",
+    "api-31",
+    "download-binaries",
+    "copy-dylibs",
+    "tls-native",
+    "directml",
+] }
+# Loads the model's tokenizer.json (byte-fallback BPE). `fancy-regex` is pure Rust: no C/C++ build.
+tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
 
-[lints.rust]
+[build-dependencies]
+# Embeds app/assets/piikey.ico as the exe icon resource (rc.exe or llvm-rc from the Windows SDK):
+# it finds the SDK tools itself and adds no manifest of its own.
+embed-resource = "3.0.12"
+
+[dev-dependencies]
+# Reads the benchmark corpora (JSONL) and writes its results (`examples/pii_eval`). Already in the
+# build graph through `tokenizers`, so it adds no crate.
+serde_json = "1.0.154"
+
+[lints]
+workspace = true
+
+[workspace.lints.rust]
 unsafe_code = "forbid"
 missing_debug_implementations = "warn"
 
-[lints.clippy]
+[workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 unwrap_used = "warn"
@@ -62,3 +99,8 @@ todo = "warn"
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# Disk: debug info of dependencies is most of target\debug (PDBs of several GB) and is never
+# stepped into; piikey's own crates keep full debug info. Line tables still give backtraces.
+[profile.dev.package."*"]
+debug = "line-tables-only"

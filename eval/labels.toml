@@ -1,0 +1,232 @@
+# Label mapping for the piikey quality benchmark (eval/README.md).
+#
+# One coarse taxonomy ties together three things that do not share a vocabulary: the labels of
+# each ground-truth corpus, the labels of the hand-made set, and piikey's 44 `EntityKind`s.
+#
+# Read by eval/fetch.py and eval/handmade.py (Python `tomllib`) and by the Rust benchmark
+# (`examples/pii_eval`, a hand-written reader for exactly this subset of TOML: `[section]`
+# headers, `KEY = "string"` lines, `#` comments; nothing else).
+
+# --- The coarse taxonomy -------------------------------------------------------------------------
+[categories]
+PERSON = "Names of people: full, first, last, aliases"
+PERSON_ATTR = "Descriptive facts about a person: age, gender, honorific, job role"
+EMAIL = "Email addresses"
+PHONE = "Phone numbers"
+ADDRESS = "Street or postal addresses, and their parts (street, number, postcode)"
+LOCATION = "Cities, states, countries and other place names"
+GEO = "Geographic coordinates"
+ORG = "Names of companies and other organizations"
+DATE = "Dates and times in general (not a birth date)"
+DOB = "Dates of birth"
+ID_NUMBER = "Identifiers issued by an authority or institution: SSN, BSN, passport, licence, tax, medical record, plate, VIN"
+ACCOUNT = "Identity inside a service: usernames, handles, customer / employee / account ids"
+FINANCIAL = "Bank and card data: IBAN, bank account, routing number, BIC, card number, CVV"
+AMOUNT = "Amounts of money"
+NETWORK = "IP and MAC addresses, URLs, device identifiers"
+SECRET = "Passwords, PINs, API keys, tokens, URL credentials"
+SENSITIVE = "GDPR special categories: health, biometric, ethnic origin, politics, religion, orientation, union, criminal"
+OTHER = "Anything else the model can tag: brand and product names, document and case references"
+
+# --- How the benchmark treats each source ---------------------------------------------------------
+# "exhaustive": every PII value of the text is labelled, so a prediction that matches no label is
+#               a false positive (the hand-made set).
+# "partial":    the source labels only the categories of its own label vocabulary below. A
+#               prediction of another category cannot be judged and is reported as unjudged. This is
+#               the default.
+[policy]
+handmade = "exhaustive"
+finance_multilingual = "partial"
+openpii = "partial"
+gretel_en = "partial"
+
+# --- Categories whose neighbours are the same thing to a different annotator ---------------------
+# The overlap-and-category metric accepts either side of a pair. The strict metric never does.
+# OpenPII calls the city of an address CITY while the model folds it into POSTAL_ADDRESS; OpenPII
+# calls every date DATE while the model can tell a date of birth.
+[compat]
+ADDRESS = "LOCATION"
+DATE = "DOB"
+
+# --- The categories the model card's scoring covers -------------------------------------------------
+# The card scores seven type groups: person, email, phone, address, ID, secret and URL. This is this
+# benchmark's reading of them (ID taken as every identifier category, URL as the network category). It
+# only feeds the "card types" columns of the verdict, which are an approximation, not the card's scorer.
+[card]
+types = "PERSON,EMAIL,PHONE,ADDRESS,ID_NUMBER,ACCOUNT,FINANCIAL,SECRET,NETWORK"
+
+# --- Gold spans the benchmark joins before scoring -------------------------------------------------
+# Sources that cut one entity into parts (OpenPII: GIVENNAME + SURNAME, STREET + BUILDINGNUM) would
+# make an exact-span match impossible against a model that reads the entity whole. Two spans of the
+# same category join when at most two characters lie between them: spaces, tabs and hyphens, plus the
+# extra characters listed here. Not applied to an "exhaustive" source (its spans are as authored).
+[merge]
+ADDRESS = ",."
+
+# --- piikey EntityKind (as_str) -> category ------------------------------------------------------
+# Every one of the 44 kinds must appear (the benchmark refuses to run otherwise). A category with no
+# kind here is one piikey cannot produce at all ("no piikey counterpart").
+[piikey]
+secret = "SECRET"
+url_credential = "SECRET"
+email = "EMAIL"
+iban = "FINANCIAL"
+credit_card = "FINANCIAL"
+ipv6 = "NETWORK"
+mac = "NETWORK"
+ipv4 = "NETWORK"
+us_ssn = "ID_NUMBER"
+nl_bsn = "ID_NUMBER"
+phone = "PHONE"
+person = "PERSON"
+person_alias = "PERSON"
+person_identifier = "ID_NUMBER"
+person_attribute = "PERSON_ATTR"
+person_role = "PERSON_ATTR"
+date_of_birth = "DOB"
+phone_number = "PHONE"
+contact_handle = "ACCOUNT"
+postal_address = "ADDRESS"
+location = "LOCATION"
+geo_location = "GEO"
+device_identifier = "NETWORK"
+identifying_link = "NETWORK"
+account_identifier = "ACCOUNT"
+auth_secret = "SECRET"
+bank_account = "FINANCIAL"
+payment_card = "FINANCIAL"
+card_security = "FINANCIAL"
+financial_amount = "AMOUNT"
+document_identifier = "ID_NUMBER"
+document_reference = "OTHER"
+vehicle_identifier = "ID_NUMBER"
+organization_name = "ORG"
+organization_identifier = "ID_NUMBER"
+proper_name = "OTHER"
+health_data = "SENSITIVE"
+biometric_data = "SENSITIVE"
+ethnic_origin = "SENSITIVE"
+political_opinion = "SENSITIVE"
+religion_or_belief = "SENSITIVE"
+sexual_orientation = "SENSITIVE"
+trade_union = "SENSITIVE"
+criminal_offence = "SENSITIVE"
+
+# --- gretelai/synthetic_pii_finance_multilingual (29 labels) --------------------------------------
+[source.finance_multilingual]
+name = "PERSON"
+first_name = "PERSON"
+last_name = "PERSON"
+company = "ORG"
+street_address = "ADDRESS"
+email = "EMAIL"
+phone_number = "PHONE"
+date = "DATE"
+time = "DATE"
+date_time = "DATE"
+date_of_birth = "DOB"
+iban = "FINANCIAL"
+bban = "FINANCIAL"
+swift_bic_code = "FINANCIAL"
+bank_routing_number = "FINANCIAL"
+credit_card_number = "FINANCIAL"
+credit_card_security_code = "FINANCIAL"
+ssn = "ID_NUMBER"
+passport_number = "ID_NUMBER"
+driver_license_number = "ID_NUMBER"
+customer_id = "ACCOUNT"
+employee_id = "ACCOUNT"
+user_name = "ACCOUNT"
+ipv4 = "NETWORK"
+ipv6 = "NETWORK"
+local_latlng = "GEO"
+password = "SECRET"
+api_key = "SECRET"
+account_pin = "SECRET"
+
+# --- ai4privacy/pii-masking-openpii-1m (19 labels) ------------------------------------------------
+[source.openpii]
+GIVENNAME = "PERSON"
+SURNAME = "PERSON"
+TITLE = "PERSON_ATTR"
+AGE = "PERSON_ATTR"
+GENDER = "PERSON_ATTR"
+SEX = "PERSON_ATTR"
+EMAIL = "EMAIL"
+TELEPHONENUM = "PHONE"
+STREET = "ADDRESS"
+BUILDINGNUM = "ADDRESS"
+ZIPCODE = "ADDRESS"
+CITY = "LOCATION"
+DATE = "DATE"
+IDCARDNUM = "ID_NUMBER"
+DRIVERLICENSENUM = "ID_NUMBER"
+TAXNUM = "ID_NUMBER"
+SOCIALNUM = "ID_NUMBER"
+PASSPORTNUM = "ID_NUMBER"
+CREDITCARDNUMBER = "FINANCIAL"
+
+# --- gretelai/gretel-pii-masking-en-v1 (41 labels) ------------------------------------------------
+[source.gretel_en]
+name = "PERSON"
+first_name = "PERSON"
+last_name = "PERSON"
+company_name = "ORG"
+street_address = "ADDRESS"
+address = "ADDRESS"
+postcode = "ADDRESS"
+city = "LOCATION"
+state = "LOCATION"
+country = "LOCATION"
+coordinate = "GEO"
+email = "EMAIL"
+phone_number = "PHONE"
+date = "DATE"
+time = "DATE"
+date_time = "DATE"
+date_of_birth = "DOB"
+ssn = "ID_NUMBER"
+national_id = "ID_NUMBER"
+tax_id = "ID_NUMBER"
+medical_record_number = "ID_NUMBER"
+health_plan_beneficiary_number = "ID_NUMBER"
+certificate_license_number = "ID_NUMBER"
+license_plate = "ID_NUMBER"
+vehicle_identifier = "ID_NUMBER"
+unique_identifier = "ID_NUMBER"
+customer_id = "ACCOUNT"
+employee_id = "ACCOUNT"
+user_name = "ACCOUNT"
+credit_card_number = "FINANCIAL"
+account_number = "FINANCIAL"
+bank_routing_number = "FINANCIAL"
+swift_bic = "FINANCIAL"
+cvv = "FINANCIAL"
+ipv4 = "NETWORK"
+ipv6 = "NETWORK"
+url = "NETWORK"
+device_identifier = "NETWORK"
+password = "SECRET"
+api_key = "SECRET"
+pin = "SECRET"
+biometric_identifier = "SENSITIVE"
+
+# --- eval/handmade.jsonl: its labels are the category names themselves -----------------------------
+[source.handmade]
+PERSON = "PERSON"
+PERSON_ATTR = "PERSON_ATTR"
+EMAIL = "EMAIL"
+PHONE = "PHONE"
+ADDRESS = "ADDRESS"
+LOCATION = "LOCATION"
+GEO = "GEO"
+ORG = "ORG"
+DOB = "DOB"
+ID_NUMBER = "ID_NUMBER"
+ACCOUNT = "ACCOUNT"
+FINANCIAL = "FINANCIAL"
+AMOUNT = "AMOUNT"
+NETWORK = "NETWORK"
+SECRET = "SECRET"
+SENSITIVE = "SENSITIVE"
+OTHER = "OTHER"

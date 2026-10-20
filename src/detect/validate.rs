@@ -21,8 +21,17 @@ pub(super) type Validator = fn(&[u8], usize, usize) -> Option<(usize, usize)>;
 /// True when `s` is, as a whole, a valid value of `kind`. Context rules (the
 /// SSN and BSN keywords) are not applied. For [`EntityKind::UrlCredential`]
 /// the value is the `user:pass` part, exactly as a [`super::Span`] covers it.
+/// A [`EntityKind::Person`] is a name: one to six whitespace-separated tokens
+/// of letters, `'`, `-` and `.`, at most 64 bytes. The kinds the detection
+/// model finds (discriminant 13 and up) share one rule, see [`model_value`].
 #[must_use]
 pub fn accepts(kind: EntityKind, s: &str) -> bool {
+    if kind == EntityKind::Person {
+        return person(s);
+    }
+    if kind as u8 >= FIRST_MODEL_KIND {
+        return model_value(kind, s);
+    }
     let value = s.as_bytes();
     if kind == EntityKind::UrlCredential {
         return credential(value);
@@ -31,6 +40,76 @@ pub fn accepts(kind: EntityKind, s: &str) -> bool {
         .iter()
         .find(|p| p.kind == kind)
         .is_some_and(|p| (p.validate)(value, 0, value.len()) == Some((0, value.len())))
+}
+
+/// Discriminant of the first kind that only the detection model finds.
+const FIRST_MODEL_KIND: u8 = 13;
+
+/// Longest value of a model kind, in bytes.
+const MODEL_MAX_BYTES: usize = 256;
+
+/// Value of a kind the detection model finds: 1 to 256 bytes, no whitespace at
+/// either end, no control characters (a [`EntityKind::PostalAddress`] may
+/// hold `\n`), at least three alphanumeric characters, plus the extra rule of
+/// the kind (a count of ASCII digits, or the shape of a link).
+fn model_value(kind: EntityKind, s: &str) -> bool {
+    if s.is_empty() || s.len() > MODEL_MAX_BYTES {
+        return false;
+    }
+    if s.starts_with(char::is_whitespace) || s.ends_with(char::is_whitespace) {
+        return false;
+    }
+    let newline_ok = kind == EntityKind::PostalAddress;
+    if s.chars()
+        .any(|c| c.is_control() && !(newline_ok && c == '\n'))
+    {
+        return false;
+    }
+    if s.chars().filter(|c| c.is_alphanumeric()).count() < 3 {
+        return false;
+    }
+    let digits = s.bytes().filter(u8::is_ascii_digit).count();
+    match kind {
+        EntityKind::PersonIdentifier
+        | EntityKind::AccountId
+        | EntityKind::BankAccount
+        | EntityKind::DocumentId
+        | EntityKind::VehicleId => digits >= 2,
+        EntityKind::DateOfBirth
+        | EntityKind::GeoLocation
+        | EntityKind::PaymentCard
+        | EntityKind::CardSecurity
+        | EntityKind::FinancialAmount => digits >= 3,
+        EntityKind::PhoneNumber => digits >= 5,
+        EntityKind::IdentifyingLink => url_ish(s),
+        _ => true,
+    }
+}
+
+/// True when `s` looks like a link: it has `://`, starts with `www.` (any case),
+/// starts with `/` and an alphanumeric, or holds `label.tld` where the label ends
+/// in an ASCII alphanumeric and the top-level label is at least two ASCII letters
+/// that end the value or are followed by a character that is not alphanumeric.
+pub(super) fn url_ish(s: &str) -> bool {
+    let b = s.as_bytes();
+    if s.contains("://") || b.get(..4).is_some_and(|p| p.eq_ignore_ascii_case(b"www.")) {
+        return true;
+    }
+    if b.first() == Some(&b'/') && b.get(1).is_some_and(u8::is_ascii_alphanumeric) {
+        return true;
+    }
+    (0..b.len().saturating_sub(1)).any(|i| {
+        if !(b[i].is_ascii_alphanumeric() && b[i + 1] == b'.') {
+            return false;
+        }
+        let letters = b[i + 2..]
+            .iter()
+            .take_while(|c| c.is_ascii_alphabetic())
+            .count();
+        letters >= 2
+            && b.get(i + 2 + letters)
+                .is_none_or(|c| !c.is_ascii_alphanumeric())
+    })
 }
 
 /// Luhn checksum over ASCII digits. Empty input or any non-digit is invalid.
@@ -422,6 +501,43 @@ fn credential(value: &[u8]) -> bool {
         && !pass
             .iter()
             .any(|&b| b.is_ascii_whitespace() || matches!(b, b'/' | b'@'))
+}
+
+/// Longest [`EntityKind::Person`] value, in bytes.
+const PERSON_MAX_BYTES: usize = 64;
+
+/// Most tokens a [`EntityKind::Person`] value has.
+const PERSON_MAX_TOKENS: usize = 6;
+
+/// Person name: one to six tokens separated by whitespace, at most 64 bytes,
+/// with no whitespace at either end. A token holds letters (of any script, so
+/// `Zoë` and `José` pass), `'`, `’`, `-` and `.` (initials such as `J.`) and
+/// at least one letter. The first token has at least two characters: `J.` and
+/// `'t` can open a name, a lone `J` cannot.
+fn person(s: &str) -> bool {
+    if s.len() > PERSON_MAX_BYTES
+        || s.starts_with(char::is_whitespace)
+        || s.ends_with(char::is_whitespace)
+    {
+        return false;
+    }
+    let mut tokens = 0;
+    for token in s.split_whitespace() {
+        tokens += 1;
+        let long_enough = tokens > 1 || token.chars().nth(1).is_some();
+        if tokens > PERSON_MAX_TOKENS || !long_enough || !name_token(token) {
+            return false;
+        }
+    }
+    tokens > 0
+}
+
+/// Letters, apostrophes, hyphens and dots, with at least one letter.
+fn name_token(token: &str) -> bool {
+    token
+        .chars()
+        .all(|c| c.is_alphabetic() || matches!(c, '\'' | '\u{2019}' | '-' | '.'))
+        && token.chars().any(char::is_alphabetic)
 }
 
 /// URL with embedded credentials (`scheme://user:pass@`), trimmed to the bytes
@@ -1036,5 +1152,140 @@ mod tests {
             "https://admin:hunter2@"
         ));
         assert!(!accepts(EntityKind::UrlCredential, ""));
+    }
+
+    #[test]
+    fn person_accepts_one_to_six_name_tokens() {
+        for ok in [
+            "Jeroen",
+            "Ed",
+            "Jeroen de Vries",
+            "J. Jansen",
+            "J.R.R. Tolkien",
+            "MARIA LOPEZ-GARCIA",
+            "jan van der berg",
+            "Jan 't Hart",
+            "'t Hart",
+            "Patrick O'Brien",
+            "Patrick O\u{2019}Brien",
+            "Anne-Marie",
+            "Zoë de Vries",
+            "José García",
+            "Jan Willem Karel Pieter Hendrik Jansen",
+            "Jeroen  de\tVries",
+        ] {
+            assert!(accepts(EntityKind::Person, ok), "{ok:?}");
+        }
+    }
+
+    #[test]
+    fn person_rejects_other_shapes() {
+        let seven = "Aa Bb Cc Dd Ee Ff Gg";
+        let long = format!("Jeroen {}", "x".repeat(60));
+        for (bad, why) in [
+            ("", "empty"),
+            (" ", "only whitespace"),
+            (" Jeroen", "leading whitespace"),
+            ("Jeroen ", "trailing whitespace"),
+            ("J", "one-character first token"),
+            ("A de Vries", "one-character first token"),
+            ("Jeroen 3", "digit"),
+            ("Jeroen2 de Vries", "digit"),
+            ("Jeroen, de Vries", "comma"),
+            ("jeroen@test.nl", "email"),
+            ("Jeroen - Vries", "token without a letter"),
+            ("Jeroen ..", "token without a letter"),
+            ("..", "no letter"),
+            (seven, "seven tokens"),
+            (long.as_str(), "over 64 bytes"),
+        ] {
+            assert!(!accepts(EntityKind::Person, bad), "{why}: {bad:?}");
+        }
+        // Exactly 64 bytes and exactly six tokens are still fine.
+        let edge = format!("Jeroen {}", "x".repeat(57));
+        assert_eq!(edge.len(), 64);
+        assert!(accepts(EntityKind::Person, &edge));
+        assert!(accepts(EntityKind::Person, "Aa Bb Cc Dd Ee Ff"));
+    }
+
+    #[test]
+    fn model_kinds_share_the_common_rule() {
+        let long = "a".repeat(257);
+        for kind in EntityKind::ALL.into_iter().filter(|k| *k as u8 >= 13) {
+            assert!(!accepts(kind, ""), "{kind:?}: empty");
+            assert!(!accepts(kind, " Jan Jansen"), "{kind:?}: leading space");
+            assert!(!accepts(kind, "Jan Jansen\t"), "{kind:?}: trailing tab");
+            assert!(!accepts(kind, "Jan\u{7}Jansen"), "{kind:?}: control");
+            assert!(!accepts(kind, "ab"), "{kind:?}: two alphanumerics");
+            assert!(!accepts(kind, "a-b-"), "{kind:?}: two alphanumerics");
+            assert!(!accepts(kind, &long), "{kind:?}: over 256 bytes");
+        }
+        assert!(accepts(EntityKind::Location, "Den Haag"));
+        assert!(accepts(EntityKind::Location, &"a".repeat(256)));
+        assert!(!accepts(EntityKind::Location, "Den\nHaag"), "newline");
+        assert!(accepts(
+            EntityKind::PostalAddress,
+            "Keizersgracht 123\n1015 CJ Amsterdam"
+        ));
+        assert!(!accepts(EntityKind::PostalAddress, "Keizersgracht\r123"));
+    }
+
+    #[test]
+    fn model_kinds_with_digit_rules() {
+        // (kind, good, bad): two digits, three digits and five digits respectively.
+        let table = [
+            (EntityKind::PersonIdentifier, "ID 12", "ID 1"),
+            (EntityKind::AccountId, "acct-42", "acct-4"),
+            (EntityKind::BankAccount, "BE 12 abc", "BE 1 abcd"),
+            (EntityKind::DocumentId, "NR 17", "NR 7"),
+            (EntityKind::VehicleId, "AB-12-CD", "AB-C-CD"),
+            (EntityKind::DateOfBirth, "14 mei 1990", "mei 90"),
+            (EntityKind::GeoLocation, "52.37, 4.9", "5.4 N"),
+            (EntityKind::PaymentCard, "5555 55", "55 abc"),
+            (EntityKind::CardSecurity, "123", "12 a"),
+            (EntityKind::FinancialAmount, "EUR 100", "EUR 10"),
+            (EntityKind::PhoneNumber, "12345", "1234"),
+        ];
+        for (kind, good, bad) in table {
+            assert!(accepts(kind, good), "{kind:?}: {good}");
+            assert!(!accepts(kind, bad), "{kind:?}: {bad}");
+        }
+        // Non-ASCII digits are not counted.
+        assert!(!accepts(
+            EntityKind::PhoneNumber,
+            "\u{661}\u{662}\u{663}\u{664}\u{665}"
+        ));
+    }
+
+    #[test]
+    fn identifying_links_must_look_like_links() {
+        for ok in [
+            "https://example.org/jan",
+            "HTTP://x.y",
+            "www.example",
+            "WWW.Example",
+            "/users/jan",
+            "linkedin.com/in/jan",
+            "example.nl",
+            "a.co",
+            "see jan.nl now",
+        ] {
+            assert!(accepts(EntityKind::IdentifyingLink, ok), "{ok}");
+        }
+        for bad in [
+            "jan jansen",
+            "//x",
+            "/ jan",
+            "v1.2.3",
+            "example.n",
+            "example.nl2",
+            "jan.",
+            "@jan_jansen",
+            "wwwexample",
+        ] {
+            assert!(!accepts(EntityKind::IdentifyingLink, bad), "{bad}");
+        }
+        // The same text is fine for kinds without the link rule.
+        assert!(accepts(EntityKind::ContactHandle, "@jan_jansen"));
     }
 }

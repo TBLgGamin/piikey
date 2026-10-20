@@ -667,7 +667,7 @@ mod tests {
         );
         assert_eq!(parse_plain(&[0, 1, 0, b'a', 1, 0, b'b']), None, "kind 0");
         assert_eq!(
-            parse_plain(&[12, 1, 0, b'a', 1, 0, b'b']),
+            parse_plain(&[45, 1, 0, b'a', 1, 0, b'b']),
             None,
             "unknown kind"
         );

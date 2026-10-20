@@ -2,6 +2,7 @@
 
 use std::{
     ffi::OsString,
+    fmt::Display,
     fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -11,9 +12,10 @@ use std::{
 
 use lexopt::{Arg, Parser, ValueExt};
 use piikey::{
-    detect::Mode,
+    detect::{EntityKind, Mode, NerDetector, ner},
     engine::Engine,
     formats::{self, Output},
+    restore::{Restorer, Scope, ScopeEntry},
     service,
     vault::default_path,
 };
@@ -21,12 +23,15 @@ use rayon::prelude::*;
 
 const USAGE: &str = "\
 usage:
-  piikey anonymize   [--vault PATH] [--out DIR] [PATH...]
-  piikey deanonymize [--vault PATH] [--out DIR] [PATH...]
-  piikey serve       [--vault PATH] [--pipe NAME]      (default \\\\.\\pipe\\piikey)
+  piikey-cli anonymize   [--vault PATH] [--out DIR] [PATH...]
+  piikey-cli deanonymize [--vault PATH] [--tolerant] [--out DIR] [PATH...]
+  piikey-cli serve       [--vault PATH] [--pipe NAME]      (default \\\\.\\pipe\\piikey)
 
 With no PATH, stdin is processed and the result goes to stdout.
-With PATHs, --out DIR is required; directories are walked recursively.";
+With PATHs, --out DIR is required; directories are walked recursively.
+
+--tolerant     also restores proxies that came back with a typo, and first or last
+               names that came back alone; only for text, not for zip documents";
 
 /// A parsed command line.
 #[derive(Debug, PartialEq, Eq)]
@@ -36,11 +41,13 @@ enum Command {
     Stdin {
         mode: Mode,
         vault: Option<PathBuf>,
+        tolerant: bool,
     },
     /// Process files and directories into `out`.
     Files {
         mode: Mode,
         vault: Option<PathBuf>,
+        tolerant: bool,
         out: PathBuf,
         inputs: Vec<PathBuf>,
     },
@@ -82,6 +89,7 @@ where
     let mut out: Option<PathBuf> = None;
     let mut pipe: Option<String> = None;
     let mut inputs: Vec<PathBuf> = Vec::new();
+    let mut tolerant = false;
 
     while let Some(arg) = parser.next()? {
         match arg {
@@ -89,6 +97,7 @@ where
             Arg::Long("vault") => vault = Some(PathBuf::from(parser.value()?)),
             Arg::Long("out") => out = Some(PathBuf::from(parser.value()?)),
             Arg::Long("pipe") => pipe = Some(parser.value()?.string()?),
+            Arg::Long("tolerant") => tolerant = true,
             Arg::Value(value) => {
                 if sub.is_none() {
                     sub = Some(match value.to_str() {
@@ -116,6 +125,11 @@ where
             if out.is_some() {
                 return Err(ParseError::Usage("--out is not valid for serve".into()));
             }
+            if tolerant {
+                return Err(ParseError::Usage(
+                    "--tolerant is not valid for serve".into(),
+                ));
+            }
             if !inputs.is_empty() {
                 return Err(ParseError::Usage("serve takes no input paths".into()));
             }
@@ -125,18 +139,28 @@ where
             if pipe.is_some() {
                 return Err(ParseError::Usage("--pipe is only valid for serve".into()));
             }
+            if tolerant && mode != Mode::Deanonymize {
+                return Err(ParseError::Usage(
+                    "--tolerant is only valid for deanonymize".into(),
+                ));
+            }
             if inputs.is_empty() {
                 if out.is_some() {
                     return Err(ParseError::Usage(
                         "--out is only valid with input paths".into(),
                     ));
                 }
-                Ok(Command::Stdin { mode, vault })
+                Ok(Command::Stdin {
+                    mode,
+                    vault,
+                    tolerant,
+                })
             } else {
                 let out = out.ok_or(ParseError::OutRequired)?;
                 Ok(Command::Files {
                     mode,
                     vault,
+                    tolerant,
                     out,
                     inputs,
                 })
@@ -154,41 +178,119 @@ pub fn main() -> ExitCode {
         }
         Ok(command) => execute(command),
         Err(ParseError::OutRequired) => {
-            eprintln!("piikey: --out is required with input paths");
+            eprintln!("piikey-cli: --out is required with input paths");
             ExitCode::from(2)
         }
         Err(ParseError::Usage(msg)) => {
-            eprintln!("piikey: {msg}\n{USAGE}");
+            eprintln!("piikey-cli: {msg}\n{USAGE}");
             ExitCode::from(2)
         }
     }
 }
 
+/// Opens the engine for `vault` (the default vault when `None`), with the
+/// detection model when the app has downloaded it.
 fn open_engine(vault: Option<PathBuf>) -> piikey::Result<Engine> {
     let path = match vault {
         Some(path) => path,
         None => default_path()?,
     };
-    Engine::open(&path)
+    match ner::files::default_dir() {
+        Ok(dir) if ner::files::is_installed(&dir) => {
+            Engine::open_with_model(&path, NerDetector::new(dir))
+        }
+        _ => {
+            eprintln!(
+                "note: the detection model is not downloaded yet (start piikey.exe once); \
+                 only emails, phone numbers, IBANs and other patterns are masked"
+            );
+            Engine::open(&path)
+        }
+    }
+}
+
+/// The restorer behind `--tolerant`: scoped to every proxy in the vault. `None` when the flag
+/// is off or the vault holds no proxy.
+fn tolerant_restorer(engine: &Engine, wanted: bool) -> piikey::Result<Option<Restorer>> {
+    if !wanted {
+        return Ok(None);
+    }
+    let scope = vault_scope(engine)?;
+    if scope.entries().is_empty() {
+        return Ok(None);
+    }
+    Restorer::new(scope).map(Some)
+}
+
+/// Every proxy the vault has issued, with its kind and original, in a fixed order.
+fn vault_scope(engine: &Engine) -> piikey::Result<Scope> {
+    let guard = engine.vault().read()?;
+    let view = &guard;
+    let mut entries: Vec<ScopeEntry> = EntityKind::ALL
+        .into_iter()
+        .flat_map(|kind| {
+            view.proxies_of(kind).filter_map(move |proxy| {
+                view.original_for(proxy).map(|original| ScopeEntry {
+                    kind,
+                    proxy: proxy.into(),
+                    original: original.into(),
+                })
+            })
+        })
+        .collect();
+    entries.sort_unstable_by(|a, b| (a.kind, &a.proxy).cmp(&(b.kind, &b.proxy)));
+    Ok(Scope::from_pairs(entries))
+}
+
+/// The result of the exact pass, run through `restorer` when there is one. A zip document
+/// keeps its exact result: its XML is compressed and cannot be edited as a byte string.
+fn tolerate(restorer: Option<&Restorer>, output: Output, label: &dyn Display) -> Output {
+    let Some(restorer) = restorer else {
+        return output;
+    };
+    match output {
+        Output::Text(text) => {
+            let bytes = restorer.restore(text.as_bytes());
+            Output::Text(
+                String::from_utf8(bytes)
+                    .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned()),
+            )
+        }
+        Output::Same(raw) if raw.starts_with(b"PK\x03\x04") => {
+            eprintln!(
+                "piikey-cli: {label}: --tolerant skipped, documents are restored exactly only"
+            );
+            Output::Same(raw)
+        }
+        Output::Same(raw) => Output::Same(restorer.restore(&raw)),
+    }
 }
 
 fn execute(command: Command) -> ExitCode {
     match command {
         Command::Help => ExitCode::SUCCESS,
-        Command::Stdin { mode, vault } => {
-            let result = open_engine(vault).and_then(|engine| run_stdin(&engine, mode));
+        Command::Stdin {
+            mode,
+            vault,
+            tolerant,
+        } => {
+            let result = open_engine(vault).and_then(|engine| {
+                let restorer = tolerant_restorer(&engine, tolerant)?;
+                run_stdin(&engine, mode, restorer.as_ref())
+            });
             finish(result)
         }
         Command::Files {
             mode,
             vault,
+            tolerant,
             out,
             inputs,
-        } => run_files_command(mode, vault, &out, &inputs),
+        } => run_files_command(mode, vault, tolerant, &out, &inputs),
         Command::Serve { vault, pipe } => {
             let pipe = pipe.unwrap_or_else(|| service::DEFAULT_PIPE.to_owned());
             let result = open_engine(vault).and_then(|engine| {
-                eprintln!("piikey: serving on {pipe}");
+                eprintln!("piikey-cli: serving on {pipe}");
                 service::serve(Arc::new(engine), &pipe)
             });
             finish(result)
@@ -200,16 +302,17 @@ fn finish(result: piikey::Result<()>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("piikey: {err}");
+            eprintln!("piikey-cli: {err}");
             ExitCode::FAILURE
         }
     }
 }
 
-fn run_stdin(engine: &Engine, mode: Mode) -> piikey::Result<()> {
+fn run_stdin(engine: &Engine, mode: Mode, restorer: Option<&Restorer>) -> piikey::Result<()> {
     let mut bytes = Vec::new();
     io::stdin().lock().read_to_end(&mut bytes)?;
     let output = formats::process(engine, mode, &bytes, 0)?;
+    let output = tolerate(restorer, output, &"stdin");
     let mut stdout = io::stdout().lock();
     match &output {
         Output::Same(raw) => stdout.write_all(raw)?,
@@ -222,6 +325,7 @@ fn run_stdin(engine: &Engine, mode: Mode) -> piikey::Result<()> {
 fn run_files_command(
     mode: Mode,
     vault: Option<PathBuf>,
+    tolerant: bool,
     out: &Path,
     inputs: &[PathBuf],
 ) -> ExitCode {
@@ -229,38 +333,44 @@ fn run_files_command(
         Ok(None) => {}
         Ok(Some(dir)) => {
             eprintln!(
-                "piikey: --out {} must not be inside input directory {}",
+                "piikey-cli: --out {} must not be inside input directory {}",
                 out.display(),
                 dir.display()
             );
             return ExitCode::from(2);
         }
         Err(err) => {
-            eprintln!("piikey: {}: {err}", out.display());
+            eprintln!("piikey-cli: {}: {err}", out.display());
             return ExitCode::FAILURE;
         }
     }
-    let engine = match open_engine(vault) {
-        Ok(engine) => engine,
+    let opened = open_engine(vault).and_then(|engine| {
+        let restorer = tolerant_restorer(&engine, tolerant)?;
+        Ok((engine, restorer))
+    });
+    let (engine, restorer) = match opened {
+        Ok(opened) => opened,
         Err(err) => {
-            eprintln!("piikey: {err}");
+            eprintln!("piikey-cli: {err}");
             return ExitCode::FAILURE;
         }
     };
 
     let (jobs, walk_errors) = collect_jobs(inputs);
     for (path, err) in &walk_errors {
-        eprintln!("piikey: {}: {err}", path.display());
+        eprintln!("piikey-cli: {}: {err}", path.display());
     }
     let any_failed = jobs
         .par_iter()
-        .map(|job| match process_file(&engine, mode, job, out) {
-            Ok(()) => false,
-            Err(err) => {
-                eprintln!("piikey: {}: {err}", job.src.display());
-                true
-            }
-        })
+        .map(
+            |job| match process_file(&engine, mode, restorer.as_ref(), job, out) {
+                Ok(()) => false,
+                Err(err) => {
+                    eprintln!("piikey-cli: {}: {err}", job.src.display());
+                    true
+                }
+            },
+        )
         .reduce(|| false, |a, b| a || b);
 
     if any_failed || !walk_errors.is_empty() {
@@ -277,9 +387,16 @@ struct Job {
     rel: PathBuf,
 }
 
-fn process_file(engine: &Engine, mode: Mode, job: &Job, out: &Path) -> piikey::Result<()> {
+fn process_file(
+    engine: &Engine,
+    mode: Mode,
+    restorer: Option<&Restorer>,
+    job: &Job,
+    out: &Path,
+) -> piikey::Result<()> {
     let bytes = fs::read(&job.src)?;
     let output = formats::process(engine, mode, &bytes, 0)?;
+    let output = tolerate(restorer, output, &job.src.display());
     let (dest, data) = match &output {
         Output::Same(raw) => (output_path(out, &job.rel, false), raw.as_slice()),
         Output::Text(text) => (output_path(out, &job.rel, true), text.as_bytes()),
@@ -484,14 +601,16 @@ mod tests {
             args(&["anonymize"]),
             Ok(Command::Stdin {
                 mode: Mode::Anonymize,
-                vault: None
+                vault: None,
+                tolerant: false,
             })
         );
         assert_eq!(
             args(&["deanonymize", "--vault", "v.pkv"]),
             Ok(Command::Stdin {
                 mode: Mode::Deanonymize,
-                vault: Some(PathBuf::from("v.pkv"))
+                vault: Some(PathBuf::from("v.pkv")),
+                tolerant: false,
             })
         );
     }
@@ -503,8 +622,31 @@ mod tests {
             Ok(Command::Files {
                 mode: Mode::Anonymize,
                 vault: Some(PathBuf::from("v")),
+                tolerant: false,
                 out: PathBuf::from("o"),
                 inputs: vec![PathBuf::from("a.txt"), PathBuf::from("dir")],
+            })
+        );
+    }
+
+    #[test]
+    fn parses_tolerant() {
+        assert_eq!(
+            args(&["deanonymize", "--tolerant", "--vault", "v"]),
+            Ok(Command::Stdin {
+                mode: Mode::Deanonymize,
+                vault: Some(PathBuf::from("v")),
+                tolerant: true,
+            })
+        );
+        assert_eq!(
+            args(&["deanonymize", "--tolerant", "--out", "o", "a.txt"]),
+            Ok(Command::Files {
+                mode: Mode::Deanonymize,
+                vault: None,
+                tolerant: true,
+                out: PathBuf::from("o"),
+                inputs: vec![PathBuf::from("a.txt")],
             })
         );
     }
@@ -548,6 +690,9 @@ mod tests {
         assert!(usage(&["anonymize", "--out", "o"]));
         assert!(usage(&["serve", "a.txt"]));
         assert!(usage(&["serve", "--out", "o"]));
+        assert!(usage(&["anonymize", "--tolerant"]));
+        assert!(usage(&["anonymize", "--tolerant", "--out", "o", "a.txt"]));
+        assert!(usage(&["serve", "--tolerant"]));
     }
 
     #[test]
@@ -635,6 +780,60 @@ mod tests {
         assert!(jobs.is_empty());
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].0, missing);
+        Ok(())
+    }
+
+    #[test]
+    fn the_tolerant_scope_holds_every_proxy_with_its_kind_and_original() -> piikey::Result<()> {
+        let tmp = TempDir::new()?;
+        let engine = Engine::open(&tmp.0.join("v.pkv"))?;
+        engine.run(
+            Mode::Anonymize,
+            &["NL91ABNA0417164300 mailt jan.jansen@acme.nl"],
+        )?;
+        let scope = vault_scope(&engine)?;
+        let mut found: Vec<(EntityKind, &str)> = scope
+            .entries()
+            .iter()
+            .map(|e| (e.kind, &*e.original))
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                (EntityKind::Email, "jan.jansen@acme.nl"),
+                (EntityKind::Iban, "NL91ABNA0417164300")
+            ]
+        );
+        let view = engine.vault().read()?;
+        for entry in scope.entries() {
+            assert_eq!(view.original_for(&entry.proxy), Some(&*entry.original));
+            assert_eq!(view.kind_of(&entry.proxy), Some(entry.kind));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_tolerant_restorer_needs_the_flag_and_a_proxy() -> piikey::Result<()> {
+        let tmp = TempDir::new()?;
+        let engine = Engine::open(&tmp.0.join("v.pkv"))?;
+        assert!(tolerant_restorer(&engine, true)?.is_none(), "empty vault");
+        engine.run(Mode::Anonymize, &["jan.jansen@acme.nl"])?;
+        assert!(tolerant_restorer(&engine, false)?.is_none(), "flag off");
+        assert!(tolerant_restorer(&engine, true)?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn tolerate_leaves_documents_alone_and_does_nothing_without_a_restorer() -> piikey::Result<()> {
+        let tmp = TempDir::new()?;
+        let engine = Engine::open(&tmp.0.join("v.pkv"))?;
+        engine.run(Mode::Anonymize, &["jan.jansen@acme.nl"])?;
+        let restorer = tolerant_restorer(&engine, true)?;
+        let zip = Output::Same(b"PK\x03\x04 pretend this is a zip".to_vec());
+        assert_eq!(tolerate(restorer.as_ref(), zip.clone(), &"x.docx"), zip);
+        let text = Output::Text("plain text".to_owned());
+        assert_eq!(tolerate(None, text.clone(), &"x.txt"), text);
         Ok(())
     }
 }

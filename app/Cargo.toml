@@ -1,0 +1,52 @@
+[package]
+name = "piikey-app"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+
+[[bin]]
+name = "piikey"
+path = "src/main.rs"
+
+[dependencies]
+piikey = { path = ".." }
+# MITM HTTP/S + WebSocket proxy.
+hudsucker = { version = "0.25.0", default-features = false, features = [
+    "rcgen-ca",
+    "rustls-client",
+    "decoder",
+    "http2",
+] }
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time"] }
+# WinINET system proxy on/off.
+sysproxy = "0.3.0"
+# Client port -> PID, PID -> exe name (per-program rules).
+netstat2 = "0.11.2"
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
+# CA private key at rest.
+windows-dpapi = "0.2.0"
+# Native WinUI 3 UI. Pinned to windows-rs master: the tray / multi-window
+# Application API is not in a crates.io release yet (0.100.0 lacks it).
+windows-reactor = { git = "https://github.com/microsoft/windows-rs", rev = "20f6de7473ebb2761a19a73dcc2c25ac9499db6e" }
+serde_json = { version = "1.0.154", features = ["float_roundtrip", "preserve_order"] }
+# Reads the Windows light/dark app setting (HKCU Personalize) with a safe registry API.
+winreg = "0.56.0"
+# Reads the focused text field of protected sites (what the user types) through Windows UI
+# Automation, behind a safe wrapper: raw `windows` UIA calls are `unsafe` and `unsafe` is forbidden.
+# Uses windows 0.62.2, the version the root crate already builds.
+# Default features: the crate does not build with fewer (its feature gates are incomplete).
+uiautomation = "0.25.1"
+# What the user pastes: clipboard sequence number and text, safe API, no other dependencies.
+clipboard-win = "5.4.1"
+# Finds the captured values in outgoing requests; already built for the root crate.
+aho-corasick = "1.1.5"
+
+[build-dependencies]
+# Embeds assets/piikey.ico as the exe icon resource (icon only: the manifest comes from windows-reactor-setup).
+embed-resource = "3.0.12"
+# Stages a private Windows App SDK runtime so no runtime install is needed.
+windows-reactor-setup = { git = "https://github.com/microsoft/windows-rs", rev = "20f6de7473ebb2761a19a73dcc2c25ac9499db6e" }
+
+[lints]
+workspace = true

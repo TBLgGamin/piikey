@@ -4,6 +4,12 @@
 
 # Local scratch (playground, experiments)
 /.tmp
+/start.bat
+
+# Benchmark corpora (eval/fetch.py downloads them) and results (eval/results/*): regenerate
+/eval/data/
+/eval/results/
+__pycache__/
 
 # piikey vaults hold (encrypted) PII mappings: never commit them
 *.pkv

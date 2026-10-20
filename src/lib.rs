@@ -15,6 +15,7 @@ pub mod error;
 pub mod formats;
 pub mod ocr;
 pub mod proxy;
+pub mod restore;
 pub mod service;
 pub mod vault;
 

@@ -19,6 +19,7 @@ use crate::detect::EntityKind;
 
 // `gen` is a reserved keyword in edition 2024.
 mod r#gen;
+mod model;
 mod words;
 
 /// Keys for proxy derivation (`gen`) and watermarking (`mark`).
@@ -82,7 +83,7 @@ mod tests {
     };
     use crate::{
         Result,
-        detect::{Detector, EntityKind, Mode, RegexDetector, validate::accepts},
+        detect::{Detector, EntityKind, IssuedProxies, Mode, RegexDetector, validate::accepts},
     };
 
     const EMAIL: &[&str] = &[
@@ -275,6 +276,445 @@ mod tests {
         "john:12345",
         "mail:Qwerty!23",
     ];
+    /// Names as people write them: particles, initials, hyphens, apostrophes, accents, every
+    /// letter case, one word and six, a particle first.
+    const PERSON: &[&str] = &[
+        "Jeroen de Vries",
+        "J. Jansen",
+        "MARIA LOPEZ-GARCIA",
+        "Haley van Zessen",
+        "Jan Willem Karel Pieter Hendrik Jansen",
+        "Sanne de Boer",
+        "Pieter van der Berg",
+        "Kees 't Hart",
+        "Fatima El Amrani",
+        "Jean-Pierre Dubois",
+        "Anne-Marie Visser",
+        "Patrick O'Brien",
+        "J.R.R. Tolkien",
+        "john smith",
+        "ANNA KOWALSKI",
+        "Elon Reeve Musk",
+        "Zo\u{eb} de Vries",
+        "Jos\u{e9} Garc\u{ed}a",
+        "Ren\u{e9}e M\u{fc}ller",
+        "Jeroen",
+        "Haley",
+        "de Vries",
+        "van der Berg",
+        "'t Hart",
+        "Mohammed bin Salman",
+        "Ludwig von Beethoven",
+        "Ed Op de Beeck",
+        "Van Dijk",
+        "T. de Groot",
+        "A. B. C. Dekker",
+        "Marie Louise Mulder-de Jong",
+        "SMITH",
+        "McDonald Jones",
+        "Li Wei",
+    ];
+
+    // Values the detection model finds, in the layouts people write them.
+
+    const PERSON_ALIAS: &[&str] = &[
+        "Jantje",
+        "Big Mike",
+        "Coach Dave",
+        "Sasha",
+        "Kiki",
+        "Bram",
+        "Little Joe",
+        "Hansje Brinker",
+        "Tommy Gun",
+        "Stevie B",
+        "Pete",
+        "Rocky",
+    ];
+    const PERSON_IDENTIFIER: &[&str] = &[
+        "EMP-48213",
+        "P1234567",
+        "S/N 99-2231",
+        "A12 345 678",
+        "JD-2025-0042",
+        "member #884-221",
+        "ID 483920",
+        "KLANT-77310",
+        "GB-4821-X",
+        "N123456789",
+    ];
+    const PERSON_ATTRIBUTE: &[&str] = &[
+        "left-handed",
+        "vegetarian",
+        "tall",
+        "wears glasses",
+        "has two dogs",
+        "nervous",
+        "retired",
+        "a wheelchair user",
+        "very shy",
+        "single mother",
+    ];
+    const PERSON_ROLE: &[&str] = &[
+        "CEO",
+        "Chief Financial Officer",
+        "head of sales",
+        "Prof. dr.",
+        "burgemeester",
+        "teamleider",
+        "Senior Engineer",
+        "chairman",
+        "huisarts",
+        "Managing Director",
+    ];
+    const DATE_OF_BIRTH: &[&str] = &[
+        "1990-05-14",
+        "14/05/1990",
+        "05/14/1985",
+        "14.05.1990",
+        "1975-12-01",
+        "02-11-1968",
+        "31/12/1999",
+        "1988-07-23",
+        "23 07 1988",
+        "1969-04-20",
+        "20/04/1969",
+    ];
+    const PHONE_NUMBER: &[&str] = &[
+        "020 123 4567",
+        "+49 30 901820",
+        "(0) 6 1234 5678",
+        "0900-1234",
+        "1800 555 0199",
+        "+48 600 123 456",
+        "06 12345678",
+        "+33 1 42 68 53 00",
+        "555-0142-77",
+        "+1 202 555 0143",
+    ];
+    const CONTACT_HANDLE: &[&str] = &[
+        "@jan_jansen",
+        "@jeroen.dev",
+        "@acme_support",
+        "@maria92",
+        "@JohnDoe",
+        "skype:jan.jansen42",
+        "t.me/janjansen",
+        "@lotte_p",
+        "@dev_null_1",
+        "@kees.hart",
+    ];
+    const POSTAL_ADDRESS: &[&str] = &[
+        "Keizersgracht 123, 1015 CJ Amsterdam",
+        "Main Street 42, Springfield",
+        "221B Baker Street, London NW1 6XE",
+        "ul. D\u{142}uga 5, 00-238 Warszawa",
+        "Hauptstra\u{df}e 12\n10115 Berlin",
+        "Rue de Rivoli 99, 75001 Paris",
+        "Damrak 1",
+        "Calle Mayor 5, 28013 Madrid",
+        "1600 Pennsylvania Avenue NW, Washington",
+        "Stationsplein 9, 3511 CE Utrecht",
+        "Lange Voorhout 3 2514 EA Den Haag",
+    ];
+    const LOCATION: &[&str] = &[
+        "Amsterdam",
+        "Den Haag",
+        "New York",
+        "Rotterdam",
+        "Warszawa",
+        "Utrecht",
+        "Lower Saxony",
+        "San Francisco",
+        "Sint-Michielsgestel",
+        "Nederland",
+        "Bavaria",
+        "Ede",
+        "Groningen",
+    ];
+    const GEO_LOCATION: &[&str] = &[
+        "52.3676, 4.9041",
+        "51\u{b0}30'26\"N 0\u{b0}7'39\"W",
+        "40.7128 -74.0060",
+        "48.8566,2.3522",
+        "N 52.37 E 4.90",
+        "-33.8688, 151.2093",
+        "35.6762 139.6503",
+        "37.7749,-122.4194",
+        "59.3293 18.0686",
+        "55.7558, 37.6173",
+    ];
+    const DEVICE_ID: &[&str] = &[
+        "A1B2C3D4E5F6",
+        "IMEI 356938035643809",
+        "iPhone-8F3A21",
+        "SN: XK9-4482-LM",
+        "device_id=7f3a9c",
+        "F2:3D:7A:19:00:C4",
+        "ANDROID-5d3f9a1c2b",
+        "Pixel-7-8821AB",
+        "3C5A-91F2",
+        "UDID 00008030-001A2C3E0A90402E",
+    ];
+    const IDENTIFYING_LINK: &[&str] = &[
+        "https://www.linkedin.com/in/jan-jansen",
+        "www.example.nl/jan",
+        "http://acme.nl/team/jan",
+        "linkedin.com/in/lotte-peters",
+        "/users/kees42",
+        "https://twitter.com/janjansen",
+        "facebook.com/jan.jansen.55",
+        "https://github.com/jjansen",
+        "instagram.com/lotte_p",
+        "https://example.org/profile?id=4821",
+    ];
+    const ACCOUNT_ID: &[&str] = &[
+        "ACC-4482-1190",
+        "user_id 77123",
+        "klantnummer 5512093",
+        "NL-ACC 889210",
+        "acct#00391",
+        "member 4421",
+        "UID: 8f3a9c21",
+        "account 1234 5678",
+        "CUST-009211",
+        "login jan.jansen42",
+    ];
+    const AUTH_SECRET: &[&str] = &[
+        "hunter2",
+        "correct-horse-battery-staple",
+        "P@ssw0rd!",
+        "Zomer2024!",
+        "letmein123",
+        "8f3a9c21d7",
+        "tr0ub4dor&3",
+        "qwerty987",
+        "Welkom01",
+        "s3cr3t-Pa55",
+    ];
+    const BANK_ACCOUNT: &[&str] = &[
+        "123456789",
+        "12-34-56 98765432",
+        "BE68 5390 0754 7034",
+        "GB29 NWBK 6016 1331 9268 19",
+        "1234.56.789",
+        "0417164300",
+        "ES91 2100 0418 4502 0005 1332",
+        "rekening 9876543",
+        "sort 20-00-00 acct 55779911",
+        "FR14 2004 1010 0505 0001 3M02 606",
+    ];
+    const PAYMENT_CARD: &[&str] = &[
+        "5555 5555 5555 4444",
+        "3782 822463 10005",
+        "6011-1111-1111-1117",
+        "4012 8888 8888 1881",
+        "card ending 4242",
+        "**** **** **** 1881",
+        "2223003122003222",
+        "5105 1051 0510 5100",
+        "9792 0000 0000 0001",
+        "3530 1113 3330 0000",
+    ];
+    const CARD_SECURITY: &[&str] = &[
+        "4821",
+        "9921",
+        "CVV 5738",
+        "cvc: 9921",
+        "7254",
+        "3318",
+        "CVV 6402",
+        "cvc 8137",
+        "1190",
+        "2487",
+    ];
+    const FINANCIAL_AMOUNT: &[&str] = &[
+        "\u{20ac}1.250,00",
+        "EUR 4500",
+        "$99.95",
+        "12.500 euro",
+        "USD 1,200,000",
+        "\u{a3}3500",
+        "salaris 3.250 euro",
+        "5000 EUR",
+        "\u{a5}120000",
+        "\u{20ac} 75,50",
+    ];
+    const DOCUMENT_ID: &[&str] = &[
+        "P1234567",
+        "NL-12345678",
+        "passport no. X4829301",
+        "DL 99-2231-AA",
+        "123456789",
+        "AB1234567",
+        "A12B34567",
+        "ID-NL-2931845",
+        "S1234567D",
+        "rijbewijs 5123456789",
+        "XD 482 913",
+    ];
+    const DOCUMENT_REFERENCE: &[&str] = &[
+        "INV-2025-0042",
+        "contract ref ABC-123",
+        "Zaak 2024/1887",
+        "PO#771204",
+        "dossier 88-AB",
+        "Case No. 22-cv-1043",
+        "ref: KL/2024/0091",
+        "Bestelling 559201",
+        "RFC 2119",
+        "Order 7781-QX",
+    ];
+    const VEHICLE_ID: &[&str] = &[
+        "AB-123-C",
+        "12-ABC-3",
+        "WBA3A5C50CF256985",
+        "1HGCM82633A004352",
+        "BX-12-LK",
+        "M-AB 1234",
+        "GR 483 KL",
+        "XYZ 1234",
+        "KL-97-TT",
+        "AA-11-BB",
+    ];
+    const ORGANIZATION_NAME: &[&str] = &[
+        "Acme B.V.",
+        "Philips",
+        "Royal Dutch Shell plc",
+        "Gemeente Amsterdam",
+        "Stichting Voorbeeld",
+        "Deutsche Bank AG",
+        "Bol.com",
+        "Albert Heijn",
+        "Google LLC",
+        "Jumbo Supermarkten",
+        "Rijksmuseum",
+        "Tesla Inc.",
+    ];
+    const ORGANIZATION_ID: &[&str] = &[
+        "KvK 12345678",
+        "VAT NL123456789B01",
+        "DE123456789",
+        "KVK-27312345",
+        "EIN 12-3456789",
+        "BTW NL8123.45.678.B01",
+        "HRB 12345",
+        "CHE-123.456.789",
+        "company no. 00445790",
+        "SIREN 552 100 554",
+        "OrgID 99-8821",
+    ];
+    const PROPER_NAME: &[&str] = &[
+        "Spotify",
+        "Coca-Cola",
+        "PlayStation",
+        "Tesla Model S",
+        "Big Mac",
+        "Mount Everest",
+        "Eiffel Tower",
+        "Harry Potter",
+        "Bitcoin",
+        "Netflix",
+        "Opera House",
+    ];
+    const HEALTH_DATA: &[&str] = &[
+        "diabetes",
+        "type 2 diabetes",
+        "hypertension",
+        "broken leg",
+        "asthma",
+        "depression",
+        "chemotherapy",
+        "HIV positive",
+        "migraine",
+        "pregnant",
+        "kanker",
+        "burn-out",
+    ];
+    const BIOMETRIC_DATA: &[&str] = &[
+        "fingerprint",
+        "iris scan",
+        "face scan",
+        "DNA profile",
+        "voiceprint",
+        "retina scan",
+        "palm vein pattern",
+        "gait signature",
+        "facial template",
+        "vingerafdruk",
+    ];
+    const ETHNIC_ORIGIN: &[&str] = &[
+        "Moroccan",
+        "Turkish descent",
+        "Roma",
+        "Kurdish",
+        "Surinamese",
+        "Chinese-Dutch",
+        "of Polish origin",
+        "Afro-Caribbean",
+        "Ashkenazi",
+        "Indonesian heritage",
+    ];
+    const POLITICAL_OPINION: &[&str] = &[
+        "votes for the Labour party",
+        "VVD",
+        "left-wing",
+        "far-right",
+        "supports Brexit",
+        "member of the Green Party",
+        "conservative",
+        "anarchist",
+        "Democrat",
+        "socialist",
+    ];
+    const RELIGION_OR_BELIEF: &[&str] = &[
+        "Muslim",
+        "Catholic",
+        "atheist",
+        "Jehovah's Witness",
+        "Buddhist",
+        "Jewish",
+        "Hindu",
+        "protestants",
+        "Sikh",
+        "humanist",
+    ];
+    const SEXUAL_ORIENTATION: &[&str] = &[
+        "gay",
+        "lesbian",
+        "bisexual",
+        "homosexual",
+        "heterosexual",
+        "asexual",
+        "pansexual",
+        "queer",
+        "straight",
+        "trans man",
+    ];
+    const TRADE_UNION: &[&str] = &[
+        "FNV member",
+        "member of the Teamsters",
+        "CNV",
+        "trade union member",
+        "AFL-CIO",
+        "Unite the union",
+        "ver.di",
+        "shop steward at FNV",
+        "union rep",
+        "vakbond lid",
+    ];
+    const CRIMINAL_OFFENCE: &[&str] = &[
+        "convicted of fraud",
+        "speeding fine",
+        "prison sentence",
+        "arrested in 2019",
+        "criminal record",
+        "theft",
+        "drink driving",
+        "probation",
+        "shoplifting",
+        "served 3 years",
+    ];
 
     /// Repeating pool of alphanumerics for building tokens of an exact length.
     fn pool(n: usize) -> String {
@@ -328,6 +768,39 @@ mod tests {
             EntityKind::UsSsn => SSN,
             EntityKind::NlBsn => BSN,
             EntityKind::Phone => PHONE,
+            EntityKind::Person => PERSON,
+            EntityKind::PersonAlias => PERSON_ALIAS,
+            EntityKind::PersonIdentifier => PERSON_IDENTIFIER,
+            EntityKind::PersonAttribute => PERSON_ATTRIBUTE,
+            EntityKind::PersonRole => PERSON_ROLE,
+            EntityKind::DateOfBirth => DATE_OF_BIRTH,
+            EntityKind::PhoneNumber => PHONE_NUMBER,
+            EntityKind::ContactHandle => CONTACT_HANDLE,
+            EntityKind::PostalAddress => POSTAL_ADDRESS,
+            EntityKind::Location => LOCATION,
+            EntityKind::GeoLocation => GEO_LOCATION,
+            EntityKind::DeviceId => DEVICE_ID,
+            EntityKind::IdentifyingLink => IDENTIFYING_LINK,
+            EntityKind::AccountId => ACCOUNT_ID,
+            EntityKind::AuthSecret => AUTH_SECRET,
+            EntityKind::BankAccount => BANK_ACCOUNT,
+            EntityKind::PaymentCard => PAYMENT_CARD,
+            EntityKind::CardSecurity => CARD_SECURITY,
+            EntityKind::FinancialAmount => FINANCIAL_AMOUNT,
+            EntityKind::DocumentId => DOCUMENT_ID,
+            EntityKind::DocumentReference => DOCUMENT_REFERENCE,
+            EntityKind::VehicleId => VEHICLE_ID,
+            EntityKind::OrganizationName => ORGANIZATION_NAME,
+            EntityKind::OrganizationId => ORGANIZATION_ID,
+            EntityKind::ProperName => PROPER_NAME,
+            EntityKind::HealthData => HEALTH_DATA,
+            EntityKind::BiometricData => BIOMETRIC_DATA,
+            EntityKind::EthnicOrigin => ETHNIC_ORIGIN,
+            EntityKind::PoliticalOpinion => POLITICAL_OPINION,
+            EntityKind::ReligionOrBelief => RELIGION_OR_BELIEF,
+            EntityKind::SexualOrientation => SEXUAL_ORIENTATION,
+            EntityKind::TradeUnion => TRADE_UNION,
+            EntityKind::CriminalOffence => CRIMINAL_OFFENCE,
         };
         list.iter().map(|s| (*s).to_owned()).collect()
     }
@@ -526,6 +999,31 @@ mod tests {
                     assert!(
                         same_layout(&original, &proxy),
                         "{kind:?}: {original} -> {proxy}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_email_proxy_reuses_no_name_of_the_original_local_part() {
+        let originals = [
+            "jan.jansen@acme.nl",
+            "paul_jansen@acme.nl",
+            "maria@gmail.com",
+        ];
+        for original in originals {
+            let local = original.split('@').next().unwrap_or_default();
+            let words: Vec<&str> = local.split(['.', '_']).collect();
+            for seed in 0..=255u8 {
+                let k = ProxyKeys::new([seed; 32], [2; 32]);
+                let proxy = generate(&k, EntityKind::Email, original, 0);
+                let proxy_local = proxy.split('@').next().unwrap_or_default();
+                let proxy_words = proxy_local.split(|c: char| !c.is_alphabetic());
+                for word in proxy_words {
+                    assert!(
+                        !words.iter().any(|w| w.eq_ignore_ascii_case(word)),
+                        "{original} -> {proxy}"
                     );
                 }
             }
@@ -750,6 +1248,46 @@ mod tests {
         }
     }
 
+    /// Allocates proxies the way the vault does: the first attempt whose candidate differs from
+    /// the original and is not issued yet. Returns the first original that finds none.
+    fn first_unallocated(kind: EntityKind, originals: &[String]) -> Option<String> {
+        let k = keys();
+        let mut used: HashSet<String> = HashSet::new();
+        for original in originals {
+            let proxy = (0..4096).find_map(|attempt| {
+                let proxy = generate(&k, kind, original, attempt);
+                (proxy != *original && !used.contains(&proxy)).then_some(proxy)
+            });
+            match proxy {
+                Some(proxy) => {
+                    assert!(accepts(kind, &proxy), "{kind:?} {original:?} -> {proxy:?}");
+                    used.insert(proxy);
+                }
+                None => return Some(original.clone()),
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn many_short_originals_of_one_kind_all_get_a_proxy() {
+        // 200 distinct years share 66 base proxies; 900 three-digit values share 900.
+        let years: Vec<String> = (1900..2100).map(|y| y.to_string()).collect();
+        assert_eq!(first_unallocated(EntityKind::DateOfBirth, &years), None);
+        let dates: Vec<String> = (1..=12)
+            .flat_map(|m| (1900..2100).step_by(7).map(move |y| format!("{m:02}/{y}")))
+            .collect();
+        assert_eq!(first_unallocated(EntityKind::DateOfBirth, &dates), None);
+        let numbers: Vec<String> = (100..1000).map(|n| n.to_string()).collect();
+        for kind in [
+            EntityKind::AccountId,
+            EntityKind::DocumentId,
+            EntityKind::PaymentCard,
+        ] {
+            assert_eq!(first_unallocated(kind, &numbers), None, "{kind:?}");
+        }
+    }
+
     #[test]
     fn odd_inputs_never_panic() {
         let k = keys();
@@ -791,6 +1329,83 @@ mod tests {
         }
     }
 
+    /// Values the model emits that no list covers: all caps, two letters, digits, punctuation
+    /// that is neither a space nor a comma, non-Latin scripts, and values whose only words are too
+    /// short to be invented. Each is tried for every kind of the model; those a kind's validator
+    /// accepts must get a proxy inside the vault's candidate budget.
+    const AWKWARD: &[&str] = &[
+        "Sant'Antonio:IT",
+        "Villa Sant'Antonio:IT",
+        "BANKCITY",
+        "IT",
+        "NL:IT",
+        "Ab",
+        "ab cd",
+        "a.b.c",
+        "St.",
+        "Hamburg.",
+        "Z\u{fc}rich-Altstetten",
+        "\u{141}\u{f3}d\u{17a}",
+        "\u{43c}\u{43e}\u{441}\u{43a}\u{432}\u{430}",
+        "\u{4e1c}\u{4eac}\u{90fd}",
+        "\u{661}\u{662}\u{663}\u{664}",
+        "IT00B0123456789",
+        "3 CANALE REMBRANDT",
+        "ul. D\u{142}uga 5, 00-238 Warszawa",
+        "12/10/1951",
+        "1 jan 90",
+        "5.5.55",
+        "**** 962",
+        "$12,50",
+        "52.3676, 4.9041",
+        "@x_y",
+        "www.a.io",
+        "http://.com",
+        "https://example.com/a?b=c",
+        "/etc/passwd",
+        "foo.bar",
+        "A/B-C_D",
+        "O'Brien & Sons B.V.",
+        "HOLDING GMBH",
+        "L1",
+        "12345",
+        "line one\nline two 7",
+    ];
+
+    #[test]
+    fn every_value_a_model_kind_accepts_gets_a_proxy_within_the_candidate_budget() {
+        let k = keys();
+        for kind in EntityKind::ALL
+            .into_iter()
+            .filter(|k| k.is_listed() && *k != EntityKind::Person)
+        {
+            let mut tried = 0;
+            for &original in AWKWARD {
+                if !accepts(kind, original) {
+                    continue;
+                }
+                tried += 1;
+                let found = (0..4096).find_map(|attempt| {
+                    let proxy = generate(&k, kind, original, attempt);
+                    (proxy != original).then_some(proxy)
+                });
+                let proxy = found.unwrap_or_else(|| panic!("{kind:?} {original:?}: no proxy"));
+                assert!(accepts(kind, &proxy), "{kind:?} {original:?} -> {proxy:?}");
+            }
+            assert!(tried > 0, "{kind:?}: no awkward value was valid");
+        }
+    }
+
+    #[test]
+    fn a_place_with_punctuation_inside_a_word_is_still_replaced() {
+        let k = keys();
+        for original in ["Sant'Antonio:IT", "NL:IT", "Ab", "ab cd", "IT"] {
+            let proxy = generate(&k, EntityKind::Location, original, 0);
+            assert_ne!(proxy, original);
+            assert!(accepts(EntityKind::Location, &proxy), "{proxy}");
+        }
+    }
+
     #[test]
     fn watermark_is_a_keyed_one_in_sixteen_tag_bound_to_the_kind() {
         let (a, other_mark, other_gen) = (
@@ -828,7 +1443,7 @@ mod tests {
     #[test]
     fn every_kind_reaches_a_watermarked_candidate() {
         let k = keys();
-        for kind in EntityKind::ALL {
+        for kind in EntityKind::ALL.into_iter().filter(|k| k.is_watermarked()) {
             for original in seeds(kind) {
                 let found = (0..4096).find(|&attempt| {
                     watermark_ok(&k, kind, &generate(&k, kind, &original, attempt))
@@ -874,13 +1489,20 @@ mod tests {
     #[test]
     fn detector_finds_each_proxy_exactly_once_with_the_same_kind() -> Result<()> {
         let k = keys();
-        let detector = RegexDetector::new()?;
+        let regex = RegexDetector::new()?;
         for kind in EntityKind::ALL {
             for original in samples(kind) {
                 for attempt in 0..3 {
                     let proxy = generate(&k, kind, &original, attempt);
                     let text = context(kind, &proxy);
-                    let spans = detector.detect(&text, Mode::Deanonymize);
+                    // Only the patterned kinds have a pattern. The proxies of the listed kinds are
+                    // found by looking for the issued proxy itself.
+                    let spans = if kind.is_listed() {
+                        IssuedProxies::new(&[(kind, proxy.as_str())])?
+                            .detect(&text, Mode::Deanonymize)
+                    } else {
+                        regex.detect(&text, Mode::Deanonymize)
+                    };
                     let exact = matches!(spans.as_slice(), [s] if s.kind == kind && text[s.start..s.end] == proxy);
                     assert!(
                         exact,
@@ -889,6 +1511,79 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn random_names_get_valid_proxies_that_are_found_again_as_issued() -> Result<()> {
+        const TOKENS: &[&str] = &[
+            "Jan",
+            "jan",
+            "JAN",
+            "Willem",
+            "de",
+            "De",
+            "DE",
+            "van",
+            "der",
+            "'t",
+            "\u{2019}t",
+            "J.",
+            "j.",
+            "J.R.",
+            "O'Brien",
+            "Anne-Marie",
+            "LOPEZ-GARCIA",
+            "Zo\u{eb}",
+            "M\u{fc}ller",
+            "al",
+            "Al",
+            "bin",
+            "St.",
+            "Q",
+            "Ed",
+        ];
+        let k = keys();
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        let mut below = |n: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            usize::try_from(state % u64::try_from(n).unwrap_or(1)).unwrap_or(0)
+        };
+        let mut checked = 0;
+        for _ in 0..600 {
+            let count = 1 + below(6);
+            let original = (0..count)
+                .map(|_| TOKENS[below(TOKENS.len())])
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !accepts(EntityKind::Person, &original) {
+                continue;
+            }
+            checked += 1;
+            for attempt in 0..3 {
+                let proxy = generate(&k, EntityKind::Person, &original, attempt);
+                assert_eq!(
+                    proxy,
+                    generate(&k, EntityKind::Person, &original, attempt),
+                    "{original}"
+                );
+                assert_ne!(proxy, original);
+                assert!(accepts(EntityKind::Person, &proxy), "{original} -> {proxy}");
+                let text = context(EntityKind::Person, &proxy);
+                let spans = IssuedProxies::new(&[(EntityKind::Person, proxy.as_str())])?
+                    .detect(&text, Mode::Deanonymize);
+                assert!(
+                    matches!(spans.as_slice(), [s] if text[s.start..s.end] == proxy),
+                    "{original} -> {proxy}: {spans:?} in {text:?}"
+                );
+            }
+        }
+        assert!(
+            checked > 300,
+            "only {checked} of the random names were valid"
+        );
         Ok(())
     }
 }

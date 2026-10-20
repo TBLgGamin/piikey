@@ -427,6 +427,65 @@ pub(super) const WORDS: [&str; 128] = [
     "walnut", "wave", "willow", "winter", "wren", "zenith", "zephyr",
 ];
 
+/// First half of an invented place name (`ash` + `ford`); lowercase, never a given name,
+/// surname or stopword.
+pub(super) const PLACE_HEAD: [&str; 64] = [
+    "ash", "mill", "west", "oak", "stone", "brook", "east", "south", "elm", "birch", "pine", "fox",
+    "wolf", "bear", "deer", "raven", "swan", "hart", "alder", "queen", "aspen", "fern", "high",
+    "low", "frost", "glade", "red", "heron", "black", "grey", "clay", "sand", "rock", "cliff",
+    "marsh", "fen", "moor", "heath", "larch", "holt", "hazel", "thorn", "rose", "lily", "iron",
+    "gold", "silver", "copper", "salt", "lake", "river", "spring", "linden", "bridge", "church",
+    "abbey", "castle", "tower", "bay", "cove", "glen", "ridge", "maple", "dun",
+];
+
+/// Second half of an invented place name.
+pub(super) const PLACE_TAIL: [&str; 64] = [
+    "ford", "field", "haven", "wick", "dale", "mere", "ton", "ham", "ley", "worth", "bury",
+    "stead", "stoke", "thorpe", "combe", "hurst", "den", "mouth", "port", "bridge", "cross",
+    "gate", "side", "holt", "land", "rise", "ridge", "vale", "glen", "moor", "fell", "heath",
+    "marsh", "holm", "stow", "spring", "wall", "barrow", "cliff", "bank", "shaw", "weald",
+    "hollow", "strand", "water", "lake", "pool", "beck", "burn", "firth", "ness", "wyke", "garth",
+    "fold", "croft", "bourne", "park", "point", "view", "rest", "end", "mount", "rock", "stone",
+];
+
+/// First half of an invented organization or brand word (`north` + `stone`).
+pub(super) const ORG_HEAD: [&str; 64] = [
+    "north", "bright", "silver", "blue", "iron", "clear", "swift", "prime", "nova", "apex",
+    "vertex", "summit", "cedar", "pure", "true", "open", "fresh", "solid", "rapid", "smart",
+    "keen", "bold", "grand", "royal", "first", "alpha", "delta", "omega", "sigma", "zenith",
+    "polar", "solar", "lunar", "stellar", "cobalt", "amber", "crimson", "scarlet", "azure",
+    "ivory", "onyx", "jade", "coral", "topaz", "opal", "pearl", "quartz", "granite", "urban",
+    "metro", "civic", "global", "union", "pacific", "atlantic", "nordic", "eastern", "western",
+    "golden", "crystal", "sterling", "harbor", "beacon", "anchor",
+];
+
+/// Second half of an invented organization or brand word.
+pub(super) const ORG_TAIL: [&str; 64] = [
+    "stone", "wave", "bridge", "point", "forge", "light", "yard", "field", "gate", "peak", "ridge",
+    "crest", "bay", "port", "vale", "cliff", "tree", "leaf", "root", "seed", "bloom", "grove",
+    "timber", "fire", "spark", "flame", "glow", "beam", "ray", "star", "moon", "sun", "path",
+    "span", "road", "trail", "track", "line", "link", "bond", "net", "web", "grid", "node", "hub",
+    "core", "base", "sign", "wing", "hawk", "fox", "lynx", "wolf", "bear", "lion", "eagle",
+    "shield", "guard", "tower", "cove", "arch", "dome", "vault", "haven",
+];
+
+/// Words that close an invented organization name when the original had several words.
+pub(super) const ORG_FORM: [&str; 8] = [
+    "group", "partners", "labs", "works", "company", "studio", "holding", "systems",
+];
+
+/// Legal forms, lowercase and without a trailing dot. An organization keeps its own.
+pub(super) const LEGAL_FORMS: [&str; 18] = [
+    "bv", "b.v", "nv", "n.v", "gmbh", "ag", "ltd", "llc", "inc", "plc", "sa", "sarl", "srl", "spa",
+    "oy", "ab", "as", "kg",
+];
+
+/// Street-name endings in the languages the model covers.
+pub(super) const STREET_TAIL: [&str; 16] = [
+    "straat", "laan", "weg", "plein", "gracht", "kade", "road", "street", "lane", "avenue", "way",
+    "strasse", "gasse", "rue", "via", "ulica",
+];
+
 /// Public mailbox providers: their domain carries no information about the person,
 /// so an email on one of them keeps its domain.
 pub(super) const FREEMAIL: [&str; 23] = [
@@ -459,7 +518,11 @@ pub(super) const FREEMAIL: [&str; 23] = [
 mod tests {
     use std::collections::HashSet;
 
-    use super::{FIRST, FREEMAIL, LAST, WORDS};
+    use super::{
+        FIRST, FREEMAIL, LAST, LEGAL_FORMS, ORG_FORM, ORG_HEAD, ORG_TAIL, PLACE_HEAD, PLACE_TAIL,
+        STREET_TAIL, WORDS,
+    };
+    use crate::restore::STOPWORDS;
 
     fn assert_clean(name: &str, list: &[&str]) {
         let unique: HashSet<&str> = list.iter().copied().collect();
@@ -478,6 +541,57 @@ mod tests {
         assert_clean("FIRST", &FIRST);
         assert_clean("LAST", &LAST);
         assert_clean("WORDS", &WORDS);
+        for (name, list) in [
+            ("PLACE_HEAD", &PLACE_HEAD[..]),
+            ("PLACE_TAIL", &PLACE_TAIL[..]),
+            ("ORG_HEAD", &ORG_HEAD[..]),
+            ("ORG_TAIL", &ORG_TAIL[..]),
+            ("ORG_FORM", &ORG_FORM[..]),
+            ("STREET_TAIL", &STREET_TAIL[..]),
+        ] {
+            assert_clean(name, list);
+        }
+    }
+
+    #[test]
+    fn legal_forms_are_unique_lowercase_without_trailing_dot() {
+        let unique: HashSet<&str> = LEGAL_FORMS.iter().copied().collect();
+        assert_eq!(unique.len(), LEGAL_FORMS.len());
+        for form in LEGAL_FORMS {
+            assert!(
+                form.bytes().all(|b| b.is_ascii_lowercase() || b == b'.') && !form.ends_with('.'),
+                "{form}"
+            );
+        }
+    }
+
+    #[test]
+    fn names_are_not_everyday_words() {
+        // The restorer puts the original's part back wherever a name part of a proxy shows up
+        // by itself. A name that is also a word (`will`, `may`, `de`) would hit ordinary text.
+        for (name, list) in [
+            ("FIRST", &FIRST[..]),
+            ("LAST", &LAST[..]),
+            ("PLACE_HEAD", &PLACE_HEAD[..]),
+            ("PLACE_TAIL", &PLACE_TAIL[..]),
+            ("ORG_HEAD", &ORG_HEAD[..]),
+            ("ORG_TAIL", &ORG_TAIL[..]),
+        ] {
+            for word in list {
+                assert!(!STOPWORDS.contains(word), "{name}: {word} is a stopword");
+            }
+        }
+        for (name, list) in [
+            ("PLACE_HEAD", &PLACE_HEAD[..]),
+            ("PLACE_TAIL", &PLACE_TAIL[..]),
+            ("ORG_HEAD", &ORG_HEAD[..]),
+            ("ORG_TAIL", &ORG_TAIL[..]),
+        ] {
+            for word in list {
+                assert!(!FIRST.contains(word), "{name}: {word} is a given name");
+                assert!(!LAST.contains(word), "{name}: {word} is a surname");
+            }
+        }
     }
 
     #[test]

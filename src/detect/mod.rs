@@ -1,13 +1,20 @@
 //! PII detection. [`Detector`] is the extension point (a future ML detector
 //! implements it); [`RegexDetector`] is the validated-regex implementation.
 
+mod composite;
+mod issued;
 mod kind;
+pub mod ner;
 mod patterns;
 pub mod validate;
 
 use std::ops::Range;
 
-pub use kind::{EntityKind, Span};
+pub use composite::CompositeDetector;
+pub(crate) use composite::overlaps;
+pub(crate) use issued::{IssuedProxies, Words};
+pub use kind::{EntityKind, KindSet, Span};
+pub use ner::NerDetector;
 use rayon::prelude::*;
 use regex_automata::{Anchored, Input, meta, util::syntax};
 
@@ -26,6 +33,20 @@ pub enum Mode {
 pub trait Detector: Send + Sync + std::fmt::Debug {
     /// Spans sorted by start, never overlapping.
     fn detect(&self, text: &str, mode: Mode) -> Vec<Span>;
+
+    /// Spans per text. `wanted`: kinds the caller keeps (a detector may skip
+    /// work for others; the caller filters). `taken`: empty, or per text the
+    /// sorted, disjoint spans earlier detectors already claimed.
+    fn detect_batch(
+        &self,
+        texts: &[&str],
+        mode: Mode,
+        wanted: KindSet,
+        taken: &[Vec<Span>],
+    ) -> Vec<Vec<Span>> {
+        let _ = (wanted, taken);
+        texts.par_iter().map(|t| self.detect(t, mode)).collect()
+    }
 }
 
 /// Upper bound on the length of any regex match. Every pattern bounds every
@@ -407,7 +428,9 @@ mod tests {
     #[test]
     fn table_is_in_priority_order_with_one_pattern_per_kind() {
         let kinds: Vec<K> = PATTERNS.iter().map(|p| p.kind).collect();
-        assert_eq!(kinds, K::ALL);
+        // Person and the model kinds come from other detectors, not the regex table.
+        let regex_kinds: Vec<K> = K::ALL.into_iter().filter(|k| k.is_patterned()).collect();
+        assert_eq!(kinds, regex_kinds);
     }
 
     #[test]

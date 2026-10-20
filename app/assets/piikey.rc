@@ -1,0 +1,2 @@
+// The exe icon of piikey.exe and piikey-cli.exe (the manifest is not here: windows-reactor-setup adds it).
+1 ICON "piikey.ico"
