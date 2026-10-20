@@ -5,17 +5,22 @@
   <img alt="piikey" src="assets/brand/piikey-logo-kit/horizontal/piikey-horizontal-mono-6f49b1.svg" height="96">
 </picture>
 
-<h3>Your personal data stays on your PC. AI gets believable stand-ins.</h3>
+<h3>The privacy layer between you and the internet.</h3>
 
-[![CI](https://github.com/TBLgGamin/piikey/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/TBLgGamin/piikey/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/TBLgGamin/piikey?sort=semver&color=6f49b1&style=flat)](https://github.com/TBLgGamin/piikey/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/TBLgGamin/piikey/total?color=6f49b1&style=flat)](https://github.com/TBLgGamin/piikey/releases)
+[![CI](https://github.com/TBLgGamin/piikey/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/TBLgGamin/piikey/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/github/license/TBLgGamin/piikey?style=flat)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6?logo=windows&style=flat)](#install)
-[![Rust 1.95](https://img.shields.io/badge/rust-1.95-orange?logo=rust&style=flat)](rust-toolchain.toml)
-[![unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-success?style=flat)](Cargo.toml)
-[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/TBLgGamin/piikey/badge)](https://scorecard.dev/viewer/?uri=github.com/TBLgGamin/piikey)
-[![Conventional Commits](https://img.shields.io/badge/Conventional%20Commits-1.0.0-%23FE5196?logo=conventionalcommits&logoColor=white&style=flat)](https://www.conventionalcommits.org)
+[![Windows 10 | 11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6?logo=windows&style=flat)](#install)
+
+<br>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/hero-dark.png">
+  <img alt="You type: Hi, I'm Sanne de Vries (sanne.devries@example.nl, +31 6 12345678)... The internet sees: Hi, I'm Eline de Deruiter (carolyn.carter38@olivedawn.nl, +31 6 48171596)..., every value swapped for a stand-in of the same shape" src="docs/assets/hero-light.png" width="100%">
+</picture>
+
+<br><br>
 
 [![Download for Windows x64](https://img.shields.io/badge/Download-Windows%20x64-6f49b1?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/TBLgGamin/piikey/releases/latest)
 
@@ -23,31 +28,21 @@
 
 </div>
 
-<br>
+## What it is
+
+piikey sits between you and the sites and programs you choose: chatbots, webmail, forms, anything
+that goes through the Windows proxy. Before a message leaves your PC, it finds the names, emails,
+phone numbers, IBANs, card numbers, addresses and other personal data in it and swaps each one for a
+believable stand-in of the same shape. When the answer comes back, piikey puts your real values
+back in. Detection, the stand-ins and the vault that remembers them all stay on your machine.
+
+The example above is real `piikey-cli anonymize` output, and `piikey-cli deanonymize` turns the
+right side back into the left character for character.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/home-dark.png">
   <img alt="piikey's Home page: protection switch, values keyed, masked and restored today, a 14-day chart and a by-kind chart" src="docs/assets/screenshots/home-light.png" width="900">
 </picture>
-
-## What it is
-
-piikey sits between you and the AI chatbots you use. Before a message leaves your PC, it finds the
-names, emails, phone numbers, IBANs, card numbers, addresses and other personal data in it and
-swaps each one for a believable stand-in of the same shape. When the answer comes back, piikey puts
-your real values back in. Detection, the stand-ins and the vault that remembers them all stay on
-your machine.
-
-## See it work
-
-| You type | The AI receives |
-|---|---|
-| Hi, I'm Sanne de Vries (sanne.devries@example.nl, +31 6 12345678). Please refund €250 to NL91ABNA0417164300: my card 4111 1111 1111 1111 was charged twice. I live at Keizersgracht 123, 1015 CJ Amsterdam. | Hi, I'm Eline de Deruiter (carolyn.carter38@olivedawn.nl, +31 6 48171596). Please refund €250 to NL69ABNA4201013737: my card 4493 2819 7493 4301 was charged twice. I live at Crimsonvia 634, 4351 CJ Pinecliff. |
-
-That is real `piikey-cli anonymize` output. The stand-ins keep their shape: the IBAN still passes
-mod-97, the card still passes Luhn, the phone number is still Dutch. Running `piikey-cli
-deanonymize` on the right column gives back the left column character for character, and the app
-does the same to the chatbot's reply as it streams in.
 
 ## Features
 
@@ -78,7 +73,7 @@ sequenceDiagram
     participant You
     participant App as Browser or app
     participant piikey as piikey (on your PC)
-    participant AI as AI service
+    participant AI as Website or AI service
     You->>App: type or paste a message
     App->>piikey: request with your message
     piikey->>piikey: find personal data, issue stand-ins, store the pairs in the vault

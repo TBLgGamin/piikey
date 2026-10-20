@@ -18,7 +18,7 @@ SIZE = (1280, 640)
 PURPLE = "#6f49b1"
 LOGO_WIDTH = 560
 LOGO_TOP = 190
-TAGLINE = "Your personal data stays on your PC. AI gets believable stand-ins."
+TAGLINE = "The privacy layer between you and the internet."
 TAGLINE_SIZE = 40
 TAGLINE_TOP = 450
 
