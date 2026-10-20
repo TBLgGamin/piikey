@@ -1,2 +1,30 @@
-// The exe icon of piikey.exe and piikey-cli.exe (the manifest is not here: windows-reactor-setup adds it).
+// The exe icon and version information of piikey.exe and piikey-cli.exe (the manifest is not here:
+// windows-reactor-setup adds it). The PIIKEY_* macros come from build.rs and app/build.rs, which
+// take the version from Cargo.toml ([workspace.package]), so Explorer shows the released version.
 1 ICON "piikey.ico"
+
+1 VERSIONINFO
+FILEVERSION PIIKEY_VERSION_MAJOR,PIIKEY_VERSION_MINOR,PIIKEY_VERSION_PATCH,0
+PRODUCTVERSION PIIKEY_VERSION_MAJOR,PIIKEY_VERSION_MINOR,PIIKEY_VERSION_PATCH,0
+FILEOS 0x40004
+FILETYPE 0x1
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "TBLgGamin"
+            VALUE "FileDescription", PIIKEY_FILE_DESCRIPTION
+            VALUE "FileVersion", PIIKEY_VERSION_STR
+            VALUE "InternalName", PIIKEY_ORIGINAL_NAME
+            VALUE "LegalCopyright", "Copyright (c) 2026 TBLgGamin. MIT License."
+            VALUE "OriginalFilename", PIIKEY_ORIGINAL_NAME
+            VALUE "ProductName", "piikey"
+            VALUE "ProductVersion", PIIKEY_VERSION_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END
