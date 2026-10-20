@@ -17,7 +17,7 @@
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/hero-dark.png">
-  <img alt="You type: Hi, I'm Sanne de Vries (sanne.devries@example.nl, +31 6 12345678)... The internet sees: Hi, I'm Eline de Deruiter (carolyn.carter38@olivedawn.nl, +31 6 48171596)..., every value swapped for a stand-in of the same shape" src="docs/assets/hero-light.png" width="100%">
+  <img alt="Two ChatGPT windows. On your screen: 'My manager Mark Jansen (mark.jansen@example.nl) asked why I missed Monday's meeting...', signed Sanne de Vries. What chatgpt.com sees: the same message with Kevin Wolters, geertje.young90@arrowholly.nl and Nancy de Haas. The reply comes back with your real names." src="docs/assets/hero-light.png" width="100%">
 </picture>
 
 <br><br>
@@ -36,8 +36,9 @@ phone numbers, IBANs, card numbers, addresses and other personal data in it and 
 believable stand-in of the same shape. When the answer comes back, piikey puts your real values
 back in. Detection, the stand-ins and the vault that remembers them all stay on your machine.
 
-The example above is real `piikey-cli anonymize` output, and `piikey-cli deanonymize` turns the
-right side back into the left character for character.
+In the example above, the masked message is real `piikey-cli anonymize` output. The reply is turned
+back into your values by `piikey-cli deanonymize --tolerant`: the full names, the lone first name
+"Kevin" and the phone number all come back as yours.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/home-dark.png">
