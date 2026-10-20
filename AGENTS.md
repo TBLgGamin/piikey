@@ -87,5 +87,5 @@ CI runs all three on Windows. Never bypass hooks with `--no-verify`.
 |`release-plz.toml`, `commitlint.config.mjs`|release automation (one shared version; the root package `piikey` carries `CHANGELOG.md`, the tag `vX.Y.Z` and the release) and commit message rules|
 |`packaging/windows/`|`package.ps1` (release folder, zip, Inno Setup installer `piikey.iss`, `SHA256SUMS.txt`), `smoke.ps1` (CI-only install/uninstall check), `about.hbs` (third-party license page)|
 |`deny.toml`, `about.toml`|cargo-deny (licenses, advisories, sources) and cargo-about (`THIRD_PARTY_LICENSES.html`) settings|
-|`.github/`|workflows (`ci`, `codeql`, `scorecard`, `release` = release-plz + `release-assets`), issue/PR templates, Dependabot, CODEOWNERS|
+|`.github/`|workflows (`ci`, `codeql`: Actions on every push, Rust weekly, `release` = release-plz + `release-assets`), issue/PR templates, Dependabot, CODEOWNERS|
 |`docs/`|`how-it-works.md` (detection, proxy and capture, devices, formats, crash safety), `assets/hero-*.png` and `assets/screenshots/` (README images)|

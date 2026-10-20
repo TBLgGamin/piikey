@@ -1,11 +1,14 @@
 name: codeql
 
+# The Actions scan is quick and runs on every push and pull request. The Rust scan takes minutes and
+# adds little to `unsafe` forbidden, clippy pedantic and cargo-deny, so it runs weekly (and by hand).
 on:
   push:
     branches: [main]
   pull_request:
   schedule:
     - cron: "23 4 * * 1"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -13,19 +16,14 @@ permissions:
 jobs:
   analyze:
     name: analyze (${{ matrix.language }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       security-events: write
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - language: actions
-            os: ubuntu-latest
-          # If the Rust extraction fails on Linux (the app is Windows-only), set this to windows-latest.
-          - language: rust
-            os: ubuntu-latest
+        language: ${{ fromJSON(contains(fromJSON('["schedule","workflow_dispatch"]'), github.event_name) && '["actions","rust"]' || '["actions"]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
