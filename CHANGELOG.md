@@ -1,0 +1,28 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.1.0](https://github.com/TBLgGamin/piikey/releases/tag/v0.1.0) - 2026-10-20
+
+### Added
+
+- *(cli)* add --version
+- on-device PII model, typed-input capture, Windows app and activity feed
+- lightweight Windows PII masker
+
+### Build
+
+- release zip and installer through release-plz
+- pin actions, add commit lint, cargo-deny, CodeQL and Scorecard
+- embed version information in both executables
+- share version and package metadata through the workspace
+
+### Documentation
+
+- rewrite README with screenshots and move details to docs/how-it-works.md
+- add MIT license, code of conduct, security policy and contributing guide
