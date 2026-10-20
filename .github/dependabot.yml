@@ -1,0 +1,47 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      cargo:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    ignore:
+      # Pinned release candidate: its API changes between candidates.
+      - dependency-name: ort
+      # Must match the version uiautomation depends on.
+      - dependency-name: windows
+      # Git dependency pinned to a rev: Dependabot cannot bump it safely.
+      - dependency-name: windows-reactor
+      # Git dependency pinned to a rev, like windows-reactor.
+      - dependency-name: windows-reactor-setup
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      npm:
+        patterns: ["*"]
