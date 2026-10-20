@@ -1,9 +1,16 @@
 [package]
 name = "piikey-app"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.95"
-publish = false
+description = "Windows app and local proxy that masks your personal data before it reaches AI chatbots and restores it in their replies"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
 
 [[bin]]
 name = "piikey"
