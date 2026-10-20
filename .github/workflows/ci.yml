@@ -5,15 +5,79 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check:
     # piikey is Windows-only (DPAPI vault, Windows.Media.Ocr).
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # rust-toolchain.toml selects the version; rustup installs it on first use.
       - run: rustup show active-toolchain
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo fmt-check
       - run: cargo lint
-      - run: cargo test --all-targets -- --nocapture
+      - run: cargo test --all-targets --locked -- --nocapture
+
+  commits:
+    # Conventional Commits, and versions, CHANGELOG.md and tags left to release-plz
+    # (CONTRIBUTING.md#releases). Needs the whole history to walk a range of commits.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Commit messages and release guard (pull request)
+        if: github.event_name == 'pull_request'
+        # GITHUB_HEAD_REF, the pull request's branch, is set by the runner; the guard reads it to
+        # let release-plz's own pull request change the version and CHANGELOG.md.
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          # The pull request's own commits: the base branch may have moved on since it branched.
+          base=$(git merge-base "$BASE" "$HEAD")
+          npx commitlint --from "$base" --to "$HEAD" --verbose
+          # Squash merging makes the title the commit message.
+          printf '%s' "$PR_TITLE" | npx commitlint --verbose
+          node scripts/release-guard.mjs ci --base "$base" --head "$HEAD"
+      - name: Commit messages and release guard (push)
+        if: github.event_name == 'push'
+        env:
+          BASE: ${{ github.event.before }}
+          HEAD: ${{ github.sha }}
+        run: |
+          if [[ "$BASE" =~ ^0+$ ]]; then
+            echo "No earlier commit to compare with: skipping commitlint."
+          else
+            npx commitlint --from "$BASE" --to "$HEAD" --verbose
+          fi
+          node scripts/release-guard.mjs ci --base "$BASE" --head "$HEAD"
+
+  deny:
+    # Advisories, licenses, banned crates and sources (deny.toml). --workspace: without it only the
+    # root package is checked and the app's dependencies are skipped.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: --workspace

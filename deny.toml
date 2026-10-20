@@ -1,0 +1,53 @@
+# cargo-deny: advisories, licenses, bans and sources of the dependency graph.
+# CI runs it as the `deny` job (.github/workflows/ci.yml); locally: `cargo deny --workspace check`.
+# --workspace matters: without it only the root package (piikey) is checked and the app is skipped.
+
+[graph]
+# piikey is Windows-only: judge the crates that end up in the Windows build, not the ones other
+# platforms would pull in.
+targets = ["x86_64-pc-windows-msvc"]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+# Each entry needs the advisory id and why it is accepted.
+ignore = [
+  { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained but sound, and a proc macro: it runs while compiling and is not in the binaries. It comes in through tokenizers 0.23.2, the newest stable release, which has no replacement yet." },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+# The list below is the policy, not an inventory: a license no crate uses today stays allowed.
+unused-allowed-license = "allow"
+# Permissive licenses only. A copyleft license (GPL, LGPL, AGPL) must not enter the dependency graph.
+# about.toml carries the same list, for THIRD_PARTY_LICENSES.html: change both together.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "BSL-1.0",
+  "CC0-1.0",
+  "MPL-2.0",
+  "CDLA-Permissive-2.0",
+  "0BSD",
+  "Unlicense",
+]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# windows-reactor and windows-reactor-setup (app/Cargo.toml) are git dependencies on windows-rs.
+allow-git = ["https://github.com/microsoft/windows-rs"]
