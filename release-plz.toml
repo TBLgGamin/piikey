@@ -1,0 +1,55 @@
+# release-plz: versions, CHANGELOG.md, the v* tag and the GitHub Release (see CONTRIBUTING.md#releases).
+# Both packages share one version ([workspace.package]). The root package carries the changelog, the
+# tag and the release: its files are the whole repository, so every commit reaches the changelog
+# (release-plz attributes commits by path; the app's own changelog would only see app/).
+[workspace]
+git_only = true
+release_always = false
+semver_check = false
+features_always_increment_minor = true
+pr_name = "chore: release{% if version %} v{{ version }}{% endif %}"
+pr_labels = ["release"]
+
+[[package]]
+name = "piikey"
+version_group = "piikey"
+git_tag_name = "v{{ version }}"
+git_release_name = "piikey v{{ version }}"
+changelog_path = "CHANGELOG.md"
+changelog_include = ["piikey-app"]
+git_release_body = """
+{{ changelog }}
+
+## Download
+
+| File | What |
+|---|---|
+| `piikey-{{ version }}-setup-x64.exe` | Installer: per user, no admin rights, Start-menu entry, uninstaller |
+| `piikey-{{ version }}-windows-x64.zip` | Portable: unzip anywhere and run `piikey.exe` |
+| `SHA256SUMS.txt` | SHA-256 of both files |
+
+The builds are not code-signed yet: Windows SmartScreen asks once (More info, Run anyway).
+Verify a download: `gh attestation verify <file> --repo TBLgGamin/piikey`.
+"""
+
+[[package]]
+name = "piikey-app"
+version_group = "piikey"
+git_tag_name = "v{{ version }}"
+git_tag_enable = false
+git_release_enable = false
+changelog_update = false
+
+[changelog]
+commit_parsers = [
+  { message = "^chore: release", skip = true },
+  { message = "^feat", group = "Added" },
+  { message = "^fix", group = "Fixed" },
+  { message = "^perf", group = "Performance" },
+  { message = "^refactor", group = "Changed" },
+  { message = "^docs", group = "Documentation" },
+  { message = "^(build|ci)", group = "Build" },
+  { message = "^chore\\(deps\\)", group = "Dependencies" },
+  { message = "^revert", group = "Reverted" },
+  { message = "^(chore|style|test)", skip = true },
+]

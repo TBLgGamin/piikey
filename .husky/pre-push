@@ -1,1 +1,2 @@
+node scripts/release-guard.mjs pre-push
 cargo test --all-targets

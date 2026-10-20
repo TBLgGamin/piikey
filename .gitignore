@@ -1,5 +1,6 @@
 # Build output and dev tooling
 /target
+/dist
 /node_modules
 
 # Local scratch (playground, experiments)
