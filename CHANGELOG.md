@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/TBLgGamin/piikey/compare/v0.1.0...v0.1.1) - 2026-10-20
+
+### Build
+
+- drop Scorecard and run the Rust CodeQL scan weekly
+
+### Documentation
+
+- show the before/after as ChatGPT conversations
+- lead the README with a before/after card, new tagline and fewer badges
+
 ## [0.1.0](https://github.com/TBLgGamin/piikey/releases/tag/v0.1.0) - 2026-10-20
 
 ### Added
