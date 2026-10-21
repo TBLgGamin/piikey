@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/TBLgGamin/piikey/compare/v0.1.1...v0.2.0) - 2026-10-21
+
+### Added
+
+- [**breaking**] add the JSON and HTTP API, PII inventory, subject search and live highlight
+
+### Documentation
+
+- update README screenshots, feature icons and how-it-works for the new features
+
+### Fixed
+
+- restore in one pass, harden vault and proxy settings restore, and clean up the codebase
+
 ## [0.1.1](https://github.com/TBLgGamin/piikey/compare/v0.1.0...v0.1.1) - 2026-10-20
 
 ### Build
