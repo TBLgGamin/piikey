@@ -4,7 +4,7 @@
 use std::{cmp::Reverse, path::Path};
 
 use piikey::{
-    Result,
+    Error, Result,
     detect::{CompositeDetector, Detector, EntityKind, Mode, RegexDetector, Span},
     engine::Engine,
     vault::Vault,
@@ -63,4 +63,26 @@ pub(super) fn engine(vault_path: &Path, names: &'static [&'static str]) -> Resul
         Box::new(Names(names)),
     ]);
     Ok(Engine::new(Box::new(detector), Vault::open(vault_path)?))
+}
+
+/// A vault in which a real value equals the stand-in of another: it gave `Jan Smit` the
+/// stand-in `first`, and then somebody whose real name is `first` the stand-in `second`.
+/// Returns `(first, second)`. A reply that says both comes back as `Jan Smit` and `first`:
+/// that `first` is a real name, which is not a stand-in to restore once more.
+///
+/// # Errors
+/// Vault failures.
+pub(super) fn lookalike_stand_ins(engine: &Engine) -> Result<(String, String)> {
+    let stand_in = |original: &str| -> Result<String> {
+        engine
+            .vault()
+            .resolve(vec![(EntityKind::Person, original.into())], &|_, _| false)?;
+        let view = engine.vault().read()?;
+        view.proxy_for(EntityKind::Person, original)
+            .map(str::to_owned)
+            .ok_or(Error::Protocol("the vault issued no stand-in"))
+    };
+    let first = stand_in("Jan Smit")?;
+    let second = stand_in(&first)?;
+    Ok((first, second))
 }

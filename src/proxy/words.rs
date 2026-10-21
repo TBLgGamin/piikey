@@ -1,6 +1,7 @@
-//! Word lists for believable proxies. All entries are lowercase ASCII letters
-//! (or, for [`FREEMAIL`], plain domains) so they drop straight into email local
-//! parts and domain labels without escaping.
+//! Word lists for believable proxies. Every entry is lowercase ASCII letters, except the plain
+//! domains of [`FREEMAIL`], the dots inside [`LEGAL_FORMS`] (`b.v`) and the apostrophe of the
+//! particle `'t`. [`FIRST`], [`LAST`] and [`WORDS`] are the lists that go into email addresses:
+//! their entries drop straight into a local part or a domain label without escaping.
 
 /// Common US and Dutch given names.
 pub(super) const FIRST: [&str; 200] = [
@@ -485,6 +486,23 @@ pub(super) const STREET_TAIL: [&str; 16] = [
     "straat", "laan", "weg", "plein", "gracht", "kade", "road", "street", "lane", "avenue", "way",
     "strasse", "gasse", "rue", "via", "ulica",
 ];
+
+/// Name particles. A proxy keeps them: they say nothing about who the person is, and they make
+/// `Jeroen de Vries` read as `Haley de Zessen`. The restorer never takes one for a name by
+/// itself. Compared ignoring ASCII case.
+pub(super) const PARTICLES: [&str; 21] = [
+    "van", "de", "der", "den", "het", "von", "zu", "du", "da", "la", "le", "di", "del", "bin",
+    "ibn", "al", "el", "ter", "ten", "'t", "op",
+];
+
+/// True for a particle, also when the apostrophe of `'t` is a curly quote (`\u{2018}t`,
+/// `\u{2019}t`), as word processors write it.
+pub(crate) fn is_particle(token: &str) -> bool {
+    if let Some(rest) = token.strip_prefix(['\u{2018}', '\u{2019}']) {
+        return rest.eq_ignore_ascii_case("t");
+    }
+    PARTICLES.iter().any(|p| p.eq_ignore_ascii_case(token))
+}
 
 /// Public mailbox providers: their domain carries no information about the person,
 /// so an email on one of them keeps its domain.

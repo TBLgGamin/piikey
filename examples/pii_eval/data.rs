@@ -208,3 +208,26 @@ pub fn merge_parts(tax: &Taxonomy, text: &str, gold: Vec<Gold>) -> Vec<Gold> {
     }
     out
 }
+
+/// `n` items spread evenly over `items` (all of them when there are fewer): the samples that are
+/// timed or sent through the engine must not favour the start of a corpus.
+pub fn evenly<T>(items: &[T], n: usize) -> Vec<&T> {
+    let n = n.min(items.len());
+    (0..n).map(|i| &items[i * items.len() / n]).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::evenly;
+
+    #[test]
+    fn a_sample_reaches_the_end_of_the_corpus() {
+        let items: Vec<usize> = (0..150).collect();
+        let sample = evenly(&items, 100);
+        assert_eq!(sample.len(), 100);
+        assert!(*sample[99] >= 148, "the last pick is near the end");
+        assert_eq!(evenly(&items, 400).len(), 150);
+        assert!(evenly(&items, 0).is_empty());
+        assert!(evenly::<usize>(&[], 5).is_empty());
+    }
+}

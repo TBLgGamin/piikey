@@ -5,7 +5,7 @@
 //! followed, so a link cannot lead out of the tree or round in a circle.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::OsStr,
     fs::{self, Metadata},
     io,
@@ -21,7 +21,7 @@ use crate::{
     engine::Engine,
     formats::{self, Output},
     restore::{Restorer, Scope, ScopeEntry},
-    sys::io_context,
+    sys::{io_context, path_key, write_atomic},
 };
 
 /// `FILE_ATTRIBUTE_OFFLINE`, `_RECALL_ON_OPEN` and `_RECALL_ON_DATA_ACCESS`: the attributes a
@@ -51,8 +51,9 @@ pub struct Job {
 ///
 /// This is for work the caller asked for by name, so it fails rather than skips: on the first
 /// input or entry that does not exist or cannot be listed, on an output folder inside an input
-/// directory (the output would be processed in turn), and on two files that would be written to
-/// the same file (Windows paths are not case sensitive).
+/// directory (the output would be processed in turn), on a result that would be written over an
+/// input, and on two files that would be written to the same file (Windows paths are not case
+/// sensitive). The jobs of one input come in path order.
 ///
 /// # Errors
 /// `Io` naming the path that cannot be read; `BadRequest` for the output problems above.
@@ -75,6 +76,7 @@ pub fn collect(inputs: &[PathBuf], out: Option<&Path>) -> Result<Vec<Job>> {
         let mut found = Vec::new();
         let mut errors = Vec::new();
         crawl(input, &|_, _| false, &mut found, &mut errors);
+        found.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         if let Some((path, err)) = errors.first() {
             return Err(io_context(err, "read", path));
         }
@@ -112,12 +114,22 @@ fn relative_to(input: &Path, path: &Path) -> Result<PathBuf> {
 }
 
 /// Windows paths are not case sensitive: two inputs mapping to the same output would silently
-/// overwrite each other.
+/// overwrite each other, and an output that is an input (or the `.txt` of one, see
+/// [`text_path`]) would replace a file that is read in the same run.
 fn refuse_collisions(jobs: &[Job]) -> Result<()> {
+    let key = |path: &Path| path.to_string_lossy().to_lowercase();
+    let inputs: HashSet<String> = jobs.iter().map(|job| key(&job.input)).collect();
     let mut seen: HashMap<String, &Path> = HashMap::with_capacity(jobs.len());
     for job in jobs {
-        let key = job.output.to_string_lossy().to_lowercase();
-        if let Some(first) = seen.insert(key, &job.input) {
+        let output = key(&job.output);
+        if inputs.contains(&output) || inputs.contains(&key(&text_path(&job.output))) {
+            return Err(Error::BadRequest(format!(
+                "the result for {} would be written over {}, which is an input",
+                job.input.display(),
+                job.output.display()
+            )));
+        }
+        if let Some(first) = seen.insert(output, &job.input) {
             return Err(Error::BadRequest(format!(
                 "{} and {} would be written to the same file",
                 first.display(),
@@ -129,10 +141,12 @@ fn refuse_collisions(jobs: &[Job]) -> Result<()> {
 }
 
 /// Every regular file under `inputs`, with its metadata, each once and in path order: a file
-/// input as itself, a directory recursively. `skip` is asked about every entry found while
-/// walking, not about the inputs, and says whether to leave it out (a directory with
-/// everything below it). The metadata is the directory listing's, so no entry costs a system
-/// call of its own.
+/// input as itself, a directory recursively. Inputs may overlap (a folder and one inside it),
+/// even when they spell a folder in another letter case: a file found through both counts once,
+/// as the first of its spellings in path order spells it. `skip` is asked about every entry
+/// found while walking, not about the inputs, and says whether to leave it out (a directory
+/// with everything below it). The metadata is the directory listing's, so no entry costs a
+/// system call of its own.
 ///
 /// This is for crawls that do what they can: an input that does not exist and a directory
 /// that cannot be listed are left out. [`collect`] is the strict one.
@@ -147,7 +161,11 @@ pub fn walk(
         crawl(input, skip, &mut found, &mut errors);
     }
     found.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    found.dedup_by(|a, b| a.0 == b.0);
+    // A single input cannot reach a file twice: links are not followed.
+    if inputs.len() > 1 {
+        let mut seen = HashSet::with_capacity(found.len());
+        found.retain(|(path, _)| seen.insert(path_key(path)));
+    }
     found
 }
 
@@ -221,9 +239,11 @@ fn crawl(
 /// mail, goes to `<output>.txt`) or why that job failed; the other jobs go on. Missing folders
 /// are created and an existing output is overwritten.
 ///
-/// `tolerant` also restores proxies that came back with a typo, and names that came back alone;
-/// it only applies to [`Mode::Deanonymize`] (after an anonymize it would undo the masking), and
-/// only to text, not to zip documents, which are restored exactly.
+/// `tolerant` also restores proxies that came back with a typo, and names that came back alone,
+/// in the same pass as the exact restore: a value that is also a stand-in the vault issued for
+/// another value comes back once, as itself. It only applies to [`Mode::Deanonymize`] (after an
+/// anonymize it would undo the masking), and to every format [`formats::restore`] reads, each
+/// text of a document on its own.
 #[must_use]
 pub fn transform(
     engine: &Engine,
@@ -262,7 +282,10 @@ fn process_file(
     job: &Job,
 ) -> Result<PathBuf> {
     let bytes = fs::read(&job.input)?;
-    let output = tolerate(restorer, formats::process(engine, mode, &bytes, 0)?);
+    let output = match restorer {
+        Some(restorer) => formats::restore(engine, restorer, &bytes)?,
+        None => formats::process(engine, mode, &bytes, 0)?,
+    };
     let (dest, data) = match &output {
         Output::Same(raw) => (job.output.clone(), raw.as_slice()),
         Output::Text(text) => (text_path(&job.output), text.as_bytes()),
@@ -270,7 +293,9 @@ fn process_file(
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|e| io_context(&e, "create", parent))?;
     }
-    fs::write(&dest, data).map_err(|e| io_context(&e, "write", &dest))?;
+    // Whole or not at all: a result that fails halfway (a full disk) leaves the old output, or
+    // none, never half of a new one.
+    write_atomic(&dest, data)?;
     Ok(dest)
 }
 
@@ -375,26 +400,6 @@ fn vault_scope(engine: &Engine) -> Result<Scope> {
         .collect();
     entries.sort_unstable_by(|a, b| (a.kind, &a.proxy).cmp(&(b.kind, &b.proxy)));
     Ok(Scope::from_pairs(entries))
-}
-
-/// The result of the exact pass, run through `restorer` when there is one. A zip document
-/// keeps its exact result: its XML is compressed and cannot be edited as a byte string.
-#[must_use]
-pub fn tolerate(restorer: Option<&Restorer>, output: Output) -> Output {
-    let Some(restorer) = restorer else {
-        return output;
-    };
-    match output {
-        Output::Text(text) => {
-            let bytes = restorer.restore(text.as_bytes());
-            Output::Text(
-                String::from_utf8(bytes)
-                    .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned()),
-            )
-        }
-        Output::Same(raw) if raw.starts_with(b"PK\x03\x04") => Output::Same(raw),
-        Output::Same(raw) => Output::Same(restorer.restore(&raw)),
-    }
 }
 
 #[cfg(test)]
@@ -589,6 +594,48 @@ mod tests {
     }
 
     #[test]
+    fn a_result_over_an_input_is_refused() -> Result<()> {
+        let tmp = TempDir::new()?;
+        write(&tmp.0.join("a.txt"), b"1")?;
+        write(&tmp.0.join("b.txt"), b"2")?;
+        let inputs = [tmp.0.join("a.txt"), tmp.0.join("b.txt")];
+        // The output folder is the folder of the inputs, however it is spelled: every result
+        // would replace the file it was made from.
+        let shouted = PathBuf::from(tmp.0.to_string_lossy().to_uppercase());
+        for out in [&tmp.0, &shouted] {
+            let Err(Error::BadRequest(message)) = collect(&inputs, Some(out)) else {
+                panic!("expected a bad request for {}", out.display());
+            };
+            assert!(message.contains("is an input"), "{message}");
+        }
+        // A text result goes to `<name>.txt`: here that is another input.
+        write(&tmp.0.join("src").join("c.pdf"), b"%PDF-")?;
+        write(&tmp.0.join("out").join("c.pdf.txt"), b"x")?;
+        let inputs = [
+            tmp.0.join("src").join("c.pdf"),
+            tmp.0.join("out").join("c.pdf.txt"),
+        ];
+        let result = collect(&inputs, Some(&tmp.0.join("out")));
+        assert!(matches!(result, Err(Error::BadRequest(_))), "{result:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn the_jobs_of_one_input_come_in_path_order() -> Result<()> {
+        let tmp = TempDir::new()?;
+        for file in ["b.txt", "a/z.txt", "a.txt", "a/b/c.txt"] {
+            write(&tmp.0.join("in").join(file), b"x")?;
+        }
+        let jobs = collect(&[tmp.0.join("in")], None)?;
+        let inputs: Vec<PathBuf> = jobs.into_iter().map(|job| job.input).collect();
+        let mut sorted = inputs.clone();
+        sorted.sort();
+        assert_eq!(inputs.len(), 4);
+        assert_eq!(inputs, sorted);
+        Ok(())
+    }
+
+    #[test]
     fn walking_lists_each_file_once_in_path_order_and_honours_skip() -> io::Result<()> {
         let tmp = TempDir::new()?;
         let root = tmp.0.join("root");
@@ -619,6 +666,19 @@ mod tests {
                 .iter()
                 .all(|(_, meta)| meta.is_file() && meta.len() == 1)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn inputs_that_overlap_in_another_letter_case_find_each_file_once() -> io::Result<()> {
+        let tmp = TempDir::new()?;
+        let root = tmp.0.join("Docs");
+        write(&root.join("Sub").join("a.txt"), b"x")?;
+        write(&root.join("b.txt"), b"x")?;
+        // A folder of the root, spelled in capitals: Windows takes it for the same folder.
+        let shouted = PathBuf::from(root.join("Sub").to_string_lossy().to_uppercase());
+        let walked = walk(&[root, shouted], &|_, _| false);
+        assert_eq!(walked.len(), 2, "{walked:?}");
         Ok(())
     }
 
@@ -753,16 +813,94 @@ mod tests {
         Ok(())
     }
 
+    /// The stand-in the vault holds for the person `original`, issued now when it has none.
+    fn stand_in(engine: &Engine, original: &str) -> Result<String> {
+        let kind = EntityKind::Person;
+        engine
+            .vault()
+            .resolve(vec![(kind, original.into())], &|_, _| false)?;
+        let view = engine.vault().read()?;
+        view.proxy_for(kind, original)
+            .map(str::to_owned)
+            .ok_or_else(|| Error::BadRequest("the vault issued no stand-in".into()))
+    }
+
+    /// `name` with its third letter doubled: a typo that only a tolerant restore repairs.
+    fn with_typo(name: &str) -> String {
+        format!("{}{}", &name[..3], &name[2..])
+    }
+
     #[test]
-    fn tolerate_leaves_documents_alone_and_does_nothing_without_a_restorer() -> Result<()> {
+    fn a_tolerant_restore_writes_text_in_the_encoding_it_read_it_in() -> Result<()> {
         let tmp = TempDir::new()?;
         let engine = engine_in(&tmp)?;
-        engine.run(Mode::Anonymize, &["jan.jansen@acme.nl"])?;
-        let restorer = tolerant_restorer(&engine, true)?;
-        let zip = Output::Same(b"PK\x03\x04 pretend this is a zip".to_vec());
-        assert_eq!(tolerate(restorer.as_ref(), zip.clone()), zip);
-        let text = Output::Text("plain text".to_owned());
-        assert_eq!(tolerate(None, text.clone()), text);
+        let typo = with_typo(&stand_in(&engine, "José Jansen")?);
+        let utf16 = |text: &str| -> Vec<u8> {
+            let mut bytes = vec![0xFF, 0xFE];
+            bytes.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+            bytes
+        };
+        // The file as it comes, and as it must go out: the original has an `é` of its own.
+        let cases = [
+            (
+                "utf8.txt",
+                format!("café {typo}").into_bytes(),
+                "café José Jansen".as_bytes().to_vec(),
+            ),
+            (
+                "utf16.txt",
+                utf16(&format!("café {typo}")),
+                utf16("café José Jansen"),
+            ),
+            (
+                "windows-1252.txt",
+                [b"caf\xE9 ".as_slice(), typo.as_bytes()].concat(),
+                b"caf\xE9 Jos\xE9 Jansen".to_vec(),
+            ),
+        ];
+        for (name, input, _) in &cases {
+            write(&tmp.0.join("in").join(name), input)?;
+        }
+        let jobs = collect(&[tmp.0.join("in")], Some(&tmp.0.join("out")))?;
+        for (_, written) in transform(&engine, Mode::Deanonymize, true, &jobs) {
+            written?;
+        }
+        for (name, _, restored) in &cases {
+            assert_eq!(&fs::read(tmp.0.join("out").join(name))?, restored, "{name}");
+        }
+        // Without the flag the typo stays: only the tolerant restore repaired it.
+        let jobs = collect(&[tmp.0.join("in")], Some(&tmp.0.join("exact")))?;
+        for (_, written) in transform(&engine, Mode::Deanonymize, false, &jobs) {
+            written?;
+        }
+        for (name, input, _) in &cases {
+            assert_eq!(&fs::read(tmp.0.join("exact").join(name))?, input, "{name}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_value_that_is_another_stand_in_comes_back_once() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let engine = engine_in(&tmp)?;
+        // `Jan Smit` has a stand-in, and so has somebody whose real name is that stand-in.
+        let first = stand_in(&engine, "Jan Smit")?;
+        let second = stand_in(&engine, &first)?;
+        write(
+            &tmp.0.join("in").join("a.txt"),
+            format!("{first} and {second}").as_bytes(),
+        )?;
+        let jobs = collect(&[tmp.0.join("in")], Some(&tmp.0.join("out")))?;
+        for tolerant in [false, true] {
+            for (_, written) in transform(&engine, Mode::Deanonymize, tolerant, &jobs) {
+                written?;
+            }
+            assert_eq!(
+                fs::read_to_string(tmp.0.join("out").join("a.txt"))?,
+                format!("Jan Smit and {first}"),
+                "tolerant {tolerant}"
+            );
+        }
         Ok(())
     }
 }

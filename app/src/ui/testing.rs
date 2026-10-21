@@ -22,7 +22,7 @@ use super::{
     controller::{Backend, Controller, Running},
 };
 use crate::{
-    Res,
+    Describe, Res,
     proxy::{Event, Shared},
 };
 
@@ -37,7 +37,7 @@ impl TempDir {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        fs::create_dir_all(&dir).describe()?;
         Ok(Self(dir))
     }
 }
@@ -126,11 +126,11 @@ impl Backend for Stub {
     }
 
     fn open_engine(&self) -> Res<Engine> {
-        Engine::open(&self.vault).map_err(|e| e.to_string())
+        Engine::open(&self.vault).describe()
     }
 
     fn open_inventory(&self) -> Res<Inventory> {
-        Inventory::open(&self.vault.with_file_name("inventory.jsonl")).map_err(|e| e.to_string())
+        Inventory::open(&self.vault.with_file_name("inventory.jsonl")).describe()
     }
 
     fn load_activity(&self) -> Activity {
@@ -155,7 +155,11 @@ impl Backend for Stub {
 
     fn release_model(&self) {}
 
-    fn start_http(&self, _port: u16) -> Res<Box<dyn Running>> {
+    fn token(&self, _rotate: bool) -> Res<String> {
+        Ok("test-token".to_owned())
+    }
+
+    fn start_http(&self, _port: u16, _token: String) -> Res<Box<dyn Running>> {
         Ok(Box::new(Nothing))
     }
 
@@ -177,7 +181,7 @@ pub fn stub_controller(dir: &TempDir) -> Result<Arc<Controller>, String> {
 /// Like [`stub_controller`], with the certificate trusted or, with `certificate` false, missing.
 pub fn stub_controller_with(dir: &TempDir, certificate: bool) -> Result<Arc<Controller>, String> {
     let vault = dir.0.join("vault.pkv");
-    let engine = Engine::open(&vault).map_err(|e| e.to_string())?;
+    let engine = Engine::open(&vault).describe()?;
     let stub = Stub {
         vault: vault.clone(),
         certificate,

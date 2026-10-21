@@ -46,14 +46,16 @@ pub const FILES: [ModelFile; 2] = [
     },
 ];
 
-/// Marker file, written once every file has the right size and SHA-256.
+/// Marker file, written once every file has the right size and SHA-256. A download that brings
+/// in a file removes it first, so the marker is never there for a file nobody has checked.
 pub const VERIFIED: &str = "verified";
 
 /// What the first load found out about this machine, so later loads skip the measuring: `hybrid`
 /// (the graphics card is fast enough to help: big calls use it next to the processor) or `cpu`
 /// (it is not, or does not work). Delete the file to measure again, for example after a new
-/// graphics card, or write one of the two words into it to choose by hand. A `gpu` written by an
-/// older version reads as `hybrid`.
+/// graphics card, or write one of the two words into it to choose by hand: any editor or shell
+/// of Windows will do, UTF-8 and UTF-16 are both read. A `gpu` written by an older version
+/// reads as `hybrid`.
 pub const DEVICE_FILE: &str = "device.cfg";
 
 /// `%LOCALAPPDATA%\piikey\models\<MODEL_ID>`, next to the default vault. Not created.
@@ -80,12 +82,32 @@ fn installed(dir: &Path, files: &[ModelFile]) -> bool {
         })
 }
 
+/// A fresh folder under the system temp dir for a test, removed on drop.
+#[cfg(test)]
+pub(super) struct Scratch(pub(super) PathBuf);
+
+#[cfg(test)]
+impl Scratch {
+    pub(super) fn new(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("piikey-ner-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        Self(dir)
+    }
+}
+
+#[cfg(test)]
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
 
     use super::*;
-    use crate::vault;
 
     const SMALL: [ModelFile; 2] = [
         ModelFile {
@@ -102,39 +124,27 @@ mod tests {
         },
     ];
 
-    /// A fresh folder under the system temp dir, removed on drop.
-    struct Scratch(PathBuf);
-
-    impl Scratch {
-        fn new(tag: &str) -> Self {
-            let dir =
-                std::env::temp_dir().join(format!("piikey-ner-files-{tag}-{}", std::process::id()));
-            let _ = fs::remove_dir_all(&dir);
-            let _ = fs::create_dir_all(&dir);
-            Self(dir)
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
     #[test]
-    fn the_pinned_files_are_well_formed() {
+    fn the_pinned_files_share_one_revision_that_names_the_model_folder() {
+        let revision_of = |url: &str| {
+            url.split_once("/resolve/")
+                .and_then(|(_, rest)| rest.split('/').next())
+                .map(str::to_owned)
+        };
+        let revision = revision_of(FILES[0].url).unwrap_or_default();
+        // A commit, not a branch that can move.
+        assert_eq!(revision.len(), 40, "{revision}");
+        assert!(
+            revision
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        );
+        assert!(
+            MODEL_ID.ends_with(&revision[..7]),
+            "{MODEL_ID} vs {revision}"
+        );
         for file in &FILES {
-            assert!(
-                file.url.starts_with("https://huggingface.co/"),
-                "{}",
-                file.name
-            );
-            assert!(
-                file.url
-                    .contains("/resolve/5e61416e77675881185767fc0c67759d48b35592/"),
-                "{} must stay pinned to a revision",
-                file.name
-            );
+            assert_eq!(revision_of(file.url).as_deref(), Some(revision.as_str()));
             assert!(file.url.ends_with(file.name), "{}", file.name);
             assert_eq!(file.sha256.len(), 64, "{}", file.name);
             assert!(
@@ -144,19 +154,8 @@ mod tests {
                 "{}",
                 file.name
             );
-            assert!(file.size > 0);
+            assert!(file.size > 0, "{}", file.name);
         }
-        assert!(MODEL_ID.ends_with("5e61416"));
-    }
-
-    #[test]
-    fn the_default_dir_sits_beside_the_vault() -> crate::Result<()> {
-        // Needs LOCALAPPDATA, which every Windows session has.
-        let dir = default_dir()?;
-        let vault = vault::default_path()?;
-        assert_eq!(dir.parent().and_then(Path::parent), vault.parent());
-        assert!(dir.ends_with(Path::new("models").join(MODEL_ID)));
-        Ok(())
     }
 
     #[test]

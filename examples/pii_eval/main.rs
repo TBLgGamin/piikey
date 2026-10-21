@@ -33,7 +33,7 @@ use serde_json::Value;
 
 use crate::{
     bench::{Choice, Config, DeviceFile, Model, Plan},
-    data::{Doc, Source},
+    data::{Doc, Source, evenly},
     report::{Meta, ModelInfo, Report, Run, SourceNote},
     taxonomy::Taxonomy,
 };
@@ -56,7 +56,7 @@ OPTIONS:
     --examples N       examples shown per failure list (default 3)
     --json-examples N  examples of each failure list kept in the JSON (default 60)
     --model-dir DIR    detection model folder (default: the app's, in %LOCALAPPDATA%\\piikey\\models)
-    --device D         run the model on cpu or gpu instead of the saved choice (restored afterwards)
+    --device D         run the model on cpu, gpu or hybrid instead of the saved choice (restored afterwards)
     --recalibrate      measure GPU against CPU again on the first load (the old choice is restored)
     --eval-dir DIR     the eval folder (default: eval/ of this repository)
     --out DIR          results folder (default: <eval-dir>/results)
@@ -344,8 +344,7 @@ fn round_trip_in(
     let Some(engine) = bench::engine(config, &dir.join("vault.pkv"), model)? else {
         return Ok(None);
     };
-    let step = (source.docs.len() / n).max(1);
-    let sample: Vec<&Doc> = source.docs.iter().step_by(step).take(n).collect();
+    let sample: Vec<&Doc> = evenly(&source.docs, n);
     let checked = |c| tax.supported(c);
     Ok(Some(roundtrip::run(&engine, &sample, &checked)))
 }

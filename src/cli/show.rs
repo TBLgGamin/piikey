@@ -4,11 +4,22 @@
 //! match: an operation added to the API cannot be forgotten here.
 
 use std::{
-    collections::BTreeMap,
     io::{self, Write},
+    path::PathBuf,
 };
 
-use piikey::api::{ApiError, Request};
+use piikey::{
+    api::{
+        ApiError, Request,
+        reply::{
+            Entries, Exported, Forgotten, Found, InventoryStatus, Kind, Model, ModelState, Nodes,
+            Protection, Records, Reported, Scanned, Spans, Status, Texts, Token, Written,
+        },
+    },
+    detect::EntityKind,
+    inventory::{Entry, Status as FileStatus, Totals},
+    policy::Policy,
+};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -47,9 +58,7 @@ pub enum View {
     Downloaded,
     Token,
     Status,
-    Protection {
-        on: bool,
-    },
+    Protection,
     /// Nothing better than the JSON.
     Json,
 }
@@ -78,7 +87,7 @@ impl View {
             Request::ModelDownload => Self::Downloaded,
             Request::ApiToken { .. } => Self::Token,
             Request::Status => Self::Status,
-            Request::Protection { on } => Self::Protection { on: *on },
+            Request::Protection { .. } => Self::Protection,
             Request::ExplorerScan { .. } => Self::Json,
         }
     }
@@ -115,7 +124,7 @@ pub fn print(
         View::Downloaded => Ok(writeln!(out, "the detection model is downloaded")?),
         View::Token => token(value, out),
         View::Status => status(value, out),
-        View::Protection { on } => Ok(writeln!(out, "protection is {}", on_off(*on))?),
+        View::Protection => protection(value, out),
         View::Json => Ok(writeln!(out, "{}", pretty(value))?),
     }
 }
@@ -123,258 +132,59 @@ pub fn print(
 /// The result as indented JSON.
 #[must_use]
 pub fn pretty(value: &Value) -> String {
-    // A `Value` always serializes; its own text is the fallback for the case that never is.
-    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+    format!("{value:#}")
 }
 
-/// Whether a scan found a value that `fail_on` fails on. Other views never do.
+/// How a result bears on the exit code of the command.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Verdict {
+    /// A value of a kind `--fail-on` fails on was found.
+    pub found: bool,
+    /// Files that could not be read or written.
+    pub failed: usize,
+}
+
+/// The [`Verdict`] on `value`, the result of a request that had `view`. Only scans and writes
+/// have one: the reply of any other view is not looked at, so it is never an error there.
 ///
 /// # Errors
 /// A reply that does not have the shape the operation promises.
-pub fn found(fail_on: &FailOn, view: &View, value: &Value) -> Result<bool, Fail> {
-    Ok(match view {
-        View::Spans => reply::<SpansReply>(value)?
-            .results
-            .iter()
-            .flatten()
-            .any(|span| fail_on.matches(&span.kind)),
-        View::Files => reply::<FilesReply>(value)?.files.iter().any(|file| {
-            file.counts
-                .iter()
-                .any(|(kind, &n)| n > 0 && fail_on.matches(kind))
+pub fn verdict(view: &View, value: &Value, fail_on: Option<&FailOn>) -> Result<Verdict, Fail> {
+    match view {
+        // Without a gate a found value is no news, so the reply is not even read.
+        View::Spans => Ok(Verdict {
+            found: match fail_on {
+                Some(fail_on) => reply::<Spans>(value)?
+                    .results
+                    .iter()
+                    .flatten()
+                    .any(|span| fail_on.matches(&span.kind)),
+                None => false,
+            },
+            failed: 0,
         }),
-        _ => false,
-    })
-}
-
-/// How many items of an operation that went on failed: files that could not be read or written.
-///
-/// # Errors
-/// A reply that does not have the shape the operation promises.
-pub fn failed(view: &View, value: &Value) -> Result<usize, Fail> {
-    Ok(match view {
-        View::Files => reply::<FilesReply>(value)?
-            .files
-            .iter()
-            .filter(|file| file.status == "failed")
-            .count(),
-        View::Written => reply::<WrittenReply>(value)?.failed.len(),
-        _ => 0,
-    })
-}
-
-#[derive(Deserialize)]
-struct TextsReply {
-    texts: Vec<String>,
-}
-
-#[derive(Deserialize)]
-struct SpansReply {
-    results: Vec<Vec<SpanReply>>,
-}
-
-#[derive(Deserialize)]
-struct SpanReply {
-    start: usize,
-    end: usize,
-    kind: String,
-    value: String,
-}
-
-#[derive(Deserialize)]
-struct FilesReply {
-    files: Vec<FileReply>,
-}
-
-/// A scanned file, and an inventory entry, which is the same plus what the scan ran into.
-#[derive(Deserialize)]
-struct FileReply {
-    path: String,
-    status: String,
-    #[serde(default)]
-    error: Option<String>,
-    #[serde(default)]
-    counts: BTreeMap<String, u64>,
-}
-
-impl FileReply {
-    fn hits(&self) -> u64 {
-        self.counts.values().sum()
+        View::Files => {
+            let scanned = reply::<Scanned>(value)?;
+            let found = fail_on.is_some_and(|fail_on| {
+                scanned
+                    .files
+                    .iter()
+                    .flat_map(|file| &file.counts)
+                    .any(|&(kind, n)| n > 0 && fail_on.matches(kind.as_str()))
+            });
+            let failed = scanned
+                .files
+                .iter()
+                .filter(|file| matches!(file.status, FileStatus::Failed(_)))
+                .count();
+            Ok(Verdict { found, failed })
+        }
+        View::Written => Ok(Verdict {
+            found: false,
+            failed: reply::<Written>(value)?.failed.len(),
+        }),
+        _ => Ok(Verdict::default()),
     }
-}
-
-#[derive(Deserialize)]
-struct WrittenReply {
-    written: Vec<MovedReply>,
-    failed: Vec<FailedReply>,
-}
-
-#[derive(Deserialize)]
-struct MovedReply {
-    input: String,
-    output: String,
-}
-
-#[derive(Deserialize)]
-struct FailedReply {
-    input: String,
-    error: String,
-}
-
-#[derive(Deserialize)]
-struct SubjectReply {
-    matches: Vec<MatchReply>,
-}
-
-#[derive(Deserialize)]
-struct MatchReply {
-    path: String,
-    values: Vec<usize>,
-    count: u64,
-}
-
-#[derive(Deserialize)]
-struct RecordsReply {
-    records: Vec<RecordReply>,
-    total: usize,
-}
-
-#[derive(Deserialize)]
-struct RecordReply {
-    kind: String,
-    original: String,
-    proxy: String,
-}
-
-#[derive(Deserialize)]
-struct ForgottenReply {
-    forgotten: u64,
-}
-
-#[derive(Deserialize)]
-struct ExportedReply {
-    records: u64,
-    path: String,
-}
-
-#[derive(Deserialize)]
-struct ReportReply {
-    rows: u64,
-    path: String,
-}
-
-#[derive(Deserialize)]
-struct InventoryStatusReply {
-    enabled: bool,
-    roots: Vec<String>,
-    files: u64,
-    files_with_pii: u64,
-    hits: u64,
-    #[serde(default)]
-    scanning: Option<ProgressReply>,
-}
-
-/// How far a scan or a download is: `done` of `total`.
-#[derive(Deserialize)]
-struct ProgressReply {
-    done: u64,
-    total: u64,
-}
-
-#[derive(Deserialize)]
-struct EntriesReply {
-    entries: Vec<FileReply>,
-    total: usize,
-}
-
-#[derive(Deserialize)]
-struct NodesReply {
-    nodes: Vec<NodeReply>,
-}
-
-#[derive(Deserialize)]
-struct NodeReply {
-    path: String,
-    name: String,
-    is_dir: bool,
-    hits: u64,
-    files: u64,
-    #[serde(default)]
-    counts: BTreeMap<String, u64>,
-}
-
-#[derive(Deserialize)]
-struct TotalsReply {
-    files: u64,
-    files_with_pii: u64,
-    hits: u64,
-}
-
-/// The saved settings, as the `guard.cfg` keys name them.
-#[derive(Deserialize)]
-struct SettingsReply {
-    highlight: String,
-    explorer_menu: bool,
-    inventory: bool,
-    http_api: bool,
-    http_port: u16,
-    #[serde(default)]
-    sites: Vec<String>,
-    #[serde(default)]
-    programs: Vec<String>,
-    #[serde(default)]
-    disabled_kinds: Vec<String>,
-    #[serde(default)]
-    inventory_roots: Vec<String>,
-    #[serde(default)]
-    inventory_exclude: Vec<String>,
-}
-
-#[derive(Deserialize)]
-struct KindReply {
-    kind: String,
-    label: String,
-    group: String,
-    enabled: bool,
-}
-
-#[derive(Deserialize)]
-struct ModelReply {
-    state: String,
-    #[serde(default)]
-    device: Option<String>,
-    #[serde(default)]
-    error: Option<String>,
-    /// Only the app says it: the download it is running, in bytes.
-    #[serde(default)]
-    downloading: Option<ProgressReply>,
-    dir: String,
-}
-
-#[derive(Deserialize)]
-struct TokenReply {
-    token: String,
-}
-
-#[derive(Deserialize)]
-struct StatusReply {
-    app: bool,
-    #[serde(default)]
-    protection: Option<bool>,
-    version: String,
-    vault_records: u64,
-    model: ModelReply,
-    highlight: String,
-    #[serde(flatten)]
-    features: Features,
-}
-
-/// The on/off switches of the features that sit in the status next to the rest.
-#[derive(Deserialize)]
-struct Features {
-    explorer_menu: bool,
-    inventory: bool,
-    http_api: bool,
 }
 
 /// `value` as the reply `T`.
@@ -383,7 +193,7 @@ fn reply<'a, T: Deserialize<'a>>(value: &'a Value) -> Result<T, Fail> {
 }
 
 fn text(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
-    let texts = reply::<TextsReply>(value)?.texts;
+    let texts = reply::<Texts>(value)?.texts;
     let [text] = texts.as_slice() else {
         return Err(unexpected("not exactly one text"));
     };
@@ -393,7 +203,7 @@ fn text(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
 }
 
 fn spans(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
-    let spans = reply::<SpansReply>(value)?
+    let spans = reply::<Spans>(value)?
         .results
         .into_iter()
         .next()
@@ -413,35 +223,29 @@ fn spans(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
         })
         .collect();
     table(out, &["KIND", "BYTES", "VALUE"], &[], &rows)?;
-    writeln!(out, "{} found", plural(len(&spans), "value"))?;
+    writeln!(out, "{} found", plural(count(spans.len()), "value"))?;
     Ok(())
 }
 
 fn files(value: &Value, out: &mut dyn Write, err: &mut dyn Write) -> Result<(), Fail> {
-    let files = reply::<FilesReply>(value)?.files;
+    let files = reply::<Scanned>(value)?.files;
     // The files that hold something, the one with the most first.
-    let mut holding: Vec<&FileReply> = files.iter().filter(|file| file.hits() > 0).collect();
+    let mut holding: Vec<&Entry> = files.iter().filter(|file| file.hits() > 0).collect();
     holding.sort_by(|a, b| b.hits().cmp(&a.hits()).then_with(|| a.path.cmp(&b.path)));
     if !holding.is_empty() {
-        let rows: Vec<Vec<String>> = holding
-            .iter()
-            .map(|file| {
-                vec![
-                    file.hits().to_string(),
-                    counts(&file.counts),
-                    file.path.clone(),
-                ]
-            })
-            .collect();
-        table(out, &["HITS", "FOUND", "FILE"], &[0], &rows)?;
+        scan_table(out, holding.iter().copied())?;
     }
     let hits: u64 = holding.iter().map(|file| file.hits()).sum();
-    let failed = files.iter().filter(|file| file.status == "failed").count();
-    let skipped = files
-        .iter()
-        .filter(|file| file.status != "failed" && file.status != "ok")
-        .count();
-    let mut summary = vec![format!("{} scanned", plural(len(&files), "file"))];
+    let mut skipped = 0;
+    let mut failures = Vec::new();
+    for file in &files {
+        match &file.status {
+            FileStatus::Ok => {}
+            FileStatus::Unsupported | FileStatus::TooLarge => skipped += 1,
+            FileStatus::Failed(why) => failures.push((file, why)),
+        }
+    }
+    let mut summary = vec![format!("{} scanned", plural(count(files.len()), "file"))];
     summary.push(if hits == 0 {
         "no personal data found".to_owned()
     } else {
@@ -456,17 +260,39 @@ fn files(value: &Value, out: &mut dyn Write, err: &mut dyn Write) -> Result<(), 
             "{skipped} not read (unsupported format or too big)"
         ));
     }
-    if failed > 0 {
-        summary.push(format!("{failed} failed"));
+    if !failures.is_empty() {
+        summary.push(format!("{} failed", failures.len()));
     }
     writeln!(out, "{}", summary.join(", "))?;
     // What went wrong comes after the table even when both end up on the same screen.
     out.flush()?;
-    for file in files.iter().filter(|file| file.status == "failed") {
-        let why = file.error.as_deref().unwrap_or("could not be read");
-        writeln!(err, "piikey-cli: {}: {why}", file.path)?;
+    for (file, why) in failures {
+        let why = if why.is_empty() {
+            "could not be read"
+        } else {
+            why.as_str()
+        };
+        writeln!(err, "piikey-cli: {}: {why}", file.path.display())?;
     }
     Ok(())
+}
+
+/// `HITS FOUND FILE`, a row per file.
+fn scan_table<'a>(
+    out: &mut dyn Write,
+    files: impl IntoIterator<Item = &'a Entry>,
+) -> io::Result<()> {
+    let rows: Vec<Vec<String>> = files
+        .into_iter()
+        .map(|file| {
+            vec![
+                file.hits().to_string(),
+                counts(&file.counts),
+                file.path.display().to_string(),
+            ]
+        })
+        .collect();
+    table(out, &["HITS", "FOUND", "FILE"], &[0], &rows)
 }
 
 fn unexpected(what: &str) -> Fail {
@@ -474,18 +300,18 @@ fn unexpected(what: &str) -> Fail {
 }
 
 fn written(value: &Value, out: &mut dyn Write, err: &mut dyn Write) -> Result<(), Fail> {
-    let reply = reply::<WrittenReply>(value)?;
+    let reply = reply::<Written>(value)?;
     for moved in &reply.written {
         writeln!(out, "{} -> {}", moved.input, moved.output)?;
     }
     writeln!(
         out,
         "{} written{}",
-        plural(len(&reply.written), "file"),
+        plural(count(reply.written.len()), "file"),
         if reply.failed.is_empty() {
             String::new()
         } else {
-            format!(", {} failed", len(&reply.failed))
+            format!(", {} failed", reply.failed.len())
         }
     )?;
     out.flush()?;
@@ -496,7 +322,7 @@ fn written(value: &Value, out: &mut dyn Write, err: &mut dyn Write) -> Result<()
 }
 
 fn subject(values: &[String], value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
-    let matches = reply::<SubjectReply>(value)?.matches;
+    let matches = reply::<Found>(value)?.matches;
     if matches.is_empty() {
         writeln!(out, "no file mentions these values")?;
         return Ok(());
@@ -513,11 +339,15 @@ fn subject(values: &[String], value: &Value, out: &mut dyn Write) -> Result<(), 
                         .map_or_else(|| format!("#{i}"), |v| one_line(v))
                 })
                 .collect();
-            vec![m.count.to_string(), named.join(", "), m.path.clone()]
+            vec![
+                m.count.to_string(),
+                named.join(", "),
+                m.path.display().to_string(),
+            ]
         })
         .collect();
     table(out, &["COUNT", "VALUES", "FILE"], &[0], &rows)?;
-    let mentioning = len(&matches);
+    let mentioning = count(matches.len());
     let verb = if mentioning == 1 {
         "mentions"
     } else {
@@ -528,7 +358,7 @@ fn subject(values: &[String], value: &Value, out: &mut dyn Write) -> Result<(), 
 }
 
 fn records(offset: usize, value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
-    let reply = reply::<RecordsReply>(value)?;
+    let reply = reply::<Records>(value)?;
     if reply.records.is_empty() {
         writeln!(out, "no records")?;
         return Ok(());
@@ -554,8 +384,7 @@ fn footer(
 ) -> io::Result<()> {
     let next = offset + shown;
     if offset == 0 && next >= total {
-        let total = u64::try_from(total).unwrap_or(u64::MAX);
-        writeln!(out, "{}", plural(total, noun))
+        writeln!(out, "{}", plural(count(total), noun))
     } else if next < total {
         writeln!(
             out,
@@ -568,32 +397,37 @@ fn footer(
 }
 
 fn forgotten(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
-    match reply::<ForgottenReply>(value)?.forgotten {
+    match reply::<Forgotten>(value)?.forgotten {
         0 => writeln!(out, "no records removed")?,
-        n => writeln!(out, "forgot {}", plural(n, "record"))?,
+        n => writeln!(out, "forgot {}", plural(count(n), "record"))?,
     }
     Ok(())
 }
 
 fn exported(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
-    let reply = reply::<ExportedReply>(value)?;
+    let reply = reply::<Exported>(value)?;
     writeln!(
         out,
         "wrote {} to {}",
-        plural(reply.records, "record"),
+        plural(count(reply.records), "record"),
         reply.path
     )?;
     Ok(())
 }
 
 fn report(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
-    let reply = reply::<ReportReply>(value)?;
-    writeln!(out, "wrote {} to {}", plural(reply.rows, "row"), reply.path)?;
+    let reply = reply::<Reported>(value)?;
+    writeln!(
+        out,
+        "wrote {} to {}",
+        plural(count(reply.rows), "row"),
+        reply.path
+    )?;
     Ok(())
 }
 
 fn inventory_status(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
-    let reply = reply::<InventoryStatusReply>(value)?;
+    let reply = reply::<InventoryStatus>(value)?;
     let folders = if reply.roots.is_empty() {
         "none".to_owned()
     } else {
@@ -618,23 +452,18 @@ fn inventory_status(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
 }
 
 fn entries(offset: usize, value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
-    let reply = reply::<EntriesReply>(value)?;
+    let reply = reply::<Entries>(value)?;
     if reply.entries.is_empty() {
         writeln!(out, "no files with personal data in the inventory")?;
         return Ok(());
     }
-    let rows: Vec<Vec<String>> = reply
-        .entries
-        .iter()
-        .map(|e| vec![e.hits().to_string(), counts(&e.counts), e.path.clone()])
-        .collect();
-    table(out, &["HITS", "FOUND", "FILE"], &[0], &rows)?;
+    scan_table(out, &reply.entries)?;
     footer(out, offset, reply.entries.len(), reply.total, "file")?;
     Ok(())
 }
 
 fn nodes(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
-    let nodes = reply::<NodesReply>(value)?.nodes;
+    let nodes = reply::<Nodes>(value)?.nodes;
     if nodes.is_empty() {
         writeln!(out, "nothing with personal data here")?;
         return Ok(());
@@ -642,13 +471,14 @@ fn nodes(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
     let rows: Vec<Vec<String>> = nodes
         .iter()
         .map(|node| {
+            let path = node.path.display().to_string();
             // The node for scans outside every watched folder has no path.
-            let place = if node.path.is_empty() {
+            let place = if path.is_empty() {
                 node.name.clone()
             } else if node.is_dir {
-                format!("{}\\", node.path.trim_end_matches('\\'))
+                format!("{}\\", path.trim_end_matches('\\'))
             } else {
-                node.path.clone()
+                path
             };
             vec![
                 node.hits.to_string(),
@@ -663,7 +493,7 @@ fn nodes(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
 }
 
 fn rescanned(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
-    let totals = reply::<TotalsReply>(value)?;
+    let totals = reply::<Totals>(value)?;
     writeln!(
         out,
         "scanned: the inventory holds {}, {} with personal data, {} found",
@@ -676,18 +506,28 @@ fn rescanned(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
 
 /// The settings as `KEY=VALUE` lines: what `settings set` takes.
 fn settings(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
-    let settings = reply::<SettingsReply>(value)?;
-    writeln!(out, "highlight={}", settings.highlight)?;
+    let settings = reply::<Policy>(value)?;
+    writeln!(out, "highlight={}", settings.highlight.as_str())?;
     writeln!(out, "explorer_menu={}", settings.explorer_menu)?;
     writeln!(out, "inventory={}", settings.inventory)?;
     writeln!(out, "http_api={}", settings.http_api)?;
     writeln!(out, "http_port={}", settings.http_port)?;
+    let paths = |paths: &[PathBuf]| -> Vec<String> {
+        paths.iter().map(|p| p.display().to_string()).collect()
+    };
     let lists = [
-        ("site", &settings.sites),
-        ("program", &settings.programs),
-        ("disabled_kind", &settings.disabled_kinds),
-        ("inventory_root", &settings.inventory_roots),
-        ("inventory_exclude", &settings.inventory_exclude),
+        ("site", settings.sites),
+        ("program", settings.programs),
+        (
+            "disabled_kind",
+            settings
+                .disabled_kinds
+                .iter()
+                .map(|kind| kind.as_str().to_owned())
+                .collect(),
+        ),
+        ("inventory_root", paths(&settings.inventory_roots)),
+        ("inventory_exclude", paths(&settings.inventory_exclude)),
     ];
     for (key, list) in lists {
         for item in list {
@@ -698,7 +538,7 @@ fn settings(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
 }
 
 fn kinds(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
-    let kinds = reply::<Vec<KindReply>>(value)?;
+    let kinds = reply::<Vec<Kind>>(value)?;
     let rows: Vec<Vec<String>> = kinds
         .iter()
         .map(|k| {
@@ -715,7 +555,7 @@ fn kinds(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
 }
 
 fn model(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
-    let model = reply::<ModelReply>(value)?;
+    let model = reply::<Model>(value)?;
     pairs(
         out,
         &[
@@ -726,7 +566,7 @@ fn model(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
     Ok(())
 }
 
-fn model_phrase(model: &ModelReply) -> String {
+fn model_phrase(model: &Model) -> String {
     const MB: u64 = 1024 * 1024;
     if let Some(download) = &model.downloading {
         return format!(
@@ -735,23 +575,24 @@ fn model_phrase(model: &ModelReply) -> String {
             download.total / MB
         );
     }
-    match (model.state.as_str(), &model.device, &model.error) {
-        ("missing", ..) => "not downloaded (piikey-cli model download)".to_owned(),
-        ("unloaded", ..) => "downloaded, loads when it is needed".to_owned(),
-        ("ready", Some(device), _) => format!("ready ({device})"),
-        ("failed", _, Some(error)) => format!("failed: {error}"),
-        (state, ..) => state.to_owned(),
+    match (model.state, model.device, &model.error) {
+        (ModelState::Missing, ..) => "not downloaded (piikey-cli model download)".to_owned(),
+        (ModelState::Unloaded, ..) => "downloaded, loads when it is needed".to_owned(),
+        (ModelState::Ready, Some(device), _) => format!("ready ({})", device.as_str()),
+        (ModelState::Ready, None, _) => "ready".to_owned(),
+        (ModelState::Failed, _, Some(error)) => format!("failed: {error}"),
+        (ModelState::Failed, _, None) => "failed".to_owned(),
     }
 }
 
 /// Just the token, so `$(piikey-cli token)` is the token.
 fn token(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
-    writeln!(out, "{}", reply::<TokenReply>(value)?.token)?;
+    writeln!(out, "{}", reply::<Token>(value)?.token)?;
     Ok(())
 }
 
 fn status(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
-    let status = reply::<StatusReply>(value)?;
+    let status = reply::<Status>(value)?;
     let protection = match status.protection {
         Some(on) => on_off(on).to_owned(),
         None => "unknown (it is the app's)".to_owned(),
@@ -767,15 +608,18 @@ fn status(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
             ("protection", protection),
             ("vault", plural(status.vault_records, "record")),
             ("model", model_phrase(&status.model)),
-            ("highlight", status.highlight.clone()),
-            (
-                "explorer menu",
-                on_off(status.features.explorer_menu).to_owned(),
-            ),
-            ("inventory", on_off(status.features.inventory).to_owned()),
-            ("HTTP API", on_off(status.features.http_api).to_owned()),
+            ("highlight", status.highlight.as_str().to_owned()),
+            ("explorer menu", on_off(status.explorer_menu).to_owned()),
+            ("inventory", on_off(status.inventory).to_owned()),
+            ("HTTP API", on_off(status.http_api).to_owned()),
         ],
     )?;
+    Ok(())
+}
+
+fn protection(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
+    let on = reply::<Protection>(value)?.protection;
+    writeln!(out, "protection is {}", on_off(on))?;
     Ok(())
 }
 
@@ -792,17 +636,16 @@ fn plural(n: u64, noun: &str) -> String {
     }
 }
 
-fn len<T>(items: &[T]) -> u64 {
-    u64::try_from(items.len()).unwrap_or(u64::MAX)
+fn count(n: usize) -> u64 {
+    u64::try_from(n).unwrap_or(u64::MAX)
 }
 
-/// `email: 3, phone_number: 1`: the kind with the most first.
-fn counts(counts: &BTreeMap<String, u64>) -> String {
-    let mut sorted: Vec<(&String, &u64)> = counts.iter().filter(|(_, n)| **n > 0).collect();
-    sorted.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
-    let parts: Vec<String> = sorted
+/// `email: 3, phone_number: 1`, in the order given (the most first); a zero is left out.
+fn counts(counts: &[(EntityKind, u32)]) -> String {
+    let parts: Vec<String> = counts
         .iter()
-        .map(|(kind, n)| format!("{kind}: {n}"))
+        .filter(|&&(_, n)| n > 0)
+        .map(|(kind, n)| format!("{}: {n}", kind.as_str()))
         .collect();
     parts.join(", ")
 }

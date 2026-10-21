@@ -343,6 +343,7 @@ fn timed_batch(
     );
     Ok(found)
 }
+
 /// Calls of growing size, each of different texts: where a call is big enough for the GPU to pay
 /// off shows as the time per text dropping.
 fn ladder(ner: &NerDetector) {

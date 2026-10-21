@@ -190,13 +190,20 @@ impl EntityKind {
         Self::ALL.into_iter().find(|k| k.as_str() == s)
     }
 
+    /// Where this kind is listed in [`KIND_GROUPS`]: the index of its group. Every kind is listed
+    /// (a test checks), so the 0 it falls back to only keeps the function total.
+    #[must_use]
+    pub fn group_index(self) -> usize {
+        KIND_GROUPS
+            .iter()
+            .position(|(_, kinds)| kinds.contains(&self))
+            .unwrap_or_default()
+    }
+
     /// The [`KIND_GROUPS`] name this kind is listed under, e.g. "Contact" for `email`.
     #[must_use]
     pub fn group(self) -> &'static str {
-        KIND_GROUPS
-            .iter()
-            .find(|(_, kinds)| kinds.contains(&self))
-            .map_or("Other", |&(name, _)| name)
+        KIND_GROUPS[self.group_index()].0
     }
 
     /// What the apps call this kind, e.g. "Card number" for `credit_card`.
@@ -302,10 +309,10 @@ impl EntityKind {
         })
     }
 
-    /// Found by the regex pattern table.
+    /// Found by the regex pattern table: the kinds before [`Self::Person`].
     #[must_use]
     pub const fn is_patterned(self) -> bool {
-        (self as u8) <= 11
+        (self as u8) < Self::Person as u8
     }
 
     /// Found back in proxied text by exact lookup of the issued proxies
@@ -315,10 +322,10 @@ impl EntityKind {
         !self.is_patterned()
     }
 
-    /// Proxies carry a watermark the deanonymizer checks.
+    /// Proxies carry a watermark the deanonymizer checks: the patterned kinds and `Person`.
     #[must_use]
     pub const fn is_watermarked(self) -> bool {
-        (self as u8) <= 12
+        (self as u8) <= Self::Person as u8
     }
 }
 
@@ -522,16 +529,11 @@ mod tests {
     }
 
     #[test]
-    fn every_kind_names_its_group() {
+    fn every_kind_is_in_the_group_its_index_names() {
         for kind in EntityKind::ALL {
-            let group = kind.group();
-            let (_, members) = KIND_GROUPS
-                .iter()
-                .find(|(name, _)| *name == group)
-                .unwrap_or_else(|| panic!("{kind:?} has no group"));
+            let (_, members) = KIND_GROUPS[kind.group_index()];
             assert!(members.contains(&kind), "{kind:?}");
         }
-        assert_eq!(EntityKind::Email.group(), "Contact");
     }
 
     #[test]

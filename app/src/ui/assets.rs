@@ -114,6 +114,7 @@ pub fn icon_file(vault: &Path) -> Res<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Describe;
 
     /// Widths of the images listed in the ICONDIR (a stored 0 means 256).
     fn icon_sizes() -> Vec<u32> {
@@ -161,17 +162,17 @@ mod tests {
     #[test]
     fn the_icon_is_written_next_to_the_vault_and_repaired_when_stale() -> Result<(), String> {
         let folder = std::env::temp_dir().join(format!("piikey-icon-{}", std::process::id()));
-        fs::create_dir_all(&folder).map_err(|error| error.to_string())?;
+        fs::create_dir_all(&folder).describe()?;
         let vault = folder.join("vault.pkv");
 
         let path = icon_file(&vault)?;
         assert_eq!(path, folder.join("piikey.ico"));
-        assert_eq!(fs::read(&path).map_err(|error| error.to_string())?, ICON);
+        assert_eq!(fs::read(&path).describe()?, ICON);
 
-        fs::write(&path, b"stale").map_err(|error| error.to_string())?;
+        fs::write(&path, b"stale").describe()?;
         icon_file(&vault)?;
-        assert_eq!(fs::read(&path).map_err(|error| error.to_string())?, ICON);
+        assert_eq!(fs::read(&path).describe()?, ICON);
 
-        fs::remove_dir_all(&folder).map_err(|error| error.to_string())
+        fs::remove_dir_all(&folder).describe()
     }
 }

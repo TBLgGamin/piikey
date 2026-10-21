@@ -1,9 +1,7 @@
-//! [`Local`]: the handler that answers a request in this process, and the API token.
+//! [`Local`]: the handler that answers a request in this process.
 
 use std::{
     fmt,
-    fs::{self, OpenOptions},
-    io::{self, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, TryLockError,
@@ -12,10 +10,12 @@ use std::{
 };
 
 use rayon::prelude::*;
-use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
-use super::{ApiError, Format, Handler, Request, object};
+use super::{
+    ApiError, Code, Format, Handler, Request, reply, require_absolute, to_json,
+    token::read_or_create_token,
+};
 use crate::{
     Error, Result,
     detect::{
@@ -25,11 +25,8 @@ use crate::{
     engine::Engine,
     files,
     inventory::{Entry, Inventory, Progress},
-    policy::{Policy, SettingsPatch, default_inventory_roots},
-    restore::Restorer,
-    subject,
-    sys::{self, io_context},
-    vault,
+    policy::{Policy, SettingsPatch},
+    subject, sys, vault,
 };
 
 /// Hands out the engine a request runs on, each time one does. The command line holds one
@@ -38,14 +35,13 @@ use crate::{
 pub type EngineSource = Arc<dyn Fn() -> Arc<Engine> + Send + Sync>;
 
 /// Told how far a download is, in bytes done and bytes in all.
-type DownloadProgress = Arc<dyn Fn(u64, u64) + Send + Sync>;
+pub type DownloadProgress = Arc<dyn Fn(u64, u64) + Send + Sync>;
 
-/// The token's file in the data folder.
-const TOKEN_FILE: &str = "api.token";
-/// A token is this many random bytes, written in hex.
-const TOKEN_BYTES: usize = 32;
-/// A token on file shorter than this is not one piikey made (or someone cut it): it is replaced.
-const MIN_TOKEN: usize = 32;
+/// Hands out the settings a request runs on, each time one does. The command line reads them
+/// from the data folder; the app hands out the ones it holds, which are the ones that apply
+/// while a change is still being saved.
+pub type PolicySource = Arc<dyn Fn() -> Result<Policy> + Send + Sync>;
+
 /// How many records or entries a list returns when it is not told.
 const LIST_DEFAULT: usize = 100;
 /// The most a list returns at once.
@@ -59,8 +55,12 @@ const LIST_MAX: usize = 10_000;
 /// (`%LOCALAPPDATA%\piikey`), so they are the user's, like the app's. The kinds of personal data
 /// a scan or a masking looks for are the engine's ([`Engine::set_enabled`]), not read from the
 /// settings here: whoever hands over the engine sets them from [`Policy::enabled_kinds`].
+///
+/// The app answers `status`, `model_status` and `inventory_status` with what these give, and the
+/// facts only it knows put in.
 pub struct Local {
     engine: EngineSource,
+    settings: PolicySource,
     inventory: Arc<Inventory>,
     /// The model the engine detects with, if it has one: it tells how the model is doing.
     ner: Option<NerDetector>,
@@ -87,6 +87,7 @@ impl Local {
     pub fn new(engine: EngineSource, inventory: Arc<Inventory>, ner: Option<NerDetector>) -> Self {
         Self {
             engine,
+            settings: Arc::new(Policy::load),
             inventory,
             ner,
             model_dir: None,
@@ -97,14 +98,23 @@ impl Local {
         }
     }
 
+    /// Reads the settings from `settings` instead of the data folder.
+    #[must_use]
+    pub fn with_policy(mut self, settings: PolicySource) -> Self {
+        self.settings = settings;
+        self
+    }
+
     /// Calls `progress(done, total)`, in bytes, while `model_download` runs.
     #[must_use]
-    pub fn with_progress(mut self, progress: Arc<dyn Fn(u64, u64) + Send + Sync>) -> Self {
+    pub fn with_progress(mut self, progress: DownloadProgress) -> Self {
         self.on_download = Some(progress);
         self
     }
 
-    /// Looks for the model, and downloads it, in `dir` instead of the data folder.
+    /// Looks for the model, and downloads it, in `dir` instead of the data folder. For tests,
+    /// which must not see the model of the machine they run on.
+    #[doc(hidden)]
     #[must_use]
     pub fn with_model_dir(mut self, dir: PathBuf) -> Self {
         self.model_dir = Some(dir);
@@ -113,6 +123,10 @@ impl Local {
 
     fn engine(&self) -> Arc<Engine> {
         (self.engine)()
+    }
+
+    fn policy(&self) -> Result<Policy> {
+        (self.settings)()
     }
 
     fn model_dir(&self) -> Result<PathBuf> {
@@ -124,27 +138,25 @@ impl Local {
 
     fn scan_text(&self, texts: &[String]) -> Result<Value, ApiError> {
         let found = self.engine().scan(&refs(texts))?;
-        let results: Vec<Value> = texts
+        let results = texts
             .iter()
-            .zip(&found)
+            .zip(found)
             .map(|(text, spans)| {
                 spans
-                    .iter()
-                    .map(|span| {
-                        object([
-                            ("start", span.start.into()),
-                            ("end", span.end.into()),
-                            ("kind", span.kind.as_str().into()),
-                            (
-                                "value",
-                                text.get(span.start..span.end).unwrap_or_default().into(),
-                            ),
-                        ])
+                    .into_iter()
+                    .map(|span| reply::Span {
+                        start: span.start,
+                        end: span.end,
+                        kind: span.kind.as_str().to_owned(),
+                        value: text
+                            .get(span.start..span.end)
+                            .unwrap_or_default()
+                            .to_owned(),
                     })
                     .collect()
             })
             .collect();
-        Ok(object([("results", results.into())]))
+        to_json(&reply::Spans { results })
     }
 
     fn rewrite_text(
@@ -154,13 +166,17 @@ impl Local {
         tolerant: bool,
     ) -> Result<Value, ApiError> {
         let engine = self.engine();
-        let mut out = engine.run(mode, &refs(texts))?;
         let restorer = files::tolerant_restorer(&engine, tolerant && mode == Mode::Deanonymize)?;
-        if let Some(restorer) = &restorer {
-            out.par_iter_mut()
-                .for_each(|text| *text = restore_text(restorer, text));
-        }
-        Ok(object([("texts", out.into())]))
+        let out = match &restorer {
+            // The vault's proxies and the scope's, typos and lone names included, in one pass
+            // over each text.
+            Some(restorer) => texts
+                .par_iter()
+                .map(|text| Engine::apply(text, &restorer.plan_with(text.as_bytes(), &*engine)))
+                .collect(),
+            None => engine.run(mode, &refs(texts))?,
+        };
+        to_json(&reply::Texts { texts: out })
     }
 
     fn scan_files(&self, paths: &[PathBuf], record: bool) -> Result<Value, ApiError> {
@@ -170,16 +186,17 @@ impl Local {
         jobs.sort_unstable_by(|a, b| a.input.cmp(&b.input));
         jobs.dedup_by(|a, b| a.input == b.input);
         let engine = self.engine();
-        let entries: Vec<Entry> = jobs
+        let files: Vec<Entry> = jobs
             .par_iter()
             .map(|job| Entry::scan(&engine, &job.input))
             .collect();
-        let hits: u64 = entries.iter().map(Entry::hits).sum();
-        let shown = to_json(&entries)?;
+        let hits = files.iter().map(Entry::hits).sum();
+        let scanned = reply::Scanned { files, hits };
+        let shown = to_json(&scanned)?;
         if record {
-            self.inventory.record(entries)?;
+            self.inventory.record(scanned.files)?;
         }
-        Ok(object([("files", shown), ("hits", hits.into())]))
+        Ok(shown)
     }
 
     fn rewrite_files(
@@ -190,40 +207,40 @@ impl Local {
         tolerant: bool,
     ) -> Result<Value, ApiError> {
         all_absolute(paths)?;
-        absolute(out)?;
+        require_absolute(out)?;
         let jobs = files::collect(paths, Some(out))?;
         let engine = self.engine();
-        let mut written = Vec::new();
-        let mut failed = Vec::new();
+        let mut done = reply::Written {
+            written: Vec::new(),
+            failed: Vec::new(),
+        };
         for (input, result) in files::transform(&engine, mode, tolerant, &jobs) {
+            let input = lossy(&input);
             match result {
-                Ok(output) => written.push(object([
-                    ("input", lossy(&input).into()),
-                    ("output", lossy(&output).into()),
-                ])),
-                Err(error) => failed.push(object([
-                    ("input", lossy(&input).into()),
-                    ("error", error.to_string().into()),
-                ])),
+                Ok(output) => done.written.push(reply::Moved {
+                    input,
+                    output: lossy(&output),
+                }),
+                Err(error) => done.failed.push(reply::Failed {
+                    input,
+                    error: error.to_string(),
+                }),
             }
         }
-        Ok(object([
-            ("written", written.into()),
-            ("failed", failed.into()),
-        ]))
+        to_json(&done)
     }
 
     fn subject_search(&self, values: &[String], paths: &[PathBuf]) -> Result<Value, ApiError> {
         all_absolute(paths)?;
         let roots;
         let paths = if paths.is_empty() {
-            roots = effective_roots(&Policy::load()?);
+            roots = self.policy()?.inventory_roots_or_default();
             roots.as_slice()
         } else {
             paths
         };
-        let found = subject::search(&self.engine(), values, paths, &AtomicBool::new(false))?;
-        Ok(object([("matches", to_json(&found)?)]))
+        let matches = subject::search(&self.engine(), values, paths, &AtomicBool::new(false))?;
+        to_json(&reply::Found { matches })
     }
 
     fn vault_list(
@@ -244,22 +261,19 @@ impl Local {
         {
             total += 1;
             if at >= offset && records.len() < limit {
-                records.push(object([
-                    ("kind", kind.as_str().into()),
-                    ("original", original.into()),
-                    ("proxy", proxy.into()),
-                ]));
+                records.push(reply::Record {
+                    kind: kind.as_str().to_owned(),
+                    original: original.to_owned(),
+                    proxy: proxy.to_owned(),
+                });
             }
         }
-        Ok(object([
-            ("records", records.into()),
-            ("total", total.into()),
-        ]))
+        to_json(&reply::Records { records, total })
     }
 
     fn vault_forget(&self, values: &[String]) -> Result<Value, ApiError> {
         let forgotten = self.engine().forget(&refs(values))?;
-        Ok(object([("forgotten", forgotten.into())]))
+        to_json(&reply::Forgotten { forgotten })
     }
 
     fn vault_wipe(&self, confirm: bool) -> Result<Value, ApiError> {
@@ -269,38 +283,46 @@ impl Local {
             ));
         }
         let forgotten = self.engine().wipe()?;
-        Ok(object([("forgotten", forgotten.into())]))
+        to_json(&reply::Forgotten { forgotten })
     }
 
     fn vault_export(&self, path: &Path, format: Format) -> Result<Value, ApiError> {
-        absolute(path)?;
+        require_absolute(path)?;
         let engine = self.engine();
-        let records = write_new(path, |out| {
+        let records = sys::write_new(path, |out| {
             vault::export(&engine.vault().read()?, format.into(), out)
         })?;
-        Ok(object([
-            ("records", records.into()),
-            ("path", lossy(path).into()),
-        ]))
+        to_json(&reply::Exported {
+            records,
+            path: lossy(path),
+        })
     }
 
-    fn inventory_status(&self) -> Result<Value, ApiError> {
-        let policy = Policy::load()?;
+    /// The inventory in numbers, with the progress of the rescan this process runs, if any.
+    ///
+    /// # Errors
+    /// `Io` when the saved settings cannot be read.
+    pub fn inventory_status(&self) -> Result<reply::InventoryStatus, ApiError> {
+        let policy = self.policy()?;
         let totals = self.inventory.totals();
-        let scanning = self.rescanning.load(Ordering::Relaxed).then(|| {
-            object([
-                ("done", self.rescan.done.load(Ordering::Relaxed).into()),
-                ("total", self.rescan.total.load(Ordering::Relaxed).into()),
-            ])
-        });
-        Ok(object([
-            ("enabled", policy.inventory.into()),
-            ("roots", paths_json(&effective_roots(&policy))),
-            ("files", totals.files.into()),
-            ("files_with_pii", totals.files_with_pii.into()),
-            ("hits", totals.hits.into()),
-            ("scanning", scanning.into()),
-        ]))
+        Ok(reply::InventoryStatus {
+            enabled: policy.inventory,
+            roots: policy
+                .inventory_roots_or_default()
+                .iter()
+                .map(|root| lossy(root))
+                .collect(),
+            files: totals.files,
+            files_with_pii: totals.files_with_pii,
+            hits: totals.hits,
+            scanning: self
+                .rescanning
+                .load(Ordering::Relaxed)
+                .then(|| reply::Progress {
+                    done: self.rescan.done.load(Ordering::Relaxed),
+                    total: self.rescan.total.load(Ordering::Relaxed),
+                }),
+        })
     }
 
     fn inventory_list(
@@ -309,29 +331,28 @@ impl Local {
         limit: Option<usize>,
         offset: usize,
     ) -> Result<Value, ApiError> {
-        under.map(absolute).transpose()?;
+        under.map(require_absolute).transpose()?;
         let mut entries = self.inventory.entries(under, 1);
         entries.sort_by(|a, b| b.hits().cmp(&a.hits()).then_with(|| a.path.cmp(&b.path)));
         let total = entries.len();
-        let page = entries
-            .iter()
+        let entries = entries
+            .into_iter()
             .skip(offset)
             .take(limit.unwrap_or(LIST_DEFAULT).min(LIST_MAX))
-            .map(to_json)
-            .collect::<Result<Vec<Value>, ApiError>>()?;
-        Ok(object([("entries", page.into()), ("total", total.into())]))
+            .collect();
+        to_json(&reply::Entries { entries, total })
     }
 
     fn inventory_tree(&self, under: Option<&Path>) -> Result<Value, ApiError> {
-        under.map(absolute).transpose()?;
-        let roots = effective_roots(&Policy::load()?);
+        under.map(require_absolute).transpose()?;
+        let roots = self.policy()?.inventory_roots_or_default();
         let nodes = self.inventory.children(under, &roots);
-        Ok(object([("nodes", to_json(&nodes)?)]))
+        to_json(&reply::Nodes { nodes })
     }
 
     fn inventory_rescan(&self) -> Result<Value, ApiError> {
-        let policy = Policy::load()?;
-        let roots = effective_roots(&policy);
+        let policy = self.policy()?;
+        let roots = policy.inventory_roots_or_default();
         let _lock = self.inventory.lock_scan()?;
         let _running = Running::start(&self.rescanning);
         self.inventory.scan_paths(
@@ -345,37 +366,38 @@ impl Local {
     }
 
     fn inventory_report(&self, path: &Path, format: Format) -> Result<Value, ApiError> {
-        absolute(path)?;
-        let rows = write_new(path, |out| self.inventory.report(None, format.into(), out))?;
-        Ok(object([
-            ("rows", rows.into()),
-            ("path", lossy(path).into()),
-        ]))
+        require_absolute(path)?;
+        let rows = sys::write_new(path, |out| self.inventory.report(None, format.into(), out))?;
+        to_json(&reply::Reported {
+            rows,
+            path: lossy(path),
+        })
     }
 
-    fn model_status(&self) -> Result<Value, ApiError> {
+    /// Where the detection model stands: on disk or not, loaded, or failed.
+    ///
+    /// # Errors
+    /// `VaultPathUnavailable` when there is no data folder to look in.
+    pub fn model_status(&self) -> Result<reply::Model, ApiError> {
         let dir = self.model_dir()?;
         let state = match &self.ner {
             Some(ner) => ner.state(),
             None if ner::files::is_installed(&dir) => NerState::Unloaded,
             None => NerState::Missing,
         };
-        let (name, device, error) = match &state {
-            NerState::Missing => ("missing", None, None),
-            NerState::Unloaded => ("unloaded", None, None),
-            NerState::Ready(Device::Cpu) => ("ready", Some("cpu"), None),
-            NerState::Ready(Device::Hybrid) => ("ready", Some("hybrid"), None),
-            NerState::Failed(message) => ("failed", None, Some(message.as_str())),
+        let (state, device, error) = match state {
+            NerState::Missing => (reply::ModelState::Missing, None, None),
+            NerState::Unloaded => (reply::ModelState::Unloaded, None, None),
+            NerState::Ready(device) => (reply::ModelState::Ready, Some(device_of(device)), None),
+            NerState::Failed(message) => (reply::ModelState::Failed, None, Some(message)),
         };
-        let mut status = object([
-            ("state", name.into()),
-            ("device", device.into()),
-            ("dir", lossy(&dir).into()),
-        ]);
-        if let (Some(error), Some(fields)) = (error, status.as_object_mut()) {
-            fields.insert("error".to_owned(), error.into());
-        }
-        Ok(status)
+        Ok(reply::Model {
+            state,
+            device,
+            error,
+            downloading: None,
+            dir: lossy(&dir),
+        })
     }
 
     fn model_download(&self) -> Result<Value, ApiError> {
@@ -394,26 +416,51 @@ impl Local {
         };
         ner::fetch(&dir, &report).map_err(|error| match error {
             // A tool the download needs is missing: for the caller that is the model failing.
-            Error::Tool(message) => ApiError::new("model", message),
+            Error::Tool(message) => ApiError::new(Code::Model, message),
             other => ApiError::from(other),
         })?;
-        Ok(object([]))
+        Ok(json!({}))
     }
 
-    fn status(&self) -> Result<Value, ApiError> {
-        let policy = Policy::load()?;
-        let records = self.engine().vault().read()?.record_count();
-        Ok(object([
-            ("app", false.into()),
-            ("protection", Value::Null),
-            ("version", env!("CARGO_PKG_VERSION").into()),
-            ("vault_records", records.into()),
-            ("model", self.model_status()?),
-            ("highlight", policy.highlight.as_str().into()),
-            ("explorer_menu", policy.explorer_menu.into()),
-            ("inventory", policy.inventory.into()),
-            ("http_api", policy.http_api.into()),
-        ]))
+    /// How piikey is doing, as a process without the app sees it: no app, and no word on
+    /// protection.
+    ///
+    /// # Errors
+    /// `Io` when the saved settings cannot be read; `Vault` when the vault cannot be read.
+    pub fn status(&self) -> Result<reply::Status, ApiError> {
+        let policy = self.policy()?;
+        Ok(reply::Status {
+            app: false,
+            protection: None,
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            vault_records: self.engine().vault().read()?.record_count(),
+            model: self.model_status()?,
+            highlight: policy.highlight,
+            explorer_menu: policy.explorer_menu,
+            inventory: policy.inventory,
+            http_api: policy.http_api,
+        })
+    }
+
+    fn settings_set(&self, patch: &SettingsPatch) -> Result<Value, ApiError> {
+        let mut policy = self.policy()?;
+        patch.apply(&mut policy)?;
+        policy.save()?;
+        to_json(&policy)
+    }
+
+    fn kinds(&self) -> Result<Value, ApiError> {
+        let enabled = self.policy()?.enabled_kinds();
+        let kinds: Vec<reply::Kind> = EntityKind::ALL
+            .into_iter()
+            .map(|kind| reply::Kind {
+                kind: kind.as_str().to_owned(),
+                label: kind.label().to_owned(),
+                group: kind.group().to_owned(),
+                enabled: enabled.contains(kind),
+            })
+            .collect();
+        to_json(&kinds)
     }
 }
 
@@ -444,7 +491,7 @@ impl Handler for Local {
             Request::VaultForget { values } => self.vault_forget(&values),
             Request::VaultExport { path, format } => self.vault_export(&path, format),
             Request::VaultWipe { confirm } => self.vault_wipe(confirm),
-            Request::InventoryStatus => self.inventory_status(),
+            Request::InventoryStatus => to_json(&self.inventory_status()?),
             Request::InventoryList {
                 under,
                 limit,
@@ -453,15 +500,15 @@ impl Handler for Local {
             Request::InventoryTree { under } => self.inventory_tree(under.as_deref()),
             Request::InventoryRescan => self.inventory_rescan(),
             Request::InventoryReport { path, format } => self.inventory_report(&path, format),
-            Request::SettingsGet => to_json(&Policy::load()?),
-            Request::SettingsSet { settings } => settings_set(&settings),
-            Request::Kinds => kinds(),
-            Request::ModelStatus => self.model_status(),
+            Request::SettingsGet => to_json(&self.policy()?),
+            Request::SettingsSet { settings } => self.settings_set(&settings),
+            Request::Kinds => self.kinds(),
+            Request::ModelStatus => to_json(&self.model_status()?),
             Request::ModelDownload => self.model_download(),
-            Request::ApiToken { rotate } => {
-                Ok(object([("token", read_or_create_token(rotate)?.into())]))
-            }
-            Request::Status => self.status(),
+            Request::ApiToken { rotate } => to_json(&reply::Token {
+                token: read_or_create_token(rotate)?,
+            }),
+            Request::Status => to_json(&self.status()?),
             Request::Protection { .. } => Err(app_required("protection")),
             Request::ExplorerScan { .. } => Err(app_required("explorer_scan")),
         }
@@ -474,35 +521,10 @@ fn app_required(op: &str) -> ApiError {
     ))
 }
 
-fn settings_set(patch: &SettingsPatch) -> Result<Value, ApiError> {
-    let mut policy = Policy::load()?;
-    patch.apply(&mut policy)?;
-    policy.save()?;
-    to_json(&policy)
-}
-
-fn kinds() -> Result<Value, ApiError> {
-    let enabled = Policy::load()?.enabled_kinds();
-    let kinds: Vec<Value> = EntityKind::ALL
-        .into_iter()
-        .map(|kind| {
-            object([
-                ("kind", kind.as_str().into()),
-                ("label", kind.label().into()),
-                ("group", kind.group().into()),
-                ("enabled", enabled.contains(kind).into()),
-            ])
-        })
-        .collect();
-    Ok(kinds.into())
-}
-
-/// The folders the inventory scans: the saved ones, or the usual ones when none were saved.
-fn effective_roots(policy: &Policy) -> Vec<PathBuf> {
-    if policy.inventory_roots.is_empty() {
-        default_inventory_roots()
-    } else {
-        policy.inventory_roots.clone()
+fn device_of(device: Device) -> reply::Device {
+    match device {
+        Device::Cpu => reply::Device::Cpu,
+        Device::Hybrid => reply::Device::Hybrid,
     }
 }
 
@@ -515,62 +537,12 @@ fn refs(texts: &[String]) -> Vec<&str> {
     texts.iter().map(String::as_str).collect()
 }
 
-/// `text` with the proxies in it restored by `restorer`.
-fn restore_text(restorer: &Restorer, text: &str) -> String {
-    let bytes = restorer.restore(text.as_bytes());
-    String::from_utf8(bytes)
-        .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
-}
-
 fn lossy(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn paths_json(paths: &[PathBuf]) -> Value {
-    paths
-        .iter()
-        .map(|path| Value::from(lossy(path)))
-        .collect::<Vec<_>>()
-        .into()
-}
-
-fn to_json<T: Serialize + ?Sized>(value: &T) -> Result<Value, ApiError> {
-    serde_json::to_value(value)
-        .map_err(|e| ApiError::internal(format!("cannot encode the result: {e}")))
-}
-
-/// A path in a request is absolute: the process that answers is not always the one that asked,
-/// and a relative path means the folder it runs in.
-fn absolute(path: &Path) -> Result<(), ApiError> {
-    if path.is_absolute() {
-        Ok(())
-    } else {
-        Err(ApiError::bad_request(format!(
-            "Not an absolute path: {}",
-            path.display()
-        )))
-    }
-}
-
 fn all_absolute(paths: &[PathBuf]) -> Result<(), ApiError> {
-    paths.iter().try_for_each(|path| absolute(path))
-}
-
-/// Creates the file `path`, which must not exist, lets `write` fill it and returns what it
-/// returns. A file that was not written whole is removed again.
-fn write_new(path: &Path, write: impl FnOnce(&mut dyn Write) -> Result<usize>) -> Result<usize> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|e| io_context(&e, "create", path))?;
-    let written = write(&mut file);
-    drop(file);
-    if written.is_err() {
-        // Best effort: the file is ours, and half of it is of no use to anyone.
-        let _ = fs::remove_file(path);
-    }
-    written
+    paths.iter().try_for_each(|path| require_absolute(path))
 }
 
 /// Says a rescan runs for as long as it lives.
@@ -589,78 +561,20 @@ impl Drop for Running<'_> {
     }
 }
 
-/// Where the HTTP API's token is kept: `%LOCALAPPDATA%\piikey\api.token`.
-///
-/// # Errors
-/// `VaultPathUnavailable` when `LOCALAPPDATA` is unset; `Io` when the folder cannot be made.
-pub fn token_path() -> Result<PathBuf> {
-    Ok(sys::data_dir()?.join(TOKEN_FILE))
-}
-
-/// The token the HTTP API wants as `Authorization: Bearer <token>`: 32 random bytes in hex,
-/// kept in [`token_path`]. It is made the first time it is asked for, and again when `rotate`
-/// says so. A running HTTP server keeps the token it was started with, so start it again
-/// after a rotation.
-///
-/// # Errors
-/// `Io` when the token cannot be read or written, or no random bytes can be had.
-pub fn read_or_create_token(rotate: bool) -> Result<String> {
-    token_in(&token_path()?, rotate)
-}
-
-fn token_in(path: &Path, rotate: bool) -> Result<String> {
-    if !rotate {
-        match fs::read_to_string(path) {
-            Ok(text) => {
-                let token = text.trim();
-                if token.len() >= MIN_TOKEN && token.bytes().all(|byte| byte.is_ascii_graphic()) {
-                    return Ok(token.to_owned());
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(io_context(&e, "read", path)),
-        }
-    }
-    let mut bytes = [0_u8; TOKEN_BYTES];
-    getrandom::fill(&mut bytes).map_err(|e| Error::Io(io::Error::other(e)))?;
-    let token = hex(&bytes);
-    sys::write_atomic(path, token.as_bytes())?;
-    Ok(token)
-}
-
-fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &byte in bytes {
-        out.push(char::from(DIGITS[usize::from(byte >> 4)]));
-        out.push(char::from(DIGITS[usize::from(byte & 0xF)]));
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
-    use std::{error::Error as StdError, sync::atomic::AtomicUsize};
-
-    use serde_json::json;
+    use std::{error::Error as StdError, fs, io};
 
     use super::*;
 
     type TestResult = std::result::Result<(), Box<dyn StdError>>;
 
-    /// A scratch folder under the system temp dir, removed on drop.
+    /// A scratch folder, removed when the test ends.
     struct TempDir(PathBuf);
 
     impl TempDir {
-        fn new() -> io::Result<Self> {
-            static NEXT: AtomicUsize = AtomicUsize::new(0);
-            let dir = std::env::temp_dir().join(format!(
-                "piikey-test-{}-api-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            fs::create_dir_all(&dir)?;
-            Ok(Self(dir))
+        fn new() -> Self {
+            Self(crate::testing::temp_dir("api"))
         }
 
         fn file(&self, name: &str) -> PathBuf {
@@ -674,31 +588,34 @@ mod tests {
         }
     }
 
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
-    /// A handler over a vault and an inventory in a scratch folder.
+    /// A handler over a vault, an inventory and settings in a scratch folder: the settings are
+    /// the ones in `policy`, not the user's.
     struct Fixture {
         dir: TempDir,
+        engine: Arc<Engine>,
         local: Local,
         inventory: Arc<Inventory>,
+        policy: Arc<Mutex<Policy>>,
     }
 
     impl Fixture {
         fn new() -> std::result::Result<Self, Box<dyn StdError>> {
-            let dir = TempDir::new()?;
+            let dir = TempDir::new();
             let engine = Arc::new(Engine::open(&dir.file("vault.pkv"))?);
             let inventory = Arc::new(Inventory::open(&dir.file("inventory.jsonl"))?);
+            let held = Arc::clone(&engine);
             let source: EngineSource = Arc::new(move || Arc::clone(&engine));
-            let local =
-                Local::new(source, Arc::clone(&inventory), None).with_model_dir(dir.file("model"));
+            let policy = Arc::new(Mutex::new(Policy::default()));
+            let live = Arc::clone(&policy);
+            let local = Local::new(source, Arc::clone(&inventory), None)
+                .with_policy(Arc::new(move || Ok(live.lock()?.clone())))
+                .with_model_dir(dir.file("model"));
             Ok(Self {
                 dir,
+                engine: held,
                 local,
                 inventory,
+                policy,
             })
         }
 
@@ -721,6 +638,15 @@ mod tests {
                 texts: vec![text.to_owned()],
             })?;
             Ok(out["texts"][0].as_str().ok_or("no text")?.to_owned())
+        }
+
+        /// The stand-in the vault holds for the person `original`, issued now when it has none.
+        fn stand_in(&self, original: &str) -> std::result::Result<String, Box<dyn StdError>> {
+            let vault = self.engine.vault();
+            vault.resolve(vec![(EntityKind::Person, original.into())], &|_, _| false)?;
+            let view = vault.read()?;
+            let stand_in = view.proxy_for(EntityKind::Person, original);
+            Ok(stand_in.ok_or("the vault issued no stand-in")?.to_owned())
         }
     }
 
@@ -770,6 +696,26 @@ mod tests {
                 tolerant,
             })?;
             assert_eq!(back["texts"][0], original, "tolerant {tolerant}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_value_that_is_another_stand_in_is_restored_once() -> TestResult {
+        let fx = Fixture::new()?;
+        // `Jan Smit` has a stand-in, and so has somebody whose real name is that stand-in.
+        let first = fx.stand_in("Jan Smit")?;
+        let second = fx.stand_in(&first)?;
+        for tolerant in [false, true] {
+            let back = fx.ask(Request::Deanonymize {
+                texts: vec![format!("{first} and {second}")],
+                tolerant,
+            })?;
+            assert_eq!(
+                back["texts"][0],
+                format!("Jan Smit and {first}"),
+                "tolerant {tolerant}"
+            );
         }
         Ok(())
     }
@@ -1054,7 +1000,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_and_kinds_read_the_saved_settings() -> TestResult {
+    fn settings_and_kinds_are_listed_and_a_bad_patch_is_refused() -> TestResult {
         let fx = Fixture::new()?;
         let settings = fx.ask(Request::SettingsGet)?;
         assert!(settings["http_port"].is_u64(), "{settings}");
@@ -1079,6 +1025,33 @@ mod tests {
         assert_eq!(email["label"], "Email");
         assert_eq!(email["group"], "Contact");
         assert!(email["enabled"].is_boolean());
+        Ok(())
+    }
+
+    /// The app answers with the settings it holds, which may not be on disk yet: every answer
+    /// that depends on a setting reads the same ones.
+    #[test]
+    fn every_answer_follows_the_settings_the_source_hands_out() -> TestResult {
+        let fx = Fixture::new()?;
+        let folder = fx.dir.file("watched");
+        {
+            let mut policy = fx.policy.lock().map_err(|_| "settings poisoned")?;
+            policy.inventory = true;
+            policy.inventory_roots = vec![folder.clone()];
+            policy.disabled_kinds = vec![EntityKind::Email];
+        }
+        let settings = fx.ask(Request::SettingsGet)?;
+        assert_eq!(settings["inventory"], true);
+        let status = fx.ask(Request::InventoryStatus)?;
+        assert_eq!(status["enabled"], true);
+        assert_eq!(status["roots"], json!([lossy(&folder)]));
+        let kinds = fx.ask(Request::Kinds)?;
+        let email = kinds
+            .as_array()
+            .and_then(|all| all.iter().find(|k| k["kind"] == "email"))
+            .ok_or("no email")?;
+        assert_eq!(email["enabled"], false);
+        assert_eq!(fx.ask(Request::Status)?["inventory"], true);
         Ok(())
     }
 
@@ -1123,30 +1096,5 @@ mod tests {
             assert!(error.message().contains("piikey.exe"), "{error}");
         }
         Ok(())
-    }
-
-    #[test]
-    fn the_token_is_made_once_and_replaced_on_request() -> TestResult {
-        let dir = TempDir::new()?;
-        let path = dir.file("api.token");
-        let first = token_in(&path, false)?;
-        assert_eq!(first.len(), TOKEN_BYTES * 2);
-        assert!(first.bytes().all(|b| b.is_ascii_hexdigit()));
-        assert_eq!(token_in(&path, false)?, first);
-        let second = token_in(&path, true)?;
-        assert_ne!(second, first);
-        assert_eq!(token_in(&path, false)?, second);
-        // A file that is no token (cut short, edited) is replaced.
-        fs::write(&path, "abc")?;
-        let third = token_in(&path, false)?;
-        assert_eq!(third.len(), TOKEN_BYTES * 2);
-        assert_eq!(fs::read_to_string(&path)?, third);
-        Ok(())
-    }
-
-    #[test]
-    fn hex_writes_two_lowercase_digits_per_byte() {
-        assert_eq!(hex(&[0x00, 0x0F, 0xA5, 0xFF]), "000fa5ff");
-        assert_eq!(hex(&[]), "");
     }
 }

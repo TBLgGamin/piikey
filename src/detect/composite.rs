@@ -64,10 +64,16 @@ fn claim(kept: &mut Vec<Span>, found: Vec<Span>) {
 /// True when `span` shares a byte with a span of `kept`, which is sorted and
 /// disjoint.
 pub(crate) fn overlaps(kept: &[Span], span: &Span) -> bool {
+    overlaps_bytes(kept, span.start, span.end)
+}
+
+/// True when the bytes `start..end` share a byte with a span of `kept`, which is sorted and
+/// disjoint.
+pub(crate) fn overlaps_bytes(kept: &[Span], start: usize, end: usize) -> bool {
     // Disjoint and sorted by start means sorted by end too: the first span
-    // that ends after `span` starts is the only one that can overlap it.
-    let next = kept.partition_point(|k| k.end <= span.start);
-    kept.get(next).is_some_and(|k| k.start < span.end)
+    // that ends after `start` is the only one that can overlap it.
+    let next = kept.partition_point(|k| k.end <= start);
+    kept.get(next).is_some_and(|k| k.start < end)
 }
 
 #[cfg(test)]
@@ -217,6 +223,28 @@ mod tests {
                 span(50, 60, Phone),
             ]
         );
+    }
+
+    #[test]
+    fn a_range_overlaps_the_kept_spans_it_shares_a_byte_with() {
+        let kept = [
+            span(5, 10, EntityKind::Person),
+            span(20, 30, EntityKind::Person),
+        ];
+        for (start, end, shares) in [
+            (0, 6, true),
+            (9, 12, true),
+            (22, 24, true),
+            (0, 100, true),
+            (0, 5, false),
+            (10, 20, false),
+            (30, 40, false),
+        ] {
+            let probe = span(start, end, EntityKind::Email);
+            assert_eq!(overlaps(&kept, &probe), shares, "{start}..{end}");
+            assert_eq!(overlaps_bytes(&kept, start, end), shares, "{start}..{end}");
+        }
+        assert!(!overlaps(&[], &span(0, 5, EntityKind::Email)));
     }
 
     #[test]

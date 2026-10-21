@@ -14,16 +14,15 @@
 //! 4. A word joins the span before it when both have the same type, only spaces and `,-/.()`
 //!    lie between them and the word's first position does not look like a new beginning (mean
 //!    `B-` mass below one half).
-//! 5. Spans whose text has too few digits for their type are dropped (a phone number needs five,
-//!    the identifiers two), and the type becomes a kind through [`target`], which also drops what
-//!    the kind's validator rejects (a link that is no link, a name that is no name).
+//! 5. A span becomes a kind through [`target`], which drops what the kind's validator rejects: a
+//!    link that is no link, a name that is no name, a phone number of fewer than five digits.
 //!
 //! The reference also marks every email address its own regex finds. Not ported: the regex
 //! detector runs first and owns those.
 
 use super::{
     gate::RawSpan,
-    labels::{COLUMNS, LABELS, O, TYPES, target},
+    labels::{COLUMNS, LABELS, O, target},
 };
 
 /// Between two words of one span: spaces and `,-/.()` only.
@@ -132,7 +131,8 @@ impl Tokens {
 
     /// The entity spans of `text`, sorted by start and disjoint.
     pub(super) fn decode(mut self, text: &str) -> Vec<RawSpan> {
-        let positions = merge(&mut self.positions);
+        merge(&mut self.positions);
+        let positions = &self.positions;
         let mut spans: Vec<(usize, usize, usize)> = Vec::new();
         let mut next = 0;
         for (start, end) in Words::new(text) {
@@ -170,9 +170,6 @@ impl Tokens {
             .into_iter()
             .filter_map(|(start, end, ty)| {
                 let value = text.get(start..end)?;
-                if digits(value) < min_digits(TYPES[ty]) {
-                    return None;
-                }
                 Some(RawSpan {
                     start: u32::try_from(start).ok()?,
                     end: u32::try_from(end).ok()?,
@@ -183,23 +180,20 @@ impl Tokens {
     }
 }
 
-/// `positions` sorted by byte, the ones at the same byte added up.
-fn merge(positions: &mut [Position]) -> Vec<Position> {
+/// Sorts `positions` by byte and adds up the ones at the same byte.
+fn merge(positions: &mut Vec<Position>) {
     positions.sort_unstable_by_key(|p| p.at);
-    let mut merged: Vec<Position> = Vec::with_capacity(positions.len());
-    for p in positions.iter() {
-        match merged.last_mut() {
-            Some(last) if last.at == p.at => {
-                for (sum, prob) in last.probs.iter_mut().zip(&p.probs) {
-                    *sum += prob;
-                }
-                last.begin += p.begin;
-                last.count += p.count;
-            }
-            _ => merged.push(*p),
+    positions.dedup_by(|next, kept| {
+        if next.at != kept.at {
+            return false;
         }
-    }
-    merged
+        for (sum, prob) in kept.probs.iter_mut().zip(&next.probs) {
+            *sum += prob;
+        }
+        kept.begin += next.begin;
+        kept.count += next.count;
+        true
+    });
 }
 
 /// Index of the largest value; the first one on a tie.
@@ -218,25 +212,7 @@ fn argmax(values: &[f32; COLUMNS]) -> usize {
 
 /// True when the gap between two words keeps them in one entity.
 fn joins(gap: &str) -> bool {
-    gap.chars().all(|c| JOINERS.contains(c)) && !gap.contains("\n\n")
-}
-
-fn digits(value: &str) -> usize {
-    value.bytes().filter(u8::is_ascii_digit).count()
-}
-
-/// Digits a value of this type must have: a phone number five, an identifier two.
-fn min_digits(type_name: &str) -> usize {
-    match type_name {
-        "PHONE_NUMBER" => 5,
-        "PERSON_IDENTIFIER"
-        | "BANK_ACCOUNT_IDENTIFIER"
-        | "PAYMENT_CARD"
-        | "ACCOUNT_IDENTIFIER"
-        | "DOCUMENT_IDENTIFIER"
-        | "VEHICLE_IDENTIFIER" => 2,
-        _ => 0,
-    }
+    gap.chars().all(|c| JOINERS.contains(c))
 }
 
 /// The words of a text, as byte ranges, in order.
@@ -281,11 +257,11 @@ impl Iterator for Words<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::detect::EntityKind;
+    use crate::detect::{EntityKind, ner::labels::TYPES};
 
     /// The logit of a type's `B-` or `I-` tag.
     fn tag(type_name: &str, begin: bool) -> usize {
-        match TYPES.iter().position(|t| *t == type_name) {
+        match TYPES.iter().position(|(name, ..)| *name == type_name) {
             Some(i) => 1 + 2 * i + usize::from(!begin),
             None => panic!("no type {type_name}"),
         }
@@ -584,7 +560,10 @@ mod tests {
         let begin = pool(&row(tag("PERSON_NAME", true)));
         let inside = pool(&row(tag("PERSON_NAME", false)));
         let outside = pool(&row(0));
-        let person = TYPES.iter().position(|t| *t == "PERSON_NAME").unwrap_or(0);
+        let person = TYPES
+            .iter()
+            .position(|(name, ..)| *name == "PERSON_NAME")
+            .unwrap_or(0);
         for pooled in [begin, inside] {
             assert!((pooled.probs[person] - 1.0).abs() < 1e-4);
             assert!((pooled.probs.iter().sum::<f32>() - 1.0).abs() < 1e-4);
@@ -594,11 +573,13 @@ mod tests {
         assert!((outside.probs[O] - 1.0).abs() < 1e-4);
         assert!(outside.begin < 1e-4);
 
-        // No preference: every one of 71 labels equally likely.
+        // No preference: every label equally likely. A type has two of them, `O` one, and the
+        // `B-` tags are one of every type's two.
         let flat = pool(&[0.0; LABELS]);
-        assert!((flat.probs[O] - 1.0 / 71.0).abs() < 1e-6);
-        assert!((flat.probs[0] - 2.0 / 71.0).abs() < 1e-6);
-        assert!((flat.begin - 35.0 / 71.0).abs() < 1e-5);
+        let count = |n: usize| f32::from(u8::try_from(n).unwrap_or(u8::MAX));
+        assert!((flat.probs[O] * count(LABELS) - 1.0).abs() < 1e-4);
+        assert!((flat.probs[0] * count(LABELS) - 2.0).abs() < 1e-4);
+        assert!((flat.begin * count(LABELS) - count(TYPES.len())).abs() < 1e-4);
     }
 
     #[test]
@@ -630,35 +611,6 @@ mod tests {
             "\n", " \n ", "\n\n", ": ", "; ", "! ", " ? ", "'", "\"", "x",
         ] {
             assert!(!joins(gap), "{gap:?}");
-        }
-    }
-
-    #[test]
-    fn digit_minimums_follow_the_reference() {
-        assert_eq!(min_digits("PHONE_NUMBER"), 5);
-        for name in [
-            "PERSON_IDENTIFIER",
-            "BANK_ACCOUNT_IDENTIFIER",
-            "PAYMENT_CARD",
-            "ACCOUNT_IDENTIFIER",
-            "DOCUMENT_IDENTIFIER",
-            "VEHICLE_IDENTIFIER",
-        ] {
-            assert_eq!(min_digits(name), 2, "{name}");
-        }
-        assert_eq!(min_digits("PERSON_NAME"), 0);
-        assert_eq!(min_digits("IDENTIFYING_LINK"), 0);
-        // Every name the minimums mention is a real type.
-        for name in [
-            "PHONE_NUMBER",
-            "PERSON_IDENTIFIER",
-            "BANK_ACCOUNT_IDENTIFIER",
-            "PAYMENT_CARD",
-            "ACCOUNT_IDENTIFIER",
-            "DOCUMENT_IDENTIFIER",
-            "VEHICLE_IDENTIFIER",
-        ] {
-            assert!(TYPES.contains(&name), "{name}");
         }
     }
 }

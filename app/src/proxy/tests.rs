@@ -22,7 +22,7 @@ use hudsucker::{
         tungstenite::{Message as WsMessage, protocol::Role},
     },
 };
-use piikey::{detect::Mode, engine::Engine};
+use piikey::engine::Engine;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -33,14 +33,14 @@ use super::events::{
     fixtures::{anthropic, ndjson, openai, sse_events, texts},
 };
 use super::*;
-use crate::{Res, ca};
+use crate::{Describe, Res, ca};
 
 fn io<T>(result: std::io::Result<T>) -> Res<T> {
-    result.map_err(|e| e.to_string())
+    result.describe()
 }
 
 fn core<T>(result: piikey::Result<T>) -> Res<T> {
-    result.map_err(|e| e.to_string())
+    result.describe()
 }
 
 fn utf8(bytes: &[u8]) -> &str {
@@ -78,6 +78,8 @@ enum Reply {
     SplitStream,
     /// These bytes with this content type.
     Fixed(&'static str, Vec<u8>),
+    /// These bytes, gzip-compressed JSON, whatever the request said it accepts.
+    Gzip(Vec<u8>),
 }
 
 struct Server {
@@ -106,14 +108,15 @@ impl Server {
         }
         let reply = self.reply.lock().map_or(Reply::Echo, |reply| reply.clone());
         let body = String::from_utf8_lossy(&request.body).into_owned();
-        let (content_type, answer) = match reply {
+        let (content_type, encoding, answer) = match reply {
             Reply::SplitStream => return stream_split_email(socket, &body).await,
-            Reply::Echo => ("application/json", request.body.clone()),
-            Reply::Typo => ("application/json", with_typo(&body).into_bytes()),
-            Reply::Fixed(content_type, bytes) => (content_type, bytes),
+            Reply::Echo => ("application/json", "", request.body.clone()),
+            Reply::Typo => ("application/json", "", with_typo(&body).into_bytes()),
+            Reply::Fixed(content_type, bytes) => (content_type, "", bytes),
+            Reply::Gzip(bytes) => ("application/json", "Content-Encoding: gzip\r\n", bytes),
         };
         let head = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n{encoding}Content-Length: {}\r\n\
              Connection: close\r\n\r\n",
             answer.len()
         );
@@ -393,11 +396,11 @@ impl Rig {
 
     /// The issued proxies in `text`.
     fn proxies_in(&self, text: &str) -> Res<Vec<String>> {
-        let plans = core(self.engine().plan(Mode::Deanonymize, &[text]))?;
-        Ok(plans
+        let found = core(self.engine().proxies_in(&[text]))?;
+        Ok(found
             .into_iter()
             .flatten()
-            .map(|rep| text[rep.start..rep.end].to_owned())
+            .map(|span| text[span.start..span.end].to_owned())
             .collect())
     }
 
@@ -525,7 +528,7 @@ fn stand_ins_in_a_resent_history_go_out_as_they_are() -> Res<()> {
 
 #[test]
 fn a_typo_in_the_reply_is_repaired_for_proxies_sent_to_that_host() -> Res<()> {
-    // Needs the tolerant restorer: the exact pass alone cannot match it.
+    // Needs the tolerant tiers of the restorer: the exact one alone cannot match it.
     let rig = rig("typo", local_sites())?;
     rig.server.reply_with(Reply::Typo);
     let (_, body) = rig.post("application/json", JSON.as_bytes())?;
@@ -534,6 +537,61 @@ fn a_typo_in_the_reply_is_repaired_for_proxies_sent_to_that_host() -> Res<()> {
         JSON,
         "the doubled letter did not stop the restore"
     );
+    Ok(())
+}
+
+/// The Restored event of a reply: how many proxies were put back.
+fn restored_count(rig: &Rig) -> Res<usize> {
+    match rig.event() {
+        Some(Event::Restored { count, .. }) => Ok(count),
+        other => Err(format!("expected a Restored event, got {other:?}")),
+    }
+}
+
+/// The vault gave `Jan Smit` a stand-in, and then somebody whose real name is that stand-in one
+/// of her own. A reply that holds both comes back with each restored once: the real name that
+/// one of them restores to is not a stand-in to restore again.
+#[test]
+fn a_value_equal_to_another_stand_in_is_restored_once_in_a_reply() -> Res<()> {
+    let rig = rig("lookalike", local_sites())?;
+    let (first, second) = core(test_names::lookalike_stand_ins(&rig.engine()))?;
+    let reply = format!(r#"{{"m":"{first} and {second}"}}"#);
+    let read = format!(r#"{{"m":"Jan Smit and {first}"}}"#);
+    rig.server
+        .reply_with(Reply::Fixed("application/json", reply.into_bytes()));
+
+    // This app has sent the host neither: the vault restores both.
+    let (_, body) = rig.post("application/json", br#"{"m":"hello"}"#)?;
+    assert_eq!(utf8(&body), read);
+    assert_eq!(restored_count(&rig)?, 2);
+
+    // It has sent both: the scope of the host reads the same text in the same pass.
+    rig.shared.ledger.touch("127.0.0.1", &first);
+    rig.shared.ledger.touch("127.0.0.1", &second);
+    let (_, body) = rig.post("application/json", br#"{"m":"hello"}"#)?;
+    assert_eq!(utf8(&body), read);
+    assert_eq!(restored_count(&rig)?, 2);
+    Ok(())
+}
+
+#[test]
+fn a_value_equal_to_another_stand_in_is_restored_once_in_an_event_stream() -> Res<()> {
+    let rig = rig("lookalike-events", local_sites())?;
+    let (first, second) = core(test_names::lookalike_stand_ins(&rig.engine()))?;
+    rig.shared.ledger.touch("127.0.0.1", &second);
+    // A few characters to an event: both stand-ins are cut across events.
+    let said: Vec<char> = format!("{first} and {second}").chars().collect();
+    let pieces: Vec<String> = said.chunks(4).map(|piece| piece.iter().collect()).collect();
+    let pieces: Vec<&str> = pieces.iter().map(String::as_str).collect();
+    rig.server
+        .reply_with(Reply::Fixed("text/event-stream", openai(&pieces)));
+
+    let (_, body) = rig.post("application/json", br#"{"m":"hello"}"#)?;
+    assert_eq!(
+        texts(&body, Framing::Sse, "/choices/0/delta/content"),
+        format!("Jan Smit and {first}")
+    );
+    assert_eq!(restored_count(&rig)?, 2);
     Ok(())
 }
 
@@ -814,6 +872,50 @@ fn compressed_request_bodies_are_decoded_anonymized_and_sent_plain() -> Res<()> 
     Ok(())
 }
 
+/// `data` as a gzip stream of stored (uncompressed) deflate blocks: the proxy's decoder takes
+/// any valid stream, and a test needs no compressor for that.
+fn gzip_stored(data: &[u8]) -> Vec<u8> {
+    let mut out = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff];
+    let mut blocks = data.chunks(0xFFFF).peekable();
+    if blocks.peek().is_none() {
+        out.extend([1, 0, 0, 0xff, 0xff]);
+    }
+    while let Some(block) = blocks.next() {
+        let len = u16::try_from(block.len()).unwrap_or(u16::MAX);
+        out.push(u8::from(blocks.peek().is_none()));
+        out.extend(len.to_le_bytes());
+        out.extend((!len).to_le_bytes());
+        out.extend(block);
+    }
+    let mut crc = u32::MAX;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xEDB8_8320 * (crc & 1));
+        }
+    }
+    out.extend((!crc).to_le_bytes());
+    out.extend(u32::try_from(data.len()).unwrap_or(u32::MAX).to_le_bytes());
+    out
+}
+
+#[test]
+fn a_reply_the_server_compressed_anyway_is_decoded_and_restored() -> Res<()> {
+    let rig = rig("gzip-reply", local_sites())?;
+    rig.post("application/json", JSON.as_bytes())?;
+    let proxy = rig.proxies_in(utf8(&rig.received(0)?.body))?.remove(0);
+    // Some servers send gzip whatever the request accepts (`identity` here).
+    let reply = format!(r#"{{"m":"mail {proxy}"}}"#);
+    rig.server
+        .reply_with(Reply::Gzip(gzip_stored(reply.as_bytes())));
+    let (head, body) = rig.post("application/json", JSON.as_bytes())?;
+    let head = head.to_ascii_lowercase();
+    assert!(!head.contains("content-encoding"), "now plain: {head}");
+    assert!(!head.contains("content-length"), "{head}");
+    assert_eq!(utf8(&body), JSON, "the original came back");
+    Ok(())
+}
+
 #[test]
 fn a_vault_failure_stops_the_request_instead_of_leaking_it() -> Res<()> {
     let rig = rig("failing", local_sites())?;
@@ -1047,7 +1149,7 @@ fn unusable_ca_material_is_reported_when_starting() -> Res<()> {
     let listener = io(StdListener::bind("127.0.0.1:0"))?;
     let broken = ca::Ca {
         cert_pem: "not a certificate".to_owned(),
-        key_pem: "not a key".to_owned(),
+        key_pem: zeroize::Zeroizing::new("not a key".to_owned()),
     };
     let engine = core(Engine::open(&temp_vault("bad-ca")))?;
     let shared = Arc::new(Shared {

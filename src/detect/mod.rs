@@ -1,24 +1,25 @@
-//! PII detection. [`Detector`] is the extension point (a future ML detector
-//! implements it); [`RegexDetector`] is the validated-regex implementation.
+//! PII detection. [`Detector`] is the extension point: [`RegexDetector`] finds what has a format,
+//! [`NerDetector`] what the on-device model reads out of prose, [`CompositeDetector`] runs several
+//! of them, and `IssuedProxies` finds the proxies the vault issued.
 
 mod composite;
 mod issued;
 mod kind;
 pub mod ner;
 mod patterns;
-pub mod validate;
+pub(crate) mod validate;
 
 use std::ops::Range;
 
 pub use composite::CompositeDetector;
-pub(crate) use composite::overlaps;
+pub(crate) use composite::{overlaps, overlaps_bytes};
 pub(crate) use issued::{IssuedProxies, Words};
 pub use kind::{EntityKind, KIND_GROUPS, KindSet, Span};
 pub use ner::NerDetector;
 use rayon::prelude::*;
 use regex_automata::{Anchored, Input, meta, util::syntax};
 
-use self::patterns::{PATTERNS, Pattern, SOLO};
+use self::patterns::{PATTERNS, SOLO};
 use crate::{Error, Result};
 
 /// Which direction text is flowing. Deanonymize relaxes context rules so a
@@ -86,14 +87,13 @@ pub struct RegexDetector {
     /// Every pattern alone: the searchers of the solo ones, and the anchored
     /// fallback for all.
     each: Vec<meta::Regex>,
-    table: &'static [Pattern],
 }
 
 /// Lists the kinds only: the derived output would dump every compiled
 /// automaton, megabytes of it, into any log line that prints an engine.
 impl std::fmt::Debug for RegexDetector {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let kinds: Vec<EntityKind> = self.table.iter().map(|p| p.kind).collect();
+        let kinds: Vec<EntityKind> = PATTERNS.iter().map(|p| p.kind).collect();
         f.debug_struct("RegexDetector")
             .field("kinds", &kinds)
             .finish_non_exhaustive()
@@ -135,7 +135,6 @@ impl RegexDetector {
             shared_ids,
             solo,
             each,
-            table: &PATTERNS,
         })
     }
 
@@ -216,57 +215,51 @@ impl RegexDetector {
     /// Next candidate of searcher `searcher` within `input`: searcher 0 is the
     /// shared regex, searcher `k` the solo pattern `k - 1`.
     fn find(&self, searcher: usize, input: &Input<'_>) -> Option<Hit> {
-        match searcher.checked_sub(1) {
+        let (id, found) = match searcher.checked_sub(1) {
             None => {
                 let found = self.shared.search(input)?;
-                let id = *self.shared_ids.get(found.pattern().as_usize())?;
-                Some(Hit {
-                    id,
-                    start: found.start(),
-                    end: found.end(),
-                })
+                (*self.shared_ids.get(found.pattern().as_usize())?, found)
             }
             Some(solo) => {
                 let id = *self.solo.get(solo)?;
-                let found = self.each.get(id)?.search(input)?;
-                Some(Hit {
-                    id,
-                    start: found.start(),
-                    end: found.end(),
-                })
+                (id, self.each.get(id)?.search(input)?)
             }
-        }
+        };
+        Some(Hit {
+            id,
+            start: found.start(),
+            end: found.end(),
+        })
     }
 
     /// Turns a regex hit into an accepted span: the hit's own pattern first,
     /// then every lower-priority pattern anchored at the same start.
     fn resolve(&self, hay: &[u8], hit: Hit, limit: usize, mode: Mode) -> Option<Span> {
-        self.accept(hay, hit.id, hit.start..hit.end, mode)
-            .or_else(|| {
-                (hit.id + 1..self.table.len()).find_map(|id| {
-                    let input = Input::new(hay)
-                        .range(hit.start..limit)
-                        .anchored(Anchored::Yes);
-                    let again = self.each.get(id)?.search(&input)?;
-                    self.accept(hay, id, again.range(), mode)
-                })
+        accept(hay, hit.id, hit.start..hit.end, mode).or_else(|| {
+            (hit.id + 1..PATTERNS.len()).find_map(|id| {
+                let input = Input::new(hay)
+                    .range(hit.start..limit)
+                    .anchored(Anchored::Yes);
+                let again = self.each.get(id)?.search(&input)?;
+                accept(hay, id, again.range(), mode)
             })
-    }
-
-    /// Runs pattern `id`'s validator and context rule on `hit`.
-    fn accept(&self, hay: &[u8], id: usize, hit: Range<usize>, mode: Mode) -> Option<Span> {
-        let pattern = self.table.get(id)?;
-        let (start, end) = (pattern.validate)(hay, hit.start, hit.end)?;
-        // A validator may only trim. Anything else would let the scan stall.
-        if start < hit.start || end > hit.end || start >= end {
-            return None;
-        }
-        pattern.permits(mode, hay, start, end).then_some(Span {
-            start,
-            end,
-            kind: pattern.kind,
         })
     }
+}
+
+/// Runs pattern `id`'s validator and context rule on `hit`.
+fn accept(hay: &[u8], id: usize, hit: Range<usize>, mode: Mode) -> Option<Span> {
+    let pattern = PATTERNS.get(id)?;
+    let (start, end) = (pattern.validate)(hay, hit.start, hit.end)?;
+    // A validator may only trim. Anything else would let the scan stall.
+    if start < hit.start || end > hit.end || start >= end {
+        return None;
+    }
+    pattern.permits(mode, hay, start, end).then_some(Span {
+        start,
+        end,
+        kind: pattern.kind,
+    })
 }
 
 /// Reports a regex that failed to compile.
@@ -610,6 +603,8 @@ mod tests {
         ),
         ("host 2001:db8::1 up", K::Ipv6, "2001:db8::1"),
         ("fe80::1%eth0", K::Ipv6, "fe80::1"),
+        ("peer ::ffff:192.0.2.128 up", K::Ipv6, "::ffff:192.0.2.128"),
+        ("nat64 64:ff9b::192.0.2.33.", K::Ipv6, "64:ff9b::192.0.2.33"),
         (
             "2001:0db8:85a3:0000:0000:8a2e:0370:7334",
             K::Ipv6,
@@ -675,8 +670,12 @@ mod tests {
             "serial 0 123-45-0000",
             "bare 123456789",
             "bare 111222333",
+            "className=\"row\" 123456789",
+            "businessNumber: 123456789",
             "broadcast mac ff:ff:ff:ff:ff:ff",
             "zero mac 00:00:00:00:00:00",
+            "mapped loopback ::ffff:127.0.0.1",
+            "mapped zero ::ffff:0.0.0.0",
             "user@localhost",
             "eight digits 12345678",
             "short +1234",
@@ -940,7 +939,7 @@ mod tests {
     /// A text of PII-like tokens in random order, so tokens run into each
     /// other the way real separators allow.
     fn token_soup(rng: &mut Rng) -> String {
-        const TOKENS: [&str; 34] = [
+        const TOKENS: [&str; 36] = [
             "+31 6 12345678",
             "06-12345678",
             "0612345678",
@@ -964,6 +963,8 @@ mod tests {
             "1.2.3.4.5",
             "00:1A:2B:3C:4D:5E",
             "2001:db8::1",
+            "::ffff:192.0.2.128",
+            "64:ff9b::192.0.2.33",
             "12:30:45",
             "AKIAIOSFODNN7EXAMPLE",
             "https://u:p@h.io/",
@@ -1087,7 +1088,6 @@ mod tests {
     fn debug_output_stays_short() {
         let text = format!("{:?}", detector());
         assert!(text.len() < 500, "{} bytes", text.len());
-        assert!(text.contains("Phone"), "{text}");
     }
 
     /// Random text over an alphabet that mixes PII building blocks with

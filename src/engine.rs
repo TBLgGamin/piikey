@@ -219,18 +219,24 @@ impl Engine {
     /// # Errors
     /// Vault failures.
     pub fn anonymize(&self, texts: &[&str], resent: Resent<'_>) -> Result<Vec<Vec<Replacement>>> {
+        let (wanted, spans) = self.detect_wanted(texts);
+        self.plan_anonymize(texts, spans, !wanted.is_empty(), resent)
+    }
+
+    /// What the detector finds in `texts` of the kinds [`Engine::enabled`] says, with the
+    /// kinds. A detector may skip the kinds nobody wants, but need not: what it reports of them
+    /// stays in the text.
+    fn detect_wanted(&self, texts: &[&str]) -> (KindSet, Vec<Vec<Span>>) {
         let wanted = self.enabled();
         let mut spans = self
             .detector
             .detect_batch(texts, Mode::Anonymize, wanted, &[]);
-        // A detector may skip the kinds nobody wants, but need not: what it reports of them
-        // stays in the text.
         if wanted != KindSet::ALL {
             for found in &mut spans {
                 found.retain(|s| wanted.contains(s.kind));
             }
         }
-        self.plan_anonymize(texts, spans, !wanted.is_empty(), resent)
+        (wanted, spans)
     }
 
     /// What the detector finds in each of `texts`, as spans sorted by start and never
@@ -244,22 +250,28 @@ impl Engine {
     /// # Errors
     /// `Poisoned`.
     pub fn scan(&self, texts: &[&str]) -> Result<Vec<Vec<Span>>> {
-        let wanted = self.enabled();
-        let mut spans = self
-            .detector
-            .detect_batch(texts, Mode::Anonymize, wanted, &[]);
-        // As in `anonymize`: a detector may report kinds nobody wants.
-        if wanted != KindSet::ALL {
-            for found in &mut spans {
-                found.retain(|s| wanted.contains(s.kind));
-            }
-        }
+        let (_, mut spans) = self.detect_wanted(texts);
         // Hash lookups, sequential and short: see `plan_anonymize` on holding the view.
         let view = self.vault.read()?;
         for (text, found) in texts.iter().zip(&mut spans) {
             found.retain(|s| view.kind_of(&text[s.start..s.end]).is_none());
         }
         Ok(spans)
+    }
+
+    /// The stand-ins the vault issued that each of `texts` holds, as spans sorted by start and
+    /// never overlapping, found by exact whole-word lookup of the stand-ins themselves: where
+    /// [`Mode::Deanonymize`] would put the originals back, without running the detector, so for
+    /// a caller that only wants to know which stand-ins a text holds (the app notes the ones it
+    /// sends) this costs a fraction of `plan`.
+    ///
+    /// # Errors
+    /// `Poisoned`.
+    pub fn proxies_in(&self, texts: &[&str]) -> Result<Vec<Vec<Span>>> {
+        let listed = self.matcher(Class::Listed)?;
+        let patterned = self.matcher(Class::Patterned)?;
+        let issued = listed.union(&patterned);
+        Ok(texts.par_iter().map(|text| issued.spans(text)).collect())
     }
 
     /// `masking`: some kind is on. With none on, the text is left exactly as it is.
@@ -509,7 +521,7 @@ impl Engine {
     /// again from the vault as it is then. [`Engine::forget`] and [`Engine::wipe`] do this. The
     /// automata notice by themselves when the vault's records were replaced (see
     /// [`VaultView::generation`]), so it frees them early rather than making them right.
-    pub fn reset_issued(&self) {
+    fn reset_issued(&self) {
         // Clearing is valid whatever a panicking thread left behind.
         for cache in [&self.listed, &self.patterned] {
             *cache.write().unwrap_or_else(PoisonError::into_inner) = None;
@@ -1169,7 +1181,7 @@ mod tests {
                 EntityKind::PostalAddress,
                 EntityKind::HealthData,
             ] {
-                assert_eq!(view.count_of(kind), 1, "{kind:?}");
+                assert_eq!(view.proxies_of(kind).count(), 1, "{kind:?}");
             }
         }
         assert_eq!(engine.run(Mode::Deanonymize, &[&anon])?, [text]);
@@ -1440,12 +1452,61 @@ mod tests {
         Ok(())
     }
 
+    /// `(start, end)` of each of `texts`' stand-ins as a deanonymize plan restores them.
+    fn restored_spans(engine: &Engine, texts: &[&str]) -> crate::Result<Vec<Vec<(usize, usize)>>> {
+        let plans = engine.plan(Mode::Deanonymize, texts)?;
+        Ok(plans
+            .iter()
+            .map(|reps| reps.iter().map(|r| (r.start, r.end)).collect())
+            .collect())
+    }
+
+    /// `(start, end)` of each of `texts`' stand-ins as `proxies_in` finds them.
+    fn held_spans(engine: &Engine, texts: &[&str]) -> crate::Result<Vec<Vec<(usize, usize)>>> {
+        Ok(engine
+            .proxies_in(texts)?
+            .iter()
+            .map(|spans| spans.iter().map(|s| (s.start, s.end)).collect())
+            .collect())
+    }
+
     #[test]
-    fn the_vault_is_reachable_and_grows_with_issued_proxies() -> crate::Result<()> {
-        let engine = engine_at(&temp_vault("vault"), Finds::people(&["Jeroen"]))?;
-        assert_eq!(engine.vault().read()?.record_count(), 0);
-        engine.run(Mode::Anonymize, &["Jeroen"])?;
-        assert_eq!(engine.vault().read()?.record_count(), 1);
+    fn proxies_in_finds_the_stand_ins_a_deanonymize_restores() -> crate::Result<()> {
+        let finds = Finds(vec![
+            ("Jeroen de Vries".to_owned(), EntityKind::Person),
+            ("1968".to_owned(), EntityKind::DateOfBirth),
+        ]);
+        let engine = engine_at(&temp_vault("proxies-in"), finds)?;
+        let masked = engine.run(Mode::Anonymize, &CORPUS)?;
+        let mut stand_ins = engine.run(Mode::Anonymize, &["Jeroen de Vries", "1968"])?;
+        let born = stand_ins.remove(1);
+        let name = stand_ins.remove(0);
+        let phone = engine.run(Mode::Anonymize, &[ORIGINALS[10]])?.remove(0);
+        let mut texts: Vec<String> = masked;
+        for stand_in in [&name, &born, &phone] {
+            // Where a stand-in stands in real text: punctuation, possessives, glued to words.
+            for shape in [
+                "{}",
+                "call {}, then",
+                "({})",
+                "{}'s car",
+                "{} {}",
+                "x{}",
+                "{}x",
+                "{}.{}",
+            ] {
+                texts.push(shape.replace("{}", stand_in));
+            }
+        }
+        // The bare number and the SSN keyword: see `issued_proxies_survive_reanonymize_...`.
+        texts.push("nothing issued in this text, 1234 or 12345678".to_owned());
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let held = held_spans(&engine, &refs)?;
+        assert_eq!(held, restored_spans(&engine, &refs)?);
+        assert!(
+            held.iter().flatten().count() > 10,
+            "the texts must hold stand-ins"
+        );
         Ok(())
     }
 

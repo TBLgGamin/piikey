@@ -306,7 +306,7 @@ global: --json  --local  --vault PATH  -h/--help  -V/--version
 
 - With paths, `anonymize` and `deanonymize` need `--out DIR`, and folders are walked recursively
   (symbolic links are skipped). `--tolerant` also restores stand-ins that came back with a typo, and
-  first or last names that came back alone (text only, not zip documents).
+  first or last names that came back alone (a document is read one piece of text at a time).
 - With no path, `scan`, `anonymize` and `deanonymize` read UTF-8 text from stdin, and the last two
   write the result to stdout, as it came, line breaks and all. Give other encodings and documents
   as paths.

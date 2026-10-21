@@ -1,31 +1,32 @@
 //! Restoring proxies in a response while it streams.
 //!
-//! Two passes over the text, in this order:
+//! One pass reads the text once: a [`Restorer`] that restores
 //!
-//! 1. The tolerant [`Restorer`], scoped to the proxies this app sent to the
-//!    host (exact, typo'd and partial mentions).
-//! 2. [`ExactStream`]: every proxy the vault ever issued, exactly. It covers
-//!    what the ledger no longer (or does not yet) remember: a restarted app,
-//!    a proxy sent more than a day ago, a chat history that the server stores
-//!    and replays.
+//! 1. the proxies this app sent to the host, which its scope holds (exact, typo'd and partial
+//!    mentions), and
+//! 2. every proxy the vault ever issued, exactly, which the engine finds in the same text
+//!    ([`piikey::restore::ProxyFinder`]). It covers what the ledger no longer (or does not yet)
+//!    remember: a restarted app, a proxy sent more than a day ago, a chat history that the
+//!    server stores and replays.
 //!
-//! Both are cut-safe: the output of any chunking equals the one-shot result.
+//! Both are found before anything is replaced, so a value that is restored is never read again:
+//! a real value that equals the proxy of another comes back once, as itself. The output of any
+//! chunking equals the one-shot result.
 //!
 //! Event streams (server-sent events, JSON lines) are not restored as bytes: a
 //! mention cut across two delta events has JSON between its pieces. The
 //! [`events`](super::events) layer feeds the text of the delta strings, as one
-//! continuous text per channel, through both passes ([`Restoring`]) and puts
+//! continuous text per channel, through a restorer ([`Restoring`]) and puts
 //! the result back into the events.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, hash_map::Entry},
     sync::{Arc, mpsc::Sender},
 };
 
 use hudsucker::{Body, Error as BodyError, futures::stream, hyper::body::Bytes};
 use piikey::{
-    detect::{EntityKind, Mode},
-    engine::{Engine, Replacement},
+    engine::Engine,
     restore::{Restorer, Scope},
 };
 
@@ -36,200 +37,7 @@ use super::{
 };
 use crate::ledger::Ledger;
 
-/// The most the exact pass holds back for a proxy that may still be
-/// arriving. A longer proxy (a JWT) can be missed when it straddles two
-/// chunks; holding a whole token back would stall every stream for the sake
-/// of one rare value.
-const MAX_HOLD: usize = 1024;
-/// Held back on top of the longest proxy, so the text after a proxy is
-/// visible before the proxy is judged complete.
-const SLACK: usize = 16;
-/// Text with no place to cut (one huge token) is cut anyway past this size,
-/// so rescanning it stays cheap.
-const MAX_PENDING: usize = 1 << 20;
-/// How far back from the ideal cut to look for a gap before cutting anyway.
-/// Bounds the work of one push when a token has no gap for kilobytes.
-const MAX_BACKTRACK: usize = 8 * 1024;
-
-/// Restores exact vault proxies in text that arrives in pieces.
-///
-/// Each push rescans the not-yet-emitted text and emits what lies before a
-/// cut: a point that is at least `hold` bytes from the end, right after a
-/// byte no proxy runs through (space, quote, bracket, non-ASCII), and not
-/// inside a proxy found in the text. Proxies are ASCII and the detectors
-/// need no context before them, so splitting there changes nothing.
-pub(super) struct ExactStream {
-    engine: Arc<Engine>,
-    pending: Vec<u8>,
-    hold: usize,
-    restored: usize,
-}
-
-impl ExactStream {
-    pub(super) fn new(engine: Arc<Engine>) -> Self {
-        let longest = longest_proxy(&engine);
-        Self::with_longest(engine, longest)
-    }
-
-    /// An exact pass for a vault whose longest proxy is `longest` bytes.
-    pub(super) fn with_longest(engine: Arc<Engine>, longest: usize) -> Self {
-        Self {
-            engine,
-            pending: Vec::new(),
-            hold: longest.min(MAX_HOLD) + SLACK,
-            restored: 0,
-        }
-    }
-
-    /// Adds `bytes`; returns the restored text that can be sent now.
-    pub(super) fn push(&mut self, bytes: &[u8]) -> Vec<u8> {
-        self.pending.extend_from_slice(bytes);
-        self.drain(false)
-    }
-
-    /// The end of the stream: everything still held back.
-    pub(super) fn finish(&mut self) -> Vec<u8> {
-        self.drain(true)
-    }
-
-    fn drain(&mut self, last: bool) -> Vec<u8> {
-        if self.pending.is_empty() || (!last && self.pending.len() <= self.hold) {
-            return Vec::new();
-        }
-        let reps = self.scan();
-        let cut = if last {
-            self.pending.len()
-        } else {
-            choose_cut(
-                &self.pending,
-                &reps,
-                self.pending.len() - self.hold,
-                self.pending.len() > MAX_PENDING,
-            )
-        };
-        if cut == 0 {
-            return Vec::new();
-        }
-        let mut out = Vec::with_capacity(cut);
-        let mut at = 0;
-        for rep in reps.iter().take_while(|rep| rep.end <= cut) {
-            out.extend_from_slice(&self.pending[at..rep.start]);
-            out.extend_from_slice(rep.with.as_bytes());
-            at = rep.end;
-            self.restored += 1;
-        }
-        out.extend_from_slice(&self.pending[at..cut]);
-        self.pending.drain(..cut);
-        out
-    }
-
-    /// Replacements for the pending text, as byte offsets into it. Text that
-    /// is not UTF-8 is scanned stretch by stretch; the invalid bytes between
-    /// are left as they are.
-    fn scan(&self) -> Vec<Replacement> {
-        let mut texts = Vec::new();
-        let mut offsets = Vec::new();
-        let mut at = 0;
-        for chunk in self.pending.utf8_chunks() {
-            offsets.push(at);
-            texts.push(chunk.valid());
-            at += chunk.valid().len() + chunk.invalid().len();
-        }
-        let Ok(plans) = self.engine.plan(Mode::Deanonymize, &texts) else {
-            return Vec::new();
-        };
-        plans
-            .into_iter()
-            .zip(offsets)
-            .flat_map(|(plan, offset)| {
-                plan.into_iter().map(move |rep| Replacement {
-                    start: rep.start + offset,
-                    end: rep.end + offset,
-                    with: rep.with,
-                })
-            })
-            .collect()
-    }
-}
-
-/// Byte length of the longest proxy in the vault, of any kind.
-fn longest_proxy(engine: &Engine) -> usize {
-    let Ok(view) = engine.vault().read() else {
-        return MAX_HOLD;
-    };
-    EntityKind::ALL
-        .iter()
-        .flat_map(|&kind| view.proxies_of(kind))
-        .map(str::len)
-        .max()
-        .unwrap_or(0)
-}
-
-/// Bytes after which the text may be cut: whitespace, quotes, brackets and
-/// the like, and anything non-ASCII. Not `.`, `-`, `@`, `:` or `/`, which
-/// occur inside emails, addresses and URLs.
-fn is_gap(byte: u8) -> bool {
-    byte >= 0x80
-        || byte.is_ascii_whitespace()
-        || matches!(
-            byte,
-            b'"' | b'`'
-                | b','
-                | b';'
-                | b'('
-                | b')'
-                | b'['
-                | b']'
-                | b'{'
-                | b'}'
-                | b'<'
-                | b'>'
-                | b'|'
-                | b'!'
-                | b'?'
-                | b'*'
-                | b'&'
-                | b'#'
-                | b'$'
-                | b'^'
-                | b'~'
-                | b'\\'
-        )
-}
-
-/// The replacement that contains the position `cut` strictly inside it.
-fn straddler(reps: &[Replacement], cut: usize) -> Option<&Replacement> {
-    // Replacements are sorted and do not overlap: only the last one that
-    // starts before the cut can reach past it.
-    let before = reps.partition_point(|rep| rep.start < cut);
-    before
-        .checked_sub(1)
-        .map(|i| &reps[i])
-        .filter(|rep| rep.end > cut)
-}
-
-/// The largest cut position `<= limit` that no replacement straddles and
-/// that falls after a gap byte and on a character boundary. The gap rule is
-/// waived when `forced`, and after [`MAX_BACKTRACK`] bytes without a gap.
-/// `0` when there is no place to cut.
-fn choose_cut(pending: &[u8], reps: &[Replacement], limit: usize, forced: bool) -> usize {
-    let mut cut = limit;
-    let floor = limit.saturating_sub(MAX_BACKTRACK);
-    loop {
-        if let Some(rep) = straddler(reps, cut) {
-            cut = rep.start;
-            continue;
-        }
-        let inside_char = pending.get(cut).is_some_and(|&b| (0x80..0xC0).contains(&b));
-        let gapless_ok = forced || cut <= floor;
-        if cut == 0 || (!inside_char && (gapless_ok || is_gap(pending[cut - 1]))) {
-            return cut;
-        }
-        cut -= 1;
-    }
-}
-
-/// Both restore passes for one response.
+/// The restore pass for one response.
 pub(super) struct Pipeline {
     inner: Inner,
 }
@@ -237,11 +45,10 @@ pub(super) struct Pipeline {
 enum Inner {
     /// The bytes of the response as they come.
     Raw {
-        /// `None` when nothing was sent to the host: there is nothing tolerant
-        /// matching may restore to, so the pass is skipped (it would only delay
-        /// the stream by its holdback).
-        restorer: Option<Restorer>,
-        exact: ExactStream,
+        engine: Arc<Engine>,
+        /// Scoped to what was sent to the host. Nothing sent: it restores only what the engine
+        /// finds, and with an empty vault as well it holds nothing back.
+        restorer: Restorer,
     },
     /// An event stream, delta text by delta text.
     Events(EventStream<Restoring>),
@@ -261,18 +68,14 @@ impl Pipeline {
         framing: Option<Framing>,
     ) -> piikey::Result<Self> {
         let scope = ledger.scope_for(host, engine.vault());
-        let inner = if let Some(framing) = framing {
-            Inner::Events(EventStream::new(framing, Restoring::new(engine, scope)))
-        } else {
-            let restorer = if scope.entries().is_empty() {
-                None
-            } else {
-                Some(Restorer::new(scope)?)
-            };
-            Inner::Raw {
-                restorer,
-                exact: ExactStream::new(engine),
+        let inner = match framing {
+            Some(framing) => {
+                Inner::Events(EventStream::new(framing, Restoring::new(engine, scope)?))
             }
+            None => Inner::Raw {
+                restorer: Restorer::new(scope)?,
+                engine,
+            },
         };
         Ok(Self { inner })
     }
@@ -280,10 +83,7 @@ impl Pipeline {
     /// Restored text that can be sent now (it may lag the input a little).
     pub(super) fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
         match &mut self.inner {
-            Inner::Raw { restorer, exact } => match restorer {
-                Some(restorer) => exact.push(&restorer.feed(chunk)),
-                None => exact.push(chunk),
-            },
+            Inner::Raw { engine, restorer } => restorer.feed_with(chunk, &**engine),
             Inner::Events(events) => events.push(chunk),
         }
     }
@@ -291,14 +91,7 @@ impl Pipeline {
     /// The end of the response.
     pub(super) fn finish(&mut self) -> Vec<u8> {
         match &mut self.inner {
-            Inner::Raw { restorer, exact } => {
-                let mut out = match restorer {
-                    Some(restorer) => exact.push(&restorer.flush()),
-                    None => Vec::new(),
-                };
-                out.extend(exact.finish());
-                out
-            }
+            Inner::Raw { engine, restorer } => restorer.flush_with(&**engine),
             Inner::Events(events) => events.finish(),
         }
     }
@@ -306,135 +99,97 @@ impl Pipeline {
     /// Proxies put back so far.
     pub(super) fn restored(&self) -> usize {
         match &self.inner {
-            Inner::Raw { restorer, exact } => {
-                restorer.as_ref().map_or(0, Restorer::restored_count) + exact.restored
-            }
+            Inner::Raw { restorer, .. } => restorer.restored_count(),
             Inner::Events(events) => events.channels().restored(),
         }
     }
 }
 
-/// The restore passes for the text of one channel of an event stream.
+/// The restorer for the text of one channel of an event stream.
 struct Channel {
-    restorer: Option<Restorer>,
-    exact: Option<ExactStream>,
-    /// The first bytes of a character that a pass cut in two, until the rest
+    restorer: Restorer,
+    /// The first bytes of a character that the restorer cut in two, until the rest
     /// comes: events carry strings, which must be whole characters.
     carry: Vec<u8>,
 }
 
 impl Channel {
-    fn feed(&mut self, text: &str) -> String {
-        let mut bytes = match &mut self.restorer {
-            Some(restorer) => restorer.feed(text.as_bytes()),
-            None => text.as_bytes().to_vec(),
-        };
-        if let Some(exact) = &mut self.exact {
-            bytes = exact.push(&bytes);
-        }
+    fn feed(&mut self, text: &str, engine: &Engine) -> String {
+        let bytes = self.restorer.feed_with(text.as_bytes(), engine);
         take_text(&mut self.carry, bytes, false)
     }
 
-    fn flush(&mut self) -> String {
-        let mut bytes = self
-            .restorer
-            .as_mut()
-            .map(Restorer::flush)
-            .unwrap_or_default();
-        if let Some(exact) = &mut self.exact {
-            bytes = exact.push(&bytes);
-            bytes.extend(exact.finish());
-        }
+    fn flush(&mut self, engine: &Engine) -> String {
+        let bytes = self.restorer.flush_with(engine);
         take_text(&mut self.carry, bytes, true)
-    }
-
-    fn restored(&self) -> usize {
-        self.restorer.as_ref().map_or(0, Restorer::restored_count)
-            + self.exact.as_ref().map_or(0, |exact| exact.restored)
     }
 }
 
-/// The channels of one event stream: each gets the tolerant pass (when the
-/// ledger knows proxies for the host) and the exact pass (when the vault holds
-/// proxies). Text that is not a delta is restored on its own.
+/// The channels of one event stream: each gets a restorer of its own, scoped to the proxies the
+/// ledger knows for the host and finding every proxy of the vault. Text that is not a delta is
+/// restored on its own.
 pub(super) struct Restoring {
     engine: Arc<Engine>,
-    /// `None` when nothing was sent to the host.
-    scope: Option<Scope>,
-    /// Bytes of the longest proxy in the vault; `0` for an empty vault.
-    longest: usize,
+    /// What was sent to the host; empty when nothing was.
+    scope: Scope,
     channels: HashMap<String, Channel>,
-    /// The tolerant pass for text that stands alone.
-    alone: Option<Restorer>,
-    /// Texts restored on their own so far.
+    /// The restorer for text that stands alone.
+    alone: Restorer,
+    /// Proxies put back in text that stood alone so far.
     alone_restored: usize,
 }
 
 impl Restoring {
-    fn new(engine: Arc<Engine>, scope: Scope) -> Self {
-        let longest = longest_proxy(&engine);
-        let scope = (!scope.entries().is_empty()).then_some(scope);
-        Self {
+    /// # Errors
+    /// The tolerant matcher cannot be built.
+    fn new(engine: Arc<Engine>, scope: Scope) -> piikey::Result<Self> {
+        Ok(Self {
             engine,
-            alone: scope.clone().and_then(|scope| Restorer::new(scope).ok()),
+            alone: Restorer::new(scope.clone())?,
             scope,
-            longest,
             channels: HashMap::new(),
             alone_restored: 0,
-        }
+        })
     }
 
     /// Proxies put back so far, in all channels and in text on its own.
     pub(super) fn restored(&self) -> usize {
-        self.channels.values().map(Channel::restored).sum::<usize>() + self.alone_restored
+        let channels: usize = self
+            .channels
+            .values()
+            .map(|channel| channel.restorer.restored_count())
+            .sum();
+        channels + self.alone_restored
     }
 }
 
 impl Channels for Restoring {
     fn feed(&mut self, channel: &str, text: &str) -> String {
-        let Self {
-            engine,
-            scope,
-            longest,
-            channels,
-            ..
-        } = self;
-        channels
-            .entry(channel.to_owned())
-            .or_insert_with(|| Channel {
-                restorer: scope.clone().and_then(|scope| Restorer::new(scope).ok()),
-                exact: (*longest > 0)
-                    .then(|| ExactStream::with_longest(Arc::clone(engine), *longest)),
-                carry: Vec::new(),
-            })
-            .feed(text)
+        let channel = match self.channels.entry(channel.to_owned()) {
+            Entry::Occupied(channel) => channel.into_mut(),
+            Entry::Vacant(slot) => match Restorer::new(self.scope.clone()) {
+                Ok(restorer) => slot.insert(Channel {
+                    restorer,
+                    carry: Vec::new(),
+                }),
+                // The scope was built once already, for text on its own: not in practice.
+                Err(_) => return text.to_owned(),
+            },
+        };
+        channel.feed(text, &self.engine)
     }
 
     fn flush(&mut self, channel: &str) -> String {
         self.channels
             .get_mut(channel)
-            .map(Channel::flush)
+            .map(|channel| channel.flush(&self.engine))
             .unwrap_or_default()
     }
 
     fn restore(&mut self, text: &str) -> String {
-        if self.alone.is_none() && self.longest == 0 {
-            return text.to_owned();
-        }
-        let mut restored = match &self.alone {
-            Some(alone) => take_text(&mut Vec::new(), alone.restore(text.as_bytes()), true),
-            None => text.to_owned(),
-        };
-        // The tolerant pass does not count what it restores here: a changed text is one.
-        self.alone_restored += usize::from(restored != text);
-        if self.longest > 0
-            && let Ok(plans) = self.engine.plan(Mode::Deanonymize, &[restored.as_str()])
-            && let Some(reps) = plans.first().filter(|reps| !reps.is_empty())
-        {
-            self.alone_restored += reps.len();
-            restored = Engine::apply(&restored, reps);
-        }
-        restored
+        let reps = self.alone.plan_with(text.as_bytes(), &*self.engine);
+        self.alone_restored += reps.len();
+        Engine::apply(text, &reps)
     }
 }
 
@@ -546,6 +301,7 @@ mod tests {
     };
 
     use hudsucker::futures::StreamExt as _;
+    use piikey::{detect::Mode, restore::ProxyFinder};
 
     use super::*;
     use crate::proxy::{body::collect, test_names};
@@ -581,11 +337,11 @@ mod tests {
 
     /// The issued proxies in `text`, in order.
     fn proxies_in(engine: &Engine, text: &str) -> piikey::Result<Vec<String>> {
-        let plans = engine.plan(Mode::Deanonymize, &[text])?;
-        Ok(plans
+        let found = engine.proxies_in(&[text])?;
+        Ok(found
             .into_iter()
             .flatten()
-            .map(|rep| text[rep.start..rep.end].to_owned())
+            .map(|span| text[span.start..span.end].to_owned())
             .collect())
     }
 
@@ -658,14 +414,11 @@ mod tests {
         pieces
     }
 
-    fn exact_stream(engine: &Arc<Engine>, pieces: &[&[u8]]) -> Vec<u8> {
-        let mut stream = ExactStream::new(Arc::clone(engine));
-        let mut out = Vec::new();
-        for piece in pieces {
-            out.extend(stream.push(piece));
-        }
-        out.extend(stream.finish());
-        out
+    /// What a response that comes in `pieces` is restored to when nothing was sent to its host:
+    /// only the proxies the vault knows come back.
+    fn vault_only(engine: &Arc<Engine>, pieces: &[&[u8]]) -> piikey::Result<Vec<u8>> {
+        let (out, _) = pipeline_run(engine, &Ledger::default(), "chat.example.com", pieces)?;
+        Ok(out)
     }
 
     fn utf8(bytes: &[u8]) -> &str {
@@ -673,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_stream_equals_one_shot_under_any_chunking() -> piikey::Result<()> {
+    fn vault_proxies_equal_one_shot_under_any_chunking() -> piikey::Result<()> {
         let (engine, sentences) = setup("equiv")?;
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
         let mut changed = 0;
@@ -683,7 +436,7 @@ mod tests {
             changed += usize::from(expected != text);
             for max in [1, 3, 17, 64, 4096] {
                 let pieces = chunks(&mut rng, text.as_bytes(), max);
-                let got = exact_stream(&engine, &pieces);
+                let got = vault_only(&engine, &pieces)?;
                 assert_eq!(
                     utf8(&got),
                     expected,
@@ -710,7 +463,7 @@ mod tests {
         );
         let expected = engine.run(Mode::Deanonymize, &[&text])?.remove(0);
         for at in 0..=text.len() {
-            let got = exact_stream(&engine, &[&text.as_bytes()[..at], &text.as_bytes()[at..]]);
+            let got = vault_only(&engine, &[&text.as_bytes()[..at], &text.as_bytes()[at..]])?;
             assert_eq!(utf8(&got), expected, "split at {at}");
         }
         Ok(())
@@ -735,7 +488,7 @@ mod tests {
         for max in [1, 5, 50] {
             let pieces = chunks(&mut rng, &bytes, max);
             assert_eq!(
-                exact_stream(&engine, &pieces),
+                vault_only(&engine, &pieces)?,
                 expected,
                 "chunks up to {max}"
             );
@@ -750,14 +503,15 @@ mod tests {
     #[test]
     fn the_tail_held_back_stays_small_so_streams_do_not_stall() -> piikey::Result<()> {
         let (engine, _) = setup("tail")?;
-        let mut stream = ExactStream::new(Arc::clone(&engine));
-        let hold = stream.hold;
+        // The longest proxy of the vault, and some slack after it.
+        let hold = engine.longest() + 16;
+        let mut pipeline = Pipeline::new(Arc::clone(&engine), &Ledger::default(), "h", None)?;
         let prose = "lorem ipsum dolor sit amet, consectetur adipiscing elit ".repeat(400);
         let mut sent = 0;
         let mut emitted = 0;
         for piece in prose.as_bytes().chunks(100) {
             sent += piece.len();
-            emitted += stream.push(piece).len();
+            emitted += pipeline.push(piece).len();
             assert!(
                 sent - emitted <= hold + 100 + 16,
                 "{} bytes held at {sent}",
@@ -768,18 +522,19 @@ mod tests {
             emitted > prose.len() - hold - 200,
             "most of the text went out early"
         );
-        assert_eq!(emitted + stream.finish().len(), prose.len());
+        assert_eq!(emitted + pipeline.finish().len(), prose.len());
         Ok(())
     }
 
     #[test]
     fn a_token_with_no_gaps_is_cut_once_it_grows_huge() -> piikey::Result<()> {
         let (engine, _) = setup("huge")?;
-        let mut stream = ExactStream::new(engine);
-        let blob = vec![b'a'; MAX_PENDING + 5_000];
-        let mut emitted = stream.push(&blob).len();
+        let mut pipeline = Pipeline::new(engine, &Ledger::default(), "h", None)?;
+        // More than a restorer holds back for one token.
+        let blob = vec![b'a'; 2 << 20];
+        let mut emitted = pipeline.push(&blob).len();
         assert!(emitted > 0, "forced cut");
-        emitted += stream.finish().len();
+        emitted += pipeline.finish().len();
         assert_eq!(emitted, blob.len());
         Ok(())
     }
@@ -788,11 +543,9 @@ mod tests {
     fn nothing_to_restore_nothing_changes() -> piikey::Result<()> {
         let (engine, _) = setup("plain")?;
         let text = "just words, 42 of them, and a@b without a proxy";
-        let mut stream = ExactStream::new(engine);
-        let mut out = stream.push(text.as_bytes());
-        out.extend(stream.finish());
+        let (out, restored) = pipeline_run(&engine, &Ledger::default(), "h", &[text.as_bytes()])?;
         assert_eq!(utf8(&out), text);
-        assert_eq!(stream.restored, 0);
+        assert_eq!(restored, 0);
         Ok(())
     }
 
@@ -800,61 +553,9 @@ mod tests {
     fn restored_proxies_are_counted() -> piikey::Result<()> {
         let (engine, sentences) = setup("count")?;
         let text = format!("{} and {}", sentences[0], sentences[1]);
-        let mut stream = ExactStream::new(engine);
-        stream.push(text.as_bytes());
-        stream.finish();
-        assert_eq!(stream.restored, 2);
+        let (_, restored) = pipeline_run(&engine, &Ledger::default(), "h", &[text.as_bytes()])?;
+        assert_eq!(restored, 2);
         Ok(())
-    }
-
-    #[test]
-    fn the_search_for_a_gap_is_bounded_and_straddlers_are_found_by_position() {
-        let rep = |start, end| Replacement {
-            start,
-            end,
-            with: "x".into(),
-        };
-        let long = vec![b'a'; 20_000];
-        assert_eq!(
-            choose_cut(&long, &[], 20_000, false),
-            20_000 - MAX_BACKTRACK
-        );
-        let reps = [rep(1, 3), rep(10, 20), rep(30, 31)];
-        assert_eq!(
-            straddler(&reps, 15).map(|r| (r.start, r.end)),
-            Some((10, 20))
-        );
-        assert!(straddler(&reps, 10).is_none() && straddler(&reps, 20).is_none());
-        assert!(straddler(&reps, 0).is_none() && straddler(&[], 5).is_none());
-    }
-
-    #[test]
-    fn cuts_avoid_replacements_and_character_interiors() {
-        let rep = |start, end| Replacement {
-            start,
-            end,
-            with: "x".into(),
-        };
-        let text = b"aa bbbb cc";
-        // Limit 5 falls inside the replacement 3..7: cut before it, after the gap.
-        assert_eq!(choose_cut(text, &[rep(3, 7)], 5, false), 3);
-        // No gap at the limit and nothing straddling: back to the last gap.
-        assert_eq!(choose_cut(text, &[], 6, false), 3);
-        assert_eq!(
-            choose_cut(text, &[], 2, false),
-            0,
-            "no gap before position 2"
-        );
-        assert_eq!(choose_cut(text, &[], 6, true), 6, "forced: any boundary");
-        // Never inside a multibyte character: `é` is 0xC3 0xA9.
-        let accented = "ab é cd".as_bytes();
-        assert_eq!(
-            choose_cut(accented, &[], 4, true),
-            3,
-            "not between the two bytes"
-        );
-        assert!(is_gap(b' ') && is_gap(0xC3) && is_gap(b'"'));
-        assert!(!is_gap(b'a') && !is_gap(b'@') && !is_gap(b'.') && !is_gap(b':'));
     }
 
     // ---- the full pipeline ----
@@ -908,6 +609,40 @@ mod tests {
         assert_eq!(utf8(&got), expected);
         assert_eq!(restored, proxies_in(&engine, &text)?.len());
         assert!(restored >= SOURCES.len());
+        Ok(())
+    }
+
+    /// A ledger that has been sent each of `proxies` at `host`.
+    fn ledger_with(host: &str, proxies: &[&str]) -> Ledger {
+        let ledger = Ledger::default();
+        for proxy in proxies {
+            ledger.touch(host, proxy);
+        }
+        ledger
+    }
+
+    #[test]
+    fn a_value_equal_to_another_stand_in_is_restored_once() -> piikey::Result<()> {
+        let (engine, _) = setup("lookalike")?;
+        let (first, second) = test_names::lookalike_stand_ins(&engine)?;
+        let host = "chat.example.com";
+        let reply = format!("{first} and {second}, {second} and {first}.");
+        let want = format!("Jan Smit and {first}, {first} and Jan Smit.");
+        // The app sent the host both of them, one of them or none: the vault knows both.
+        let ledgers = [
+            ledger_with(host, &[&first, &second]),
+            ledger_with(host, &[&first]),
+            ledger_with(host, &[&second]),
+            Ledger::default(),
+        ];
+        for ledger in &ledgers {
+            for size in [1, 3, reply.len()] {
+                let pieces: Vec<&[u8]> = reply.as_bytes().chunks(size).collect();
+                let (got, restored) = pipeline_run(&engine, ledger, host, &pieces)?;
+                assert_eq!(utf8(&got), want, "chunks of {size}");
+                assert_eq!(restored, 4, "chunks of {size}");
+            }
+        }
         Ok(())
     }
 
@@ -1012,7 +747,7 @@ mod tests {
 
     #[tokio::test]
     async fn output_starts_long_before_the_input_ends() -> piikey::Result<()> {
-        // A ledger with entries keeps the tolerant pass (and its holdback) on.
+        // A ledger with entries gives the restorer a scope, and with it a longer holdback.
         let (engine, sentences) = setup("body-early")?;
         let ledger = sent_ledger(&engine, &sentences, "h.example.com")?;
         let pipeline = Pipeline::new(engine, &ledger, "h.example.com", None)?;
@@ -1346,6 +1081,43 @@ mod tests {
                 assert_eq!(events[2].1, "[DONE]");
                 assert!(restored >= 2, "{restored}");
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_value_equal_to_another_stand_in_is_restored_once_in_events_too() -> piikey::Result<()> {
+        let (engine, _) = setup("events-lookalike")?;
+        let (first, second) = test_names::lookalike_stand_ins(&engine)?;
+        let said = format!("{first} and {second}");
+        let want = format!("Jan Smit and {first}");
+        // As deltas cut into pieces, and whole in an event that is not a delta.
+        let chars: Vec<char> = said.chars().collect();
+        let pieces: Vec<String> = chars
+            .chunks(3)
+            .map(|chars| chars.iter().collect())
+            .collect();
+        let refs: Vec<&str> = pieces.iter().map(String::as_str).collect();
+        let deltas = openai(&refs);
+        let title = serde_json::json!({ "type": "title", "title": said });
+        let alone = format!("event: title\ndata: {title}\n\n");
+        let ledgers = [
+            sent_ledger(&engine, std::slice::from_ref(&said), HOST)?,
+            Ledger::default(),
+        ];
+        for ledger in &ledgers {
+            for size in [1, 7, deltas.len()] {
+                let (out, restored) = event_run(&engine, ledger, Framing::Sse, &deltas, size)?;
+                let got = texts(&out, Framing::Sse, "/choices/0/delta/content");
+                assert_eq!(got, want, "chunks of {size}");
+                assert_eq!(restored, 2, "chunks of {size}");
+            }
+            let (out, restored) = event_run(&engine, ledger, Framing::Sse, alone.as_bytes(), 5)?;
+            let events = sse_events(&out);
+            assert_eq!(events.len(), 1);
+            let title: Value = serde_json::from_str(&events[0].1).unwrap_or_default();
+            assert_eq!(title["title"], want);
+            assert_eq!(restored, 2);
         }
         Ok(())
     }

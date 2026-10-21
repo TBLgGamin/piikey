@@ -25,14 +25,14 @@ hudsucker = { version = "0.25.0", default-features = false, features = [
     "decoder",
     "http2",
 ] }
-tokio = { version = "1.53.3", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 # WinINET system proxy on/off.
 sysproxy = "0.3.0"
 # Client port -> PID, PID -> exe name (per-program rules).
 netstat2 = "0.11.2"
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
-# CA private key at rest.
-windows-dpapi = "0.2.0"
+# The decrypted CA private key is wiped on drop.
+zeroize.workspace = true
 # Native WinUI 3 UI. Pinned to windows-rs master: the tray / multi-window
 # Application API is not in a crates.io release yet (0.100.0 lacks it).
 # The `test` feature is for `subscribe_live_interval`, the only way to a timer on the application
@@ -40,7 +40,7 @@ windows-dpapi = "0.2.0"
 # handle and no timer, and the reactor's own dispatcher is private. The feature only adds test
 # hooks next to it (a recording adapter, more event payloads); the real adapter is unchanged.
 windows-reactor = { git = "https://github.com/microsoft/windows-rs", rev = "20f6de7473ebb2761a19a73dcc2c25ac9499db6e", features = ["test"] }
-serde_json = { version = "1.0.154", features = ["float_roundtrip", "preserve_order"] }
+serde_json.workspace = true
 # Reads the Windows light/dark app setting (HKCU Personalize) with a safe registry API.
 winreg = "0.56.0"
 # Reads the focused text field of protected sites (what the user types) through Windows UI
@@ -51,7 +51,7 @@ uiautomation = "0.25.1"
 # What the user pastes: clipboard sequence number and text, safe API, no other dependencies.
 clipboard-win = "5.4.1"
 # Finds the captured values in outgoing requests; already built for the root crate.
-aho-corasick = "1.1.5"
+aho-corasick.workspace = true
 # The live highlight (`highlight.rs`): an outline of four topmost, click-through windows around the
 # field in focus. windows-reactor has no such window and the raw Win32 calls are `unsafe`, which is
 # forbidden here, so winit makes the windows, softbuffer fills them and global-hotkey registers
@@ -59,13 +59,13 @@ aho-corasick = "1.1.5"
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
 softbuffer = { version = "0.4.8", default-features = false }
 global-hotkey = "0.7.0"
-# Scans of files run on a pool of half the cores (`ui/controller.rs`), so the PC stays responsive;
+# Scans of files run on a pool of half the cores (`ui/controller/inventory.rs`), so the PC stays responsive;
 # the root crate already depends on it.
-rayon = "1.12.0"
+rayon.workspace = true
 
 [build-dependencies]
 # Embeds assets/piikey.ico as the exe icon resource (icon only: the manifest comes from windows-reactor-setup).
-embed-resource = "3.0.12"
+embed-resource.workspace = true
 # Stages a private Windows App SDK runtime so no runtime install is needed.
 windows-reactor-setup = { git = "https://github.com/microsoft/windows-rs", rev = "20f6de7473ebb2761a19a73dcc2c25ac9499db6e" }
 

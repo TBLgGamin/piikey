@@ -18,12 +18,11 @@ use std::{
     path::{self, Path, PathBuf},
     process::ExitCode,
     sync::Arc,
-    time::Duration,
 };
 
 use parse::{Call, Cli, Command, Input, ParseError, Serve};
 use piikey::{
-    api::{self, ApiError, EngineSource, Handler, Local, Request},
+    api::{self, ApiError, DownloadProgress, EngineSource, Handler, Local, Request},
     detect::{NerDetector, ner},
     engine::Engine,
     inventory::Inventory,
@@ -56,20 +55,14 @@ folders are walked recursively.
 
 --fail-on      the kinds (see `piikey-cli kinds`) whose presence makes scan exit 1
 --tolerant     also restores stand-ins that came back with a typo, and first or last names
-               that came back alone; only for text, not for zip documents
+               that came back alone
 --local        work in this process even when the app is running; --vault PATH implies it
 --pipe         serve on \\\\.\\pipe\\NAME instead of \\\\.\\pipe\\piikey-<USERNAME>
 
 exit codes: 0 done; 1 personal data found under --fail-on; 2 usage error; 3 any API error";
 
-/// How long to wait for the app to take the call before doing the work in this process.
-const ASK_APP: Duration = Duration::from_millis(300);
-
 /// The prefix of a named pipe's path.
 const PIPE_PREFIX: &str = r"\\.\pipe\";
-
-/// Told how far the model download is, in bytes done and bytes in all.
-type Progress = Arc<dyn Fn(u64, u64) + Send + Sync>;
 
 /// How the command ended, which is the process's exit code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,13 +135,13 @@ impl Caller for Router {
     fn call(&mut self, request: Request) -> Result<Value, Fail> {
         let download = matches!(request, Request::ModelDownload);
         // What the download shares with the app is nothing, so it never asks.
-        if !self.in_process && !download {
-            let pipe = service::default_pipe();
-            if let Some(envelope) = service::call(&pipe, &request, ASK_APP)? {
-                return Ok(api::open_envelope(envelope)?);
-            }
+        if !self.in_process
+            && !download
+            && let Some(value) = service::ask(&request)?
+        {
+            return Ok(value);
         }
-        let progress = download.then(|| -> Progress { Arc::new(show_download) });
+        let progress = download.then(|| -> DownloadProgress { Arc::new(show_download) });
         let local = open_local(self.vault.as_deref(), detects(&request), progress)?;
         let reply = local.handle(request);
         if download {
@@ -183,7 +176,7 @@ fn detects(request: &Request) -> bool {
 fn open_local(
     vault: Option<&Path>,
     detecting: bool,
-    progress: Option<Progress>,
+    progress: Option<DownloadProgress>,
 ) -> piikey::Result<Local> {
     let vault = match vault {
         Some(path) => path.to_path_buf(),
@@ -253,12 +246,10 @@ fn execute(
         Err(Fail::Io(error)) if error.kind() == io::ErrorKind::BrokenPipe => {}
         printed => printed?,
     }
-    if let Some(fail_on) = &fail_on
-        && show::found(fail_on, &view, &value)?
-    {
-        return Ok(Exit::Found);
-    }
-    Ok(if show::failed(&view, &value)? > 0 {
+    let verdict = show::verdict(&view, &value, fail_on.as_ref())?;
+    Ok(if verdict.found {
+        Exit::Found
+    } else if verdict.failed > 0 {
         Exit::Failed
     } else {
         Exit::Ok
@@ -370,8 +361,8 @@ fn serve(vault: Option<&Path>, args: &Serve) -> Result<(), Fail> {
     eprintln!("piikey-cli: serving the API on {pipe}; stop with Ctrl+C");
     if let Some((_, port)) = &http_server {
         eprintln!(
-            "piikey-cli: serving HTTP on http://127.0.0.1:{port}/v1/<op>; the token is what \
-             piikey-cli token prints"
+            "piikey-cli: serving HTTP on {}; the token is what piikey-cli token prints",
+            api::http::url(*port)
         );
     }
     // Ctrl+C ends the process, which closes the pipe: nothing here needs a clean stop.

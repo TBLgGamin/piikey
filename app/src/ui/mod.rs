@@ -25,7 +25,7 @@ mod window;
 pub use self::watchdog::{RESTORE_FLAG, WATCH_FLAG, restore as restore_proxy, watch};
 
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::{Arc, OnceLock},
     thread,
@@ -34,7 +34,7 @@ use std::{
 
 use piikey::{
     Error,
-    api::{self, Handler, Request},
+    api::{Handler, Request},
     detect::NerDetector,
     policy::Policy,
     service::{self, Server},
@@ -53,14 +53,12 @@ use self::{
     ticker::Ticker,
     window::{Handle, MainWindow, WindowInput},
 };
-use crate::{Res, api::AppApi};
+use crate::{Describe, Res, api::AppApi};
 
 /// Why a second app does not start.
 const ALREADY_RUNNING: &str = "piikey is already running for your Windows account. Open it from its key icon in the notification area.";
 /// How long a starting app waits for one that is still ending, and for its watchdog.
 const START_WAIT: Duration = Duration::from_secs(2);
-/// How long a call to the app's pipe waits while the pipe is busy.
-const CALL_WAIT: Duration = Duration::from_millis(300);
 /// How long Explorer's scan waits for an app that is still starting to open its pipe, and how
 /// often it asks again.
 const EXPLORER_WAIT: Duration = Duration::from_secs(5);
@@ -118,13 +116,8 @@ fn hand_over(paths: &[PathBuf]) -> Res<bool> {
     let request = Request::ExplorerScan {
         paths: paths.to_vec(),
     };
-    let reply = service::call(&service::default_pipe(), &request, CALL_WAIT)
-        .map_err(|error| error.to_string())?;
-    let Some(envelope) = reply else {
-        return Ok(false);
-    };
-    match api::open_envelope(envelope) {
-        Ok(_) => Ok(true),
+    match service::ask(&request) {
+        Ok(reply) => Ok(reply.is_some()),
         // `piikey-cli serve` has the pipe, not the app: this process becomes the app.
         Err(error) if error.code() == "app_required" => Ok(false),
         Err(error) => Err(error.to_string()),
@@ -133,11 +126,11 @@ fn hand_over(paths: &[PathBuf]) -> Res<bool> {
 
 /// [`run`] with the files and folders `scan` names scanned first, as Explorer's menu asks.
 fn run_with(scan: Option<Vec<PathBuf>>) -> Res<Ran> {
-    let vault = piikey::vault::default_path().map_err(|error| error.to_string())?;
-    let folder = vault.parent().ok_or("the vault path has no folder")?;
+    let folder = piikey::sys::data_dir().describe()?;
+    let vault = piikey::vault::default_path().describe()?;
     // First of all: a second copy would take the port and the Windows proxy from the first, and
     // its clean-up at launch (see `Controller::launch`) would undo the first one's work.
-    let Some(_instance) = Instance::acquire(folder, START_WAIT)? else {
+    let Some(_instance) = Instance::acquire(&folder, START_WAIT)? else {
         return Ok(Ran::AlreadyRunning);
     };
     // Dropped before `_instance`: the watchdog then waits for the lock, and finds Windows already
@@ -168,7 +161,7 @@ fn run_with(scan: Option<Vec<PathBuf>>) -> Res<Ran> {
         controller: Arc::clone(&controller),
         icon,
     })
-    .map_err(|error| error.to_string());
+    .describe();
     if let Some(pipe) = pipe {
         pipe.stop();
     }
@@ -203,7 +196,7 @@ fn open(vault: PathBuf) -> Res<(Arc<Controller>, Arc<AppApi>)> {
             ))),
         ),
     };
-    let model_dir = piikey::detect::ner::files::default_dir().map_err(|error| error.to_string())?;
+    let model_dir = piikey::detect::ner::files::default_dir().describe()?;
     let ner = NerDetector::new(model_dir.clone());
     let slot: Arc<OnceLock<Arc<dyn Handler>>> = Arc::new(OnceLock::new());
     let controller = Controller::launch(
@@ -261,6 +254,8 @@ enum AppMessage {
 
 struct PiikeyApp {
     controller: Arc<Controller>,
+    /// The tray icon is shown: the way back to the app once its window is closed.
+    tray: bool,
     /// What the tray menu shows right after a toggle from the tray, before the controller has
     /// caught up. The next message of any kind replaces it with the real state.
     wish: Option<bool>,
@@ -305,6 +300,23 @@ impl PiikeyApp {
     }
 }
 
+/// The icon the tray shows, or `None` when the app has no tray icon.
+fn tray_icon(input: &AppInput) -> Option<&Path> {
+    // Debug builds only, for the README screenshots: `PIIKEY_NO_TRAY` leaves the tray icon out,
+    // so the app also starts on a desktop that has no notification area.
+    #[cfg(debug_assertions)]
+    if std::env::var_os("PIIKEY_NO_TRAY").is_some() {
+        return None;
+    }
+    input.icon.as_deref()
+}
+
+/// Whether closing the window ends the app: it does when nothing works in the background, and
+/// when no tray icon is left to open the window again.
+const fn closing_ends_app(tray: bool, runs_in_background: bool) -> bool {
+    !tray || !runs_in_background
+}
+
 /// What the tray icon says when the pointer rests on it.
 fn tooltip(on: bool, highlight_paused: bool) -> String {
     let state = if on { "piikey: on" } else { "piikey: off" };
@@ -324,6 +336,7 @@ impl Application for PiikeyApp {
         let sender: LocalSender<AppMessage> = context.sender();
         Self {
             controller: Arc::clone(&input.controller),
+            tray: tray_icon(input).is_some(),
             wish: None,
             reveal: None,
             revealed: 0,
@@ -356,7 +369,7 @@ impl Application for PiikeyApp {
             AppMessage::Sync => self.show_scan(context),
             AppMessage::WindowClosed => {
                 self.reveal = None;
-                if !self.controller.runs_in_background() {
+                if closing_ends_app(self.tray, self.controller.runs_in_background()) {
                     self.quit(context);
                 }
             }
@@ -378,15 +391,9 @@ impl Application for PiikeyApp {
                 reveal: self.reveal.clone(),
             },
         );
-        let Some(icon) = &input.icon else {
+        let Some(icon) = tray_icon(input) else {
             return view;
         };
-        // Debug builds only, for the README screenshots: `PIIKEY_NO_TRAY` leaves the tray icon out,
-        // so the app also starts on a desktop that has no notification area.
-        #[cfg(debug_assertions)]
-        if std::env::var_os("PIIKEY_NO_TRAY").is_some() {
-            return view;
-        }
         view.notify_icon(
             "tray",
             NotifyIcon::new(icon)
@@ -414,16 +421,15 @@ impl Application for PiikeyApp {
 
 #[cfg(test)]
 mod tests {
-    use super::tooltip;
+    use super::closing_ends_app;
 
     #[test]
-    fn the_tooltip_says_when_the_highlight_is_paused() {
-        assert_eq!(tooltip(true, false), "piikey: on");
-        assert_eq!(tooltip(false, false), "piikey: off");
-        assert_eq!(tooltip(true, true), "piikey: on \u{b7} highlighting paused");
-        assert_eq!(
-            tooltip(false, true),
-            "piikey: off \u{b7} highlighting paused"
-        );
+    fn a_window_closed_without_a_tray_icon_ends_the_app_even_when_features_run() {
+        // With no tray icon nothing is left to open the window again: the app would run
+        // unseen, holding the proxy and the API.
+        assert!(closing_ends_app(false, true));
+        assert!(closing_ends_app(false, false));
+        assert!(closing_ends_app(true, false));
+        assert!(!closing_ends_app(true, true));
     }
 }

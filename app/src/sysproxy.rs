@@ -13,26 +13,33 @@
 //! app with `--restore-proxy` at the next sign-in, for a session ended by
 //! a shutdown or sign-out that the app could not clean up after.
 //!
-//! The previous values are read as raw registry strings with `reg.exe`: the
-//! `sysproxy` crate can only read a bare `ip:port`, so it would lose a proxy
-//! given by host name or per protocol (`http=a:80;https=b:80`). `sysproxy`
-//! writes the settings and tells `WinINET` to reload them.
+//! The previous values are read as raw registry values: the `sysproxy` crate
+//! can only read a bare `ip:port`, so it would lose a proxy given by host
+//! name or per protocol (`http=a:80;https=b:80`). `sysproxy` writes the
+//! settings and tells `WinINET` to reload them; it also respells the server
+//! and writes all three values, so a restore puts the saved ones back raw.
 
 use std::{
     fs,
+    io::ErrorKind,
     path::{Path, PathBuf},
     sync::{Mutex, PoisonError},
 };
 
 use ::sysproxy::Sysproxy;
-use piikey::sys::{data_dir, run_system_tool, write_atomic};
+use piikey::sys::{data_dir, write_atomic};
+use winreg::{
+    RegKey,
+    enums::{HKEY_CURRENT_USER, KEY_SET_VALUE, REG_DWORD, REG_EXPAND_SZ, REG_SZ, RegType},
+    types::FromRegValue,
+};
 
-use crate::Res;
+use crate::{Describe, Res};
 
-const SETTINGS_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+const SETTINGS_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
 // The file name is kept for existing installs.
 const STATE_FILE: &str = "proxy.prev";
-const RUN_ONCE_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce";
+const RUN_ONCE_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\RunOnce";
 const RUN_ONCE_VALUE: &str = "piikey proxy restore";
 /// The `RunOnce` value name of the builds before the rename; removed so no stale entry stays behind.
 const OLD_RUN_ONCE_VALUE: &str = "piikey Guard proxy restore";
@@ -93,7 +100,7 @@ pub fn enable(port: u16) -> Res<()> {
     let saved = plan_enable(&current, read_saved(&state).as_ref(), &ours);
     // Saved first: a crash between the two writes then leaves a record that
     // `disable` recognizes as stale instead of settings nobody can undo.
-    write_atomic(&state, saved.to_text().as_bytes()).map_err(|e| e.to_string())?;
+    write_atomic(&state, saved.to_text().as_bytes()).describe()?;
     arm_sign_in_restore()?;
     apply(true, &ours, BYPASS)
 }
@@ -133,39 +140,37 @@ pub fn disable() -> Res<()> {
 fn arm_sign_in_restore() -> Res<()> {
     let exe = std::env::current_exe().map_err(|e| format!("cannot locate the piikey exe: {e}"))?;
     let command = format!("\"{}\" {}", exe.display(), crate::ui::RESTORE_FLAG);
-    let out = run_system_tool(
-        "reg.exe",
-        &[
-            "add",
-            RUN_ONCE_KEY,
-            "/v",
-            RUN_ONCE_VALUE,
-            "/t",
-            "REG_SZ",
-            "/d",
-            &command,
-            "/f",
-        ],
-    )
-    .map_err(|e| e.to_string())?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "cannot register the proxy restore at sign-in (reg.exe: {})",
-            out.status
-        ))
-    }
+    arm_in(RUN_ONCE_KEY, &command)
+}
+
+fn arm_in(path: &str, command: &str) -> Res<()> {
+    let (key, _) = RegKey::predef(HKEY_CURRENT_USER)
+        .create_subkey(path)
+        .map_err(|e| format!("cannot register the proxy restore at sign-in (HKCU\\{path}): {e}"))?;
+    key.set_value(RUN_ONCE_VALUE, &command)
+        .map_err(|e| format!("cannot register the proxy restore at sign-in: {e}"))
 }
 
 /// Removes the entry of [`arm_sign_in_restore`], and the one an earlier build
-/// left under its old name. The exit statuses are not checked: an entry is
-/// usually gone already (a restore without a prior enable), and one left
-/// behind only runs a restore that finds nothing to do.
+/// left under its old name. An entry that is already gone is fine (a restore
+/// without a prior enable).
 fn disarm_sign_in_restore() -> Res<()> {
+    disarm_in(RUN_ONCE_KEY)
+}
+
+fn disarm_in(path: &str) -> Res<()> {
+    let key = match RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(path, KEY_SET_VALUE) {
+        Ok(key) => key,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(format!(
+                "cannot remove the proxy restore at sign-in (HKCU\\{path}): {e}"
+            ));
+        }
+    };
     for value in [RUN_ONCE_VALUE, OLD_RUN_ONCE_VALUE] {
-        run_system_tool("reg.exe", &["delete", RUN_ONCE_KEY, "/v", value, "/f"])
-            .map_err(|e| e.to_string())?;
+        delete_value(&key, value)
+            .map_err(|e| format!("cannot remove the proxy restore at sign-in: {e}"))?;
     }
     Ok(())
 }
@@ -207,15 +212,52 @@ fn server_for(port: u16) -> String {
     format!("127.0.0.1:{port}")
 }
 
-/// Writes `prev` back. A missing server leaves the app's own value behind,
-/// switched off, which is harmless.
+/// Writes `prev` back exactly. `apply` goes through `sysproxy`, which respells
+/// the server (`proxy.corp` becomes `proxy.corp:80`) and writes all three
+/// values, so the saved ones are put back raw afterwards; values the user
+/// never had are deleted again.
 fn restore(prev: &Snapshot) -> Res<()> {
-    let enable = prev.enable.unwrap_or(false);
     let server = prev
         .server
         .clone()
         .unwrap_or_else(|| server_for(FALLBACK_PORT));
-    apply(enable, &server, prev.bypass.as_deref().unwrap_or(""))
+    apply(
+        prev.enable.unwrap_or(false),
+        &server,
+        prev.bypass.as_deref().unwrap_or(""),
+    )?;
+    put_back_in(SETTINGS_KEY, prev)
+}
+
+/// Makes the values under `path` equal `prev`: text is written as it was
+/// saved, `None` removes the value.
+fn put_back_in(path: &str, prev: &Snapshot) -> Res<()> {
+    let key = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags(path, KEY_SET_VALUE)
+        .map_err(|e| format!("cannot update the Windows proxy settings (HKCU\\{path}): {e}"))?;
+    for (name, text) in [
+        ("ProxyServer", prev.server.as_deref()),
+        ("ProxyOverride", prev.bypass.as_deref()),
+    ] {
+        match text {
+            Some(text) => key.set_value(name, &text),
+            None => delete_value(&key, name),
+        }
+        .map_err(|e| format!("cannot restore the Windows proxy setting {name}: {e}"))?;
+    }
+    if prev.enable.is_none() {
+        delete_value(&key, "ProxyEnable")
+            .map_err(|e| format!("cannot restore the Windows proxy setting ProxyEnable: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Deletes `name`; a value that is not there is already as wanted.
+fn delete_value(key: &RegKey, name: &str) -> std::io::Result<()> {
+    match key.delete_value(name) {
+        Err(e) if e.kind() != ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
 }
 
 /// Writes the settings and refreshes `WinINET`. `sysproxy` stores
@@ -247,44 +289,39 @@ fn split_server(server: &str) -> (String, u16) {
 }
 
 fn read_settings() -> Res<Snapshot> {
-    let out = run_system_tool("reg.exe", &["query", SETTINGS_KEY]).map_err(|e| e.to_string())?;
-    if !out.status.success() {
-        return Err(format!(
-            "cannot read the Windows proxy settings (reg.exe: {})",
-            out.status
-        ));
-    }
-    Ok(parse_reg_query(&String::from_utf8_lossy(&out.stdout)))
+    read_settings_in(SETTINGS_KEY)
 }
 
-/// Picks the proxy values out of `reg query` output, whose value lines read
-/// `    ProxyServer    REG_SZ    127.0.0.1:8080` (four spaces between fields;
-/// the type names are not localized).
-fn parse_reg_query(text: &str) -> Snapshot {
-    let mut snapshot = Snapshot::default();
-    for line in text.lines() {
-        let mut fields = line.trim().splitn(3, "    ");
-        let (Some(name), Some(kind)) = (fields.next(), fields.next()) else {
-            continue;
-        };
-        let data = fields.next().unwrap_or("").trim();
-        let owned = || (!data.is_empty()).then(|| data.to_owned());
-        match (name, kind) {
-            ("ProxyEnable", "REG_DWORD") => {
-                snapshot.enable = u32::from_str_radix(data.trim_start_matches("0x"), 16)
-                    .ok()
-                    .map(|value| value != 0);
-            }
-            ("ProxyServer", "REG_SZ" | "REG_EXPAND_SZ") => snapshot.server = owned(),
-            ("ProxyOverride", "REG_SZ" | "REG_EXPAND_SZ") => snapshot.bypass = owned(),
-            _ => {}
-        }
+/// Reads the values under `path` (relative to `HKEY_CURRENT_USER`). A value
+/// that is absent, empty, or of another registry type than the settings use
+/// reads as `None`.
+fn read_settings_in(path: &str) -> Res<Snapshot> {
+    let key = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(path)
+        .map_err(|e| format!("cannot read the Windows proxy settings (HKCU\\{path}): {e}"))?;
+    let text = |name: &str| -> Res<Option<String>> {
+        Ok(raw_value::<String>(&key, name, &[REG_SZ, REG_EXPAND_SZ])?.filter(|s| !s.is_empty()))
+    };
+    Ok(Snapshot {
+        enable: raw_value::<u32>(&key, "ProxyEnable", &[REG_DWORD])?.map(|value| value != 0),
+        server: text("ProxyServer")?,
+        bypass: text("ProxyOverride")?,
+    })
+}
+
+/// The value `name` converted to `T`; `None` when it is absent, of a type not
+/// in `kinds`, or not convertible.
+fn raw_value<T: FromRegValue>(key: &RegKey, name: &str, kinds: &[RegType]) -> Res<Option<T>> {
+    match key.get_raw_value(name) {
+        Ok(raw) if kinds.contains(&raw.vtype) => Ok(T::from_reg_value(&raw).ok()),
+        Ok(_) => Ok(None),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("cannot read the Windows proxy setting {name}: {e}")),
     }
-    snapshot
 }
 
 fn state_path() -> Res<PathBuf> {
-    Ok(data_dir().map_err(|e| e.to_string())?.join(STATE_FILE))
+    Ok(data_dir().describe()?.join(STATE_FILE))
 }
 
 /// The saved record; a missing or unreadable file means none.
@@ -361,37 +398,139 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parses_reg_query_output() {
-        let text = "\r\nHKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\r\n\
-                    \x20   ProxyEnable    REG_DWORD    0x1\r\n\
-                    \x20   ProxyServer    REG_SZ    http=a.corp:80;https=b.corp:81\r\n\
-                    \x20   ProxyOverride    REG_SZ    <local>;*.corp.nl;10.*\r\n\
-                    \x20   AutoDetect    REG_DWORD    0x0\r\n\
-                    \x20   MigrateProxy    REG_DWORD    0x1\r\n";
-        assert_eq!(
-            parse_reg_query(text),
-            Snapshot {
-                enable: Some(true),
-                server: Some("http=a.corp:80;https=b.corp:81".into()),
-                bypass: Some("<local>;*.corp.nl;10.*".into()),
-            }
-        );
+    /// A private tree, so a test never touches the user's real settings.
+    struct Sandbox(String);
+
+    impl Sandbox {
+        fn new(name: &str) -> Self {
+            Self(format!(
+                r"Software\piikey-sysproxy-test-{}-{name}\key",
+                std::process::id()
+            ))
+        }
+
+        fn parent(&self) -> &str {
+            self.0
+                .rsplit_once('\\')
+                .map_or(&self.0, |(parent, _)| parent)
+        }
+
+        fn key(&self) -> Res<RegKey> {
+            let (key, _) = RegKey::predef(HKEY_CURRENT_USER)
+                .create_subkey(&self.0)
+                .describe()?;
+            Ok(key)
+        }
+    }
+
+    impl Drop for Sandbox {
+        /// Runs even when an assertion fails.
+        fn drop(&mut self) {
+            let _ = RegKey::predef(HKEY_CURRENT_USER).delete_subkey_all(self.parent());
+        }
+    }
+
+    fn names(key: &RegKey) -> Vec<String> {
+        // Stops at the first error: an iterator over a deleted key never ends.
+        key.enum_values()
+            .map_while(|v| v.ok().map(|v| v.0))
+            .collect()
     }
 
     #[test]
-    fn missing_values_stay_none() {
-        let text = "\r\nHKEY_CURRENT_USER\\x\r\n    ProxyEnable    REG_DWORD    0x0\r\n\
-                    \x20   ProxyOverride    REG_SZ    \r\n";
+    fn settings_are_read_from_the_registry() -> Res<()> {
+        let sandbox = Sandbox::new("read");
+        let key = sandbox.key()?;
+        key.set_value("ProxyEnable", &1u32).describe()?;
+        key.set_value("ProxyServer", &"http=a.corp:80;https=b.corp:81")
+            .describe()?;
+        key.set_value("ProxyOverride", &"<local>;*.corp.nl")
+            .describe()?;
         assert_eq!(
-            parse_reg_query(text),
+            read_settings_in(&sandbox.0)?,
             Snapshot {
-                enable: Some(false),
-                server: None,
-                bypass: None,
+                enable: Some(true),
+                server: Some("http=a.corp:80;https=b.corp:81".into()),
+                bypass: Some("<local>;*.corp.nl".into()),
             }
         );
-        assert_eq!(parse_reg_query(""), Snapshot::default());
+        key.set_value("ProxyEnable", &0u32).describe()?;
+        assert_eq!(read_settings_in(&sandbox.0)?.enable, Some(false));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_empty_and_mistyped_values_read_as_none() -> Res<()> {
+        let sandbox = Sandbox::new("none");
+        let key = sandbox.key()?;
+        assert_eq!(read_settings_in(&sandbox.0)?, Snapshot::default());
+        key.set_value("ProxyServer", &"").describe()?;
+        key.set_value("ProxyOverride", &"").describe()?;
+        key.set_value("ProxyEnable", &"1").describe()?;
+        assert_eq!(read_settings_in(&sandbox.0)?, Snapshot::default());
+        // A DWORD where a string belongs is not a server either.
+        key.set_value("ProxyServer", &1u32).describe()?;
+        assert_eq!(read_settings_in(&sandbox.0)?.server, None);
+        Ok(())
+    }
+
+    #[test]
+    fn an_unreadable_settings_key_is_an_error() {
+        let sandbox = Sandbox::new("absent");
+        assert!(read_settings_in(&sandbox.0).is_err());
+    }
+
+    #[test]
+    fn put_back_restores_exact_text_and_deletes_absent_values() -> Res<()> {
+        let sandbox = Sandbox::new("putback");
+        let key = sandbox.key()?;
+        // What `sysproxy` leaves behind after re-spelling the saved server.
+        key.set_value("ProxyEnable", &1u32).describe()?;
+        key.set_value("ProxyServer", &"proxy.corp:80").describe()?;
+        key.set_value("ProxyOverride", &"<local>").describe()?;
+
+        for server in ["proxy.corp", "http=a:80;https=b"] {
+            let prev = Snapshot {
+                enable: Some(false),
+                server: Some(server.into()),
+                bypass: Some("*.corp".into()),
+            };
+            put_back_in(&sandbox.0, &prev)?;
+            let read = read_settings_in(&sandbox.0)?;
+            assert_eq!(read.server.as_deref(), Some(server));
+            assert_eq!(read.bypass.as_deref(), Some("*.corp"));
+        }
+
+        put_back_in(&sandbox.0, &Snapshot::default())?;
+        assert!(names(&key).is_empty(), "left {:?}", names(&key));
+        // Deleting what is already gone is fine.
+        put_back_in(&sandbox.0, &Snapshot::default())?;
+        Ok(())
+    }
+
+    #[test]
+    fn arming_twice_leaves_one_entry_and_disarming_removes_both_names() -> Res<()> {
+        let sandbox = Sandbox::new("runonce");
+        arm_in(&sandbox.0, "\"a.exe\" --first")?;
+        arm_in(&sandbox.0, "\"a.exe\" --second")?;
+        let key = sandbox.key()?;
+        assert_eq!(names(&key), [RUN_ONCE_VALUE]);
+        assert_eq!(
+            key.get_value::<String, _>(RUN_ONCE_VALUE).describe()?,
+            "\"a.exe\" --second"
+        );
+
+        key.set_value(OLD_RUN_ONCE_VALUE, &"old").describe()?;
+        key.set_value("unrelated", &"keep").describe()?;
+        disarm_in(&sandbox.0)?;
+        assert_eq!(names(&key), ["unrelated"]);
+        // Nothing left to remove is fine, and so is no key at all.
+        disarm_in(&sandbox.0)?;
+        RegKey::predef(HKEY_CURRENT_USER)
+            .delete_subkey_all(sandbox.parent())
+            .describe()?;
+        disarm_in(&sandbox.0)?;
+        Ok(())
     }
 
     #[test]

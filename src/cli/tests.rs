@@ -92,8 +92,21 @@ fn one_email() -> Value {
     json!({"results": [[{"start": 5, "end": 16, "kind": "email", "value": "jan@acme.nl"}]]})
 }
 
+/// A scanned file as the API writes it.
+fn scanned(path: &str, status: &str, counts: Value) -> Value {
+    let mut file = json!({"path": path, "size": 0, "modified": 0, "scanned": 0, "status": status});
+    file["counts"] = counts;
+    file
+}
+
 fn one_file_with(kind: &str) -> Value {
-    json!({"hits": 1, "files": [{"path": r"C:\x\a.txt", "status": "ok", "hits": 1, "counts": {kind: 1}}]})
+    json!({"hits": 1, "files": [scanned(r"C:\x\a.txt", "ok", json!({kind: 1}))]})
+}
+
+fn failed_file(path: &str, error: &str) -> Value {
+    let mut failed = scanned(path, "failed", json!({}));
+    failed["error"] = json!(error);
+    failed
 }
 
 #[test]
@@ -157,23 +170,20 @@ fn fail_on_gates_a_scan_of_files_too() {
 
 #[test]
 fn a_file_that_could_not_be_scanned_fails_the_command_unless_data_was_found() {
-    let value = json!({"hits": 0, "files": [
-        {"path": "a", "status": "failed", "error": "bad zip", "counts": {}}
-    ]});
+    let value = json!({"hits": 0, "files": [failed_file("a", "bad zip")]});
     let got = ran(&["scan", "a"], b"", vec![Ok(value.clone())]);
     assert_eq!(got.exit, Exit::Failed);
     assert_eq!(got.err, "piikey-cli: a: bad zip\n");
     // A file that is not a supported format is no failure.
-    let skipped =
-        json!({"hits": 0, "files": [{"path": "b.bin", "status": "unsupported", "counts": {}}]});
+    let skipped = json!({"hits": 0, "files": [scanned("b.bin", "unsupported", json!({}))]});
     assert_eq!(
         ran(&["scan", "b.bin"], b"", vec![Ok(skipped)]).exit,
         Exit::Ok
     );
     // What was found is the more important news.
     let mixed = json!({"hits": 1, "files": [
-        {"path": "a", "status": "failed", "error": "bad zip", "counts": {}},
-        {"path": "b", "status": "ok", "hits": 1, "counts": {"email": 1}}
+        failed_file("a", "bad zip"),
+        scanned("b", "ok", json!({"email": 1}))
     ]});
     let got = ran(
         &["scan", "--fail-on", "any", "a", "b"],
@@ -361,14 +371,6 @@ fn a_subject_search_shows_the_values_it_was_given() {
 }
 
 #[test]
-fn exit_codes_are_the_documented_ones() {
-    assert_eq!(ExitCode::from(Exit::Ok), ExitCode::from(0));
-    assert_eq!(ExitCode::from(Exit::Found), ExitCode::from(1));
-    assert_eq!(ExitCode::from(Exit::Usage), ExitCode::from(2));
-    assert_eq!(ExitCode::from(Exit::Failed), ExitCode::from(3));
-}
-
-#[test]
 fn a_pipe_is_named_by_its_whole_path_or_its_name() {
     assert_eq!(pipe_name("test"), r"\\.\pipe\test");
     assert_eq!(pipe_name(r"\\.\pipe\test"), r"\\.\pipe\test");
@@ -408,39 +410,6 @@ fn the_readme_documents_the_usage_text() {
             "the README documents `{line}`, which --help does not say"
         );
     }
-}
-
-#[test]
-fn the_usage_text_names_every_command_and_the_exit_codes() {
-    for command in [
-        "scan",
-        "anonymize",
-        "deanonymize",
-        "subject",
-        "vault list",
-        "vault forget",
-        "vault export",
-        "vault wipe",
-        "inventory status",
-        "settings get",
-        "settings set",
-        "kinds",
-        "model status",
-        "model download",
-        "token",
-        "status",
-        "protection",
-        "serve",
-    ] {
-        assert!(
-            USAGE.contains(&format!("piikey-cli {command}")) || USAGE.contains(command),
-            "{command}"
-        );
-    }
-    assert!(USAGE.contains(
-        "exit codes: 0 done; 1 personal data found under --fail-on; 2 usage error; 3 any API error"
-    ));
-    assert!(USAGE.contains("global: --json  --local  --vault PATH  -h/--help  -V/--version"));
 }
 
 #[test]

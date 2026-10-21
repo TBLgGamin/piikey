@@ -21,6 +21,20 @@ fn cells(row: &[&str]) -> Vec<String> {
     row.iter().map(|cell| (*cell).to_owned()).collect()
 }
 
+/// A file of a scan or of the inventory, as the API writes it.
+fn file(path: &str, status: &str, counts: Value) -> Value {
+    let mut file = json!({"path": path, "size": 0, "modified": 0, "scanned": 0, "status": status});
+    file["counts"] = counts;
+    file
+}
+
+/// A file that could not be read, with the message the scan ran into.
+fn failed_file(path: &str, error: &str) -> Value {
+    let mut failed = file(path, "failed", json!({}));
+    failed["error"] = json!(error);
+    failed
+}
+
 #[test]
 fn a_table_pads_its_columns_but_not_the_last() {
     let mut out = Vec::new();
@@ -44,16 +58,15 @@ fn a_wide_cell_widens_its_column_and_counts_characters() {
 }
 
 #[test]
-fn counts_list_the_most_first_and_skip_zeros() {
-    let counts: BTreeMap<String, u64> = [
-        ("email".to_owned(), 1),
-        ("iban".to_owned(), 3),
-        ("phone".to_owned(), 3),
-        ("secret".to_owned(), 0),
-    ]
-    .into();
+fn counts_keep_their_order_and_skip_zeros() {
+    let counts = [
+        (EntityKind::Iban, 3),
+        (EntityKind::Phone, 3),
+        (EntityKind::Email, 1),
+        (EntityKind::Secret, 0),
+    ];
     assert_eq!(super::counts(&counts), "iban: 3, phone: 3, email: 1");
-    assert_eq!(super::counts(&BTreeMap::new()), "");
+    assert_eq!(super::counts(&[]), "");
 }
 
 #[test]
@@ -99,7 +112,7 @@ fn every_request_has_a_view() {
     );
     assert_eq!(
         View::of(&Request::Protection { on: true }),
-        View::Protection { on: true }
+        View::Protection
     );
     assert_eq!(
         View::of(&Request::VaultWipe { confirm: true }),
@@ -160,12 +173,12 @@ fn spans_are_listed_with_where_they_are() {
 #[test]
 fn scanned_files_are_listed_when_they_hold_something() {
     let value = json!({"hits": 5, "files": [
-        {"path": r"C:\x\a.txt", "status": "ok", "hits": 2, "counts": {"iban": 1, "phone": 1}},
-        {"path": r"C:\x\b.bin", "status": "unsupported", "counts": {}},
-        {"path": r"C:\x\c.docx", "status": "failed", "error": "bad zip", "counts": {}},
-        {"path": r"C:\x\d.txt", "status": "ok", "counts": {}},
-        {"path": r"C:\x\e.txt", "status": "ok", "hits": 3, "counts": {"email": 3}},
-        {"path": r"C:\x\f.iso", "status": "too_large", "counts": {}}
+        file(r"C:\x\a.txt", "ok", json!({"iban": 1, "phone": 1})),
+        file(r"C:\x\b.bin", "unsupported", json!({})),
+        failed_file(r"C:\x\c.docx", "bad zip"),
+        file(r"C:\x\d.txt", "ok", json!({})),
+        file(r"C:\x\e.txt", "ok", json!({"email": 3})),
+        file(r"C:\x\f.iso", "too_large", json!({}))
     ]});
     let (out, err) = shown(&View::Files, &value);
     assert_eq!(
@@ -181,7 +194,7 @@ fn scanned_files_are_listed_when_they_hold_something() {
 
 #[test]
 fn scanned_files_without_findings_say_so() {
-    let value = json!({"hits": 0, "files": [{"path": "a.txt", "status": "ok", "counts": {}}]});
+    let value = json!({"hits": 0, "files": [file("a.txt", "ok", json!({}))]});
     assert_eq!(
         shown(&View::Files, &value),
         (
@@ -310,8 +323,8 @@ fn the_inventory_status_is_a_list_of_facts() {
 #[test]
 fn inventory_entries_and_nodes_are_tables() {
     let entries = json!({"total": 2, "entries": [
-        {"path": r"C:\x\a.txt", "status": "ok", "counts": {"email": 3}},
-        {"path": r"C:\x\b.txt", "status": "ok", "counts": {"iban": 1, "phone": 1}}
+        file(r"C:\x\a.txt", "ok", json!({"email": 3})),
+        file(r"C:\x\b.txt", "ok", json!({"iban": 1, "phone": 1}))
     ]});
     assert_eq!(
         out_of(&View::Entries { offset: 0 }, &entries),
@@ -444,11 +457,11 @@ fn small_results() {
         "the detection model is downloaded\n"
     );
     assert_eq!(
-        out_of(&View::Protection { on: true }, &json!({})),
+        out_of(&View::Protection, &json!({"protection": true})),
         "protection is on\n"
     );
     assert_eq!(
-        out_of(&View::Protection { on: false }, &Value::Null),
+        out_of(&View::Protection, &json!({"protection": false})),
         "protection is off\n"
     );
     assert_eq!(
@@ -464,48 +477,75 @@ fn small_results() {
 #[test]
 fn the_gate_looks_at_the_kinds_of_what_was_found() {
     let spans = json!({"results": [[{"start": 0, "end": 1, "kind": "iban", "value": "x"}]]});
-    let email = FailOn::Kinds(vec![piikey::detect::EntityKind::Email]);
-    let iban = FailOn::Kinds(vec![piikey::detect::EntityKind::Iban]);
-    assert!(matches!(found(&email, &View::Spans, &spans), Ok(false)));
-    assert!(matches!(found(&iban, &View::Spans, &spans), Ok(true)));
+    let email = FailOn::Kinds(vec![EntityKind::Email]);
+    let iban = FailOn::Kinds(vec![EntityKind::Iban]);
+    let found = |fail_on: Option<&FailOn>, view: &View, value: &Value| {
+        verdict(view, value, fail_on).map(|verdict| verdict.found)
+    };
     assert!(matches!(
-        found(&FailOn::Any, &View::Spans, &spans),
+        found(Some(&email), &View::Spans, &spans),
+        Ok(false)
+    ));
+    assert!(matches!(found(Some(&iban), &View::Spans, &spans), Ok(true)));
+    assert!(matches!(
+        found(Some(&FailOn::Any), &View::Spans, &spans),
         Ok(true)
     ));
+    // Without `--fail-on` nothing is held against what was found.
+    assert!(matches!(found(None, &View::Spans, &spans), Ok(false)));
     let nothing = json!({"results": [[]]});
     assert!(matches!(
-        found(&FailOn::Any, &View::Spans, &nothing),
+        found(Some(&FailOn::Any), &View::Spans, &nothing),
         Ok(false)
     ));
 
     let files = json!({"hits": 1, "files": [
-        {"path": "a", "status": "ok", "counts": {"iban": 1}},
-        {"path": "b", "status": "ok", "counts": {"email": 0}}
+        file("a", "ok", json!({"iban": 1})),
+        file("b", "ok", json!({"email": 0}))
     ]});
-    assert!(matches!(found(&iban, &View::Files, &files), Ok(true)));
-    assert!(matches!(found(&email, &View::Files, &files), Ok(false)));
+    assert!(matches!(found(Some(&iban), &View::Files, &files), Ok(true)));
     assert!(matches!(
-        found(&FailOn::Any, &View::Files, &files),
+        found(Some(&email), &View::Files, &files),
+        Ok(false)
+    ));
+    assert!(matches!(
+        found(Some(&FailOn::Any), &View::Files, &files),
         Ok(true)
     ));
-    // Only scans are gated.
+    // Only scans are gated, and any other reply is not even read.
     assert!(matches!(
-        found(&FailOn::Any, &View::Status, &files),
-        Ok(false)
+        verdict(&View::Status, &json!("not a status"), Some(&FailOn::Any)),
+        Ok(v) if v == Verdict::default()
     ));
 }
 
 #[test]
 fn failures_are_the_files_that_could_not_be_done() {
     let files = json!({"hits": 0, "files": [
-        {"path": "a", "status": "failed", "error": "x", "counts": {}},
-        {"path": "b", "status": "unsupported", "counts": {}},
-        {"path": "c", "status": "ok", "counts": {}}
+        failed_file("a", "x"),
+        file("b", "unsupported", json!({})),
+        file("c", "ok", json!({}))
     ]});
-    assert!(matches!(failed(&View::Files, &files), Ok(1)));
+    assert!(matches!(verdict(&View::Files, &files, None), Ok(v) if v.failed == 1));
     let written = json!({"written": [], "failed": [{"input": "a", "error": "x"}]});
-    assert!(matches!(failed(&View::Written, &written), Ok(1)));
-    assert!(matches!(failed(&View::Status, &written), Ok(0)));
+    assert!(matches!(verdict(&View::Written, &written, None), Ok(v) if v.failed == 1));
+    assert!(verdict(&View::Files, &json!({"nope": 1}), None).is_err());
+}
+
+#[test]
+fn a_failure_without_a_message_is_still_reported_and_a_skipped_file_is_no_failure() {
+    let value = json!({"hits": 0, "files": [
+        failed_file(r"C:\x\a.docx", ""),
+        file(r"C:\x\b.iso", "too_large", json!({}))
+    ]});
+    let (out, err) = shown(&View::Files, &value);
+    assert_eq!(
+        out,
+        "2 files scanned, no personal data found, \
+         1 not read (unsupported format or too big), 1 failed\n"
+    );
+    assert_eq!(err, "piikey-cli: C:\\x\\a.docx: could not be read\n");
+    assert!(matches!(verdict(&View::Files, &value, None), Ok(v) if v.failed == 1));
 }
 
 #[test]

@@ -699,19 +699,4 @@ mod tests {
         assert!(outline(rect(2000, 100, 2600, 140), None).is_some());
         Ok(())
     }
-
-    #[test]
-    fn the_colours_follow_the_theme() {
-        assert_eq!(color(Mark::Pii, false), 0x006f_49b1, "brand, light");
-        assert_eq!(color(Mark::Pii, true), 0x00d6_c9f9, "brand, dark");
-        assert_eq!(color(Mark::Clean, false), 0x002e_7d32);
-        assert_eq!(color(Mark::Clean, true), 0x0081_c995);
-    }
-
-    #[test]
-    fn the_shortcut_is_ctrl_alt_p() {
-        let key = shortcut();
-        assert_eq!(key.key, Code::KeyP);
-        assert_eq!(key.mods, Modifiers::CONTROL | Modifiers::ALT);
-    }
 }

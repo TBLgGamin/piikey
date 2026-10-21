@@ -1,7 +1,7 @@
 //! The local HTTP API: [`spawn`] serves a [`Handler`] on `127.0.0.1`, behind a bearer token.
 //!
 //! `POST /v1/<op>` with the request's fields as a JSON body (the `op` is the path's; an `op` in
-//! the body is ignored), and `GET /v1/status`. The reply is the [`envelope`],
+//! the body is ignored), and `GET /v1/status`. The reply is the [`envelope`](super::envelope),
 //! with status 200, or 400, 404, 409 or 500 by its error code:
 //!
 //! - every request needs `Authorization: Bearer <token>`, else 401;
@@ -29,7 +29,7 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use serde_json::{Map, Value};
 use tokio::{net::TcpListener, sync::Notify};
 
-use super::{ApiError, Handler, Request, envelope};
+use super::{ApiError, Code, Handler, Request, answer, encode};
 use crate::{Error, Result, service::Server};
 
 /// Largest accepted request body.
@@ -38,10 +38,6 @@ const MAX_BODY: usize = 64 * 1024 * 1024;
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long to wait after a connection could not be accepted (the client was gone already).
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
-/// What a reply that cannot be encoded is replaced with.
-const UNENCODABLE: &[u8] =
-    br#"{"ok":false,"error":{"code":"internal","message":"the reply could not be encoded"}}"#;
-
 /// Everything a connection needs to answer.
 struct Gate {
     handler: Arc<dyn Handler>,
@@ -83,10 +79,7 @@ impl Gate {
             .strip_prefix("/v1/")
             .filter(|op| Request::OPS.contains(op))
         else {
-            return reply(
-                StatusCode::NOT_FOUND,
-                Err(ApiError::not_found(format!("no such operation: {path}"))),
-            );
+            return failure(ApiError::not_found(format!("no such operation: {path}")));
         };
         let allowed = if op == "status" { "GET, POST" } else { "POST" };
         let get = parts.method == Method::GET && op == "status";
@@ -105,26 +98,11 @@ impl Gate {
                 Err(response) => return response,
             }
         };
-        let (status, result) = run(Arc::clone(&self.handler), op.to_owned(), bytes).await;
-        reply(status, result)
+        let op = op.to_owned();
+        let answered = answer(Arc::clone(&self.handler), move || parse(&op, &bytes)).await;
+        let status = answered.error.as_ref().map_or(StatusCode::OK, status_of);
+        json(status, answered.body)
     }
-}
-
-/// [`answer`] on a blocking thread.
-async fn run(
-    handler: Arc<dyn Handler>,
-    op: String,
-    body: Bytes,
-) -> (StatusCode, std::result::Result<Value, ApiError>) {
-    tokio::task::spawn_blocking(move || answer(handler.as_ref(), &op, &body))
-        .await
-        // The handler panicked: that request fails, the server lives on.
-        .unwrap_or_else(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Err(ApiError::internal("the request failed unexpectedly")),
-            )
-        })
 }
 
 /// Reads a request body of at most [`MAX_BODY`] bytes.
@@ -150,23 +128,6 @@ async fn read_body(
     }
 }
 
-/// Reads the request `op` and `body` make and has `handler` answer it, with the HTTP status the
-/// answer gets. Runs on a blocking thread: parsing a big body and answering is work.
-fn answer(
-    handler: &dyn Handler,
-    op: &str,
-    body: &[u8],
-) -> (StatusCode, std::result::Result<Value, ApiError>) {
-    match parse(op, body) {
-        Ok(request) => {
-            let result = handler.handle(request);
-            let status = result.as_ref().map_or_else(status_of, |_| StatusCode::OK);
-            (status, result)
-        }
-        Err(error) => (StatusCode::BAD_REQUEST, Err(error)),
-    }
-}
-
 /// The request whose op is `op` and whose other fields are the JSON object `body` (nothing at
 /// all is an empty object).
 fn parse(op: &str, body: &[u8]) -> std::result::Result<Request, ApiError> {
@@ -187,20 +148,18 @@ fn parse(op: &str, body: &[u8]) -> std::result::Result<Request, ApiError> {
 
 /// The status an error is answered with.
 fn status_of(error: &ApiError) -> StatusCode {
-    match error.code() {
-        "bad_request" => StatusCode::BAD_REQUEST,
-        "not_found" => StatusCode::NOT_FOUND,
-        "app_required" | "busy" => StatusCode::CONFLICT,
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    match error.code {
+        Code::BadRequest => StatusCode::BAD_REQUEST,
+        Code::NotFound => StatusCode::NOT_FOUND,
+        Code::AppRequired | Code::Busy => StatusCode::CONFLICT,
+        Code::Io | Code::Vault | Code::Unsupported | Code::Model | Code::Internal => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
     }
 }
 
-/// A response with the envelope of `result` as its body.
-fn reply(
-    status: StatusCode,
-    result: std::result::Result<Value, ApiError>,
-) -> Response<Full<Bytes>> {
-    let body = serde_json::to_vec(&envelope(result)).unwrap_or_else(|_| UNENCODABLE.to_vec());
+/// A response with `body`, the bytes of an envelope, and `status`.
+fn json(status: StatusCode, body: Vec<u8>) -> Response<Full<Bytes>> {
     let mut response = Response::new(Full::new(Bytes::from(body)));
     *response.status_mut() = status;
     let headers = response.headers_mut();
@@ -209,10 +168,15 @@ fn reply(
     response
 }
 
+/// The response to an error that comes before the handler, with the status its code has.
+fn failure(error: ApiError) -> Response<Full<Bytes>> {
+    json(status_of(&error), encode(Err(error)))
+}
+
 /// A request that is refused before it gets to the handler. The code is `bad_request`; the
 /// status says why.
 fn refuse(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
-    reply(status, Err(ApiError::bad_request(message)))
+    json(status, encode(Err(ApiError::bad_request(message))))
 }
 
 /// Whether two secrets are equal, in a time that does not depend on where they differ.
@@ -254,13 +218,20 @@ async fn serve(listener: TcpListener, gate: Arc<Gate>, stop: Arc<Notify>) -> Res
 fn bind(port: u16) -> Result<TcpListener> {
     let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).map_err(|e| {
         if e.kind() == io::ErrorKind::AddrInUse {
-            Error::Busy(format!("port {port} on 127.0.0.1 is in use"))
+            Error::Busy(format!("port {port} on {} is in use", Ipv4Addr::LOCALHOST))
         } else {
             Error::Io(e)
         }
     })?;
     listener.set_nonblocking(true)?;
     Ok(TcpListener::from_std(listener)?)
+}
+
+/// Where scripts call the API when it listens on `port`, with the operation still to be named:
+/// `http://127.0.0.1:7980/v1/<op>`.
+#[must_use]
+pub fn url(port: u16) -> String {
+    format!("http://{}:{port}/v1/<op>", Ipv4Addr::LOCALHOST)
 }
 
 /// Serves `handler` over HTTP on `127.0.0.1:port`, on a thread of its own, for requests that
@@ -720,6 +691,10 @@ mod tests {
                 StatusCode::INTERNAL_SERVER_ERROR,
             ),
             (
+                Error::Dpapi("x".into()).into(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
                 Error::UnsupportedFormat("x").into(),
                 StatusCode::INTERNAL_SERVER_ERROR,
             ),
@@ -727,5 +702,18 @@ mod tests {
         for (error, status) in cases {
             assert_eq!(status_of(&error), status, "{}", error.code());
         }
+    }
+
+    #[test]
+    fn the_url_is_where_the_server_answers() -> TestResult {
+        let (server, port) = serve_stub()?;
+        let url = url(port);
+        let path = url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .ok_or("not the address the server listens on")?
+            .replace("<op>", "kinds");
+        assert_eq!(authed(port, "POST", &path, None)?.status, 200);
+        server.stop();
+        Ok(())
     }
 }

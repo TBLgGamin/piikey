@@ -10,11 +10,12 @@ use lopdf::{
 };
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
-use super::{Format, Output, Scanned, package, process, same_text, scan, sniff};
+use super::{Format, Output, Scanned, msg, package, process, restore, same_text, scan, sniff};
 use crate::{
     Error,
     detect::{EntityKind, Mode},
     engine::Engine,
+    restore::Restorer,
 };
 
 type Res<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -183,6 +184,7 @@ fn odt() -> Res<Vec<u8>> {
         ("content.xml", content.as_bytes(), DEFLATED),
         ("meta.xml", meta.as_bytes(), DEFLATED),
         ("Pictures/logo.bin", &noise(2048), DEFLATED),
+        ("Thumbnails/thumbnail.png", &noise(1024), DEFLATED),
     ])
 }
 
@@ -299,6 +301,113 @@ fn msg() -> Res<Vec<u8>> {
     Ok(file.into_inner().into_inner())
 }
 
+type Cfile = CompoundFile<Cursor<Vec<u8>>>;
+
+/// The properties, subject and plain body every message storage has: `dir` is `""` for the
+/// file itself or the storage of an embedded message.
+fn put_message(file: &mut Cfile, dir: &str, subject: &str, body: &str) -> Res {
+    put(file, &format!("{dir}/__properties_version1.0"), &[0; 32])?;
+    put(
+        file,
+        &format!("{dir}/__substg1.0_0037001F"),
+        &utf16le(subject),
+    )?;
+    put(file, &format!("{dir}/__substg1.0_1000001F"), &utf16le(body))?;
+    Ok(())
+}
+
+/// A message with nothing but a subject and a body, then whatever `add` puts in.
+fn bare_msg(add: impl FnOnce(&mut Cfile) -> Res) -> Res<Vec<u8>> {
+    let mut file = CompoundFile::create(Cursor::new(Vec::new()))?;
+    put_message(&mut file, "", "Doorgestuurd", "Zie bijlage.")?;
+    add(&mut file)?;
+    file.flush()?;
+    Ok(file.into_inner().into_inner())
+}
+
+const EMBEDDED_MESSAGE: &str = "__substg1.0_3701000D";
+
+/// Attachment storage `attach` that holds an embedded message; returns the storage of that
+/// message. `name` is the attachment's own name, if it has one.
+fn embed(
+    file: &mut Cfile,
+    attach: &str,
+    name: Option<&str>,
+    subject: &str,
+    body: &str,
+) -> Res<String> {
+    file.create_storage(attach)?;
+    let inner = format!("{attach}/{EMBEDDED_MESSAGE}");
+    file.create_storage(&inner)?;
+    put_message(file, &inner, subject, body)?;
+    if let Some(name) = name {
+        put(
+            file,
+            &format!("{attach}/__substg1.0_3707001F"),
+            &utf16le(name),
+        )?;
+    }
+    Ok(inner)
+}
+
+/// A message that forwards another one as an attachment, with a text file attached to that.
+fn msg_with_embedded(body: &str) -> Res<Vec<u8>> {
+    bare_msg(|file| {
+        let inner = embed(
+            file,
+            "/__attach_version1.0_#00000000",
+            Some("doorgestuurd.msg"),
+            "Voorstel",
+            body,
+        )?;
+        put(
+            file,
+            &format!("{inner}/__substg1.0_5D01001F"),
+            &utf16le(EMAIL),
+        )?;
+        let nested = format!("{inner}/__attach_version1.0_#00000000");
+        file.create_storage(&nested)?;
+        put(
+            file,
+            &format!("{nested}/__substg1.0_3707001F"),
+            &utf16le("rekening.txt"),
+        )?;
+        put(
+            file,
+            &format!("{nested}/__substg1.0_37010102"),
+            format!("Rekening {IBAN}\r\n").as_bytes(),
+        )
+    })
+}
+
+/// A message with a chain of `levels` embedded messages, each in the previous one.
+fn msg_with_nested_messages(levels: usize) -> Res<Vec<u8>> {
+    bare_msg(|file| {
+        let mut attach = String::from("/__attach_version1.0_#00000000");
+        for level in 1..=levels {
+            let inner = embed(
+                file,
+                &attach,
+                None,
+                &format!("niveau {level}"),
+                &format!("inhoud {level}\r\n"),
+            )?;
+            attach = format!("{inner}/__attach_version1.0_#00000000");
+        }
+        Ok(())
+    })
+}
+
+/// The sum of the lengths of all streams of a compound file.
+fn stream_bytes(compound: &[u8]) -> Res<u64> {
+    let file = CompoundFile::open(Cursor::new(compound))?;
+    Ok(file
+        .walk()
+        .filter(cfb::Entry::is_stream)
+        .map(|entry| entry.len())
+        .sum())
+}
+
 fn pdf(text: &str) -> Res<Vec<u8>> {
     let mut doc = Document::with_version("1.5");
     let pages_id = doc.new_object_id();
@@ -362,6 +471,13 @@ fn entry_text(zip: &[u8], name: &str) -> Res<String> {
     Ok(text)
 }
 
+fn entry_bytes(zip: &[u8], name: &str) -> Res<Vec<u8>> {
+    let mut archive = package::open(zip)?;
+    let mut bytes = Vec::new();
+    archive.by_name(name)?.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 fn entry_names(zip: &[u8]) -> Res<Vec<String>> {
     let archive = package::open(zip)?;
     let mut names = Vec::new();
@@ -409,16 +525,46 @@ fn bmp_needs_more_than_two_letters() {
 }
 
 #[test]
-fn mail_needs_a_known_first_header_and_a_blank_line() {
+fn mail_needs_a_first_header_only_mail_has_and_a_blank_line() {
     assert_eq!(
         sniff(b"From: a@b.nl\r\nSubject: x\r\n\r\nbody"),
         Format::Mail
     );
     assert_eq!(sniff(b"\n\nreceived: by x\nTo: y\n\nbody"), Format::Mail);
     assert_eq!(sniff(b"\xEF\xBB\xBFSubject: hi\n\nbody"), Format::Mail);
+    // What clients, libraries and servers put first.
+    for first in [
+        "X-Mozilla-Status: 0001",
+        "x-original-to: a@b.nl",
+        "Content-Type: multipart/mixed; boundary=\"B\"",
+        "Authentication-Results: mx.example.org; dkim=pass",
+        "DKIM-Signature: v=1; a=rsa-sha256",
+        "ARC-Seal: i=1",
+        "Reply-To: a@b.nl",
+        "Cc: a@b.nl",
+        "In-Reply-To: <1@b.nl>",
+    ] {
+        let mail = format!("{first}\r\nSubject: x\r\n\r\nbody");
+        assert_eq!(sniff(mail.as_bytes()), Format::Mail, "{first}");
+    }
+    // An mbox separator line only introduces the message.
+    assert_eq!(
+        sniff(b"From - Mon Jan  1 00:00:00 2024\nX-Mozilla-Status: 0001\n\nbody"),
+        Format::Mail
+    );
+    assert_eq!(
+        sniff(b"From jan@example.org Mon Jan  1 00:00:00 2024\r\nSubject: x\r\n\r\nbody"),
+        Format::Mail
+    );
+    assert_eq!(
+        sniff(b"From the desk of the mayor\n\nDear all,"),
+        Format::Text
+    );
     assert_eq!(sniff(b"Subject: no blank line follows"), Format::Text);
     assert_eq!(sniff(b"hello\nFrom: x\n\nbody"), Format::Text);
     assert_eq!(sniff(b"Frontier: x\n\nbody"), Format::Text);
+    assert_eq!(sniff(b"Note: x\n\nbody"), Format::Text);
+    assert_eq!(sniff(b"Xylophone: x\n\nbody"), Format::Text);
 }
 
 // -- Office Open XML ------------------------------------------------------------
@@ -524,6 +670,63 @@ fn rewritten_parts_keep_their_method_and_timestamp() -> Res {
         assert_eq!(entry.last_modified(), Some(stamp), "{name}");
     }
     assert_absent(&same_text(&anonymized)?, &[EMAIL]);
+    Ok(())
+}
+
+#[test]
+fn a_rewritten_package_loses_its_preview_picture_but_keeps_the_entry() -> Res {
+    let engine = engine()?;
+    let stamp =
+        zip::DateTime::from_date_and_time(2021, 5, 17, 13, 45, 30).map_err(|_| "bad date")?;
+    let previews = [
+        ("docProps/thumbnail.jpeg", DEFLATED),
+        ("docProps/thumbnail.png", STORED),
+        ("docProps/thumbnail.emf", DEFLATED),
+        ("docProps/thumbnail.wmf", STORED),
+    ];
+    let build = |text: &str| -> Res<Vec<u8>> {
+        let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+        zip.start_file("[Content_Types].xml", SimpleFileOptions::default())?;
+        zip.write_all(CONTENT_TYPES.as_bytes())?;
+        zip.start_file("word/document.xml", SimpleFileOptions::default())?;
+        zip.write_all(format!("{XML_HEAD}<w:p>{text}</w:p>").as_bytes())?;
+        for (name, method) in previews {
+            let options = SimpleFileOptions::default()
+                .compression_method(method)
+                .last_modified_time(stamp);
+            zip.start_file(name, options)?;
+            zip.write_all(&noise(4096))?;
+        }
+        // A picture inside the document is content, not a preview.
+        zip.start_file("word/media/thumbnail.png", SimpleFileOptions::default())?;
+        zip.write_all(&noise(512))?;
+        Ok(zip.finish()?.into_inner())
+    };
+    let original = build(&format!("mail {EMAIL}"))?;
+    let anonymized = same(&engine, Mode::Anonymize, &original)?;
+
+    assert_eq!(entry_names(&anonymized)?, entry_names(&original)?);
+    let mut archive = package::open(&anonymized)?;
+    for (name, method) in previews {
+        let entry = archive.by_name(name)?;
+        assert_eq!(entry.compression(), method, "{name}");
+        assert_eq!(entry.last_modified(), Some(stamp), "{name}");
+    }
+    for name in ["docProps/thumbnail.jpeg", "docProps/thumbnail.png"] {
+        let picture = crate::ocr::first_pixel(&entry_bytes(&anonymized, name)?)?;
+        assert_eq!(picture, (1, 1, [255; 4]), "{name}");
+    }
+    for name in ["docProps/thumbnail.emf", "docProps/thumbnail.wmf"] {
+        assert!(entry_bytes(&anonymized, name)?.len() < 128, "{name}");
+    }
+    assert_eq!(
+        raw_entry(&anonymized, "word/media/thumbnail.png")?,
+        raw_entry(&original, "word/media/thumbnail.png")?
+    );
+
+    // Nothing was masked, so nothing is rewritten and the preview stays.
+    let clean = build("niets te zien")?;
+    assert_eq!(same(&engine, Mode::Anonymize, &clean)?, clean);
     Ok(())
 }
 
@@ -684,6 +887,11 @@ fn odt_round_trip_keeps_mimetype_first_and_stored() -> Res {
             "{name}"
         );
     }
+    // The preview of the unmasked first page is replaced by a blank picture.
+    assert_eq!(
+        crate::ocr::first_pixel(&entry_bytes(&anonymized, "Thumbnails/thumbnail.png")?)?,
+        (1, 1, [255; 4])
+    );
 
     let restored = same(&engine, Mode::Deanonymize, &anonymized)?;
     assert_eq!(same_text(&restored)?, same_text(&original)?);
@@ -845,6 +1053,29 @@ fn eml_is_rendered_with_attachments() -> Res {
 }
 
 #[test]
+fn an_eml_that_starts_with_a_client_header_is_read_as_mail() -> Res {
+    let engine = engine()?;
+    // Thunderbird writes its own headers before the message. The number is only in the
+    // base64 body: read as plain text, the file would keep it.
+    let body = base64(format!("Bel me op {MOBILE}\r\n").as_bytes());
+    let mail = format!(
+        "X-Mozilla-Status: 0001\r\nX-Mozilla-Keys:\r\nFrom: Jan <{EMAIL}>\r\nSubject: Offerte\r\n\
+         MIME-Version: 1.0\r\nContent-Type: text/plain; charset=\"utf-8\"\r\n\
+         Content-Transfer-Encoding: base64\r\n\r\n{body}\r\n"
+    );
+    let scanned = scan(&engine, mail.as_bytes(), false)?;
+    assert!(
+        found(&scanned).contains(&(EntityKind::Phone, MOBILE)),
+        "{:?}",
+        found(&scanned)
+    );
+    let out = text(&engine, Mode::Anonymize, mail.as_bytes())?;
+    assert_absent(&out, &[EMAIL, MOBILE]);
+    assert!(out.contains("Bel me op "), "{out:?}");
+    Ok(())
+}
+
+#[test]
 fn msg_is_rendered_like_eml() -> Res {
     let engine = engine()?;
     let out = text(&engine, Mode::Anonymize, &msg()?)?;
@@ -860,6 +1091,163 @@ fn msg_is_rendered_like_eml() -> Res {
         out.contains("--- attachment: rekening.txt ---\nRekening "),
         "{out:?}"
     );
+    Ok(())
+}
+
+#[test]
+fn an_embedded_message_is_rendered_like_the_message_that_carries_it() -> Res {
+    let engine = engine()?;
+    let body = format!("Bel mij op {MOBILE}\r\n");
+    let out = text(&engine, Mode::Anonymize, &msg_with_embedded(&body)?)?;
+    assert_absent(&out, &[EMAIL, MOBILE, IBAN]);
+    assert!(
+        out.contains("--- attachment: doorgestuurd.msg ---\nFrom: "),
+        "{out:?}"
+    );
+    assert!(
+        out.contains("\nSubject: Voorstel\n\nBel mij op "),
+        "{out:?}"
+    );
+    assert!(
+        out.contains("--- attachment: rekening.txt ---\nRekening "),
+        "{out:?}"
+    );
+
+    // The stand-ins in the embedded message are restored when the message is read back.
+    let masked = out
+        .split("\nSubject: Voorstel\n\n")
+        .nth(1)
+        .and_then(|rest| rest.lines().next())
+        .ok_or("no embedded body")?;
+    let restored = text(
+        &engine,
+        Mode::Deanonymize,
+        &msg_with_embedded(&format!("{masked}\r\n"))?,
+    )?;
+    assert!(
+        restored.contains(&format!("Bel mij op {MOBILE}")),
+        "{restored:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn an_embedded_message_without_a_name_is_named_after_its_subject() -> Res {
+    let engine = engine()?;
+    let bytes = bare_msg(|file| {
+        embed(file, "/__attach_version1.0_#00000000", None, "Offerte", "x")?;
+        file.create_storage("/__attach_version1.0_#00000001")?;
+        embed(file, "/__attach_version1.0_#00000002", None, "", "y").map(drop)
+    })?;
+    let out = text(&engine, Mode::Anonymize, &bytes)?;
+    assert!(out.contains("--- attachment: Offerte ---\n"), "{out:?}");
+    assert!(out.contains("--- attachment: attachment ---\n"), "{out:?}");
+    Ok(())
+}
+
+#[test]
+fn embedded_messages_stop_at_the_depth_limit() -> Res {
+    let engine = engine()?;
+    // Level 1 is attached at depth 1, like a file attachment would be: levels 1 to 4 are
+    // rendered, 5 and deeper are not.
+    let bytes = msg_with_nested_messages(8)?;
+    let out = text(&engine, Mode::Anonymize, &bytes)?;
+    assert!(out.contains("inhoud 4"), "{out:?}");
+    assert_absent(&out, &["inhoud 5", "niveau 6"]);
+    assert!(
+        out.contains("--- attachment: niveau 5 ---\n[unsupported: "),
+        "{out:?}"
+    );
+    assert!(out.contains("nesting too deep"), "{out:?}");
+    Ok(())
+}
+
+#[test]
+fn ole_objects_and_attachments_without_contents_are_skipped() -> Res {
+    let engine = engine()?;
+    let bytes = bare_msg(|file| {
+        // An OLE object: a storage under the same name, but not a message.
+        let ole = "/__attach_version1.0_#00000000";
+        file.create_storage(ole)?;
+        put(
+            file,
+            &format!("{ole}/__substg1.0_3707001F"),
+            &utf16le("object.bin"),
+        )?;
+        file.create_storage(format!("{ole}/{EMBEDDED_MESSAGE}"))?;
+        put(
+            file,
+            &format!("{ole}/{EMBEDDED_MESSAGE}/Contents"),
+            EMAIL.as_bytes(),
+        )?;
+        // An attachment by reference: a name and nothing else.
+        let by_reference = "/__attach_version1.0_#00000001";
+        file.create_storage(by_reference)?;
+        put(
+            file,
+            &format!("{by_reference}/__substg1.0_3707001F"),
+            &utf16le("link.docx"),
+        )
+    })?;
+    let out = text(&engine, Mode::Anonymize, &bytes)?;
+    assert!(!out.contains("--- attachment:"), "{out:?}");
+    Ok(())
+}
+
+#[test]
+fn ansi_strings_lose_their_terminator_and_keep_their_text() -> Res {
+    let engine = engine()?;
+    let mut mail = format!("Bel {MOBILE}").into_bytes();
+    mail.extend(b" \0 en mail ");
+    mail.extend(EMAIL.as_bytes());
+    mail.push(0);
+    let bytes = bare_msg(|file| {
+        // "Jan\0" has as many NULs as UTF-16 text has: left on, it was read as that.
+        put(file, "/__substg1.0_0C1A001E", b"Jan\0")?;
+        put(
+            file,
+            "/__substg1.0_5D01001E",
+            format!("{EMAIL}\0").as_bytes(),
+        )?;
+        // An empty Unicode string does not hide the ANSI one next to it.
+        file.remove_stream("/__substg1.0_0037001F")?;
+        put(file, "/__substg1.0_0037001F", &[])?;
+        put(file, "/__substg1.0_0037001E", b"Caf\xE9\0")?;
+        file.remove_stream("/__substg1.0_1000001F")?;
+        put(file, "/__substg1.0_1000001E", &mail)
+    })?;
+    let scanned = scan(&engine, &bytes, true)?;
+    let head = scanned.texts.first().ok_or("no text")?;
+    assert!(
+        head.starts_with(&format!(
+            "From: Jan <{EMAIL}>\nSubject: Caf\u{E9}\n\nBel {MOBILE} \0 en mail {EMAIL}\n"
+        )),
+        "{head:?}"
+    );
+    let values = found(&scanned);
+    for expected in [(EntityKind::Email, EMAIL), (EntityKind::Phone, MOBILE)] {
+        assert!(values.contains(&expected), "{expected:?} in {values:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn the_streams_of_a_message_cannot_add_up_to_more_than_the_file() -> Res {
+    let bytes = msg_with_embedded("Bel mij")?;
+    let len = u64::try_from(bytes.len())?;
+    let total = stream_bytes(&bytes)?;
+    assert!(total <= len, "{total} streams in {len} bytes");
+    assert!(msg::read(&bytes, len, 0).is_ok());
+    assert!(msg::read(&bytes, total, 0).is_ok());
+    assert!(matches!(
+        msg::read(&bytes, total / 2, 0),
+        Err(Error::Mail(_))
+    ));
+
+    // The streams of an embedded message count too.
+    let big = msg_with_embedded(&"x".repeat(2000))?;
+    assert!(matches!(msg::read(&big, 1000, 0), Err(Error::Mail(_))));
+    assert!(msg::read(&big, u64::try_from(big.len())?, 0).is_ok());
     Ok(())
 }
 
@@ -895,6 +1283,50 @@ fn nested_mail_attachments_stop_at_the_depth_limit() -> Res {
     }
     let out = text(&engine, Mode::Anonymize, &inner)?;
     assert!(out.contains("nesting too deep"), "{out:?}");
+    Ok(())
+}
+
+// -- restoring through a restorer ---------------------------------------------------
+
+/// A restorer scoped to every proxy in the vault of `engine`, as a tolerant restore has.
+fn scoped_to_the_vault(engine: &Engine) -> Res<Restorer> {
+    crate::files::tolerant_restorer(engine, true)?.ok_or_else(|| "the vault holds no proxy".into())
+}
+
+#[test]
+fn a_tolerant_restore_repairs_the_text_of_documents_and_mail_in_the_same_pass() -> Res {
+    let engine = engine()?;
+    let proxy = engine.run(Mode::Anonymize, &[EMAIL])?.remove(0);
+    // A doubled letter: a typo that only the tolerant tiers of the restorer repair.
+    let typo = format!("{}{}", &proxy[..3], &proxy[2..]);
+    let tolerant = scoped_to_the_vault(&engine)?;
+
+    let document = docx_with(&format!(
+        "{XML_HEAD}<w:document xmlns:w=\"w\"><w:body><w:p><w:r><w:t>mail {typo}</w:t></w:r></w:p>\
+         <w:p><w:r><w:t>and {proxy}</w:t></w:r></w:p></w:body></w:document>"
+    ))?;
+    // The exact restore reads the proxy but not the typo ...
+    let exact = same(&engine, Mode::Deanonymize, &document)?;
+    assert_eq!(same_text(&exact)?, format!("mail {typo}\nand {EMAIL}"));
+    // ... the restorer reads both, a text node at a time.
+    let Output::Same(restored) = restore(&engine, &tolerant, &document)? else {
+        return Err("expected a rewritten file, got text".into());
+    };
+    assert_eq!(same_text(&restored)?, format!("mail {EMAIL}\nand {EMAIL}"));
+
+    let mail = format!("From: piet@example.net\r\nSubject: Offerte\r\n\r\nmail {typo}\r\n");
+    for (name, bytes) in [
+        ("mail", mail.into_bytes()),
+        ("pdf", pdf(&format!("mail {typo}"))?),
+    ] {
+        let Output::Text(restored) = restore(&engine, &tolerant, &bytes)? else {
+            return Err(format!("{name}: expected text, got a rewritten file").into());
+        };
+        assert!(
+            restored.contains(EMAIL) && !restored.contains(&typo),
+            "{name}: {restored:?}"
+        );
+    }
     Ok(())
 }
 
@@ -999,6 +1431,35 @@ fn scanning_a_msg_reads_it_like_an_eml() -> Res {
         assert!(values.contains(&expected), "{expected:?} in {values:?}");
     }
     assert_eq!(records(&engine)?, 0);
+    Ok(())
+}
+
+#[test]
+fn scanning_a_msg_reads_the_embedded_message_and_its_attachments_in_order() -> Res {
+    let engine = engine()?;
+    let bytes = msg_with_embedded(&format!("Bel mij op {MOBILE}\r\n"))?;
+    let scanned = scan(&engine, &bytes, true)?;
+    let values = found(&scanned);
+    for expected in [
+        (EntityKind::Email, EMAIL),
+        (EntityKind::Phone, MOBILE),
+        (EntityKind::Iban, IBAN),
+    ] {
+        assert!(values.contains(&expected), "{expected:?} in {values:?}");
+    }
+    let texts = scanned.texts.join("\n");
+    let embedded = texts
+        .find("Subject: Voorstel")
+        .ok_or("no embedded message")?;
+    let nested = texts.find("Rekening").ok_or("no nested attachment")?;
+    assert!(embedded < nested, "{texts:?}");
+    assert_eq!(records(&engine)?, 0);
+
+    // Messages beyond the limit are not read by a scan either.
+    let deep = scan(&engine, &msg_with_nested_messages(8)?, true)?;
+    let texts = deep.texts.join("\n");
+    assert!(texts.contains("inhoud 4"), "{texts:?}");
+    assert!(!texts.contains("inhoud 5"), "{texts:?}");
     Ok(())
 }
 

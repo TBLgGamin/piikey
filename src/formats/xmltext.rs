@@ -260,8 +260,8 @@ fn keep(out: &mut Vec<u8>, raw: &[u8], from: usize, to: usize, cdata: bool) -> R
 
 /// Scans an XML part into segments.
 ///
-/// `xml` may be UTF-8 (with or without BOM) or UTF-16 with a BOM; it is
-/// written back the same way.
+/// `xml` may be UTF-8 (with or without BOM) or UTF-16 (with a BOM, or without one when the part
+/// starts with `<`); it is written back the same way.
 ///
 /// # Errors
 /// `Xml` when the part is not well-formed XML or not valid text.
@@ -576,17 +576,41 @@ fn utf8<'s>(src: &'s [u8], range: &Range<usize>) -> Result<&'s str> {
 }
 
 /// `xml` as BOM-less UTF-8 and the encoding to write it back in.
+///
+/// A part is UTF-16 when it starts with a byte order mark or, as the XML specification detects
+/// the encoding, with `<` as a 16-bit unit. Read as UTF-8, UTF-16 would be text with a NUL
+/// between its letters that nothing is found in, so a part with NULs that is no UTF-16 is
+/// refused: XML cannot hold a NUL character anyway.
 fn utf8_source(mut xml: Vec<u8>) -> Result<(Vec<u8>, Encoding)> {
-    if xml.starts_with(&[0xFF, 0xFE]) || xml.starts_with(&[0xFE, 0xFF]) {
-        let (text, encoding) =
-            text::decode(&xml).map_err(|_| Error::Xml("invalid UTF-16".into()))?;
-        return Ok((text.into_owned().into_bytes(), encoding));
+    let (src, encoding) = if starts_like_utf16(&xml) {
+        let (text, encoding) = text::decode(&xml).map_err(|e| Error::Xml(e.to_string()))?;
+        if !encoding.is_utf16() {
+            return Err(Error::Xml("not valid UTF-16".into()));
+        }
+        (text.into_owned().into_bytes(), encoding)
+    } else if xml.starts_with(&text::UTF8_BOM) {
+        xml.drain(..text::UTF8_BOM.len());
+        (xml, Encoding::Utf8Bom)
+    } else {
+        (xml, Encoding::Utf8)
+    };
+    // The reader skips a mark at the start without counting it, which would shift every offset;
+    // a second one is not XML anyway.
+    if src.starts_with(&text::UTF8_BOM) {
+        return Err(Error::Xml("a second byte order mark".into()));
     }
-    if xml.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        xml.drain(..3);
-        return Ok((xml, Encoding::Utf8Bom));
+    if src.contains(&0) {
+        return Err(Error::Xml("a NUL character".into()));
     }
-    Ok((xml, Encoding::Utf8))
+    Ok((src, encoding))
+}
+
+/// Whether `xml` starts with a UTF-16 byte order mark or with `<` as one 16-bit unit.
+fn starts_like_utf16(xml: &[u8]) -> bool {
+    xml.starts_with(&text::UTF16LE_BOM)
+        || xml.starts_with(&text::UTF16BE_BOM)
+        || xml.starts_with(b"<\0")
+        || xml.starts_with(b"\0<")
 }
 
 /// UTF-8 `out` in `encoding`.
@@ -807,6 +831,62 @@ mod tests {
         expected.extend_from_slice(b"<p>mail pro@xy.nl</p>");
         assert_eq!(out, expected);
         Ok(())
+    }
+
+    fn utf16(text: &str, bom: &[u8], unit: fn(u16) -> [u8; 2]) -> Vec<u8> {
+        let mut out = bom.to_vec();
+        out.extend(text.encode_utf16().flat_map(unit));
+        out
+    }
+
+    #[test]
+    fn utf16_parts_without_a_bom_are_read_as_utf16_and_written_back_the_same() -> TestResult {
+        // The XML specification detects UTF-16 by `<` as a 16-bit unit. Read as UTF-8 the part
+        // would be text with a NUL between its letters, and nothing in it would be found.
+        let xml = r#"<?xml version="1.0" encoding="UTF-16"?><p>mail jan@x.nl</p>"#;
+        let masked = xml.replace("jan@x.nl", "pro@xy.nl");
+        for unit in [u16::to_le_bytes, u16::to_be_bytes] {
+            let doc = segments(utf16(xml, &[], unit), Attrs::None)?;
+            assert_eq!(texts(&doc), ["mail jan@x.nl"]);
+            let out = replace(&doc, 0, "jan@x.nl", "pro@xy.nl")?.ok_or("no change")?;
+            assert_eq!(out, utf16(&masked, &[], unit));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_second_byte_order_mark_is_refused_not_misread() {
+        // The reader skips a mark at the start without counting its bytes: every offset after
+        // it would be three bytes off and a replacement would cut the wrong text.
+        let mut utf8 = vec![0xEF, 0xBB, 0xBF, 0xEF, 0xBB, 0xBF];
+        utf8.extend_from_slice(b"<p>jan@x.nl</p>");
+        let wide = utf16("\u{feff}<p>jan@x.nl</p>", &[0xFF, 0xFE], u16::to_le_bytes);
+        for part in [utf8, wide] {
+            assert!(matches!(
+                segments(part, Attrs::None),
+                Err(Error::Xml(m)) if m.contains("byte order mark")
+            ));
+        }
+    }
+
+    #[test]
+    fn a_nul_that_is_no_utf16_and_utf32_are_refused_by_name() {
+        assert!(matches!(
+            segments(b"<p>jan@x.nl\0</p>".to_vec(), Attrs::None),
+            Err(Error::Xml(m)) if m.contains("NUL")
+        ));
+        // A part that starts like UTF-16 but cannot be read as such is not read as UTF-8.
+        assert!(matches!(
+            segments(b"<\0p\0>\0x".to_vec(), Attrs::None),
+            Err(Error::Xml(_))
+        ));
+        let utf32 = [
+            0xFF, 0xFE, 0, 0, b'<', 0, 0, 0, b'p', 0, 0, 0, b'>', 0, 0, 0,
+        ];
+        assert!(matches!(
+            segments(utf32.to_vec(), Attrs::None),
+            Err(Error::Xml(m)) if m.contains("UTF-32")
+        ));
     }
 
     #[test]

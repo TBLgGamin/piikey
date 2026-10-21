@@ -2,10 +2,9 @@
 //! derived from it.
 
 use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305};
-use windows_dpapi::{Scope, decrypt_data, encrypt_data};
 use zeroize::Zeroizing;
 
-use crate::{Error, Result, proxy::ProxyKeys};
+use crate::{Error, Result, proxy::ProxyKeys, sys};
 
 /// DPAPI entropy: binds the wrapped blob to this purpose and format version.
 const DPAPI_ENTROPY: &[u8] = b"piikey vault master key v1";
@@ -39,30 +38,21 @@ impl VaultKeys {
     }
 }
 
-/// Fills `buf` from the OS random number generator.
-pub(super) fn fill_random(buf: &mut [u8]) -> Result<()> {
-    getrandom::fill(buf).map_err(|e| Error::Io(std::io::Error::other(e)))
-}
-
 /// A fresh random master key.
 pub(super) fn generate_master() -> Result<Master> {
     let mut master = Zeroizing::new([0u8; 32]);
-    fill_random(master.as_mut_slice())?;
+    sys::fill_random(master.as_mut_slice())?;
     Ok(master)
 }
 
 /// Wraps `master` so only the current Windows user on this machine can unwrap it.
 pub(super) fn wrap(master: &Master) -> Result<Vec<u8>> {
-    encrypt_data(master.as_slice(), Scope::User, Some(DPAPI_ENTROPY))
-        .map_err(|e| Error::Dpapi(format!("{e:#}")))
+    sys::dpapi_protect(master.as_slice(), DPAPI_ENTROPY)
 }
 
 /// Inverse of [`wrap`].
 pub(super) fn unwrap(blob: &[u8]) -> Result<Master> {
-    let plain = Zeroizing::new(
-        decrypt_data(blob, Scope::User, Some(DPAPI_ENTROPY))
-            .map_err(|e| Error::Dpapi(format!("{e:#}")))?,
-    );
+    let plain = sys::dpapi_unprotect(blob, DPAPI_ENTROPY)?;
     if plain.len() != 32 {
         return Err(Error::Dpapi(
             "unwrapped vault key has the wrong length".into(),

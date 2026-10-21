@@ -7,15 +7,29 @@ mod ca;
 mod capture;
 mod highlight;
 mod ledger;
+mod process;
 mod proxy;
 mod shell;
 mod sysproxy;
 mod ui;
 
-use std::path::PathBuf;
-
 /// App-level result; errors are user-facing messages.
 pub type Res<T, E = String> = std::result::Result<T, E>;
+
+/// Turns what went wrong into the message the user reads.
+pub trait Describe<T> {
+    /// The same result with its error as text.
+    ///
+    /// # Errors
+    /// The error of the result, as it reads when displayed.
+    fn describe(self) -> Res<T>;
+}
+
+impl<T, E: std::fmt::Display> Describe<T> for Result<T, E> {
+    fn describe(self) -> Res<T> {
+        self.map_err(|error| error.to_string())
+    }
+}
 
 fn main() {
     let mut args = std::env::args_os().skip(1);
@@ -39,8 +53,7 @@ fn main() {
         }
         None => {
             let result = if is(ui::SCAN_FLAG) {
-                let paths: Vec<PathBuf> = args.map(PathBuf::from).collect();
-                ui::scan_from_explorer(&paths)
+                ui::scan_from_explorer(&shell::scan_paths(args))
             } else {
                 ui::run()
             };

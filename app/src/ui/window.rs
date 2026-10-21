@@ -27,7 +27,7 @@ use super::{
     assets,
     controller::{
         Command, Controller, Edit, InventoryView, KeyedPage, KeyedQuery, Model, Notice, Period,
-        Reveal, Snapshot, apply_edit, running_programs,
+        Reveal, Snapshot, apply_edit,
     },
     explorer, pages,
 };
@@ -333,7 +333,7 @@ pub struct MainWindow {
     /// The newest reveal request this window has followed.
     revealed: u64,
     timer: Option<ComponentTimer>,
-    /// Which [`pages::FLAVOR`] line the loading screen shows.
+    /// Which [`pages::loading::FLAVOR`] line the loading screen shows.
     pub(super) flavor: usize,
     flavor_timer: Option<ComponentTimer>,
 }
@@ -394,7 +394,7 @@ impl MainWindow {
     }
 
     fn refresh_processes(context: &ComponentContext<Self>) {
-        context.spawn_background(|_| Msg::Processes(running_programs()));
+        context.spawn_background(|_| Msg::Processes(crate::process::running_names()));
     }
 
     /// Runs `work` off the UI thread, where it may wait on the disk or the clipboard. The message
@@ -634,14 +634,14 @@ impl MainWindow {
                 let _ = self.edit(Edit::HttpApi(*on));
             }
             Msg::RescanAll => self.input.controller.submit(Command::Rescan),
-            Msg::CopyToken => self.background(context, |_| {
-                let token = Controller::api_token()?;
+            Msg::CopyToken => self.background(context, |controller| {
+                let token = controller.token(false)?;
                 clipboard_win::set_clipboard_string(&token)
                     .map_err(|error| format!("Could not copy the token: {error}"))?;
                 Ok(Msg::TokenNote("Token copied to the clipboard."))
             }),
             Msg::RotateToken => self.background(context, |controller| {
-                controller.rotate_token()?;
+                controller.token(true)?;
                 Ok(Msg::TokenNote(
                     "New token made. Scripts have to use it from now on: copy it with Copy token.",
                 ))
@@ -812,7 +812,7 @@ impl Component for MainWindow {
             Msg::RefreshProcesses => self.watch_programs(context),
             Msg::Flavor => {
                 if self.loading() {
-                    self.flavor = (self.flavor + 1) % pages::FLAVOR.len();
+                    self.flavor = (self.flavor + 1) % pages::loading::FLAVOR.len();
                     self.flavor_timer = Some(context.set_timeout(FLAVOR_EVERY, Msg::Flavor));
                 } else {
                     self.flavor_timer = None;
@@ -921,7 +921,7 @@ impl Component for MainWindow {
             None => title_bar,
         };
         let body: View = if self.loading() {
-            pages::loading(self, context).grid_row(1).into()
+            pages::loading::screen(self, context).grid_row(1).into()
         } else {
             navigation.into()
         };
@@ -956,7 +956,7 @@ mod tests {
         super::testing::{TempDir, stub_controller, stub_controller_with},
         *,
     };
-    use crate::proxy::PORT;
+    use crate::{Describe, proxy::PORT};
 
     fn node(path: &str, is_dir: bool) -> Node {
         Node {
@@ -1088,7 +1088,7 @@ mod tests {
         controller
             .engine()
             .run(Mode::Anonymize, &["mail jan.jansen@acme.nl"])
-            .map_err(|error| error.to_string())?;
+            .describe()?;
         controller.submit(Command::Refresh);
         assert!(controller.wait_idle(WAIT));
         assert_eq!(controller.snapshot().issued, 1);
@@ -1271,6 +1271,7 @@ mod tests {
         let about_title = format!("piikey {}", env!("CARGO_PKG_VERSION"));
         let pipe = default_pipe();
         let proxy = format!("Local proxy: 127.0.0.1:{PORT}, stopped");
+        let http = piikey::api::http::url(piikey::policy::DEFAULT_HTTP_PORT);
         let tabs: [(SettingsTab, Vec<&str>); 6] = [
             (
                 SettingsTab::Masking,
@@ -1301,7 +1302,7 @@ mod tests {
                     "Named pipe",
                     pipe.as_str(),
                     "HTTP",
-                    "http://127.0.0.1:7980/v1/<op>",
+                    http.as_str(),
                     "Off.",
                     "Switch on Local HTTP API in General ›",
                     "Copy token",
@@ -1386,7 +1387,7 @@ mod tests {
             controller
                 .engine()
                 .run(Mode::Anonymize, &["mail jan.jansen@acme.nl"])
-                .map_err(|error| error.to_string())?;
+                .describe()?;
             Ok(controller)
         })?;
         ui.send(Msg::Nav(Page::Settings))?;

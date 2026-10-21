@@ -16,6 +16,32 @@ keywords = ["pii", "privacy", "dlp", "gdpr", "anonymization"]
 categories = ["text-processing", "command-line-utilities"]
 publish = false
 
+# Dependencies both packages use: one version and one feature set, so they never drift apart.
+[workspace.dependencies]
+rayon = "1.12.0"
+# Wipes key material from memory on drop (vault master key, the app's CA key).
+zeroize = "1.9.1"
+# Safe DPAPI wrapper: the vault master key and the app's CA key are bound to the Windows user.
+windows-dpapi = "0.2.0"
+# Named-pipe server and client, the HTTP API's event loop and its shutdown signal (`sync`, `time`);
+# the app adds `rt-multi-thread` for the proxy.
+tokio = { version = "1.53.3", default-features = false, features = [
+    "rt",
+    "net",
+    "io-util",
+    "sync",
+    "time",
+    "macros",
+] }
+# Known-name detection, tolerant restore and the app's typed-value search: multi-pattern exact matching.
+aho-corasick = "1.1.5"
+# JSON for the API, the vault export and the settings patch. `preserve_order` keeps the fields of an
+# API reply in the order the docs list them; `float_roundtrip` keeps numbers exact through the proxy.
+serde_json = { version = "1.0.154", features = ["preserve_order", "float_roundtrip"] }
+# Embeds app/assets/piikey.ico as the exe icon resource (rc.exe or llvm-rc from the Windows SDK):
+# it finds the SDK tools itself and adds no manifest of its own.
+embed-resource = "3.0.12"
+
 [package]
 name = "piikey"
 description = "Local PII manager for Windows: finds, flags and masks personal data in what you type, send and store; validated regexes plus an on-device model, encrypted vault, JSON API and CLI"
@@ -46,15 +72,14 @@ regex-automata = { version = "0.4.18", default-features = false, features = [
     "hybrid",
     "dfa-onepass",
 ] }
-rayon = "1.12.0"
+rayon.workspace = true
 # Keyed hash: proxy derivation, watermark, key derivation.
 blake3 = "1.8.7"
 # Vault record encryption (XChaCha20-Poly1305; fast without AES-NI).
 chacha20poly1305 = { version = "0.11.0", features = ["zeroize"] }
 getrandom = "0.4.3"
-zeroize = "1.9.1"
-# Safe DPAPI wrapper: the vault master key is bound to the Windows user.
-windows-dpapi = "0.2.0"
+zeroize.workspace = true
+windows-dpapi.workspace = true
 # WinRT OCR + PDF rendering, shipped with Windows.
 windows = { version = "0.62.2", features = [
     "Media_Ocr",
@@ -65,15 +90,7 @@ windows = { version = "0.62.2", features = [
     "Foundation_Collections",
     "Globalization",
 ] }
-# Named-pipe server and client, the HTTP API's event loop and its shutdown signal (`sync`, `time`).
-tokio = { version = "1.53.3", default-features = false, features = [
-    "rt",
-    "net",
-    "io-util",
-    "sync",
-    "time",
-    "macros",
-] }
+tokio.workspace = true
 # The local HTTP API (`api/http.rs`): HTTP/1 on loopback. Already in the build graph through the
 # proxy stack (hudsucker), so they add no new crate.
 hyper = { version = "1.12.0", default-features = false, features = ["server", "http1"] }
@@ -86,8 +103,7 @@ lopdf = "0.45.0"
 mail-parser = "0.11.9"
 cfb = "0.15.0"
 lexopt = "0.3.2"
-# Known-name detection and tolerant restore: multi-pattern exact matching.
-aho-corasick = "1.1.5"
+aho-corasick.workspace = true
 # Tolerant restore: edit distance for typo'd proxies.
 strsim = "0.11.1"
 # On-device PII model runtime: ONNX Runtime with the DirectML GPU backend (CPU fallback) behind safe
@@ -103,16 +119,12 @@ ort = { version = "=2.0.0-rc.15", default-features = false, features = [
 ] }
 # Loads the model's tokenizer.json (byte-fallback BPE). `fancy-regex` is pure Rust: no C/C++ build.
 tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
-# JSON for the API, the vault export and the settings patch. Already in the build graph through
-# `tokenizers` and the proxy stack, so they add no new crate. `preserve_order` (as in the app, so
-# the library and the app agree) keeps the fields of an API reply in the order the docs list them.
+# Already in the build graph through `tokenizers` and the proxy stack, so they add no new crate.
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1.0.154", features = ["preserve_order"] }
+serde_json.workspace = true
 
 [build-dependencies]
-# Embeds app/assets/piikey.ico as the exe icon resource (rc.exe or llvm-rc from the Windows SDK):
-# it finds the SDK tools itself and adds no manifest of its own.
-embed-resource = "3.0.12"
+embed-resource.workspace = true
 
 [lints]
 workspace = true

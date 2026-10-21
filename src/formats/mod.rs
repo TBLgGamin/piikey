@@ -1,7 +1,7 @@
 //! Document formats: sniffing and per-format rewrite/extraction.
 //!
-//! [`process`] recognizes the format from the bytes (never the file name) and
-//! hands the input to the matching module:
+//! [`process`] and [`restore`] recognize the format from the bytes (never the file name) and
+//! hand the input to the matching module:
 //!
 //! | Format | Module | Output |
 //! |---|---|---|
@@ -14,7 +14,7 @@
 //! | Outlook `.msg` | `msg` | [`Output::Text`] |
 //!
 //! [`scan`] reads the same inputs the same way but rewrites nothing: it reports what the
-//! detector finds. Both go through one `Pass`, so a scan sees exactly the texts a rewrite
+//! detector finds. All three go through one `Pass`, so a scan sees exactly the texts a rewrite
 //! would change.
 
 mod eml;
@@ -27,14 +27,18 @@ mod pdf;
 #[cfg(test)]
 mod tests;
 mod text;
+mod thumbnail;
 mod xmltext;
 
 use std::{fmt, sync::Mutex};
+
+use rayon::prelude::*;
 
 use crate::{
     Error, Result,
     detect::{EntityKind, Mode, Span},
     engine::{Engine, Replacement},
+    restore::Restorer,
 };
 
 /// Result of processing one input.
@@ -51,17 +55,29 @@ const MAX_DEPTH: u8 = 4;
 /// How much of a file is searched for the blank line that ends mail headers.
 const MAIL_SNIFF_LEN: usize = 64 * 1024;
 /// Header names a message may start with.
-const MAIL_HEADERS: [&str; 9] = [
+const MAIL_HEADERS: [&str; 18] = [
     "Received",
     "Return-Path",
-    "From",
-    "MIME-Version",
-    "Message-ID",
     "Delivered-To",
+    "From",
+    "Sender",
+    "Reply-To",
+    "To",
+    "Cc",
+    "Bcc",
     "Date",
     "Subject",
-    "To",
+    "Message-ID",
+    "In-Reply-To",
+    "MIME-Version",
+    "Content-Type",
+    "Content-Transfer-Encoding",
+    "Authentication-Results",
+    "Received-SPF",
 ];
+/// Starts of header names only mail has: the `X-` headers that mail clients and servers add
+/// (`X-Mozilla-Status`, `X-Original-To`), and the signature and forwarding headers.
+const MAIL_HEADER_PREFIXES: [&str; 4] = ["X-", "ARC-", "DKIM-", "Resent-"];
 const CFB_MAGIC: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 
 /// Sniffs `bytes` by magic and transforms it with `engine`.
@@ -79,6 +95,26 @@ pub fn process(engine: &Engine, mode: Mode, bytes: &[u8], depth: u8) -> Result<O
         },
         bytes,
         depth,
+    )
+}
+
+/// [`process`] for [`Mode::Deanonymize`] that also restores with `restorer`: what it scopes comes
+/// back when the text spells it with a typo or only as a first or last name, and so does every
+/// proxy the vault of `engine` issued. Both are restored in one pass over each text, see
+/// [`Restorer::plan_with`], so a value that equals the proxy of another comes back once. Every
+/// format gets the same tolerance, documents and mail included, one text at a time: a name that
+/// a document splits over two text nodes is restored part by part.
+///
+/// # Errors
+/// `UnsupportedFormat` and per-format parse errors, as for [`process`].
+pub fn restore(engine: &Engine, restorer: &Restorer, bytes: &[u8]) -> Result<Output> {
+    process_pass(
+        &Pass {
+            engine,
+            how: How::Restore(restorer),
+        },
+        bytes,
+        0,
     )
 }
 
@@ -141,6 +177,9 @@ struct Pass<'a> {
 
 enum How<'a> {
     Rewrite(Mode),
+    /// A deanonymize that restores through a restorer, which finds every proxy of the vault as
+    /// well as the ones it scopes.
+    Restore(&'a Restorer),
     Scan(&'a Collect),
 }
 
@@ -171,10 +210,15 @@ impl Collect {
 }
 
 impl Pass<'_> {
-    /// [`Engine::plan`] for a rewrite. A scan records what the engine finds and plans nothing.
+    /// [`Engine::plan`] for a rewrite; for a restore, what [`Restorer::plan_with`] makes of each
+    /// text. A scan records what the engine finds and plans nothing.
     fn plan(&self, texts: &[&str]) -> Result<Vec<Vec<Replacement>>> {
         match &self.how {
             How::Rewrite(mode) => self.engine.plan(*mode, texts),
+            How::Restore(restorer) => Ok(texts
+                .par_iter()
+                .map(|text| restorer.plan_with(text.as_bytes(), self.engine))
+                .collect()),
             How::Scan(collect) => {
                 collect.record(texts, &self.engine.scan(texts)?)?;
                 Ok(vec![Vec::new(); texts.len()])
@@ -182,11 +226,16 @@ impl Pass<'_> {
         }
     }
 
-    /// [`Engine::run`] for a rewrite. A scan has no output: it looks at the texts and answers
-    /// with empty ones.
+    /// [`Engine::run`] for a rewrite and a restore. A scan has no output: it looks at the texts
+    /// and answers with empty ones.
     fn run(&self, texts: &[&str]) -> Result<Vec<String>> {
         match &self.how {
             How::Rewrite(mode) => self.engine.run(*mode, texts),
+            How::Restore(_) => Ok(texts
+                .par_iter()
+                .zip(self.plan(texts)?)
+                .map(|(text, reps)| Engine::apply(text, &reps))
+                .collect()),
             How::Scan(_) => {
                 self.plan(texts)?;
                 Ok(vec![String::new(); texts.len()])
@@ -198,13 +247,13 @@ impl Pass<'_> {
     /// scan, which has no output to copy into.
     fn unchanged(&self, bytes: &[u8]) -> Vec<u8> {
         match self.how {
-            How::Rewrite(_) => bytes.to_vec(),
+            How::Rewrite(_) | How::Restore(_) => bytes.to_vec(),
             How::Scan(_) => Vec::new(),
         }
     }
 }
 
-/// [`process`] and [`scan`] for one input: picks the format and hands the input to it.
+/// [`process`], [`restore`] and [`scan`] for one input: picks the format and hands the input to it.
 fn process_pass(pass: &Pass<'_>, bytes: &[u8], depth: u8) -> Result<Output> {
     if depth > MAX_DEPTH {
         return Err(Error::UnsupportedFormat("nesting too deep"));
@@ -212,7 +261,7 @@ fn process_pass(pass: &Pass<'_>, bytes: &[u8], depth: u8) -> Result<Output> {
     match sniff(bytes) {
         Format::Zip => {
             let (archive, scope) = open_package(bytes)?;
-            package::rewrite(pass, archive, scope).map(Output::Same)
+            package::rewrite(pass, archive, scope, depth).map(Output::Same)
         }
         Format::Pdf => pdf::process(pass, bytes),
         Format::Image => image::process(pass, bytes),
@@ -275,34 +324,35 @@ fn is_bmp(b: &[u8]) -> bool {
             })
 }
 
-/// A message: the first non-empty line is a well-known header and a blank
-/// line follows within the first 64 KiB.
+/// A message: the first non-empty line is a header only mail has, after an mbox `From ` line
+/// when there is one, and a blank line follows within the first 64 KiB.
 fn is_mail(bytes: &[u8]) -> bool {
     let head = &bytes[..bytes.len().min(MAIL_SNIFF_LEN)];
     let head = head.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(head);
-    let mut seen_header = false;
-    for line in head.split(|&b| b == b'\n') {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if seen_header {
-            if line.is_empty() {
-                return true;
-            }
-        } else if !line.trim_ascii().is_empty() {
-            if !is_mail_header(line) {
-                return false;
-            }
-            seen_header = true;
-        }
+    let mut lines = head
+        .split(|&b| b == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line));
+    let mut first = lines.by_ref().find(|line| !line.trim_ascii().is_empty());
+    if first.is_some_and(|line| line.starts_with(b"From ")) {
+        first = lines.by_ref().find(|line| !line.trim_ascii().is_empty());
     }
-    false
+    first.is_some_and(is_mail_header) && lines.any(<[u8]>::is_empty)
 }
 
 fn is_mail_header(line: &[u8]) -> bool {
-    MAIL_HEADERS.iter().any(|name| {
-        line.get(..name.len())
-            .is_some_and(|start| start.eq_ignore_ascii_case(name.as_bytes()))
-            && line.get(name.len()) == Some(&b':')
-    })
+    let Some(colon) = line.iter().position(|&b| b == b':') else {
+        return false;
+    };
+    let name = &line[..colon];
+    MAIL_HEADERS
+        .iter()
+        .any(|known| name.eq_ignore_ascii_case(known.as_bytes()))
+        || MAIL_HEADER_PREFIXES.iter().any(|prefix| {
+            name.len() > prefix.len()
+                && name
+                    .get(..prefix.len())
+                    .is_some_and(|start| start.eq_ignore_ascii_case(prefix.as_bytes()))
+        })
 }
 
 /// Opens a zip file as an Office Open XML or `OpenDocument` package.

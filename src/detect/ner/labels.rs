@@ -6,43 +6,60 @@
 
 use crate::detect::{EntityKind, KindSet, validate::accepts};
 
-/// Entity types, by type index.
-pub(super) const TYPES: [&str; 35] = [
-    "ACCOUNT_IDENTIFIER",
-    "AUTH_SECRET",
-    "BANK_ACCOUNT_IDENTIFIER",
-    "BIOMETRIC_DATA",
-    "CONTACT_HANDLE",
-    "CRIMINAL_OFFENCE_DATA",
-    "DATE_OF_BIRTH",
-    "DEVICE_IDENTIFIER",
-    "DOCUMENT_IDENTIFIER",
-    "DOCUMENT_REFERENCE",
-    "EMAIL_ADDRESS",
-    "ETHNIC_ORIGIN",
-    "FINANCIAL_AMOUNT",
-    "GEO_LOCATION",
-    "HEALTH_DATA",
-    "IDENTIFYING_LINK",
-    "IP_ADDRESS",
-    "LOCATION",
-    "ORGANIZATION_IDENTIFIER",
-    "ORGANIZATION_NAME",
-    "PAYMENT_CARD",
-    "PAYMENT_CARD_SECURITY",
-    "PERSON_ALIAS",
-    "PERSON_ATTRIBUTE",
-    "PERSON_IDENTIFIER",
-    "PERSON_NAME",
-    "PERSON_ROLE_OR_TITLE",
-    "PHONE_NUMBER",
-    "POLITICAL_OPINION",
-    "POSTAL_ADDRESS",
-    "PROPER_NAME",
-    "RELIGION_OR_BELIEF",
-    "SEXUAL_ORIENTATION",
-    "TRADE_UNION_MEMBERSHIP",
-    "VEHICLE_IDENTIFIER",
+/// The entity types, by type index: the name in the model's `config.json`, the kind the type's
+/// values usually have, and the kind to use when they fail that kind's validator.
+pub(super) const TYPES: [(&str, EntityKind, Option<EntityKind>); 35] = [
+    ("ACCOUNT_IDENTIFIER", EntityKind::AccountId, None),
+    (
+        "AUTH_SECRET",
+        EntityKind::Secret,
+        Some(EntityKind::AuthSecret),
+    ),
+    (
+        "BANK_ACCOUNT_IDENTIFIER",
+        EntityKind::Iban,
+        Some(EntityKind::BankAccount),
+    ),
+    ("BIOMETRIC_DATA", EntityKind::BiometricData, None),
+    ("CONTACT_HANDLE", EntityKind::ContactHandle, None),
+    ("CRIMINAL_OFFENCE_DATA", EntityKind::CriminalOffence, None),
+    ("DATE_OF_BIRTH", EntityKind::DateOfBirth, None),
+    ("DEVICE_IDENTIFIER", EntityKind::DeviceId, None),
+    ("DOCUMENT_IDENTIFIER", EntityKind::DocumentId, None),
+    ("DOCUMENT_REFERENCE", EntityKind::DocumentReference, None),
+    ("EMAIL_ADDRESS", EntityKind::Email, None),
+    ("ETHNIC_ORIGIN", EntityKind::EthnicOrigin, None),
+    ("FINANCIAL_AMOUNT", EntityKind::FinancialAmount, None),
+    ("GEO_LOCATION", EntityKind::GeoLocation, None),
+    ("HEALTH_DATA", EntityKind::HealthData, None),
+    ("IDENTIFYING_LINK", EntityKind::IdentifyingLink, None),
+    ("IP_ADDRESS", EntityKind::Ipv4, Some(EntityKind::Ipv6)),
+    ("LOCATION", EntityKind::Location, None),
+    ("ORGANIZATION_IDENTIFIER", EntityKind::OrganizationId, None),
+    ("ORGANIZATION_NAME", EntityKind::OrganizationName, None),
+    (
+        "PAYMENT_CARD",
+        EntityKind::CreditCard,
+        Some(EntityKind::PaymentCard),
+    ),
+    ("PAYMENT_CARD_SECURITY", EntityKind::CardSecurity, None),
+    ("PERSON_ALIAS", EntityKind::PersonAlias, None),
+    ("PERSON_ATTRIBUTE", EntityKind::PersonAttribute, None),
+    ("PERSON_IDENTIFIER", EntityKind::PersonIdentifier, None),
+    ("PERSON_NAME", EntityKind::Person, None),
+    ("PERSON_ROLE_OR_TITLE", EntityKind::PersonRole, None),
+    (
+        "PHONE_NUMBER",
+        EntityKind::Phone,
+        Some(EntityKind::PhoneNumber),
+    ),
+    ("POLITICAL_OPINION", EntityKind::PoliticalOpinion, None),
+    ("POSTAL_ADDRESS", EntityKind::PostalAddress, None),
+    ("PROPER_NAME", EntityKind::ProperName, None),
+    ("RELIGION_OR_BELIEF", EntityKind::ReligionOrBelief, None),
+    ("SEXUAL_ORIENTATION", EntityKind::SexualOrientation, None),
+    ("TRADE_UNION_MEMBERSHIP", EntityKind::TradeUnion, None),
+    ("VEHICLE_IDENTIFIER", EntityKind::VehicleId, None),
 ];
 
 /// Logits per token: `O` plus a `B-` and an `I-` tag for each type.
@@ -54,64 +71,28 @@ pub(super) const COLUMNS: usize = TYPES.len() + 1;
 /// Column of `O` in a per-type distribution.
 pub(super) const O: usize = TYPES.len();
 
-/// What a type becomes: the kind its values usually have, and one to use when they fail that
-/// kind's validator. Aligned with [`TYPES`].
-const KINDS: [(EntityKind, Option<EntityKind>); 35] = [
-    (EntityKind::AccountId, None),
-    (EntityKind::Secret, Some(EntityKind::AuthSecret)),
-    (EntityKind::Iban, Some(EntityKind::BankAccount)),
-    (EntityKind::BiometricData, None),
-    (EntityKind::ContactHandle, None),
-    (EntityKind::CriminalOffence, None),
-    (EntityKind::DateOfBirth, None),
-    (EntityKind::DeviceId, None),
-    (EntityKind::DocumentId, None),
-    (EntityKind::DocumentReference, None),
-    (EntityKind::Email, None),
-    (EntityKind::EthnicOrigin, None),
-    (EntityKind::FinancialAmount, None),
-    (EntityKind::GeoLocation, None),
-    (EntityKind::HealthData, None),
-    (EntityKind::IdentifyingLink, None),
-    (EntityKind::Ipv4, Some(EntityKind::Ipv6)),
-    (EntityKind::Location, None),
-    (EntityKind::OrganizationId, None),
-    (EntityKind::OrganizationName, None),
-    (EntityKind::CreditCard, Some(EntityKind::PaymentCard)),
-    (EntityKind::CardSecurity, None),
-    (EntityKind::PersonAlias, None),
-    (EntityKind::PersonAttribute, None),
-    (EntityKind::PersonIdentifier, None),
-    (EntityKind::Person, None),
-    (EntityKind::PersonRole, None),
-    (EntityKind::Phone, Some(EntityKind::PhoneNumber)),
-    (EntityKind::PoliticalOpinion, None),
-    (EntityKind::PostalAddress, None),
-    (EntityKind::ProperName, None),
-    (EntityKind::ReligionOrBelief, None),
-    (EntityKind::SexualOrientation, None),
-    (EntityKind::TradeUnion, None),
-    (EntityKind::VehicleId, None),
-];
-
-/// Every kind the model can produce: the eight it shares with the regex table and the kinds
-/// from code 13 up that only it finds.
-pub(super) const MODEL_KINDS: KindSet = KindSet::from_bits(!0 << 13)
-    .with(EntityKind::Person)
-    .with(EntityKind::Email)
-    .with(EntityKind::Ipv4)
-    .with(EntityKind::Ipv6)
-    .with(EntityKind::Phone)
-    .with(EntityKind::CreditCard)
-    .with(EntityKind::Iban)
-    .with(EntityKind::Secret);
+/// Every kind the model can produce: the usual and the fallback kind of each type.
+pub(super) const MODEL_KINDS: KindSet = {
+    let mut kinds = KindSet::EMPTY;
+    let mut i = 0;
+    while i < TYPES.len() {
+        let (_, usual, fallback) = TYPES[i];
+        kinds = kinds.with(usual);
+        if let Some(fallback) = fallback {
+            kinds = kinds.with(fallback);
+        }
+        i += 1;
+    }
+    kinds
+};
 
 /// The kind of a `value` the model labelled as type `type_idx`: the type's usual kind when the
 /// value passes that kind's validator, else its fallback kind when that passes, else nothing.
 /// So a valid IBAN under `BANK_ACCOUNT_IDENTIFIER` is an `Iban` and a number that fails the
-/// checksum is a `BankAccount`; a name that is not shaped like one is dropped.
+/// checksum is a `BankAccount`; a name that is not shaped like one is dropped, and so is a phone
+/// number of fewer than five digits.
 pub(super) fn target(type_idx: usize, value: &str) -> Option<EntityKind> {
-    let (usual, fallback) = KINDS.get(type_idx)?;
+    let (_, usual, fallback) = TYPES.get(type_idx)?;
     if accepts(*usual, value) {
         return Some(*usual);
     }
@@ -125,7 +106,7 @@ mod tests {
     use super::*;
 
     fn type_index(name: &str) -> usize {
-        match TYPES.iter().position(|t| *t == name) {
+        match TYPES.iter().position(|(type_name, ..)| *type_name == name) {
             Some(i) => i,
             None => panic!("no type {name}"),
         }
@@ -138,10 +119,10 @@ mod tests {
         assert_eq!(COLUMNS, 36);
         assert_eq!(O, 35);
         for pair in TYPES.windows(2) {
-            assert!(pair[0] < pair[1], "{} !< {}", pair[0], pair[1]);
+            assert!(pair[0].0 < pair[1].0, "{} !< {}", pair[0].0, pair[1].0);
         }
         // Spot checks against `id2label`: 1/2 ACCOUNT_IDENTIFIER, 51/52 PERSON_NAME, 69/70 last.
-        let type_of = |label: usize| TYPES[(label - 1) / 2];
+        let type_of = |label: usize| TYPES[(label - 1) / 2].0;
         assert_eq!(type_of(1), "ACCOUNT_IDENTIFIER");
         assert_eq!(type_of(2), "ACCOUNT_IDENTIFIER");
         assert_eq!(type_of(51), "PERSON_NAME");
@@ -150,34 +131,14 @@ mod tests {
     }
 
     #[test]
-    fn every_type_has_a_distinct_usual_kind_and_the_model_set_covers_them() {
-        let usual: HashSet<EntityKind> = KINDS.iter().map(|(kind, _)| *kind).collect();
+    fn every_type_has_a_distinct_usual_kind_and_every_model_only_kind_has_a_type() {
+        let usual: HashSet<EntityKind> = TYPES.iter().map(|&(_, kind, _)| kind).collect();
         assert_eq!(usual.len(), TYPES.len());
-        for (usual, fallback) in KINDS {
-            assert!(MODEL_KINDS.contains(usual));
-            if let Some(fallback) = fallback {
-                assert!(MODEL_KINDS.contains(fallback));
-            }
+        // A kind the model could never produce would be one nothing finds.
+        for kind in EntityKind::ALL.into_iter().filter(|k| !k.is_watermarked()) {
+            assert!(MODEL_KINDS.contains(kind), "{kind:?}");
         }
-        // Everything from code 13 up is the model's; of the others only the shared eight.
-        for kind in EntityKind::ALL {
-            let shared = matches!(
-                kind,
-                EntityKind::Person
-                    | EntityKind::Email
-                    | EntityKind::Ipv4
-                    | EntityKind::Ipv6
-                    | EntityKind::Phone
-                    | EntityKind::CreditCard
-                    | EntityKind::Iban
-                    | EntityKind::Secret
-            );
-            assert_eq!(
-                MODEL_KINDS.contains(kind),
-                shared || kind as u8 >= 13,
-                "{kind:?}"
-            );
-        }
+        // The kinds that need their pattern or its context rule stay with the regex detector.
         for kind in [
             EntityKind::UrlCredential,
             EntityKind::Mac,

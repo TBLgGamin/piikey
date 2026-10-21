@@ -2765,11 +2765,11 @@ dependencies = [
  "sysproxy",
  "tokio",
  "uiautomation",
- "windows-dpapi",
  "windows-reactor",
  "windows-reactor-setup",
  "winit",
  "winreg 0.56.0",
+ "zeroize",
 ]
 
 [[package]]

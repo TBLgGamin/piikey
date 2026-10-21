@@ -64,7 +64,8 @@ skips files that did not change since the last scan. For each file, `inventory.j
 values of each kind it holds, never the values, and the scan treats a file piikey masked as clean.
 Home shows the result as a treemap: one tile per folder or file, sized by the number of values, and
 clicking a folder opens it. A tile's side panel can open the file, show it in Explorer, rescan it,
-make a masked copy or exclude it.
+make a masked copy (beside the file; it never replaces an existing file) or exclude it. A folder
+excluded while a scan runs is dropped from the inventory when that scan ends.
 
 "Scan for PII" in Explorer's right-click menu (under "Show more options" on Windows 11) starts
 `piikey.exe --scan <path>`. It hands the paths to the running app, which scans them and, when the
@@ -86,7 +87,7 @@ process. The operations, their results and the error codes are in the
 You can search the vault, export it (JSON or CSV), forget values and wipe it. Forget and wipe
 rewrite the vault file: the kept records are sealed again under a new vault id and the new file
 replaces the old one through `vault.pkv.compact`, so a forgotten value is gone from disk and a crash
-in between is completed at the next open. The app clears its typed-value cache afterwards. A second
+in between is completed at the next open or write. The app clears its typed-value cache afterwards. A second
 process notices the new id and reloads.
 
 ## The app
@@ -99,7 +100,8 @@ process notices the new id and reloads.
   matches values, stand-ins, sites and programs; filters narrow it to a kind, a site (subdomains
   included) or a time (today, last 7 days, last 30 days). The feed persists in
   `%LOCALAPPDATA%\piikey\activity.cfg`, which holds stand-ins, sites, programs and times only;
-  the values themselves stay in the encrypted vault.
+  the values themselves stay in the encrypted vault. Forgetting a value or wiping the vault also
+  removes its lines from the feed.
 - **Settings**: seven tabs, picked in a bar under the title. The app opens on General and remembers
   the tab you chose until the window closes.
   - **General** has a card for each feature with its own control: masking (a switch; it stays off
@@ -133,14 +135,19 @@ delete it to measure again, or write `cpu` to keep the GPU out. Both executables
 ## Formats
 
 Inputs: any text encoding, DOCX/XLSX/PPTX and ODF (rewritten in place), PDF,
-images (Windows OCR) and .eml/.msg (anonymized text output).
+images (Windows OCR) and .eml/.msg (anonymized text output). A rewritten Office or ODF package
+loses its preview picture, which could show the original text; Office packages embedded in it (a
+chart's workbook, an embedded document) are rewritten too, and other pictures and binary objects
+are copied through unchanged. A message attached to a .msg is read like the message itself.
 
 ## Crash safety
 
 Windows points at piikey's proxy only while the app runs. If the app crashes or is killed, a small
-watchdog process (a second `piikey.exe`) gives Windows its previous proxy settings back at
-once. If a shutdown or sign-out ends both, a `RunOnce` entry does it at the next sign-in. With
-piikey saved as on, the next start resumes it. Only one copy runs per Windows user.
+watchdog process (a second `piikey.exe`, not a child of the app, so ending the app's process tree
+leaves it running) gives Windows its previous proxy settings back at once, exactly as they were:
+values you never had are removed again. If a shutdown or sign-out ends both, a `RunOnce` entry
+does it at the next sign-in. With piikey saved as on, the next start resumes it. Only one copy runs
+per Windows user.
 
 ## Files
 

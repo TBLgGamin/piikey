@@ -6,9 +6,10 @@
 //! vault's `gen` key, the value's kind, the value and an attempt counter, so a value always
 //! maps to the same proxy.
 //!
-//! [`watermark_ok`] is the invisible mark. The vault only issues candidates that carry it
-//! (a random value passes with probability 1/16), so deanonymizing can discard most strings
-//! that merely look like PII without consulting the vault.
+//! [`watermark_ok`] is the invisible mark. For the kinds that carry one
+//! ([`EntityKind::is_watermarked`]) the vault only issues candidates that have it (a random
+//! value passes with probability 1/16), so deanonymizing can discard most strings that merely
+//! look like PII without consulting the vault. The other kinds are found by exact vault lookup.
 
 use std::fmt;
 
@@ -21,6 +22,8 @@ use crate::detect::EntityKind;
 mod r#gen;
 mod model;
 mod words;
+
+pub(crate) use words::is_particle;
 
 /// Keys for proxy derivation (`gen`) and watermarking (`mark`).
 pub struct ProxyKeys {
@@ -66,8 +69,8 @@ pub fn watermark_ok(keys: &ProxyKeys, kind: EntityKind, proxy: &str) -> bool {
 ///
 /// The candidate never equals `original` unless the value has nothing left to randomize,
 /// in which case no candidate exists and the caller's own `!= original` check ends in
-/// exhaustion. Candidates are not checked against the watermark; the caller walks
-/// `attempt` upward until [`watermark_ok`] passes.
+/// exhaustion. Candidates are not checked against the watermark; for a kind that carries one
+/// the caller walks `attempt` upward until [`watermark_ok`] passes.
 #[must_use]
 pub fn generate(keys: &ProxyKeys, kind: EntityKind, original: &str, attempt: u32) -> String {
     r#gen::generate(keys, kind, original, attempt)
@@ -75,11 +78,12 @@ pub fn generate(keys: &ProxyKeys, kind: EntityKind, original: &str, attempt: u32
 
 #[cfg(test)]
 mod tests {
+    use rayon::prelude::*;
     use std::{collections::HashSet, net::Ipv6Addr};
 
     use super::{
         ProxyKeys, generate, watermark_ok,
-        words::{FREEMAIL, WORDS},
+        words::{FIRST, FREEMAIL, LAST, WORDS},
     };
     use crate::{
         Result,
@@ -262,6 +266,9 @@ mod tests {
         "0031 6 12345678",
         "+4915112345678",
         "+1-415-555-2671",
+        "012-00-3456",
+        "012 00 3456",
+        "034-56-0000",
     ];
     const URL_CREDENTIAL: &[&str] = &[
         "admin:hunter2",
@@ -275,6 +282,7 @@ mod tests {
         "db_admin:Passw0rd#1",
         "john:12345",
         "mail:Qwerty!23",
+        "admin:Gr\u{fc}\u{df}e2024",
     ];
     /// Names as people write them: particles, initials, hyphens, apostrophes, accents, every
     /// letter case, one word and six, a particle first.
@@ -416,6 +424,7 @@ mod tests {
         "1600 Pennsylvania Avenue NW, Washington",
         "Stationsplein 9, 3511 CE Utrecht",
         "Lange Voorhout 3 2514 EA Den Haag",
+        "Hauptstr. 12, 10115 Berlin",
     ];
     const LOCATION: &[&str] = &[
         "Amsterdam",
@@ -822,15 +831,16 @@ mod tests {
     }
 
     /// The same characters at the same positions except that every digit and letter is
-    /// replaced by one of its own class.
+    /// replaced by an ASCII one of its own class: a letter of another script by a letter of its
+    /// case, a digit of another script by a digit.
     fn same_layout(original: &str, proxy: &str) -> bool {
         original.chars().count() == proxy.chars().count()
             && original.chars().zip(proxy.chars()).all(|(o, p)| {
-                if o.is_ascii_digit() {
+                if o.is_numeric() {
                     p.is_ascii_digit()
-                } else if o.is_ascii_uppercase() {
+                } else if o.is_alphabetic() && o.is_uppercase() {
                     p.is_ascii_uppercase()
-                } else if o.is_ascii_lowercase() {
+                } else if o.is_alphabetic() {
                     p.is_ascii_lowercase()
                 } else {
                     o == p
@@ -1005,26 +1015,83 @@ mod tests {
         }
     }
 
+    /// The runs of letters of `text` with three letters or more, lower case: the names, domain
+    /// labels and top-level domains that a proxy must not repeat. A shorter run (`de`, `nl`)
+    /// sits inside too many words to count.
+    fn name_parts(text: &str) -> Vec<String> {
+        text.split(|c: char| !c.is_alphabetic())
+            .filter(|part| part.chars().count() >= 3)
+            .map(str::to_lowercase)
+            .collect()
+    }
+
+    /// Whether the list name `word` is one of `parts`, sits inside one or holds one: `smith` and
+    /// `devries` give `jsmith` and `Vries` away as much as the words themselves.
+    fn echoes_any(word: &str, parts: &[String]) -> bool {
+        parts
+            .iter()
+            .any(|part| word.contains(part.as_str()) || part.contains(word))
+    }
+
+    /// Every way to read the local part of an email proxy, `{first}{sep}{last}{dd}`, as a given
+    /// name and a family name of the lists. Without a separator the two run together, so more
+    /// than one reading can fit.
+    fn email_names(local: &str) -> Vec<(&'static str, &'static str)> {
+        let body = local
+            .get(..local.len().saturating_sub(2))
+            .unwrap_or_default();
+        FIRST
+            .into_iter()
+            .filter_map(|first| {
+                let rest = body.strip_prefix(first)?;
+                let last = rest.strip_prefix(['.', '_']).unwrap_or(rest);
+                LAST.into_iter().find(|&l| l == last).map(|l| (first, l))
+            })
+            .collect()
+    }
+
     #[test]
-    fn an_email_proxy_reuses_no_name_of_the_original_local_part() {
+    fn an_email_proxy_reuses_no_name_of_the_original() {
+        // Names written together hide in each other (`smith` in `jsmith`, `john` and `smith`
+        // in `johnsmith`), and a surname can be the domain.
         let originals = [
             "jan.jansen@acme.nl",
             "paul_jansen@acme.nl",
             "maria@gmail.com",
+            "johnsmith@acme.nl",
+            "jsmith@example.org",
+            "jan@jansen.nl",
         ];
         for original in originals {
-            let local = original.split('@').next().unwrap_or_default();
-            let words: Vec<&str> = local.split(['.', '_']).collect();
+            let parts = name_parts(original);
             for seed in 0..=255u8 {
                 let k = ProxyKeys::new([seed; 32], [2; 32]);
-                let proxy = generate(&k, EntityKind::Email, original, 0);
-                let proxy_local = proxy.split('@').next().unwrap_or_default();
-                let proxy_words = proxy_local.split(|c: char| !c.is_alphabetic());
-                for word in proxy_words {
+                for attempt in 0..4 {
+                    let proxy = generate(&k, EntityKind::Email, original, attempt);
+                    let local = proxy.split('@').next().unwrap_or_default();
                     assert!(
-                        !words.iter().any(|w| w.eq_ignore_ascii_case(word)),
+                        email_names(local).iter().any(|&(first, last)| {
+                            !echoes_any(first, &parts) && !echoes_any(last, &parts)
+                        }),
                         "{original} -> {proxy}"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_person_proxy_reuses_no_name_of_the_original() {
+        // `devries` holds `Vries`, and `janet` and `janssen` hold `Jan`.
+        for original in ["Jeroen de Vries", "Jan Jansen"] {
+            let parts = name_parts(original);
+            for seed in 0..=255u8 {
+                let k = ProxyKeys::new([seed; 32], [2; 32]);
+                for attempt in 0..4 {
+                    let proxy = generate(&k, EntityKind::Person, original, attempt);
+                    for word in name_parts(&proxy) {
+                        assert!(!echoes_any(&word, &parts), "{original} -> {proxy}");
+                    }
                 }
             }
         }
@@ -1248,15 +1315,16 @@ mod tests {
         }
     }
 
-    /// Allocates proxies the way the vault does: the first attempt whose candidate differs from
-    /// the original and is not issued yet. Returns the first original that finds none.
+    /// Allocates proxies the way the vault does: for each original in turn, the first attempt
+    /// whose candidate is neither an original of the batch nor a proxy issued before. Returns
+    /// the first original that finds none.
     fn first_unallocated(kind: EntityKind, originals: &[String]) -> Option<String> {
         let k = keys();
-        let mut used: HashSet<String> = HashSet::new();
+        let mut used: HashSet<String> = originals.iter().cloned().collect();
         for original in originals {
             let proxy = (0..4096).find_map(|attempt| {
                 let proxy = generate(&k, kind, original, attempt);
-                (proxy != *original && !used.contains(&proxy)).then_some(proxy)
+                (!used.contains(&proxy)).then_some(proxy)
             });
             match proxy {
                 Some(proxy) => {
@@ -1271,21 +1339,29 @@ mod tests {
 
     #[test]
     fn many_short_originals_of_one_kind_all_get_a_proxy() {
-        // 200 distinct years share 66 base proxies; 900 three-digit values share 900.
+        // No proxy may equal an original of the batch, and the first candidates of these years
+        // and numbers are all originals: the allocation relies on the widened ones.
         let years: Vec<String> = (1900..2100).map(|y| y.to_string()).collect();
-        assert_eq!(first_unallocated(EntityKind::DateOfBirth, &years), None);
         let dates: Vec<String> = (1..=12)
             .flat_map(|m| (1900..2100).step_by(7).map(move |y| format!("{m:02}/{y}")))
             .collect();
-        assert_eq!(first_unallocated(EntityKind::DateOfBirth, &dates), None);
         let numbers: Vec<String> = (100..1000).map(|n| n.to_string()).collect();
-        for kind in [
-            EntityKind::AccountId,
-            EntityKind::DocumentId,
-            EntityKind::PaymentCard,
-        ] {
-            assert_eq!(first_unallocated(kind, &numbers), None, "{kind:?}");
-        }
+        let jobs = [
+            (EntityKind::DateOfBirth, &years),
+            (EntityKind::DateOfBirth, &dates),
+            (EntityKind::AccountId, &numbers),
+            (EntityKind::DocumentId, &numbers),
+            (EntityKind::PaymentCard, &numbers),
+        ];
+        // Each year and number is refused 1000 to 2000 candidates before one is free: the jobs
+        // run side by side.
+        let stuck: Vec<(EntityKind, String)> = jobs
+            .par_iter()
+            .filter_map(|&(kind, originals)| {
+                first_unallocated(kind, originals).map(|original| (kind, original))
+            })
+            .collect();
+        assert!(stuck.is_empty(), "no proxy left for {stuck:?}");
     }
 
     #[test]
@@ -1330,9 +1406,10 @@ mod tests {
     }
 
     /// Values the model emits that no list covers: all caps, two letters, digits, punctuation
-    /// that is neither a space nor a comma, non-Latin scripts, and values whose only words are too
-    /// short to be invented. Each is tried for every kind of the model; those a kind's validator
-    /// accepts must get a proxy inside the vault's candidate budget.
+    /// that is neither a space nor a comma, non-Latin scripts (in a link too), values whose only
+    /// words are too short to be invented, a link with nothing but its scheme and a value whose
+    /// invented words would not fit the length limit. Each is tried for every kind of the model;
+    /// those a kind's validator accepts must get a proxy inside the vault's candidate budget.
     const AWKWARD: &[&str] = &[
         "Sant'Antonio:IT",
         "Villa Sant'Antonio:IT",
@@ -1362,6 +1439,9 @@ mod tests {
         "www.a.io",
         "http://.com",
         "https://example.com/a?b=c",
+        "https://",
+        "https://\u{43f}\u{440}\u{438}\u{43c}\u{435}\u{440}.\u{440}\u{444}",
+        "https://\u{4f8b}\u{5b50}.\u{4e2d}\u{56fd}/\u{5f20}\u{4e09}",
         "/etc/passwd",
         "foo.bar",
         "A/B-C_D",
@@ -1370,6 +1450,11 @@ mod tests {
         "L1",
         "12345",
         "line one\nline two 7",
+        // Fifty two-letter words: valid at 149 bytes, but every invented word is longer.
+        concat!(
+            "NY NJ CT MA RI VT NH ME PA DE MD VA WV NC SC GA FL AL MS TN KY OH IN IL MI ",
+            "WI MN IA MO AR LA TX OK KS NE SD ND MT WY CO NM AZ UT ID NV CA OR WA AK HI"
+        ),
     ];
 
     #[test]
@@ -1403,6 +1488,123 @@ mod tests {
             let proxy = generate(&k, EntityKind::Location, original, 0);
             assert_ne!(proxy, original);
             assert!(accepts(EntityKind::Location, &proxy), "{proxy}");
+        }
+    }
+
+    /// The tokens of an address, split at whitespace and commas.
+    fn tokens(address: &str) -> Vec<&str> {
+        address
+            .split(|c: char| c.is_whitespace() || c == ',')
+            .filter(|token| !token.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn a_street_abbreviated_with_a_dot_is_still_replaced_with_the_town() {
+        // `Hauptstr.` ends in a dot like `ul.` but is the street's name. Only a dot after up to
+        // three letters marks an abbreviation, which stays.
+        let k = keys();
+        for (original, names, kept) in [
+            ("Hauptstr. 12, 10115 Berlin", ["Hauptstr", "Berlin"], ""),
+            (
+                "Bahnhofstr. 3, 1011 Amsterdam",
+                ["Bahnhofstr", "Amsterdam"],
+                "",
+            ),
+            (
+                "ul. D\u{142}uga 5, 00-238 Warszawa",
+                ["D\u{142}uga", "Warszawa"],
+                "ul. ",
+            ),
+        ] {
+            assert!(accepts(EntityKind::PostalAddress, original), "{original}");
+            for attempt in 0..16 {
+                let proxy = generate(&k, EntityKind::PostalAddress, original, attempt);
+                assert!(proxy.starts_with(kept), "{original} -> {proxy}");
+                for name in names {
+                    assert!(!proxy.contains(name), "{original} -> {proxy}");
+                }
+                assert!(
+                    accepts(EntityKind::PostalAddress, &proxy),
+                    "{original} -> {proxy}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_dotted_number_in_an_address_is_redrawn() {
+        // `3.` is a floor, not an abbreviation: its digit says where the person lives.
+        let original = "Keizersgracht 123, Etage 3., 1015 CJ Amsterdam";
+        let k = keys();
+        let mut kept = 0;
+        for attempt in 0..32 {
+            let proxy = generate(&k, EntityKind::PostalAddress, original, attempt);
+            let floor = tokens(&proxy)[3];
+            assert!(
+                floor.len() == 2
+                    && floor.starts_with(|c: char| c.is_ascii_digit())
+                    && floor.ends_with('.'),
+                "{original} -> {proxy}"
+            );
+            kept += usize::from(floor == "3.");
+        }
+        assert!(kept < 16, "{kept} of 32 proxies keep the floor");
+    }
+
+    #[test]
+    fn a_town_written_with_a_combining_mark_is_replaced_whole() {
+        // `u` and U+0308 are one letter. Cut in two, `Zu` is too short for an address to
+        // replace and `rich` is lower case among capitals, so the town came through as it was.
+        let k = keys();
+        for (kind, original, rest) in [
+            (
+                EntityKind::PostalAddress,
+                "Bahnhofstrasse 5, 8001 Zu\u{308}rich",
+                "rich",
+            ),
+            (EntityKind::Location, "Zu\u{308}rich", "rich"),
+            (EntityKind::Location, "Mu\u{308}nchen", "nchen"),
+        ] {
+            assert!(accepts(kind, original), "{original}");
+            for attempt in 0..16 {
+                let proxy = generate(&k, kind, original, attempt);
+                assert_ne!(proxy, original);
+                assert!(
+                    !proxy.contains('\u{308}') && !proxy.contains(rest),
+                    "{original} -> {proxy}"
+                );
+                assert!(accepts(kind, &proxy), "{original} -> {proxy}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_link_in_another_script_keeps_only_its_scheme_and_top_level_domain() {
+        // The host and path were not ASCII, and the proxy has to be: ASCII letters in their place.
+        let k = keys();
+        for (original, tld) in [
+            (
+                "https://\u{43f}\u{440}\u{438}\u{43c}\u{435}\u{440}.\u{440}\u{444}",
+                ".\u{440}\u{444}",
+            ),
+            (
+                "https://\u{4f8b}\u{5b50}.\u{4e2d}\u{56fd}/\u{5f20}\u{4e09}",
+                ".\u{4e2d}\u{56fd}",
+            ),
+        ] {
+            assert!(accepts(EntityKind::IdentifyingLink, original), "{original}");
+            for attempt in 0..16 {
+                let proxy = generate(&k, EntityKind::IdentifyingLink, original, attempt);
+                assert!(
+                    proxy.starts_with("https://") && proxy.contains(tld),
+                    "{original} -> {proxy}"
+                );
+                assert!(
+                    proxy.replacen(tld, "", 1).is_ascii(),
+                    "{original} -> {proxy}"
+                );
+            }
         }
     }
 
@@ -1456,7 +1658,10 @@ mod tests {
     #[test]
     fn debug_output_hides_key_material() {
         let shown = format!("{:?}", ProxyKeys::new([0x41; 32], [0x42; 32]));
-        assert_eq!(shown, "ProxyKeys { .. }");
+        // A derived `Debug` would print the bytes: as numbers, hex or the letters they are.
+        for leaked in ["65", "66", "41", "42", "A", "B"] {
+            assert!(!shown.contains(leaked), "{shown} shows {leaked}");
+        }
     }
 
     // The tests below need the detect agent's validators and detector.
@@ -1486,6 +1691,30 @@ mod tests {
         }
     }
 
+    /// Whether `proxy` is found again, once and whole, in the text a service answers with it.
+    /// Only the patterned kinds have a pattern; the proxies of the listed kinds are found by
+    /// looking for the issued proxy itself.
+    fn assert_found_again(
+        regex: &RegexDetector,
+        kind: EntityKind,
+        original: &str,
+        proxy: &str,
+    ) -> Result<()> {
+        let text = context(kind, proxy);
+        let spans = if kind.is_listed() {
+            IssuedProxies::new(&[(kind, proxy)])?.detect(&text, Mode::Deanonymize)
+        } else {
+            regex.detect(&text, Mode::Deanonymize)
+        };
+        let exact =
+            matches!(spans.as_slice(), [s] if s.kind == kind && text[s.start..s.end] == *proxy);
+        assert!(
+            exact,
+            "{kind:?}: {original} -> {proxy}: {spans:?} in {text:?}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn detector_finds_each_proxy_exactly_once_with_the_same_kind() -> Result<()> {
         let k = keys();
@@ -1494,21 +1723,32 @@ mod tests {
             for original in samples(kind) {
                 for attempt in 0..3 {
                     let proxy = generate(&k, kind, &original, attempt);
-                    let text = context(kind, &proxy);
-                    // Only the patterned kinds have a pattern. The proxies of the listed kinds are
-                    // found by looking for the issued proxy itself.
-                    let spans = if kind.is_listed() {
-                        IssuedProxies::new(&[(kind, proxy.as_str())])?
-                            .detect(&text, Mode::Deanonymize)
-                    } else {
-                        regex.detect(&text, Mode::Deanonymize)
-                    };
-                    let exact = matches!(spans.as_slice(), [s] if s.kind == kind && text[s.start..s.end] == proxy);
-                    assert!(
-                        exact,
-                        "{kind:?}: {original} -> {proxy}: {spans:?} in {text:?}"
-                    );
+                    assert_found_again(&regex, kind, &original, &proxy)?;
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// A vault does not issue the first candidate but the first one that differs from the
+    /// original and, for a kind that carries the watermark, has it: on average the sixteenth,
+    /// far beyond the three attempts the test above looks at.
+    #[test]
+    fn the_candidates_a_vault_issues_are_valid_and_found_again() -> Result<()> {
+        let k = keys();
+        let regex = RegexDetector::new()?;
+        for kind in EntityKind::ALL {
+            for original in samples(kind).into_iter().take(30) {
+                let issued = (0..4096)
+                    .map(|attempt| generate(&k, kind, &original, attempt))
+                    .find(|c| {
+                        *c != original && (!kind.is_watermarked() || watermark_ok(&k, kind, c))
+                    });
+                let Some(proxy) = issued else {
+                    panic!("{kind:?}: {original} has no candidate to issue");
+                };
+                assert!(accepts(kind, &proxy), "{kind:?}: {original} -> {proxy}");
+                assert_found_again(&regex, kind, &original, &proxy)?;
             }
         }
         Ok(())

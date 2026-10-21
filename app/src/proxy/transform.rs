@@ -36,7 +36,7 @@ pub(super) struct ContentType {
 }
 
 impl ContentType {
-    /// `None` when the header is missing or not text.
+    /// `None` when the header is missing or has bytes a header value may not carry.
     pub(super) fn of(headers: &HeaderMap) -> Option<Self> {
         let raw = headers.get(CONTENT_TYPE)?.to_str().ok()?;
         let mut params = raw.split(';');
@@ -221,9 +221,12 @@ fn mask_typed(
                 masked
             })
             .collect(),
-        // Values were typed but cannot be searched for: nothing says what is safe to send, so
-        // the whole request is checked, as without capture.
-        None if typed.has_values() => return mask_detected(engine, resent, texts, found),
+        // Values were typed but cannot be searched for, or capture stopped (and dropped them)
+        // after the caller looked, or cannot see the screen: nothing says what is safe to send,
+        // so the whole request is checked, as without capture.
+        None if typed.has_values() || !typed.is_active() => {
+            return mask_detected(engine, resent, texts, found);
+        }
         // Nothing was typed, so there is nothing to hide.
         None => texts.iter().map(|&text| text.to_owned()).collect(),
     };
@@ -257,13 +260,14 @@ fn mask_detected(
     Ok(masked)
 }
 
-/// Adds every issued proxy found in `texts` to `found.proxies`.
+/// Adds every issued proxy found in `texts` to `found.proxies`. Only the vault's stand-ins are
+/// looked up: no detection runs over the texts again.
 fn note_proxies(engine: &Engine, texts: &[String], found: &mut Found) -> Result<()> {
     let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-    let plans = engine.plan(Mode::Deanonymize, &refs)?;
-    for (text, reps) in refs.iter().zip(&plans) {
-        for rep in reps {
-            found.proxies.insert(text[rep.start..rep.end].to_owned());
+    let spans = engine.proxies_in(&refs)?;
+    for (text, spans) in refs.iter().zip(&spans) {
+        for span in spans {
+            found.proxies.insert(text[span.start..span.end].to_owned());
         }
     }
     Ok(())
@@ -281,7 +285,14 @@ fn mask_text(
 ) -> Result<Vec<u8>> {
     let chunks: Vec<_> = bytes.utf8_chunks().collect();
     let texts: Vec<&str> = chunks.iter().map(std::str::Utf8Chunk::valid).collect();
-    let masked = mask_texts(engine, typed, resent, &texts, found)?;
+    let mut masked = mask_texts(engine, typed, resent, &texts, found)?;
+    // Valid UTF-8, the usual case: the masked text is the whole body, as it is.
+    if let ([chunk], 1) = (chunks.as_slice(), masked.len())
+        && chunk.invalid().is_empty()
+        && let Some(text) = masked.pop()
+    {
+        return Ok(text.into_bytes());
+    }
     let mut out = Vec::with_capacity(bytes.len());
     for (chunk, text) in chunks.iter().zip(&masked) {
         out.extend_from_slice(text.as_bytes());
@@ -1182,6 +1193,25 @@ mod tests {
         let out = utf8(&masked.body);
         assert!(!out.contains("jan.jansen@acme.nl"), "{out}");
         assert_eq!(masked.counts, [("email", 1)]);
+        Ok(())
+    }
+
+    /// `mask_texts` saw the store capturing; by the time `mask_typed` reads it, capture has
+    /// stopped and dropped what it kept.
+    #[test]
+    fn a_store_that_stops_while_a_request_is_masked_does_not_wave_it_through() -> Result<()> {
+        let engine = engine("typed-stopped")?;
+        let stopped = Typed::new();
+        let mut found = Found::default();
+        let masked = mask_typed(
+            &engine,
+            &stopped,
+            Resent::None,
+            &["mail jan.jansen@acme.nl"],
+            &mut found,
+        )?;
+        assert!(!masked[0].contains("jan.jansen@acme.nl"), "{masked:?}");
+        assert_eq!(found.counts(), [("email", 1)]);
         Ok(())
     }
 

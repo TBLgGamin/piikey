@@ -3,8 +3,9 @@
 //!
 //! A file holds a value when either
 //!
-//! 1. the text has it as a whole word, in any ASCII letter case, where the value's spaces match
-//!    any run of whitespace (a name split over two lines is still the name); or
+//! 1. the text has it as a whole word, in any letter case, where the value's spaces match any
+//!    run of whitespace (a name split over two lines is still the name). Only ASCII letters and
+//!    digits make a word longer: a value written straight against accented text still counts; or
 //! 2. the detector found a value of the file that is the same once both are spelled in
 //!    lowercase with only letters, digits and `@` kept. That makes `+31 6 1234 5678` and
 //!    `+31612345678` the same value, and `NL91 ABNA 0417 1643 00` the IBAN
@@ -19,21 +20,20 @@
 use std::{
     borrow::Cow,
     collections::HashMap,
-    fs,
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
 };
 
 use aho_corasick::{AhoCorasick, Input};
 use rayon::prelude::*;
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
     Error, Result,
     engine::Engine,
     files,
     formats::{self, Scanned},
-    inventory::MAX_FILE,
+    inventory::{MAX_FILE, read_capped},
 };
 
 /// A file that holds some of the values searched for.
@@ -47,20 +47,33 @@ pub struct SubjectMatch {
     pub count: u32,
 }
 
+/// A [`SubjectMatch`] as it is written and read.
+#[derive(Serialize, Deserialize)]
+struct Shape<'a> {
+    path: Cow<'a, str>,
+    values: Cow<'a, [usize]>,
+    count: u32,
+}
+
 impl Serialize for SubjectMatch {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        #[derive(Serialize)]
-        struct Shape<'a> {
-            path: Cow<'a, str>,
-            values: &'a [usize],
-            count: u32,
-        }
         Shape {
             path: self.path.to_string_lossy(),
-            values: &self.values,
+            values: Cow::Borrowed(&self.values),
             count: self.count,
         }
         .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SubjectMatch {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let shape = Shape::deserialize(deserializer)?;
+        Ok(Self {
+            path: PathBuf::from(shape.path.into_owned()),
+            values: shape.values.into_owned(),
+            count: shape.count,
+        })
     }
 }
 
@@ -97,7 +110,7 @@ pub fn search(
 
 /// What `path` holds of the values, or `None` when it holds none or cannot be read.
 fn search_file(engine: &Engine, needles: &Needles, path: &Path) -> Option<SubjectMatch> {
-    let bytes = fs::read(path).ok()?;
+    let bytes = read_capped(path).ok().flatten()?;
     let scanned = formats::scan(engine, &bytes, true).ok()?;
     let counts = needles.count_in(&scanned);
     let values: Vec<usize> = counts
@@ -115,13 +128,16 @@ fn search_file(engine: &Engine, needles: &Needles, path: &Path) -> Option<Subjec
 
 /// The values searched for, ready to be looked for in many files.
 struct Needles {
-    /// Every value, trimmed and with its whitespace runs collapsed; ASCII case-insensitive. The
-    /// pattern index is the index of the value.
+    /// Every value, trimmed, with its whitespace runs collapsed, in lowercase. The pattern
+    /// index is the index of the value.
     words: AhoCorasick,
     /// Which values a normalized spelling stands for.
     by_spelling: HashMap<String, Vec<usize>>,
     /// Whether a value holds a space. Only then do the texts have to be collapsed to be searched.
     spaced: bool,
+    /// Whether a value holds a letter outside ASCII. Only then do texts that do have to be
+    /// lowercased to be searched: the automaton folds the case of ASCII letters only.
+    unicode: bool,
 }
 
 impl Needles {
@@ -136,13 +152,14 @@ impl Needles {
             if value.is_empty() {
                 return Err(Error::BadRequest("a value to search for is blank".into()));
             }
-            patterns.push(collapse(value).into_owned());
+            patterns.push(collapse(value).to_lowercase());
             let spelling = normalize(value);
             if !spelling.is_empty() {
                 by_spelling.entry(spelling).or_default().push(index);
             }
         }
         let spaced = patterns.iter().any(|pattern| pattern.contains(' '));
+        let unicode = patterns.iter().any(|pattern| !pattern.is_ascii());
         let words = AhoCorasick::builder()
             .ascii_case_insensitive(true)
             .build(&patterns)
@@ -151,6 +168,7 @@ impl Needles {
             words,
             by_spelling,
             spaced,
+            unicode,
         })
     }
 
@@ -162,6 +180,11 @@ impl Needles {
                 collapse(text)
             } else {
                 Cow::Borrowed(text.as_str())
+            };
+            let text = if self.unicode && !text.is_ascii() {
+                Cow::Owned(text.to_lowercase())
+            } else {
+                text
             };
             for hit in self.words.find_overlapping_iter(Input::new(&*text)) {
                 if stands_alone(&text, hit.start(), hit.end())
@@ -241,7 +264,7 @@ fn stands_alone(text: &str, start: usize, end: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicUsize;
+    use std::{fs, sync::atomic::AtomicUsize};
 
     use super::*;
 
@@ -390,6 +413,33 @@ mod tests {
     }
 
     #[test]
+    fn a_value_with_accents_is_found_in_any_letter_case() -> Res {
+        let tmp = TempDir::new()?;
+        tmp.put("a.txt", "DOSSIER JOSÉ MARTÍNEZ, Utrecht")?;
+        tmp.put("b.txt", "Mevrouw José Martínez")?;
+        tmp.put("c.txt", "JOSÉ MARTINEZ")?;
+        assert_eq!(
+            find(&tmp, &["José Martínez"])?,
+            [
+                ("a.txt".to_owned(), vec![0], 1),
+                ("b.txt".to_owned(), vec![0], 1),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_same_value_twice_is_found_under_both_indexes() -> Res {
+        let tmp = TempDir::new()?;
+        tmp.put("a.txt", "Mevrouw Jansen")?;
+        assert_eq!(
+            find(&tmp, &["Jansen", "JANSEN", "Pietersen"])?,
+            [("a.txt".to_owned(), vec![0, 1], 2)]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn nothing_to_search_for_is_a_bad_request() -> Res {
         let tmp = TempDir::new()?;
         let engine = tmp.engine()?;
@@ -423,16 +473,18 @@ mod tests {
     }
 
     #[test]
-    fn matches_serialize_for_the_api() -> Res {
+    fn a_match_goes_through_json_and_comes_back_equal() -> Res {
         let one = SubjectMatch {
             path: PathBuf::from(r"C:\x\a.txt"),
             values: vec![0, 2],
             count: 3,
         };
+        let json = serde_json::to_value(&one)?;
         assert_eq!(
-            serde_json::to_value(&one)?,
+            json,
             serde_json::json!({"path": r"C:\x\a.txt", "values": [0, 2], "count": 3})
         );
+        assert_eq!(serde_json::from_value::<SubjectMatch>(json)?, one);
         Ok(())
     }
 }

@@ -1,5 +1,5 @@
 //! The named pipe the app and `piikey-cli serve` answer API requests on, and the client that
-//! calls it.
+//! calls it ([`ask`], or [`call`] for a pipe of your choice).
 //!
 //! Request: `b'P', 2, 0, 0, u32 len`, then `len` bytes of JSON, an [`api::Request`].
 //! Response: `status (0 ok, 1 error), 0, 0, 0, u32 len`, then `len` bytes of JSON, the
@@ -52,9 +52,6 @@ const RETRY: Duration = Duration::from_millis(10);
 /// How long stopping a server waits for requests that are still running before it lets go of
 /// them: their threads end when the work does, or with the process.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
-/// What a reply that cannot be encoded is replaced with.
-const UNENCODABLE: &[u8] =
-    br#"{"ok":false,"error":{"code":"internal","message":"the reply could not be encoded"}}"#;
 
 /// The pipe of this user: `\\.\pipe\piikey-<USERNAME>`, so that two users of one machine do not
 /// share one. Characters of the name other than letters, digits, `.`, `_` and `-` become `_`;
@@ -104,11 +101,11 @@ fn parse_request_header(h: [u8; 8]) -> Result<usize> {
     Ok(len)
 }
 
-/// Builds a response frame around a JSON body. A body that does not fit a `u32` length becomes
-/// an error frame instead.
+/// Builds a response frame around the bytes of an envelope. A body that does not fit a `u32`
+/// length becomes an error frame instead.
 fn frame(status: u8, body: Vec<u8>) -> Frame {
     let Ok(len) = u32::try_from(body.len()) else {
-        return reply_frame(Err(ApiError::internal("the reply is too large")));
+        return error_frame(ApiError::internal("the reply is too large"));
     };
     let len = len.to_le_bytes();
     Frame {
@@ -117,21 +114,9 @@ fn frame(status: u8, body: Vec<u8>) -> Frame {
     }
 }
 
-/// The frame that carries `reply`, as its envelope.
-fn reply_frame(reply: Result<Value, ApiError>) -> Frame {
-    let status = if reply.is_ok() { STATUS_OK } else { STATUS_ERR };
-    match serde_json::to_vec(&api::envelope(reply)) {
-        Ok(body) => frame(status, body),
-        Err(_) => frame(STATUS_ERR, UNENCODABLE.to_vec()),
-    }
-}
-
-/// Reads a request and has `handler` answer it. Runs on a blocking thread: parsing a big
-/// request and answering it is work.
-fn dispatch(handler: &dyn Handler, payload: &[u8]) -> Result<Value, ApiError> {
-    let request: Request = serde_json::from_slice(payload)
-        .map_err(|e| ApiError::bad_request(format!("not a request: {e}")))?;
-    handler.handle(request)
+/// The frame that carries `error`, as an envelope.
+fn error_frame(error: ApiError) -> Frame {
+    frame(STATUS_ERR, api::encode(Err(error)))
 }
 
 async fn write_frame(pipe: &mut NamedPipeServer, f: &Frame) -> io::Result<()> {
@@ -147,7 +132,7 @@ async fn handle_connection(mut pipe: NamedPipeServer, handler: Arc<dyn Handler>)
         pipe.read_exact(&mut header).await?;
         let len = match parse_request_header(header) {
             Ok(len) => len,
-            Err(e) => return write_frame(&mut pipe, &reply_frame(Err(e.into()))).await,
+            Err(e) => return write_frame(&mut pipe, &error_frame(e.into())).await,
         };
         // `take` + `read_to_end` grows with the bytes that actually arrive, so a client
         // announcing 512 MiB and sending nothing costs nothing.
@@ -158,12 +143,17 @@ async fn handle_connection(mut pipe: NamedPipeServer, handler: Arc<dyn Handler>)
         if got < len {
             return Err(io::ErrorKind::UnexpectedEof.into());
         }
-        let handler = Arc::clone(&handler);
-        let reply = tokio::task::spawn_blocking(move || dispatch(handler.as_ref(), &payload))
-            .await
-            // The handler panicked: that request fails, the connection and the server live on.
-            .unwrap_or_else(|_| Err(ApiError::internal("the request failed unexpectedly")));
-        write_frame(&mut pipe, &reply_frame(reply)).await?;
+        let answered = api::answer(Arc::clone(&handler), move || {
+            serde_json::from_slice(&payload)
+                .map_err(|e| ApiError::bad_request(format!("not a request: {e}")))
+        })
+        .await;
+        let status = if answered.error.is_none() {
+            STATUS_OK
+        } else {
+            STATUS_ERR
+        };
+        write_frame(&mut pipe, &frame(status, answered.body)).await?;
     }
 }
 
@@ -388,6 +378,26 @@ pub fn call(pipe: &str, request: &Request, connect_timeout: Duration) -> Result<
         .map_err(|_| Error::Protocol("the reply is not JSON"))
 }
 
+/// How long [`ask`] waits for a busy pipe: the app answers within moments, or is not there.
+const ASK_WAIT: Duration = Duration::from_millis(300);
+
+/// Asks whoever serves this user's pipe ([`default_pipe`]) to answer `request`, and opens the
+/// reply: its result, or `Ok(None)` when nobody serves the pipe. For a program that goes to the
+/// app when it is there, and does the work itself when it is not.
+///
+/// # Errors
+/// The server's own error for the request; `busy` when the pipe stays busy; `io` when talking to
+/// the server fails; `bad_request` when the request cannot be sent.
+pub fn ask(request: &Request) -> Result<Option<Value>, ApiError> {
+    ask_on(&default_pipe(), request)
+}
+
+fn ask_on(pipe: &str, request: &Request) -> Result<Option<Value>, ApiError> {
+    call(pipe, request, ASK_WAIT)?
+        .map(api::open_envelope)
+        .transpose()
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -438,7 +448,8 @@ mod tests {
         spawn(Arc::new(Stub), pipe)
     }
 
-    fn ask(pipe: &str, request: &Request) -> std::result::Result<Value, Box<dyn StdError>> {
+    /// The envelope the server on `pipe` answers `request` with.
+    fn envelope_of(pipe: &str, request: &Request) -> std::result::Result<Value, Box<dyn StdError>> {
         let reply = call(pipe, request, Duration::from_secs(5))?.ok_or("nobody listening")?;
         Ok(reply)
     }
@@ -477,27 +488,18 @@ mod tests {
         let f = frame(STATUS_ERR, b"{}".to_vec());
         assert_eq!(f.header, [1, 0, 0, 0, 2, 0, 0, 0]);
         assert_eq!(f.payload, b"{}");
+        // The length is four bytes, little-endian.
+        let long = frame(STATUS_OK, vec![b' '; 0x01_02_03]);
+        assert_eq!(long.header, [0, 0, 0, 0, 3, 2, 1, 0]);
 
-        let ok = reply_frame(Ok(json!({"a": 1})));
-        assert_eq!(ok.header[0], STATUS_OK);
-        let body: Value = serde_json::from_slice(&ok.payload)?;
-        assert_eq!(body, json!({"ok": true, "result": {"a": 1}}));
-        assert_eq!(
-            usize::try_from(u32::from_le_bytes([
-                ok.header[4],
-                ok.header[5],
-                ok.header[6],
-                ok.header[7]
-            ]))?,
-            ok.payload.len()
-        );
-
-        let failed = reply_frame(Err(Error::Protocol("bad magic").into()));
+        let error = Error::Protocol("bad magic");
+        let message = error.to_string();
+        let failed = error_frame(error.into());
         assert_eq!(failed.header[0], STATUS_ERR);
         let body: Value = serde_json::from_slice(&failed.payload)?;
         assert_eq!(
             body,
-            json!({"ok": false, "error": {"code": "bad_request", "message": "protocol: bad magic"}})
+            json!({"ok": false, "error": {"code": "bad_request", "message": message}})
         );
         Ok(())
     }
@@ -526,7 +528,7 @@ mod tests {
         let pipe = test_pipe("roundtrip");
         let server = serve_stub(&pipe)?;
 
-        let reply = ask(
+        let reply = envelope_of(
             &pipe,
             &Request::ScanText {
                 texts: vec!["héllo".into(), "wörld".into()],
@@ -542,14 +544,17 @@ mod tests {
         );
 
         // Errors are envelopes too, and the server goes on.
-        let reply = ask(&pipe, &Request::VaultWipe { confirm: true })?;
+        let reply = envelope_of(&pipe, &Request::VaultWipe { confirm: true })?;
         let error = api::open_envelope(reply).err().ok_or("expected an error")?;
         assert_eq!((error.code(), error.message()), ("busy", "not now"));
-        assert_eq!(ask(&pipe, &Request::Kinds)?["result"]["op"], "kinds");
+        assert_eq!(
+            envelope_of(&pipe, &Request::Kinds)?["result"]["op"],
+            "kinds"
+        );
 
         // A big request: the payload is read in pieces.
         let big = "x".repeat(3 * 1024 * 1024);
-        let reply = ask(
+        let reply = envelope_of(
             &pipe,
             &Request::ScanText {
                 texts: vec![big.clone()],
@@ -561,10 +566,13 @@ mod tests {
         );
 
         // A handler that panics fails that request only.
-        let reply = ask(&pipe, &Request::Status)?;
+        let reply = envelope_of(&pipe, &Request::Status)?;
         assert_eq!(reply["ok"], false);
         assert_eq!(reply["error"]["code"], "internal");
-        assert_eq!(ask(&pipe, &Request::Kinds)?["result"]["op"], "kinds");
+        assert_eq!(
+            envelope_of(&pipe, &Request::Kinds)?["result"]["op"],
+            "kinds"
+        );
 
         // The name is owned: a second server on it is told so.
         let second = serve_stub(&pipe)
@@ -574,6 +582,24 @@ mod tests {
 
         server.stop();
         assert!(call(&pipe, &Request::Kinds, Duration::from_millis(50))?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn ask_gives_the_result_or_the_servers_error() -> TestResult {
+        let pipe = test_pipe("ask");
+        assert_eq!(ask_on(&pipe, &Request::Kinds)?, None);
+        let server = serve_stub(&pipe)?;
+        assert_eq!(
+            ask_on(&pipe, &Request::Kinds)?,
+            Some(json!({"op": "kinds"}))
+        );
+        let refused = ask_on(&pipe, &Request::VaultWipe { confirm: true }).err();
+        assert_eq!(
+            refused.as_ref().map(|e| (e.code(), e.message())),
+            Some(("busy", "not now"))
+        );
+        server.stop();
         Ok(())
     }
 
@@ -744,7 +770,10 @@ mod tests {
         };
         started_rx.recv_timeout(Duration::from_secs(20))?;
         // The slow request is being answered; another client is served meanwhile.
-        assert_eq!(ask(&pipe, &Request::Kinds)?["result"]["op"], "kinds");
+        assert_eq!(
+            envelope_of(&pipe, &Request::Kinds)?["result"]["op"],
+            "kinds"
+        );
         assert!(!slow.is_finished());
         release_tx.send(())?;
         let reply = slow.join().map_err(|_| "the slow client panicked")??;
@@ -761,7 +790,10 @@ mod tests {
         let pipe = test_pipe("drop");
         drop(serve_stub(&pipe)?);
         let again = serve_stub(&pipe)?;
-        assert_eq!(ask(&pipe, &Request::Kinds)?["result"]["op"], "kinds");
+        assert_eq!(
+            envelope_of(&pipe, &Request::Kinds)?["result"]["op"],
+            "kinds"
+        );
         again.stop();
         Ok(())
     }

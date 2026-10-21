@@ -9,10 +9,13 @@
 //! to carry one.
 
 use super::{
-    r#gen::{Case, Xof, case_of, digit_char, restyle},
+    r#gen::{Case, Xof, case_of, digit_char, push_restyled},
     words::{LEGAL_FORMS, ORG_FORM, ORG_HEAD, ORG_TAIL, PLACE_HEAD, PLACE_TAIL, STREET_TAIL},
 };
-use crate::detect::{EntityKind, validate::accepts};
+use crate::detect::{
+    EntityKind,
+    validate::{accepts, is_combining_mark},
+};
 
 /// Longest organization or brand name that is invented, in words.
 const MAX_WORDS: usize = 3;
@@ -29,9 +32,10 @@ fn checked(kind: EntityKind, value: String) -> Option<String> {
     accepts(kind, &value).then_some(value)
 }
 
-/// Rewrites letters and digits of `original`: each ASCII letter or digit becomes a random one of
-/// its class, a non-ASCII letter becomes an ASCII letter of its case, and every other character
-/// stays. A first digit that was not `0` stays not `0`. With `digits_only` letters stay too.
+/// Rewrites letters and digits of `original`: each letter becomes a random ASCII one of its case
+/// and each digit a random one, whatever the script, and every other character stays. A first
+/// ASCII digit that was not `0` stays not `0`. With `digits_only` only the ASCII digits are
+/// redrawn.
 fn shape(original: &str, xof: &mut Xof, digits_only: bool) -> String {
     let mut out = String::with_capacity(original.len());
     let mut first_digit = true;
@@ -46,14 +50,8 @@ fn shape(original: &str, xof: &mut Xof, digits_only: bool) -> String {
             out.push(digit_char(d));
         } else if digits_only {
             out.push(c);
-        } else if c.is_ascii_alphabetic() {
-            out.push(xof.alnum_like(c));
-        } else if c.is_alphabetic() {
-            out.push(xof.alnum_like(if c.is_uppercase() { 'A' } else { 'a' }));
-        } else if c.is_numeric() {
-            out.push(digit_char(xof.digit()));
         } else {
-            out.push(c);
+            out.push(xof.alnum_like(c));
         }
     }
     out
@@ -150,8 +148,9 @@ fn runs(s: &str) -> Vec<(bool, &str)> {
 }
 
 /// Splits `s` into alternating runs of non-word text and words, in order, as `(is_word, text)`.
-/// A word is letters with `-` and apostrophes between them (`Sint-Michielsgestel`); digits,
-/// `:`, `.`, `/` and the rest are never part of one, so `Sant'Antonio:IT` is two words.
+/// A word is letters with `-` and apostrophes between them (`Sint-Michielsgestel`), and with the
+/// combining marks that follow its letters in decomposed text (`u` and U+0308); digits, `:`,
+/// `.`, `/` and the rest are never part of one, so `Sant'Antonio:IT` is two words.
 fn segments(s: &str) -> Vec<(bool, &str)> {
     let chars: Vec<(usize, char)> = s.char_indices().collect();
     let mut out = Vec::new();
@@ -160,11 +159,12 @@ fn segments(s: &str) -> Vec<(bool, &str)> {
     for (i, &(at, c)) in chars.iter().enumerate() {
         let inner = matches!(c, '-' | '\'' | '\u{2019}')
             && i > 0
-            && chars[i - 1].1.is_alphabetic()
+            && (chars[i - 1].1.is_alphabetic() || is_combining_mark(chars[i - 1].1))
             && chars
                 .get(i + 1)
                 .is_some_and(|&(_, next)| next.is_alphabetic());
-        let word = c.is_alphabetic() || inner;
+        let mark = is_combining_mark(c) && previous == Some(true);
+        let word = c.is_alphabetic() || inner || mark;
         if previous.is_some_and(|p| p != word) {
             out.push((previous == Some(true), &s[start..at]));
             start = at;
@@ -190,15 +190,21 @@ fn is_capitalised(token: &str) -> bool {
         .is_some_and(char::is_uppercase)
 }
 
-/// `head` + `tail` as one invented word in the case of `like`.
-fn invented(head: &[&'static str], tail: &[&'static str], like: &str, xof: &mut Xof) -> String {
-    let word = format!("{}{}", xof.pick(head), xof.pick(tail));
-    restyle(&word, case_of(like))
+/// Appends `head` + `tail` to `out` as one invented word in the case of `like`.
+fn push_invented(
+    out: &mut String,
+    head: &[&'static str],
+    tail: &[&'static str],
+    like: &str,
+    xof: &mut Xof,
+) {
+    push_restyled(out, &[xof.pick(head), xof.pick(tail)], case_of(like));
 }
 
 /// `out` unless it is the original, which no proxy may be: then every letter and digit of the
-/// original is redrawn instead, so a value always has a proxy as long as it has any letter or
-/// digit (a place such as `Sant'Antonio:IT` or `IT`, a link whose only variable part is kept).
+/// original is redrawn instead. A value gets a proxy this way whenever it is still valid with
+/// other letters and digits (a place such as `Sant'Antonio:IT` or `IT`, a link that is only a
+/// scheme).
 fn differing(original: &str, out: String, xof: &mut Xof) -> String {
     if out == original {
         shape(original, xof, false)
@@ -207,11 +213,19 @@ fn differing(original: &str, out: String, xof: &mut Xof) -> String {
     }
 }
 
+/// A token that stays in an address because it only abbreviates a word: a dot after at most
+/// three letters, and no digit (`ul.`, `St.`, `Nr.`). A longer one (`Hauptstr.`) is a name.
+fn is_abbreviation(token: &str) -> bool {
+    token.ends_with('.') && letters(token) <= 3 && !token.bytes().any(|b| b.is_ascii_digit())
+}
+
 /// A postal address. Separators stay. The first capitalised word of three letters or more (the
 /// street) becomes `{org head}{street ending}`, later ones (the town) become invented places,
 /// tokens with a digit are redrawn and everything else (`ul.`, `de`, `CJ`) stays. An address
 /// without a capitalised word has its lower-case words treated the same way. When that leaves
-/// the address as it was, every word is replaced, whatever its length or case.
+/// the address as it was, every word is replaced, whatever its length or case. The invented words
+/// are longer than most of those they replace: a value that would not fit the length limit that
+/// way has its letters and digits redrawn instead, see [`shape`].
 pub(super) fn address(kind: EntityKind, original: &str, xof: &mut Xof) -> Option<String> {
     let out = address_pass(original, xof, false);
     let out = if out == original {
@@ -220,6 +234,7 @@ pub(super) fn address(kind: EntityKind, original: &str, xof: &mut Xof) -> Option
         out
     };
     checked(kind, differing(original, out, xof))
+        .or_else(|| checked(kind, shape(original, xof, false)))
 }
 
 /// One rewrite of an address; `every_word` replaces all words and not only the long, capitalised
@@ -227,7 +242,7 @@ pub(super) fn address(kind: EntityKind, original: &str, xof: &mut Xof) -> Option
 fn address_pass(original: &str, xof: &mut Xof, every_word: bool) -> String {
     let parts = runs(original);
     let capitalised = parts.iter().any(|&(sep, t)| {
-        !sep && !t.ends_with('.')
+        !sep && !is_abbreviation(t)
             && segments(t)
                 .iter()
                 .any(|&(w, s)| w && letters(s) >= 3 && is_capitalised(s))
@@ -235,7 +250,7 @@ fn address_pass(original: &str, xof: &mut Xof, every_word: bool) -> String {
     let mut out = String::with_capacity(original.len());
     let mut street = true;
     for (separator, token) in parts {
-        if separator || (!every_word && token.ends_with('.')) {
+        if separator || (!every_word && is_abbreviation(token)) {
             out.push_str(token);
         } else if token.bytes().any(|b| b.is_ascii_digit()) {
             out.push_str(&shape(token, xof, false));
@@ -248,9 +263,9 @@ fn address_pass(original: &str, xof: &mut Xof, every_word: bool) -> String {
                     out.push_str(part);
                 } else if street {
                     street = false;
-                    out.push_str(&invented(&ORG_HEAD, &STREET_TAIL, part, xof));
+                    push_invented(&mut out, &ORG_HEAD, &STREET_TAIL, part, xof);
                 } else {
-                    out.push_str(&invented(&PLACE_HEAD, &PLACE_TAIL, part, xof));
+                    push_invented(&mut out, &PLACE_HEAD, &PLACE_TAIL, part, xof);
                 }
             }
         }
@@ -261,7 +276,8 @@ fn address_pass(original: &str, xof: &mut Xof, every_word: bool) -> String {
 /// A place: every capitalised word becomes an invented place in the case of the original word
 /// (4096 combinations per word). A value without a capitalised word has its lower-case words of
 /// three letters or more replaced instead. When that leaves the value as it was (`ab`, `Ab12`),
-/// every word is replaced, and a value without any word has its letters and digits redrawn.
+/// every word is replaced, and a value without any word has its letters and digits redrawn. So
+/// does a value that would not fit the length limit with invented words in it, see [`shape`].
 pub(super) fn place(kind: EntityKind, original: &str, xof: &mut Xof) -> Option<String> {
     let out = place_pass(original, xof, false);
     let out = if out == original {
@@ -270,6 +286,7 @@ pub(super) fn place(kind: EntityKind, original: &str, xof: &mut Xof) -> Option<S
         out
     };
     checked(kind, differing(original, out, xof))
+        .or_else(|| checked(kind, shape(original, xof, false)))
 }
 
 /// One rewrite of a place; `every_word` replaces all words, whatever their length or case.
@@ -288,7 +305,7 @@ fn place_pass(original: &str, xof: &mut Xof, every_word: bool) -> String {
                     letters(part) >= 3
                 });
         if replace {
-            out.push_str(&invented(&PLACE_HEAD, &PLACE_TAIL, part, xof));
+            push_invented(&mut out, &PLACE_HEAD, &PLACE_TAIL, part, xof);
         } else {
             out.push_str(part);
         }
@@ -303,12 +320,15 @@ fn is_legal_form(token: &str) -> bool {
     LEGAL_FORMS.contains(&form)
 }
 
-/// One invented word per word of `original`, at most [`MAX_WORDS`], in the case of each.
-fn invented_words<'a>(words: impl Iterator<Item = &'a str>, xof: &mut Xof) -> Vec<String> {
-    words
-        .take(MAX_WORDS)
-        .map(|word| invented(&ORG_HEAD, &ORG_TAIL, word, xof))
-        .collect()
+/// Appends one invented word per word of `words`, at most [`MAX_WORDS`], in the case of each and
+/// separated by spaces.
+fn push_invented_words<'a>(out: &mut String, words: impl Iterator<Item = &'a str>, xof: &mut Xof) {
+    for (i, word) in words.take(MAX_WORDS).enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        push_invented(out, &ORG_HEAD, &ORG_TAIL, word, xof);
+    }
 }
 
 /// An organization: one invented word per word of the name. A closing legal form stays as it was
@@ -321,26 +341,29 @@ pub(super) fn organization(kind: EntityKind, original: &str, xof: &mut Xof) -> O
     } else {
         &words[..]
     };
-    let mut out = invented_words(body.iter().copied(), xof).join(" ");
+    let mut out = String::new();
+    push_invented_words(&mut out, body.iter().copied(), xof);
     if let Some(form) = words.last().filter(|_| legal) {
         out.push(' ');
         out.push_str(form);
     } else if words.len() >= 2 {
         out.push(' ');
-        out.push_str(&restyle(xof.pick(&ORG_FORM), Case::Title));
+        push_restyled(&mut out, &[xof.pick(&ORG_FORM)], Case::Title);
     }
     checked(kind, out)
 }
 
 /// A brand or other proper name: one invented word per word, at most [`MAX_WORDS`].
 pub(super) fn brand(kind: EntityKind, original: &str, xof: &mut Xof) -> Option<String> {
-    let out = invented_words(original.split_whitespace(), xof).join(" ");
+    let mut out = String::new();
+    push_invented_words(&mut out, original.split_whitespace(), xof);
     checked(kind, out)
 }
 
 /// A link. A leading `https://`, `http://` and `www.` and the final label of the host (the
-/// top-level domain) stay; every other ASCII letter and digit is redrawn. A link that has
-/// nothing else to redraw (`http://.com`) loses the kept top-level domain too.
+/// top-level domain) stay; every other letter and digit, of any script, becomes an ASCII one. A
+/// link that has nothing else to redraw (`http://.com`) loses the kept top-level domain too, and
+/// one that is nothing but a scheme (`https://`) has its letters redrawn.
 pub(super) fn link(kind: EntityKind, original: &str, xof: &mut Xof) -> Option<String> {
     let out = link_pass(original, xof, true);
     let out = if out == original {
@@ -348,7 +371,7 @@ pub(super) fn link(kind: EntityKind, original: &str, xof: &mut Xof) -> Option<St
     } else {
         out
     };
-    checked(kind, out)
+    checked(kind, differing(original, out, xof))
 }
 
 /// One rewrite of a link; `keep_tld` leaves the final host label as it is.

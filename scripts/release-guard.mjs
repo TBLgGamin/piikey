@@ -84,10 +84,18 @@ function lines(text) {
   return text.split(/\r?\n/).filter((line) => line.length > 0);
 }
 
+/** The checked-out branch, or '' when HEAD is detached. Works before the first commit. */
+function currentBranch() {
+  try {
+    return git('symbolic-ref', '--short', '-q', 'HEAD').trim();
+  } catch {
+    return '';
+  }
+}
+
 function staged() {
   checkStructure(':');
-  const branch = git('rev-parse', '--abbrev-ref', 'HEAD').trim();
-  if (branch.startsWith(RELEASE_BRANCH)) {
+  if (currentBranch().startsWith(RELEASE_BRANCH)) {
     return;
   }
   // `HEAD:` is absent in a repository without commits; show() then yields null and nothing compares.

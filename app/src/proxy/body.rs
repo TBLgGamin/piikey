@@ -33,7 +33,10 @@ pub(super) async fn next_data(body: &mut Body) -> Option<Result<Bytes, BodyError
 
 /// The whole body, or an error when it is longer than `limit` bytes.
 pub(super) async fn collect(mut body: Body, limit: usize) -> Result<Vec<u8>, CollectError> {
-    let mut out = Vec::new();
+    // What the body announces is the size of the buffer, as far as the limit allows: no regrowth
+    // (and no doubled peak) for a big upload.
+    let announced = usize::try_from(body.size_hint().lower()).map_or(limit, |size| size.min(limit));
+    let mut out = Vec::with_capacity(announced);
     while let Some(data) = next_data(&mut body).await {
         let data = data.map_err(CollectError::Read)?;
         if out.len() + data.len() > limit {

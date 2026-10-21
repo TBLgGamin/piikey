@@ -6,12 +6,12 @@
 //! already seen. [`worth_running`] and [`Cache`] spare the model both.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, VecDeque, hash_map::Entry},
     sync::Arc,
 };
 
 use crate::{
-    detect::{EntityKind, Span},
+    detect::{EntityKind, Span, overlaps_bytes},
     restore::STOPWORDS,
 };
 
@@ -37,7 +37,7 @@ pub(super) struct RawSpan {
 ///   nothing left to find.
 pub(super) fn worth_running(text: &str, taken: &[Span]) -> bool {
     let loose = text.chars().any(|c| c.is_whitespace() || c.is_uppercase());
-    loose && candidate_words(text).any(|(start, end)| !overlaps(taken, start, end))
+    loose && candidate_words(text).any(|(start, end)| !overlaps_bytes(taken, start, end))
 }
 
 /// Byte ranges of the words that could be an entity: runs of letters and digits (`'` and `-`
@@ -86,19 +86,17 @@ fn is_stopword(word: &str) -> bool {
         .is_ok()
 }
 
-/// True when `start..end` shares a byte with a span of `taken`, which is sorted and disjoint.
-fn overlaps(taken: &[Span], start: usize, end: usize) -> bool {
-    let next = taken.partition_point(|span| span.end <= start);
-    taken.get(next).is_some_and(|span| span.start < end)
-}
-
 /// The cache key of a text: its BLAKE3 hash. The cache keeps no text.
 pub(super) fn key(text: &str) -> [u8; 32] {
     *blake3::hash(text.as_bytes()).as_bytes()
 }
 
-/// What the model found per text, newest `CACHE_CAPACITY` texts. First in, first out: the model
-/// is deterministic, so an entry never goes stale; the bound only caps memory.
+/// What the model found per text, newest `CACHE_CAPACITY` texts. First in, first out: what the
+/// model found for a text does not go stale, so the bound only caps memory.
+///
+/// A text keeps the answer it got first: the model is INT8 with dynamic quantization, so a
+/// borderline decision can differ between two batches, and two calls that run the same text at
+/// once (a chat client sends one conversation twice) must not each leave their own answer.
 ///
 /// The value is shared, so a hit costs a pointer copy and no lock is held while it is used.
 #[derive(Debug)]
@@ -121,21 +119,26 @@ impl Cache {
         self.map.get(key).cloned()
     }
 
-    /// Remembers `spans` for `key`, forgetting the oldest entry when full. An entry that is
-    /// already there is replaced and keeps its place in the order.
-    pub(super) fn insert(&mut self, key: [u8; 32], spans: Arc<[RawSpan]>) {
+    /// Remembers `spans` for `key` unless the text is there already, and forgets the oldest entry
+    /// when full. Returns what the cache holds for `key` afterwards: the earlier answer when
+    /// there was one, so that a call that ran the text a second time uses the first answer too.
+    pub(super) fn insert(&mut self, key: [u8; 32], spans: Arc<[RawSpan]>) -> Arc<[RawSpan]> {
         if self.capacity == 0 {
-            return;
+            return spans;
         }
-        if self.map.insert(key, spans).is_some() {
-            return;
-        }
-        self.order.push_back(key);
-        while self.map.len() > self.capacity {
-            let Some(oldest) = self.order.pop_front() else {
-                break;
-            };
-            self.map.remove(&oldest);
+        match self.map.entry(key) {
+            Entry::Occupied(held) => Arc::clone(held.get()),
+            Entry::Vacant(slot) => {
+                slot.insert(Arc::clone(&spans));
+                self.order.push_back(key);
+                while self.map.len() > self.capacity {
+                    let Some(oldest) = self.order.pop_front() else {
+                        break;
+                    };
+                    self.map.remove(&oldest);
+                }
+                spans
+            }
         }
     }
 
@@ -295,14 +298,13 @@ mod tests {
     }
 
     #[test]
-    fn the_oldest_entry_goes_first_and_a_replacement_keeps_its_place() {
+    fn the_oldest_entry_goes_first_and_asking_again_does_not_make_it_newer() {
         let mut cache = Cache::new(3);
         let keys: Vec<[u8; 32]> = (0..5).map(|n| key(&format!("text {n}"))).collect();
         for k in &keys[..3] {
             cache.insert(*k, Vec::new().into());
         }
-        // Replacing the oldest does not make it newer.
-        cache.insert(keys[0], vec![raw(0, 4)].into());
+        cache.insert(keys[0], Vec::new().into());
         assert_eq!(cache.len(), 3);
         cache.insert(keys[3], Vec::new().into());
         assert_eq!(cache.len(), 3);
@@ -313,6 +315,27 @@ mod tests {
         for k in &keys[2..] {
             assert!(cache.get(k).is_some());
         }
+    }
+
+    #[test]
+    fn a_text_keeps_the_answer_it_got_first() {
+        let mut cache = Cache::new(4);
+        let k = key("Jan Kowalski");
+        let first: Arc<[RawSpan]> = vec![raw(0, 3)].into();
+        let second: Arc<[RawSpan]> = vec![raw(0, 12)].into();
+
+        assert!(Arc::ptr_eq(&cache.insert(k, Arc::clone(&first)), &first));
+        // A second call computed the same text meanwhile: it gets the first answer, and so
+        // does everyone after it.
+        assert!(Arc::ptr_eq(&cache.insert(k, second), &first));
+        assert!(cache.get(&k).is_some_and(|held| Arc::ptr_eq(&held, &first)));
+        assert_eq!(cache.len(), 1);
+
+        // A cache that stores nothing hands the answer back as it is.
+        let mut none = Cache::new(0);
+        let spans: Arc<[RawSpan]> = vec![raw(0, 3)].into();
+        assert!(Arc::ptr_eq(&none.insert(k, Arc::clone(&spans)), &spans));
+        assert!(none.get(&k).is_none());
     }
 
     #[test]

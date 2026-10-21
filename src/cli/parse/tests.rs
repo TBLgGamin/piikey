@@ -472,11 +472,33 @@ fn settings_set_rejects_what_is_not_a_setting() {
     assert!(invalid_value(&["settings", "set", "highlight=loud"]));
     assert!(invalid_value(&["settings", "set", "inventory=maybe"]));
     assert!(invalid_value(&["settings", "set", "http_port=70000"]));
+    assert!(invalid_value(&["settings", "set", "http_port=0"]));
     assert!(invalid_value(&["settings", "set", "http_port=x"]));
     assert!(invalid_value(&["settings", "set", "colour=red"]));
     assert!(invalid_value(&["settings", "set", "site"]));
     // Protection is switched with its own command.
     assert!(invalid_value(&["settings", "set", "enabled=true"]));
+}
+
+#[test]
+fn settings_set_takes_every_key_of_the_settings_file_but_protection() {
+    for key in piikey::policy::KEYS
+        .into_iter()
+        .filter(|key| *key != "enabled")
+    {
+        let value = match key {
+            "highlight" => "off",
+            "http_port" => "8080",
+            "explorer_menu" | "inventory" | "http_api" => "true",
+            // The list keys: an empty value empties the list.
+            _ => "",
+        };
+        let line = format!("{key}={value}");
+        assert!(
+            try_parse(&["settings", "set", &line]).is_ok(),
+            "settings set refuses {key}"
+        );
+    }
 }
 
 #[test]

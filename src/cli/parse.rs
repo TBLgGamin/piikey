@@ -14,7 +14,7 @@ use lexopt::{Arg, Parser, ValueExt};
 use piikey::{
     api::{Format, Request},
     detect::EntityKind,
-    policy::{Highlight, SettingsPatch},
+    policy::{Highlight, KEYS, SettingsPatch, valid_port},
 };
 
 /// A parsed command line.
@@ -637,12 +637,13 @@ fn number(parser: &mut Parser, opt: Opt) -> Result<usize, ParseError> {
 fn port(parser: &mut Parser) -> Result<u16, ParseError> {
     let value = parser.value()?;
     let text = value.to_string_lossy();
-    match text.parse::<u16>() {
-        Ok(port) if port > 0 => Ok(port),
-        _ => Err(invalid(format!(
-            "--port needs a port from 1 to 65535, not '{text}'"
-        ))),
-    }
+    parse_port(&text)
+        .ok_or_else(|| invalid(format!("--port needs a port from 1 to 65535, not '{text}'")))
+}
+
+/// `text` as a port the API can listen on.
+fn parse_port(text: &str) -> Option<u16> {
+    text.parse().ok().filter(|&port| valid_port(port))
 }
 
 fn format(text: &str) -> Result<Format, ParseError> {
@@ -692,8 +693,10 @@ fn fail_on(before: Option<FailOn>, text: &str) -> Result<FailOn, ParseError> {
 }
 
 /// The keys `settings set` takes: the `guard.cfg` keys, except `enabled` (that is `protection`).
-const SETTINGS: &str = "highlight, explorer_menu, inventory, http_api, http_port, site, program, \
-                        disabled_kind, inventory_root, inventory_exclude";
+fn settings_keys() -> String {
+    let keys: Vec<&str> = KEYS.into_iter().filter(|key| *key != "enabled").collect();
+    keys.join(", ")
+}
 
 /// `settings set KEY=VALUE...` as a patch. A list key repeats, once per element; with an empty
 /// value it empties the list.
@@ -726,7 +729,7 @@ fn settings_patch(pairs: &[OsString]) -> Result<SettingsPatch, ParseError> {
             "inventory" => patch.inventory = Some(switch(key, value)?),
             "http_api" => patch.http_api = Some(switch(key, value)?),
             "http_port" => {
-                patch.http_port = Some(value.parse().map_err(|_| {
+                patch.http_port = Some(parse_port(value).ok_or_else(|| {
                     invalid(format!(
                         "http_port needs a port from 1 to 65535, not '{value}'"
                     ))
@@ -739,7 +742,8 @@ fn settings_patch(pairs: &[OsString]) -> Result<SettingsPatch, ParseError> {
             }
             other => {
                 return Err(invalid(format!(
-                    "unknown setting '{other}': the settings are {SETTINGS}"
+                    "unknown setting '{other}': the settings are {}",
+                    settings_keys()
                 )));
             }
         }

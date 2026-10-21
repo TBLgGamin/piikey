@@ -3,15 +3,17 @@
 //! A candidate is a pure function of `(gen key, kind, original, attempt)`. Those inputs feed
 //! a keyed BLAKE3 XOF and every random choice is read from that stream, so the same inputs
 //! always give the same proxy while different attempts give independent candidates. The vault
-//! walks `attempt = 0, 1, 2, ...` until a candidate carries the watermark and is unused.
+//! walks `attempt = 0, 1, 2, ...` until a candidate is unused and, for a kind that carries the
+//! watermark, has it.
 //!
 //! Unless a kind says otherwise, non-alphanumeric characters keep their positions and every
 //! digit, upper-case letter or lower-case letter stays in its class.
 //!
 //! Two kinds are shaped on purpose so that deanonymizing, which cannot ask for context, never
-//! mistakes them for a kind that outranks them. A bare nine-digit run is claimed by `UsSsn`
-//! first, so a bare `NlBsn` proxy always has an area number in 900-999, and a bare nine-digit
-//! `Phone` proxy has group `00`; both are rejected as SSNs. See [`bsn`] and [`phone`].
+//! mistakes them for a kind that outranks them. `UsSsn` claims a bare nine-digit run first, so a
+//! bare `NlBsn` proxy always has an area number in 900-999. It claims `ddd-dd-dddd` too, so a
+//! nine-digit `Phone` proxy, bare or in that layout, has group `00`. Both are rejected as SSNs.
+//! See [`bsn`] and [`phone`].
 //!
 //! A `Person` keeps its particles and shape and takes every other word from the name lists.
 //! See [`person`].
@@ -22,7 +24,7 @@ use blake3::{BLOCK_LEN, Hasher, OutputReader};
 
 use super::{
     ProxyKeys, model,
-    words::{FIRST, FREEMAIL, LAST, WORDS},
+    words::{FIRST, FREEMAIL, LAST, WORDS, is_particle},
 };
 use crate::detect::{EntityKind, validate::accepts};
 
@@ -180,14 +182,16 @@ impl Xof {
         items.get(index).copied().unwrap_or("")
     }
 
-    /// A random character of the same class as `c`; anything but a letter or digit stays.
+    /// A random ASCII character of the same class as `c`: a letter of any script becomes a letter
+    /// in its case, a digit of any script a digit. Anything else stays.
     pub(super) fn alnum_like(&mut self, c: char) -> char {
-        let base = match c {
-            'A'..='Z' => 'A',
-            'a'..='z' => 'a',
-            '0'..='9' => return digit_char(self.digit()),
-            other => return other,
-        };
+        if c.is_numeric() {
+            return digit_char(self.digit());
+        }
+        if !c.is_alphabetic() {
+            return c;
+        }
+        let base = if c.is_uppercase() { 'A' } else { 'a' };
         char::from_u32(u32::from(base) + self.below(26)).unwrap_or(base)
     }
 
@@ -256,11 +260,11 @@ fn secret_literal_len(s: &str) -> usize {
     }
 }
 
-/// `user:pass`: the user becomes `{first}{dd}`, the password keeps its length and character
-/// classes.
+/// `user:pass`: the user becomes `{first}{dd}`, the password keeps its length and layout, each
+/// letter and digit, of any script, becoming an ASCII one of its class.
 fn url_credential(original: &str, xof: &mut Xof) -> String {
     let mut out = String::with_capacity(original.len() + 8);
-    out.push_str(fresh_word(xof, &FIRST, original, &mut Vec::new()));
+    out.push_str(fresh_word(xof, &FIRST, original, &[]));
     out.push(digit_char(xof.digit()));
     out.push(digit_char(xof.digit()));
     if let Some((_, password)) = original.split_once(':') {
@@ -283,10 +287,10 @@ fn email(original: &str, xof: &mut Xof) -> String {
         ""
     };
     let mut out = String::with_capacity(48);
-    let mut placed = Vec::new();
-    out.push_str(fresh_word(xof, &FIRST, local, &mut placed));
+    let first = fresh_word(xof, &FIRST, original, &[]);
+    out.push_str(first);
     out.push_str(sep);
-    out.push_str(fresh_word(xof, &LAST, local, &mut placed));
+    out.push_str(fresh_word(xof, &LAST, original, &[first]));
     out.push(digit_char(xof.digit()));
     out.push(digit_char(xof.digit()));
     out.push('@');
@@ -400,12 +404,11 @@ fn ipv6(original: &str, xof: &mut Xof) -> String {
     while segments[7] == 0 {
         segments[7] = xof.hextet();
     }
-    let text = Ipv6Addr::from(segments).to_string();
+    let mut text = Ipv6Addr::from(segments).to_string();
     if original.bytes().any(|b| matches!(b, b'A'..=b'F')) {
-        text.to_ascii_uppercase()
-    } else {
-        text
+        text.make_ascii_uppercase();
     }
+    text
 }
 
 /// Keeps the vendor prefix (first three octets), separators and case; the last three octets
@@ -476,8 +479,18 @@ fn ssn(original: &str, xof: &mut Xof) -> String {
     };
     let group = 1 + xof.below(99);
     let serial = 1 + xof.below(9999);
-    let digits = format!("{area:03}{group:02}{serial:04}");
-    render_digits(original, digits.chars(), xof)
+    let digits = [
+        area / 100,
+        area / 10 % 10,
+        area % 10,
+        group / 10,
+        group % 10,
+        serial / 1000,
+        serial / 100 % 10,
+        serial / 10 % 10,
+        serial % 10,
+    ];
+    render_digits(original, digits.into_iter().map(digit_char), xof)
 }
 
 /// Eight random digits plus the 11-proof check digit, in the original's layout. `None`
@@ -510,41 +523,18 @@ fn bsn(original: &str, xof: &mut Xof) -> Option<String> {
     ))
 }
 
-/// True when the nine digits of `s` pass the BSN 11-proof.
-fn is_bsn(s: &str) -> bool {
-    let sum: u32 = s
-        .chars()
-        .filter_map(|c| c.to_digit(10))
-        .zip(BSN_WEIGHTS)
-        .map(|(d, w)| d * w)
-        .sum();
-    sum.is_multiple_of(11)
-}
-
-/// `dddd.dd.ddd` BSN layout: four digits, a dot, two digits, a dot, three digits.
-fn is_dotted_bsn_layout(s: &str) -> bool {
-    let b = s.as_bytes();
-    b.len() == 11
-        && b.iter().enumerate().all(|(i, c)| {
-            if i == 4 || i == 7 {
-                *c == b'.'
-            } else {
-                c.is_ascii_digit()
-            }
-        })
-}
-
 /// Keeps the `+`/`00`/trunk `0` prefix, the country code and the first national digit (the
 /// mobile or landline marker); every other digit is random. NANP area codes and exchanges
 /// start with 2-9.
 ///
-/// Phones rank below SSN and BSN, which only demand a keyword when anonymizing. So a bare
-/// nine-digit national number gets group `00` (never an SSN) and, like a dotted `4.2.3`
-/// layout, is rejected when it happens to pass the BSN 11-proof.
+/// Phones rank below SSN and BSN, which only demand a keyword when anonymizing. So a national
+/// number of nine digits, bare or laid out like an SSN (`012-00-3456`, a phone because its
+/// group is `00`), gets group `00` (never an SSN) and, like a dotted `4.2.3` layout, is
+/// rejected when it happens to pass the BSN 11-proof.
 fn phone(original: &str, xof: &mut Xof) -> Option<String> {
     let total = original.chars().filter(char::is_ascii_digit).count();
     let (keep, nanp_leads) = phone_lead(original, total);
-    let bare_nine = total == 9 && original.len() == 9;
+    let ssn_layout = is_ssn_layout(original, total);
     let mut out = String::with_capacity(original.len());
     let mut index = 0;
     for c in original.chars() {
@@ -556,7 +546,7 @@ fn phone(original: &str, xof: &mut Xof) -> Option<String> {
             orig
         } else if nanp_leads.contains(&Some(index)) {
             2 + xof.below(8)
-        } else if bare_nine && (index == 3 || index == 4) {
+        } else if ssn_layout && (index == 3 || index == 4) {
             0
         } else {
             xof.digit()
@@ -564,8 +554,18 @@ fn phone(original: &str, xof: &mut Xof) -> Option<String> {
         out.push(digit_char(digit));
         index += 1;
     }
-    let bsn_shaped = bare_nine || is_dotted_bsn_layout(original);
-    (!bsn_shaped || !is_bsn(&out)).then_some(out)
+    (!accepts(EntityKind::NlBsn, &out)).then_some(out)
+}
+
+/// True when `original`, which has `total` ASCII digits, is nine digits written bare
+/// (`012003456`) or in the layout of an SSN (`012-00-3456`, `012 00 3456`).
+fn is_ssn_layout(original: &str, total: usize) -> bool {
+    total == 9
+        && (original.len() == 9
+            || matches!(
+                original.as_bytes(),
+                [_, _, _, x @ (b'-' | b' '), _, _, y, _, _, _, _] if x == y
+            ))
 }
 
 /// How many leading digits of a phone number are copied, and the digit indexes that must lie
@@ -614,13 +614,6 @@ fn country_code_len(digits: &[u32]) -> usize {
     }
 }
 
-/// Name particles. A proxy keeps them: they say nothing about who the person is, and they
-/// make `Jeroen de Vries` read as `Haley de Zessen`. Compared ignoring ASCII case.
-const PARTICLES: [&str; 21] = [
-    "van", "de", "der", "den", "het", "von", "zu", "du", "da", "la", "le", "di", "del", "bin",
-    "ibn", "al", "el", "ter", "ten", "'t", "op",
-];
-
 /// One token more than a valid name has. Longer originals fail the validator anyway, so a huge
 /// string is not rewritten token by token.
 const TOKEN_CAP: usize = 7;
@@ -657,8 +650,9 @@ pub(super) enum Case {
 
 /// A name in the shape of `original`: tokens joined by single spaces, particles kept, initials
 /// swapped for other initials and every other token swapped for a name from the lists, in the
-/// letter case of the token it replaces. Words never repeat and never reuse a word of the
-/// original, which would give part of the real name away.
+/// letter case of the token it replaces. Words never repeat and never echo a word of the
+/// original (reuse it, sit inside it or hold it, see [`echoes`]), which would give part of the
+/// real name away.
 ///
 /// The first word is a given name unless a particle or initials come before it (`de Vries`,
 /// `J. Jansen`); every later word is a family name.
@@ -709,26 +703,20 @@ fn person(original: &str, xof: &mut Xof) -> Option<String> {
                     Role::Family => &LAST,
                 };
                 let case = case_of(token);
-                let word = fresh_word(xof, pool, original, &mut placed);
-                out.push_str(&restyle(word, case));
+                let word = fresh_word(xof, pool, original, &placed);
+                placed.push(word);
+                push_restyled(&mut out, &[word], case);
                 if pair {
                     out.push('-');
-                    let second = fresh_word(xof, pool, original, &mut placed);
-                    out.push_str(&restyle(second, case));
+                    let second = fresh_word(xof, pool, original, &placed);
+                    placed.push(second);
+                    push_restyled(&mut out, &[second], case);
                 }
             }
         }
         role = Role::Family;
     }
     accepts(EntityKind::Person, &out).then_some(out)
-}
-
-/// True for a particle, also in its `\u{2019}t` spelling that word processors produce.
-fn is_particle(token: &str) -> bool {
-    if let Some(rest) = token.strip_prefix(['\u{2018}', '\u{2019}']) {
-        return rest.eq_ignore_ascii_case("t");
-    }
-    PARTICLES.iter().any(|p| p.eq_ignore_ascii_case(token))
 }
 
 /// True for initials: letters that are each followed by a dot, as in `J.` or `J.R.`.
@@ -744,27 +732,42 @@ fn is_initials(token: &str) -> bool {
     any
 }
 
-/// A word of `pool` that is neither a word of `original` nor in `placed` yet, when one of the
-/// first [`FRESH_TRIES`] draws is such a word, else the last draw. The word is added to `placed`.
+/// A word of `pool` that neither echoes a word of `original` nor is among `placed`, when one of
+/// the first [`FRESH_TRIES`] draws is such a word, else the last draw.
 fn fresh_word(
     xof: &mut Xof,
     pool: &[&'static str],
     original: &str,
-    placed: &mut Vec<&'static str>,
+    placed: &[&str],
 ) -> &'static str {
     let mut word = xof.pick(pool);
     for _ in 1..FRESH_TRIES {
         let taken = placed.contains(&word)
             || original
                 .split(|c: char| !c.is_alphabetic())
-                .any(|part| part.eq_ignore_ascii_case(word));
+                .any(|part| echoes(word, part));
         if !taken {
             break;
         }
         word = xof.pick(pool);
     }
-    placed.push(word);
     word
+}
+
+/// Whether `word`, a list word, is `part` of an original or reads as a piece of it: `smith` in
+/// `jsmith`, or `devries` for `Vries`, which each give the real name away. Case is ignored. A
+/// word or part of fewer than three letters only counts when they are equal: every longer text
+/// holds a `de` or an `al`.
+fn echoes(word: &str, part: &str) -> bool {
+    if word.len() < 3 || part.chars().count() < 3 {
+        return word.eq_ignore_ascii_case(part);
+    }
+    let within = |hay: &str, needle: &str| {
+        hay.as_bytes()
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+    };
+    within(part, word) || within(word, part)
 }
 
 /// All capitals (two letters or more), all lower case, or anything else, which reads as title
@@ -781,14 +784,21 @@ pub(super) fn case_of(token: &str) -> Case {
     }
 }
 
-/// `word`, a lower-case list word, in `case`.
-pub(super) fn restyle(word: &str, case: Case) -> String {
+/// Appends `words`, lower-case list words, to `out` run together and in `case`.
+pub(super) fn push_restyled(out: &mut String, words: &[&str], case: Case) {
+    let start = out.len();
+    for word in words {
+        out.push_str(word);
+    }
+    let written = &mut out[start..];
     match case {
-        Case::Lower => word.to_owned(),
-        Case::Upper => word.to_ascii_uppercase(),
+        Case::Lower => {}
+        Case::Upper => written.make_ascii_uppercase(),
         Case::Title => {
-            let (head, tail) = word.split_at(word.len().min(1));
-            format!("{}{tail}", head.to_ascii_uppercase())
+            // A first character that is not one byte is no ASCII letter and stays as it is.
+            if let Some(first) = written.get_mut(..1) {
+                first.make_ascii_uppercase();
+            }
         }
     }
 }
@@ -797,10 +807,10 @@ pub(super) fn restyle(word: &str, case: Case) -> String {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{Case, FIRST, LAST, PARTICLES, Xof, country_code_len, generate, restyle};
+    use super::{Case, FIRST, LAST, Xof, country_code_len, generate, push_restyled};
     use crate::{
         detect::{EntityKind, validate::accepts},
-        proxy::{ProxyKeys, watermark_ok},
+        proxy::{ProxyKeys, watermark_ok, words::PARTICLES},
     };
 
     fn xof() -> Xof {
@@ -891,6 +901,13 @@ mod tests {
         letters.next().is_some_and(char::is_uppercase) && letters.all(char::is_lowercase)
     }
 
+    /// `word` in `case`, written to a new string.
+    fn styled(word: &str, case: Case) -> String {
+        let mut out = String::new();
+        push_restyled(&mut out, &[word], case);
+        out
+    }
+
     #[test]
     fn person_keeps_particles_in_place_and_changes_every_other_token() {
         for (original, kept) in [
@@ -972,10 +989,14 @@ mod tests {
                 assert!(is_title(token), "{token}");
             }
         }
-        assert_eq!(restyle("haley", Case::Title), "Haley");
-        assert_eq!(restyle("haley", Case::Upper), "HALEY");
-        assert_eq!(restyle("haley", Case::Lower), "haley");
-        assert_eq!(restyle("", Case::Title), "");
+        assert_eq!(styled("haley", Case::Title), "Haley");
+        assert_eq!(styled("haley", Case::Upper), "HALEY");
+        assert_eq!(styled("haley", Case::Lower), "haley");
+        assert_eq!(styled("", Case::Title), "");
+        // Words run together after what is there already, and only they take the case.
+        let mut out = String::from("ab-");
+        push_restyled(&mut out, &["ha", "ley"], Case::Title);
+        assert_eq!(out, "ab-Haley");
     }
 
     #[test]
@@ -1075,8 +1096,8 @@ mod tests {
 
     #[test]
     fn person_proxy_reuses_no_word_of_the_original_and_repeats_none() {
-        let first = restyle(FIRST[0], Case::Title);
-        let last = restyle(LAST[0], Case::Title);
+        let first = styled(FIRST[0], Case::Title);
+        let last = styled(LAST[0], Case::Title);
         let originals = [
             format!("{first} {last}"),
             format!("{last} {first}"),

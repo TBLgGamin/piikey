@@ -13,7 +13,7 @@ use super::{
 };
 
 /// Bytes before a value that are searched for a context keyword.
-pub(super) const CONTEXT_WINDOW: usize = 48;
+const CONTEXT_WINDOW: usize = 48;
 
 /// Keywords that mark a nearby nine-digit number as a US SSN.
 const SSN_WORDS: &[&str] = &["ssn", "social security"];
@@ -104,7 +104,9 @@ const IBAN: &str = r"\b[A-Z]{2}[0-9]{2}(?: ?[A-Z0-9]{4}){2,7}(?: ?[A-Z0-9]{1,4})
 
 const CREDIT_CARD: &str = r"\b[2-6][0-9](?:[ -]?[0-9]){11,17}\b";
 
-const IPV6: &str = r"(?:\b[0-9A-Fa-f]{1,4}|:)(?::[0-9A-Fa-f]{0,4}){2,7}\b";
+/// Hex groups around a `::`, or all eight of them, and optionally a dotted IPv4 tail
+/// (`::ffff:192.0.2.128`); the validator reads the whole of it, so the tail is not left behind.
+const IPV6: &str = r"(?:\b[0-9A-Fa-f]{1,4}|:)(?::[0-9A-Fa-f]{0,4}){2,7}(?:(?:\.[0-9]{1,3}){3})?\b";
 
 const MAC: &str = r"\b[0-9A-Fa-f]{2}(?:[:-][0-9A-Fa-f]{2}){5}\b";
 

@@ -23,12 +23,31 @@ const PDF_RENDER_SCALE: f32 = 2.0;
 
 const NO_LANGUAGE: &str = "no OCR language installed; add one in Settings > Time & language";
 
-/// True when at least one OCR recognizer language is installed.
-#[must_use]
-pub fn available() -> bool {
+/// True when at least one OCR recognizer language is installed: the tests that need one skip
+/// when it is not.
+#[cfg(test)]
+pub(crate) fn available() -> bool {
     OcrEngine::AvailableRecognizerLanguages()
         .and_then(|languages| languages.Size())
         .is_ok_and(|n| n > 0)
+}
+
+/// Size and first pixel (blue, green, red, alpha) of the picture in `bytes` as Windows decodes
+/// it: what Explorer, which uses the same decoders, would show.
+#[cfg(test)]
+pub(crate) fn first_pixel(bytes: &[u8]) -> Result<(u32, u32, [u8; 4])> {
+    use windows::Storage::Streams::{Buffer, DataReader};
+
+    let decoder = BitmapDecoder::CreateAsync(&stream_from_bytes(bytes)?)?.join()?;
+    let (width, height) = (decoder.PixelWidth()?, decoder.PixelHeight()?);
+    let bitmap = decode_bitmap(&decoder, OcrEngine::MaxImageDimension()?)?;
+    let length = width * height * 4;
+    let buffer = Buffer::Create(length)?;
+    bitmap.CopyToBuffer(&buffer)?;
+    buffer.SetLength(length)?;
+    let mut pixel = [0; 4];
+    DataReader::FromBuffer(&buffer)?.ReadBytes(&mut pixel)?;
+    Ok((width, height, pixel))
 }
 
 /// OCR text of an encoded image (PNG/JPEG/GIF/BMP/TIFF/WebP/HEIF); lines

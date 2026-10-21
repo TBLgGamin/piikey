@@ -10,11 +10,11 @@ use std::{borrow::Cow, fmt::Write as _};
 
 use mail_parser::{Address, DateTime, MessageParser, MimeHeaders};
 
-use super::{Output, Pass, process_pass as process_any, same_text};
+use super::{MAX_DEPTH, Output, Pass, process_pass as process_any, same_text};
 use crate::{Error, Result};
 
 /// Shown for an attachment without a file name.
-const UNNAMED: &str = "attachment";
+pub(super) const UNNAMED: &str = "attachment";
 
 /// A message reduced to what is rendered.
 #[derive(Debug, Default)]
@@ -33,7 +33,16 @@ pub(super) struct Mail<'a> {
 #[derive(Debug)]
 pub(super) struct Attachment<'a> {
     pub(super) name: String,
-    pub(super) data: Cow<'a, [u8]>,
+    pub(super) content: Content<'a>,
+}
+
+/// What an attachment holds.
+#[derive(Debug)]
+pub(super) enum Content<'a> {
+    /// A file of its own, of any format.
+    Bytes(Cow<'a, [u8]>),
+    /// A message that is already read (an embedded message of a `.msg`).
+    Message(Mail<'a>),
 }
 
 /// Renders an `.eml` message.
@@ -57,7 +66,7 @@ pub(super) fn process(pass: &Pass<'_>, bytes: &[u8], depth: u8) -> Result<Output
             .attachments()
             .map(|part| Attachment {
                 name: part.attachment_name().unwrap_or(UNNAMED).to_owned(),
-                data: Cow::Borrowed(part.contents()),
+                content: Content::Bytes(Cow::Borrowed(part.contents())),
             })
             .collect(),
     };
@@ -90,6 +99,11 @@ fn addresses(list: Option<&Address<'_>>) -> Vec<String> {
 /// recursive [`process_any`] call, and its already-transformed text is
 /// appended unchanged.
 pub(super) fn render(pass: &Pass<'_>, depth: u8, mail: &Mail<'_>) -> Result<Output> {
+    rendered(pass, depth, mail).map(Output::Text)
+}
+
+/// [`render`] for the message at `depth`, as text.
+fn rendered(pass: &Pass<'_>, depth: u8, mail: &Mail<'_>) -> Result<String> {
     let mut head = String::new();
     for (label, list) in [
         ("From", &mail.from),
@@ -120,40 +134,35 @@ pub(super) fn render(pass: &Pass<'_>, depth: u8, mail: &Mail<'_>) -> Result<Outp
     texts.extend(mail.attachments.iter().map(|a| a.name.as_str()));
     let mut done = pass.run(&texts)?.into_iter();
     let mut out = done.next().unwrap_or_default();
+    // One after the other: a scan reports what it found in reading order.
     for (attachment, name) in mail.attachments.iter().zip(done) {
-        let body = attachment_text(pass, depth, &attachment.data)?;
+        let body = attachment_text(pass, depth, &attachment.content)?;
         let _ = write!(out, "\n--- attachment: {name} ---\n{body}");
     }
-    Ok(Output::Text(out))
+    Ok(out)
 }
 
-/// The transformed text of one attachment. Attachments that cannot be read
-/// render as `[unsupported: …]`; failures of the engine itself still fail the
-/// whole message.
-fn attachment_text(pass: &Pass<'_>, depth: u8, data: &[u8]) -> Result<String> {
-    let text = match process_any(pass, data, depth.saturating_add(1)) {
-        Ok(Output::Text(text)) => Ok(text),
-        Ok(Output::Same(bytes)) => same_text(&bytes),
-        Err(e) => Err(e),
+/// The transformed text of one attachment of the message at `depth`; it sits one level
+/// deeper. Attachments that cannot be read render as `[unsupported: …]`; failures of the
+/// engine itself still fail the whole message.
+fn attachment_text(pass: &Pass<'_>, depth: u8, content: &Content<'_>) -> Result<String> {
+    let depth = depth.saturating_add(1);
+    let text = match content {
+        Content::Bytes(data) => match process_any(pass, data, depth) {
+            Ok(Output::Text(text)) => Ok(text),
+            Ok(Output::Same(bytes)) => same_text(&bytes),
+            Err(e) => Err(e),
+        },
+        // Same limit as `process_pass` puts on byte attachments.
+        Content::Message(_) if depth > MAX_DEPTH => {
+            Err(Error::UnsupportedFormat("nesting too deep"))
+        }
+        Content::Message(mail) => rendered(pass, depth, mail),
     };
     match text {
-        Err(e) if is_unreadable(&e) => Ok(format!("[unsupported: {e}]")),
+        Err(e) if e.is_unreadable() => Ok(format!("[unsupported: {e}]")),
         other => other,
     }
-}
-
-/// Errors that mean "this content cannot be read", as opposed to vault or
-/// I/O failures.
-fn is_unreadable(error: &Error) -> bool {
-    matches!(
-        error,
-        Error::UnsupportedFormat(_)
-            | Error::Zip(_)
-            | Error::Xml(_)
-            | Error::Pdf(_)
-            | Error::Ocr(_)
-            | Error::Mail(_)
-    )
 }
 
 #[cfg(test)]
@@ -169,13 +178,5 @@ mod tests {
         assert_eq!(display(None, Some("jan@x.nl")).as_deref(), Some("jan@x.nl"));
         assert_eq!(display(Some("Jan"), None).as_deref(), Some("Jan"));
         assert_eq!(display(Some(""), Some("")), None);
-    }
-
-    #[test]
-    fn only_unreadable_content_is_unsupported() {
-        assert!(is_unreadable(&Error::UnsupportedFormat("binary")));
-        assert!(is_unreadable(&Error::Ocr("none".into())));
-        assert!(!is_unreadable(&Error::Poisoned));
-        assert!(!is_unreadable(&Error::VaultPathUnavailable));
     }
 }

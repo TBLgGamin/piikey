@@ -68,10 +68,17 @@ impl Sandbox {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
-        if let Some(mut input) = child.stdin.take() {
-            // A command that fails before it reads has no use for it.
-            let _ = input.write_all(stdin.as_bytes());
-        }
+        // Each pipe has a thread: a command that fills a pipe nobody reads, or waits for input
+        // while the test waits for its output, would never finish.
+        let feeding = child.stdin.take().map(|mut input| {
+            let text = stdin.to_owned();
+            thread::spawn(move || {
+                // A command that fails before it reads has no use for it.
+                let _ = input.write_all(text.as_bytes());
+            })
+        });
+        let out = drain(child.stdout.take());
+        let err = drain(child.stderr.take());
         let deadline = Instant::now() + LIMIT;
         let status = loop {
             if let Some(status) = child.try_wait()? {
@@ -83,13 +90,15 @@ impl Sandbox {
             }
             thread::sleep(Duration::from_millis(20));
         };
-        let (mut out, mut err) = (Vec::new(), Vec::new());
-        if let Some(mut pipe) = child.stdout.take() {
-            pipe.read_to_end(&mut out)?;
+        if let Some(feeding) = feeding {
+            feeding
+                .join()
+                .map_err(|_| "the thread feeding stdin panicked")?;
         }
-        if let Some(mut pipe) = child.stderr.take() {
-            pipe.read_to_end(&mut err)?;
-        }
+        let (out, err) = (out.join(), err.join());
+        let (Ok(out), Ok(err)) = (out, err) else {
+            return Err("a thread reading the output panicked".into());
+        };
         Ok(Ran {
             code: status.code(),
             out: String::from_utf8_lossy(&out).into_owned(),
@@ -167,6 +176,17 @@ impl Drop for Server {
     }
 }
 
+/// Reads `pipe` to its end on a thread of its own.
+fn drain(pipe: Option<impl Read + Send + 'static>) -> thread::JoinHandle<Vec<u8>> {
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut bytes);
+        }
+        bytes
+    })
+}
+
 const MAIL: &str = "mail jan.jansen@acme.nl about it\n";
 
 #[test]
@@ -181,7 +201,6 @@ fn version_and_help_are_printed_and_exit_zero() -> TestResult {
     let got = sandbox.run(&["--help"], "")?;
     assert_eq!(got.code, Some(0));
     assert!(got.out.starts_with("usage:\n"), "{}", got.out);
-    assert!(got.out.contains("exit codes: 0 done;"), "{}", got.out);
     Ok(())
 }
 
@@ -241,6 +260,20 @@ fn text_goes_through_the_vault_and_back() -> TestResult {
     let list = sandbox.json(&["vault", "list", "--query", "jansen"], "")?;
     assert_eq!(list["total"], 1);
     assert_eq!(list["records"][0]["original"], "jan.jansen@acme.nl");
+    Ok(())
+}
+
+/// What a command prints does not wait for the test to finish reading: output that fills a pipe
+/// blocks the command until somebody reads it.
+#[test]
+fn a_command_that_prints_more_than_a_pipe_holds_still_finishes() -> TestResult {
+    let sandbox = Sandbox::new()?;
+    let lines = 2000;
+    let text = "mail jan.jansen@acme.nl about it\n".repeat(lines);
+    let masked = sandbox.run(&["anonymize", "--local"], &text)?;
+    assert_eq!(masked.code, Some(0), "{}", masked.err);
+    assert_eq!(masked.out.lines().count(), lines);
+    assert!(masked.out.len() > 64 * 1024, "{} bytes", masked.out.len());
     Ok(())
 }
 

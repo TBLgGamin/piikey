@@ -24,8 +24,9 @@
 //!
 //! `highlight` is `off`, `always` or `hotkey`. `explorer_menu` is on unless it says `false`;
 //! `inventory`, `http_api` and `enabled` are off unless they say `true`. `http_port` is a
-//! port from 1 to 65535. `inventory_root` and `inventory_exclude` repeat, one absolute folder
-//! each. A file from an older version lacks the newer keys and gets their defaults.
+//! port from 1 to 65535. `program` is an exe name; a path stands for its file name.
+//! `inventory_root` and `inventory_exclude` repeat, one absolute folder each. A file from an
+//! older version lacks the newer keys and gets their defaults.
 //!
 //! Blank lines and `#` comments are ignored, unknown keys are skipped, and
 //! every value is normalized on load, so a hand-edited file cannot make the
@@ -37,12 +38,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
 use crate::{
     Error, Result,
     detect::{EntityKind, KindSet},
-    sys::{data_dir, io_context, write_atomic},
+    sys::{data_dir, io_context, same_path, write_atomic},
 };
 
 /// Site presets offered in the UI.
@@ -61,8 +62,30 @@ pub const PRESETS: &[&str] = &[
 // The file name is kept for existing installs: renaming it would drop the saved settings.
 const FILE_NAME: &str = "guard.cfg";
 
+/// The keys of `guard.cfg`, in the order the file lists them. `settings set` takes all but
+/// `enabled`: protection is switched on and off by itself.
+pub const KEYS: [&str; 11] = [
+    "enabled",
+    "highlight",
+    "explorer_menu",
+    "inventory",
+    "http_api",
+    "http_port",
+    "site",
+    "program",
+    "disabled_kind",
+    "inventory_root",
+    "inventory_exclude",
+];
+
 /// The port of the local HTTP API unless `http_port` says otherwise.
-const DEFAULT_HTTP_PORT: u16 = 7980;
+pub const DEFAULT_HTTP_PORT: u16 = 7980;
+
+/// Whether `port` can be the HTTP API's: 1 to 65535 (a `u16` holds the upper bound).
+#[must_use]
+pub const fn valid_port(port: u16) -> bool {
+    port != 0
+}
 
 /// When the field you type in is outlined because it holds personal data.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,7 +125,9 @@ impl Highlight {
     clippy::struct_excessive_bools,
     reason = "independent feature switches of a settings file, not the states of one machine"
 )]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// A reply from another version lacks the keys it does not know: they get their defaults.
+#[serde(default)]
 pub struct Policy {
     /// Whether the proxy masks the sites and programs below.
     pub enabled: bool,
@@ -111,7 +136,10 @@ pub struct Policy {
     /// Lowercase exe names, e.g. `chrome.exe`.
     pub programs: Vec<String>,
     /// Kinds piikey leaves alone in new text; empty means every kind is masked.
-    #[serde(serialize_with = "serialize_kinds")]
+    #[serde(
+        serialize_with = "serialize_kinds",
+        deserialize_with = "deserialize_kinds"
+    )]
     pub disabled_kinds: Vec<EntityKind>,
     /// When the field in focus is outlined if it holds personal data.
     pub highlight: Highlight,
@@ -196,17 +224,24 @@ impl Policy {
         }
     }
 
-    /// Normalizes a user-typed program: lowercase, `.exe` appended when the
-    /// name has no extension; `None` for paths, blanks and control characters.
+    /// Normalizes a user-typed program: the file name of a path (which may be quoted, as
+    /// Explorer's "Copy as path" does), lowercase, `.exe` appended when the name has no
+    /// extension; `None` for blanks, a folder and control characters.
     #[must_use]
     pub fn parse_program(s: &str) -> Option<String> {
-        let name = s.trim().to_ascii_lowercase();
+        let name = s
+            .trim()
+            .trim_matches('"')
+            .rsplit(['\\', '/'])
+            .next()?
+            .trim()
+            .to_ascii_lowercase();
         let ok = !name.is_empty()
             && name.len() <= 255
             && !name.starts_with('.')
             && name
                 .chars()
-                .all(|c| !c.is_control() && !c.is_whitespace() && !"\\/:*?\"<>|=".contains(c));
+                .all(|c| !c.is_control() && !c.is_whitespace() && !":*?\"<>|=".contains(c));
         if !ok {
             return None;
         }
@@ -269,7 +304,7 @@ impl Policy {
                     policy.http_port = value
                         .parse()
                         .ok()
-                        .filter(|&port| port != 0)
+                        .filter(|&port| valid_port(port))
                         .unwrap_or(DEFAULT_HTTP_PORT);
                 }
                 "site" => push_unique(&mut policy.sites, Self::parse_site(value)),
@@ -293,10 +328,10 @@ impl Policy {
         policy
     }
 
-    /// The file contents; entries that would not survive a reload (invalid
-    /// sites and programs, relative folders, folders that are not Unicode) are left out.
+    /// The file contents, one `key=value` per line in the order of [`KEYS`]; entries that would
+    /// not survive a reload (invalid sites and programs, relative folders, folders that are not
+    /// Unicode) are left out.
     fn to_text(&self) -> String {
-        let mut out = format!("enabled={}\n", self.enabled);
         let sites = self.sites.iter().filter_map(|s| Self::parse_site(s));
         let programs = self.programs.iter().filter_map(|p| Self::parse_program(p));
         let folders = |list: &[PathBuf]| -> Vec<String> {
@@ -305,25 +340,25 @@ impl Policy {
                 .map(str::to_owned)
                 .collect()
         };
-        for (key, values) in [
-            ("highlight", vec![self.highlight.as_str().to_owned()]),
-            ("explorer_menu", vec![self.explorer_menu.to_string()]),
-            ("inventory", vec![self.inventory.to_string()]),
-            ("http_api", vec![self.http_api.to_string()]),
-            ("http_port", vec![self.http_port.to_string()]),
-            ("site", sites.collect()),
-            ("program", programs.collect()),
-            (
-                "disabled_kind",
-                EntityKind::ALL
-                    .into_iter()
-                    .filter(|kind| self.disabled_kinds.contains(kind))
-                    .map(|kind| kind.as_str().to_owned())
-                    .collect(),
-            ),
-            ("inventory_root", folders(&self.inventory_roots)),
-            ("inventory_exclude", folders(&self.inventory_exclude)),
-        ] {
+        let values: [Vec<String>; KEYS.len()] = [
+            vec![self.enabled.to_string()],
+            vec![self.highlight.as_str().to_owned()],
+            vec![self.explorer_menu.to_string()],
+            vec![self.inventory.to_string()],
+            vec![self.http_api.to_string()],
+            vec![self.http_port.to_string()],
+            sites.collect(),
+            programs.collect(),
+            EntityKind::ALL
+                .into_iter()
+                .filter(|kind| self.disabled_kinds.contains(kind))
+                .map(|kind| kind.as_str().to_owned())
+                .collect(),
+            folders(&self.inventory_roots),
+            folders(&self.inventory_exclude),
+        ];
+        let mut out = String::new();
+        for (key, values) in KEYS.into_iter().zip(values) {
             for value in values {
                 out.push_str(key);
                 out.push('=');
@@ -340,6 +375,17 @@ impl Policy {
         self.disabled_kinds
             .iter()
             .fold(KindSet::ALL, |set, &kind| set.without(kind))
+    }
+
+    /// The folders the inventory scans: the saved ones, or [`default_inventory_roots`] when
+    /// none were saved.
+    #[must_use]
+    pub fn inventory_roots_or_default(&self) -> Vec<PathBuf> {
+        if self.inventory_roots.is_empty() {
+            default_inventory_roots()
+        } else {
+            self.inventory_roots.clone()
+        }
     }
 }
 
@@ -420,7 +466,7 @@ impl SettingsPatch {
             next.http_api = value;
         }
         if let Some(port) = self.http_port {
-            if port == 0 {
+            if !valid_port(port) {
                 return Err(Error::BadRequest(
                     "Not a valid port: 0 (use 1 to 65535)".to_owned(),
                 ));
@@ -474,6 +520,19 @@ fn serialize_kinds<S: Serializer>(
     out.collect_seq(kinds.iter().map(|kind| kind.as_str()))
 }
 
+/// Reads the kinds back from their `EntityKind::as_str` names; an unknown name is an error.
+fn deserialize_kinds<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Vec<EntityKind>, D::Error> {
+    Vec::<String>::deserialize(deserializer)?
+        .iter()
+        .map(|name| {
+            EntityKind::parse(name)
+                .ok_or_else(|| D::Error::custom(format!("not a kind of personal data: {name}")))
+        })
+        .collect()
+}
+
 /// The folders the inventory scans when the user has picked none: the documents, the desktop
 /// (both also where `OneDrive` keeps them) and the downloads that exist, without duplicates.
 #[must_use]
@@ -499,7 +558,7 @@ fn default_roots_in(onedrive: Option<&OsStr>, profile: Option<&OsStr>) -> Vec<Pa
             continue;
         };
         let path = Path::new(base).join(name);
-        if path.is_dir() && !roots.iter().any(|root| same_folder(root, &path)) {
+        if path.is_dir() && !roots.iter().any(|root| same_path(root, &path)) {
             roots.push(path);
         }
     }
@@ -516,7 +575,7 @@ fn push_unique(list: &mut Vec<String>, value: Option<String>) {
 
 fn push_unique_folder(list: &mut Vec<PathBuf>, value: Option<PathBuf>) {
     if let Some(value) = value
-        && !list.iter().any(|folder| same_folder(folder, &value))
+        && !list.iter().any(|folder| same_path(folder, &value))
     {
         list.push(value);
     }
@@ -527,16 +586,6 @@ fn push_unique_folder(list: &mut Vec<PathBuf>, value: Option<PathBuf>) {
 fn normalize_folder(s: &str) -> Option<&str> {
     let s = s.trim().trim_matches('"').trim();
     (Path::new(s).is_absolute() && !s.chars().any(char::is_control)).then_some(s)
-}
-
-/// The same folder spelled alike: component by component, ignoring ASCII case (Windows paths
-/// do) and a trailing separator.
-fn same_folder(a: &Path, b: &Path) -> bool {
-    let mut b = b.components();
-    a.components().all(|part| {
-        b.next()
-            .is_some_and(|other| part.as_os_str().eq_ignore_ascii_case(other.as_os_str()))
-    }) && b.next().is_none()
 }
 
 /// DNS-style host: 1-253 bytes of dot-separated labels of 1-63 letters,
@@ -660,7 +709,7 @@ mod tests {
     fn an_invalid_value_is_rejected_and_changes_nothing() {
         for json in [
             r#"{"inventory":true,"sites":["chatgpt.com","not a host"]}"#,
-            r#"{"inventory":true,"programs":["a/b.exe"]}"#,
+            r#"{"inventory":true,"programs":["a|b.exe"]}"#,
             r#"{"inventory":true,"disabled_kinds":["nonsense"]}"#,
             r#"{"inventory":true,"inventory_roots":["relative\\folder"]}"#,
             r#"{"inventory":true,"inventory_exclude":[""]}"#,
@@ -784,7 +833,7 @@ mod tests {
         let p = Policy {
             enabled: false,
             sites: vec!["ok.com".into(), "bad host".into()],
-            programs: vec!["a\\b.exe".into()],
+            programs: vec!["a|b.exe".into()],
             disabled_kinds: vec![EntityKind::Person, EntityKind::Email, EntityKind::Person],
             ..Policy::default()
         };
@@ -906,6 +955,58 @@ mod tests {
     }
 
     #[test]
+    fn parse_reads_every_key() {
+        for key in KEYS {
+            let sample = match key {
+                "enabled" | "inventory" | "http_api" => "true",
+                "highlight" => "off",
+                "explorer_menu" => "false",
+                "http_port" => "1",
+                "site" => "a.com",
+                "program" => "a.exe",
+                "disabled_kind" => "email",
+                "inventory_root" | "inventory_exclude" => r"C:\a",
+                other => panic!("{other} needs a sample"),
+            };
+            assert_ne!(
+                Policy::parse(&format!("{key}={sample}\n")),
+                Policy::default(),
+                "{key} is not read"
+            );
+        }
+    }
+
+    #[test]
+    fn the_policy_deserializes_what_it_serializes() -> std::result::Result<(), serde_json::Error> {
+        let saved = policy();
+        let back: Policy = serde_json::from_value(serde_json::to_value(&saved)?)?;
+        assert_eq!(back, saved);
+        // A reply from another version: what it lacks is the default, what is new is ignored.
+        let partial: Policy = serde_json::from_str(r#"{"enabled":true,"from_the_future":1}"#)?;
+        assert_eq!(
+            partial,
+            Policy {
+                enabled: true,
+                ..Policy::default()
+            }
+        );
+        assert!(serde_json::from_str::<Policy>(r#"{"disabled_kinds":["nonsense"]}"#).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn saved_folders_win_and_none_saved_means_the_usual_ones() {
+        assert_eq!(
+            Policy::default().inventory_roots_or_default(),
+            default_inventory_roots()
+        );
+        assert_eq!(
+            policy().inventory_roots_or_default(),
+            policy().inventory_roots
+        );
+    }
+
+    #[test]
     fn inventory_folders_are_normalized_and_deduplicated() {
         let p = Policy::parse(
             "inventory_root=C:\\Users\\jan\\Documents\n\
@@ -976,17 +1077,6 @@ mod tests {
                  inventory_root=C:\\ok\ninventory_exclude=C:\\ok\\skip\n"
             )
         );
-    }
-
-    #[test]
-    fn folders_are_the_same_ignoring_case_and_a_trailing_separator() {
-        let same = |a: &str, b: &str| same_folder(Path::new(a), Path::new(b));
-        assert!(same(r"C:\Users\jan", r"c:\users\JAN"));
-        assert!(same(r"C:\Users\jan\", r"C:\Users\jan"));
-        assert!(same(r"C:\Users\jan", r"C:\Users\jan\"));
-        assert!(!same(r"C:\Users\jan", r"C:\Users\jan\Documents"));
-        assert!(!same(r"C:\Users\jan\Documents", r"C:\Users\jan"));
-        assert!(!same(r"C:\Users\jan", r"D:\Users\jan"));
     }
 
     #[test]
@@ -1074,14 +1164,31 @@ mod tests {
         for bad in [
             "",
             " ",
-            "C:\\a\\b.exe",
-            "a/b.exe",
             "a b.exe",
             ".exe",
             "a=b.exe",
+            "a|b",
+            "code - insiders",
+            r"C:\folder\",
+            "\"\"",
         ] {
             assert_eq!(ok(bad), None, "{bad:?} must be rejected");
         }
+    }
+
+    #[test]
+    fn a_pasted_path_stands_for_its_file_name() {
+        let ok = |s: &str| Policy::parse_program(s);
+        assert_eq!(
+            ok(r"C:\Windows\System32\Notepad.EXE").as_deref(),
+            Some("notepad.exe")
+        );
+        assert_eq!(ok("C:/tools/mytool").as_deref(), Some("mytool.exe"));
+        // Explorer's "Copy as path" quotes it.
+        assert_eq!(
+            ok(r#" "C:\Program Files\Google\Chrome\chrome.exe" "#).as_deref(),
+            Some("chrome.exe")
+        );
     }
 
     #[test]

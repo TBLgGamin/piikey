@@ -1,10 +1,11 @@
 //! `AppApi`: the API as the app serves it, on the named pipe and over local HTTP.
 //!
-//! [`Local`] answers most of it from the engine and the inventory the app uses. What only the app
-//! can do, or what must reach the rest of the app, goes through the controller: protection,
-//! settings (so the features follow them), Explorer scans, the inventory's status and rescan (the
+//! [`Local`] answers most of it from the engine, the inventory and the settings the app uses. What
+//! only the app can do, or what must reach the rest of the app, goes through the controller:
+//! protection, settings (so the features follow them), Explorer scans, the inventory's rescan (the
 //! scans are the controller's), what removes values from the vault (so what was typed is forgotten
-//! too) and the model's download (so its state is the app's).
+//! too) and the model's download (so its state is the app's). File work runs in the pool of the
+//! app's own scans, so it leaves half the cores to the PC.
 
 use std::{
     path::{Path, PathBuf},
@@ -14,9 +15,13 @@ use std::{
 
 use piikey::{
     Error,
-    api::{ApiError, Handler, Local, Request},
+    api::{
+        ApiError, Handler, Local, PolicySource, Request,
+        reply::{self, ModelState},
+        require_absolute, to_json,
+    },
     detect::NerDetector,
-    policy::{SettingsPatch, default_inventory_roots},
+    policy::SettingsPatch,
 };
 use serde_json::{Value, json};
 
@@ -48,10 +53,22 @@ impl AppApi {
         )
     }
 
+    /// `local` answers from the settings the app holds, not from the file: they are the ones that
+    /// apply while a change is still being saved.
     fn with_local(controller: &Arc<Controller>, local: Local) -> Self {
+        let controller = Arc::downgrade(controller);
+        let settings: PolicySource = Arc::new({
+            let controller = Weak::clone(&controller);
+            move || {
+                controller
+                    .upgrade()
+                    .map(|controller| controller.policy())
+                    .ok_or_else(|| Error::Busy("piikey is shutting down".to_owned()))
+            }
+        });
         Self {
-            local,
-            controller: Arc::downgrade(controller),
+            local: local.with_policy(settings),
+            controller,
         }
     }
 
@@ -76,29 +93,27 @@ impl AppApi {
                 "protection could not be switched",
             )));
         }
-        Ok(json!({ "protection": snapshot.enabled }))
+        to_json(&reply::Protection {
+            protection: snapshot.enabled,
+        })
     }
 
+    /// What [`Local`] says, with what only the app knows: that it runs, whether protection is on
+    /// and how the model's download stands.
     fn status(&self) -> Result<Value, ApiError> {
-        let mut status = self.local.handle(Request::Status)?;
-        let protection = self.controller()?.snapshot().enabled;
-        if let Value::Object(fields) = &mut status {
-            fields.insert("app".to_owned(), Value::Bool(true));
-            fields.insert("protection".to_owned(), Value::Bool(protection));
-        }
-        Ok(status)
-    }
-
-    fn settings_get(&self) -> Result<Value, ApiError> {
-        serde_json::to_value(&self.controller()?.snapshot().policy)
-            .map_err(|error| encode_error(&error))
+        let snapshot = self.controller()?.snapshot();
+        let mut status = self.local.status()?;
+        status.app = true;
+        status.protection = Some(snapshot.enabled);
+        follow_download(&mut status.model, snapshot.model);
+        to_json(&status)
     }
 
     /// Applies the patch through the controller, so the Explorer menu, the highlight, the
     /// inventory and the local API follow it, and answers with the settings as they are then.
     fn settings_set(&self, patch: &SettingsPatch) -> Result<Value, ApiError> {
         let controller = self.controller()?;
-        let mut expected = controller.snapshot().policy;
+        let mut expected = controller.policy();
         patch.apply(&mut expected)?;
         controller.submit(Command::Settings(patch.clone()));
         // The listener of this very request may be the one that restarts: it waits for the request
@@ -118,7 +133,7 @@ impl AppApi {
                 )));
             }
         }
-        serde_json::to_value(&expected).map_err(|error| encode_error(&error))
+        to_json(&expected)
     }
 
     fn explorer_scan(&self, paths: Vec<PathBuf>) -> Result<Value, ApiError> {
@@ -135,30 +150,16 @@ impl AppApi {
         Ok(json!({}))
     }
 
+    /// What [`Local`] says of the inventory, with the progress of the scan the controller runs:
+    /// the app's scans are its own, not [`Local`]'s.
     fn inventory_status(&self) -> Result<Value, ApiError> {
-        let controller = self.controller()?;
-        let snapshot = controller.snapshot();
-        let totals = controller.inventory().totals();
-        let roots = if snapshot.policy.inventory_roots.is_empty() {
-            default_inventory_roots()
-        } else {
-            snapshot.policy.inventory_roots.clone()
-        };
-        let roots: Vec<String> = roots
-            .iter()
-            .map(|root| root.to_string_lossy().into_owned())
-            .collect();
-        let scanning = snapshot
+        let mut status = self.local.inventory_status()?;
+        status.scanning = self
+            .controller()?
+            .snapshot()
             .scan
-            .map(|(done, total)| json!({ "done": done, "total": total }));
-        Ok(json!({
-            "enabled": snapshot.policy.inventory,
-            "roots": roots,
-            "files": totals.files,
-            "files_with_pii": totals.files_with_pii,
-            "hits": totals.hits,
-            "scanning": scanning,
-        }))
+            .map(|(done, total)| reply::Progress { done, total });
+        to_json(&status)
     }
 
     /// Scans the watched folders now and answers when the scan is over.
@@ -171,7 +172,7 @@ impl AppApi {
         }
         // A scan of a big folder takes as long as it takes.
         while !controller.wait_scans(LOOK) {}
-        serde_json::to_value(controller.inventory().totals()).map_err(|error| encode_error(&error))
+        to_json(&controller.inventory().totals())
     }
 
     /// Downloads the detection model, and answers when it is there. The controller does it, so
@@ -203,34 +204,15 @@ impl AppApi {
 
     /// The model as [`Local`] sees it, with the download the controller runs, or that failed.
     fn model_status(&self) -> Result<Value, ApiError> {
-        let mut status = self.local.handle(Request::ModelStatus)?;
-        let Value::Object(fields) = &mut status else {
-            return Ok(status);
-        };
-        match self.controller()?.snapshot().model {
-            Model::Downloading { done, total } => {
-                fields.insert("state".to_owned(), json!("missing"));
-                fields.insert(
-                    "downloading".to_owned(),
-                    json!({ "done": done, "total": total }),
-                );
-            }
-            Model::Failed(message) => {
-                fields.insert("state".to_owned(), json!("failed"));
-                fields.insert("error".to_owned(), json!(message));
-            }
-            Model::Ready | Model::Skipped => {}
-        }
-        Ok(status)
+        let mut model = self.local.model_status()?;
+        follow_download(&mut model, self.controller()?.snapshot().model);
+        to_json(&model)
     }
 
     /// A new token also restarts the local API, which keeps the token it started with.
     fn rotate_token(&self) -> Result<Value, ApiError> {
-        let token = self
-            .controller()?
-            .rotate_token()
-            .map_err(ApiError::internal)?;
-        Ok(json!({ "token": token }))
+        let token = self.controller()?.token(true).map_err(ApiError::internal)?;
+        to_json(&reply::Token { token })
     }
 
     /// Asks `request` of [`Local`], then lets the app know the vault lost records.
@@ -240,9 +222,16 @@ impl AppApi {
         Ok(reply)
     }
 
-    /// Asks `request` of [`Local`], then lets the app know the inventory changed.
+    /// Asks `request` of [`Local`] in the pool the app's own scans use, so file work does not take
+    /// every core of the PC.
+    fn in_scan_pool(&self, request: Request) -> Result<Value, ApiError> {
+        self.controller()?
+            .in_scan_pool(|| self.local.handle(request))
+    }
+
+    /// Scans the files in that pool, then lets the app know the inventory changed.
     fn scan_files(&self, paths: Vec<PathBuf>, record: bool) -> Result<Value, ApiError> {
-        let reply = self.local.handle(Request::ScanFiles { paths, record })?;
+        let reply = self.in_scan_pool(Request::ScanFiles { paths, record })?;
         if record {
             self.controller()?.submit(Command::Refresh);
         }
@@ -255,7 +244,6 @@ impl Handler for AppApi {
         match request {
             Request::Protection { on } => self.protection(on),
             Request::Status => self.status(),
-            Request::SettingsGet => self.settings_get(),
             Request::SettingsSet { settings } => self.settings_set(&settings),
             Request::ExplorerScan { paths } => self.explorer_scan(paths),
             Request::InventoryStatus => self.inventory_status(),
@@ -264,6 +252,9 @@ impl Handler for AppApi {
             Request::ModelDownload => self.model_download(),
             Request::ApiToken { rotate: true } => self.rotate_token(),
             Request::ScanFiles { paths, record } => self.scan_files(paths, record),
+            Request::AnonymizeFiles { .. }
+            | Request::DeanonymizeFiles { .. }
+            | Request::SubjectSearch { .. } => self.in_scan_pool(request),
             Request::VaultForget { .. } | Request::VaultWipe { .. } => self.forget(request),
             other => self.local.handle(other),
         }
@@ -278,14 +269,25 @@ fn why_not(snapshot: &Snapshot, otherwise: &str) -> String {
         .map_or_else(|| otherwise.to_owned(), |notice| notice.text.clone())
 }
 
+/// Puts the download the controller runs, or the failure of one, into what [`Local`] says of the
+/// model: the controller's download is the app's, [`Local`] knows only the files.
+fn follow_download(model: &mut reply::Model, download: Model) {
+    match download {
+        Model::Downloading { done, total } => {
+            model.state = ModelState::Missing;
+            model.downloading = Some(reply::Progress { done, total });
+        }
+        Model::Failed(message) => {
+            model.state = ModelState::Failed;
+            model.error = Some(message);
+        }
+        Model::Ready | Model::Skipped => {}
+    }
+}
+
 /// `path` is a full path to something that exists.
 fn exists(path: &Path) -> Result<(), ApiError> {
-    if !path.is_absolute() {
-        return Err(ApiError::bad_request(format!(
-            "{} is not a full path: a path must start with a drive or a share",
-            path.display()
-        )));
-    }
+    require_absolute(path)?;
     match path.try_exists() {
         Ok(true) => Ok(()),
         Ok(false) => Err(ApiError::not_found(format!(
@@ -296,17 +298,15 @@ fn exists(path: &Path) -> Result<(), ApiError> {
     }
 }
 
-/// A value that cannot be turned into JSON, which is a bug.
-fn encode_error(error: &serde_json::Error) -> ApiError {
-    ApiError::internal(format!("cannot encode the result: {error}"))
-}
-
 #[cfg(test)]
 mod tests {
     use std::{fs, time::Instant};
 
     use super::*;
-    use crate::ui::testing::{TempDir, stub_controller};
+    use crate::{
+        Describe,
+        ui::testing::{TempDir, stub_controller},
+    };
 
     type Test = Result<(), String>;
 
@@ -394,7 +394,7 @@ mod tests {
         assert!(message.contains("missing"), "{message}");
 
         let file = dir.0.join("a.txt");
-        fs::write(&file, "mail jan.jansen@acme.nl").map_err(|e| e.to_string())?;
+        fs::write(&file, "mail jan.jansen@acme.nl").describe()?;
         assert_eq!(ask(&api, scan(vec![file.clone()]))?, json!({}));
         let deadline = Instant::now() + Duration::from_secs(20);
         let reveal = loop {
@@ -415,15 +415,17 @@ mod tests {
         let dir = TempDir::new()?;
         let (api, controller) = api(&dir)?;
         let docs = dir.0.join("docs");
-        fs::create_dir(&docs).map_err(|e| e.to_string())?;
-        fs::write(docs.join("a.txt"), "mail jan.jansen@acme.nl").map_err(|e| e.to_string())?;
+        fs::create_dir(&docs).describe()?;
+        fs::write(docs.join("a.txt"), "mail jan.jansen@acme.nl").describe()?;
         let patch = SettingsPatch {
-            inventory_roots: Some(vec![docs]),
+            inventory_roots: Some(vec![docs.clone()]),
             ..SettingsPatch::default()
         };
         ask(&api, Request::SettingsSet { settings: patch })?;
+        // What the app holds, not what a file on this PC says: the stub saves nothing.
         let status = ask(&api, Request::InventoryStatus)?;
         assert_eq!(status["enabled"], false);
+        assert_eq!(status["roots"], json!([docs.to_string_lossy()]));
         assert_eq!(status["files"], 0);
         assert_eq!(status["scanning"], Value::Null);
         // A rescan answers when it is over, with what the inventory holds.
@@ -447,7 +449,7 @@ mod tests {
                 piikey::detect::Mode::Anonymize,
                 &["mail jan.jansen@acme.nl"],
             )
-            .map_err(|e| e.to_string())?;
+            .describe()?;
         controller.submit(Command::Refresh);
         assert!(controller.wait_idle(Duration::from_secs(20)));
         assert_eq!(controller.snapshot().issued, 1);
@@ -464,16 +466,31 @@ mod tests {
     }
 
     #[test]
-    fn what_local_answers_alone_is_passed_on() -> Test {
-        let dir = TempDir::new()?;
-        let (api, _controller) = api(&dir)?;
-        let reply = ask(
-            &api,
-            Request::ScanText {
-                texts: vec!["mail jan.jansen@acme.nl".to_owned()],
-            },
-        )?;
-        assert_eq!(reply["results"][0][0]["kind"], "email");
-        Ok(())
+    fn the_download_the_app_runs_is_what_the_model_status_says() {
+        let local = || reply::Model {
+            state: ModelState::Unloaded,
+            device: None,
+            error: None,
+            downloading: None,
+            dir: "model".to_owned(),
+        };
+        let mut model = local();
+        follow_download(&mut model, Model::Downloading { done: 5, total: 20 });
+        assert_eq!(model.state, ModelState::Missing);
+        assert_eq!(
+            model.downloading,
+            Some(reply::Progress { done: 5, total: 20 })
+        );
+
+        let mut model = local();
+        follow_download(&mut model, Model::Failed("no network".to_owned()));
+        assert_eq!(model.state, ModelState::Failed);
+        assert_eq!(model.error.as_deref(), Some("no network"));
+
+        for idle in [Model::Ready, Model::Skipped] {
+            let mut model = local();
+            follow_download(&mut model, idle);
+            assert_eq!(model, local(), "nothing to add");
+        }
     }
 }

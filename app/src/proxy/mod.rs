@@ -59,7 +59,7 @@ use self::{
     handler::{Env, Interceptor, WsInterceptor},
     origin::Origin,
 };
-use crate::{Res, ca, ledger::Ledger};
+use crate::{Describe, Res, ca, ledger::Ledger};
 
 /// Default proxy port.
 pub const PORT: u16 = 7979;
@@ -160,10 +160,6 @@ impl Purpose {
     }
 
     /// Sets [`Purpose::mask`].
-    #[allow(
-        dead_code,
-        reason = "the controller sets it once highlighting is wired in"
-    )]
     pub fn set_mask(&self, on: bool) {
         self.mask.store(on, Ordering::Release);
     }
@@ -175,20 +171,12 @@ impl Purpose {
     }
 
     /// Sets [`Purpose::highlight`].
-    #[allow(
-        dead_code,
-        reason = "the controller sets it once highlighting is wired in"
-    )]
     pub fn set_highlight(&self, mode: Highlight) {
         self.highlight.store(Self::encode(mode), Ordering::Release);
     }
 
     /// Whether the outline is paused: in [`Highlight::Always`] the shortcut pauses and resumes it.
     #[must_use]
-    #[allow(
-        dead_code,
-        reason = "the tray tooltip reads it once highlighting is wired in"
-    )]
     pub fn paused(&self) -> bool {
         self.paused.load(Ordering::Acquire)
     }
@@ -209,10 +197,6 @@ impl Purpose {
 
     /// Runs `hook` whenever the outline is paused or resumed, on the capture thread: it must be
     /// quick. The tray tooltip says so.
-    #[allow(
-        dead_code,
-        reason = "the controller sets it once highlighting is wired in"
-    )]
     pub fn on_pause(&self, hook: impl Fn() + Send + Sync + 'static) {
         *self.on_pause.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(hook));
     }
@@ -400,7 +384,7 @@ async fn run(
     // limit, and a streaming reply or an idle tunnel can stay open forever.
     let mut serving = pin!(proxy.start());
     tokio::select! {
-        done = &mut serving => done.map_err(|e| e.to_string()),
+        done = &mut serving => done.describe(),
         () = cut_off(stopped, grace) => Ok(()),
     }
 }

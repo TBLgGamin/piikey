@@ -8,7 +8,7 @@
 ///
 /// Lowercase ASCII, sorted and unique, so a lookup is a binary search. The proxy name lists
 /// must not contain any of them.
-pub const STOPWORDS: &[&str] = &[
+pub(crate) const STOPWORDS: &[&str] = &[
     "a", "aan", "about", "above", "across", "after", "again", "against", "all", "alle", "alleen",
     "almost", "alone", "along", "already", "als", "also", "although", "altijd", "always", "am",
     "among", "an", "and", "andere", "another", "any", "anyone", "anyway", "are", "around", "as",

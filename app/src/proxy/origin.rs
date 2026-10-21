@@ -13,13 +13,13 @@ use std::{
 };
 
 use netstat2::{AddressFamilyFlags, ProtocolFlags, ProtocolSocketInfo, get_sockets_info};
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
-/// How long a connection's owner is remembered. Short: a port number can be
-/// reused by another program once its connection is gone.
-const PORT_TTL: Duration = Duration::from_secs(10);
-/// How long a process id's exe name is remembered.
-const PID_TTL: Duration = Duration::from_mins(1);
+use crate::process::exe_name;
+
+/// How long a connection's owner and a process id's exe name are remembered. Short: a port number
+/// can be reused by another program once its connection is gone, and a process id once its
+/// process has ended.
+const TTL: Duration = Duration::from_secs(10);
 
 /// Maps proxy clients to exe names, caching both steps because walking the
 /// TCP table and the process list costs milliseconds.
@@ -56,7 +56,7 @@ impl Origin {
 
     fn owner_of(&self, now: Instant, client: SocketAddr) -> Option<u32> {
         if let Some(&(pid, at)) = lock(&self.owners).get(&client)
-            && now.saturating_duration_since(at) <= PORT_TTL
+            && now.saturating_duration_since(at) <= TTL
         {
             return Some(pid);
         }
@@ -64,35 +64,20 @@ impl Origin {
         // client may both scan, which is only a little wasted work.
         let pid = scan_for_owner(client, self.proxy_port)?;
         let mut owners = lock(&self.owners);
-        owners.retain(|_, &mut (_, at)| now.saturating_duration_since(at) <= PORT_TTL);
+        owners.retain(|_, &mut (_, at)| now.saturating_duration_since(at) <= TTL);
         owners.insert(client, (pid, now));
         Some(pid)
     }
 
     fn name_of(&self, now: Instant, pid: u32) -> Option<Arc<str>> {
         if let Some((name, at)) = lock(&self.names).get(&pid)
-            && now.saturating_duration_since(*at) <= PID_TTL
+            && now.saturating_duration_since(*at) <= TTL
         {
             return Some(Arc::clone(name));
         }
-        let pid_key = Pid::from_u32(pid);
-        let mut system = System::new();
-        system.refresh_processes_specifics(
-            ProcessesToUpdate::Some(&[pid_key]),
-            true,
-            ProcessRefreshKind::nothing(),
-        );
-        let name = system
-            .process(pid_key)?
-            .name()
-            .to_string_lossy()
-            .to_ascii_lowercase();
-        if name.is_empty() {
-            return None;
-        }
-        let name: Arc<str> = Arc::from(name);
+        let name: Arc<str> = Arc::from(exe_name(pid)?);
         let mut names = lock(&self.names);
-        names.retain(|_, (_, at)| now.saturating_duration_since(*at) <= PID_TTL);
+        names.retain(|_, (_, at)| now.saturating_duration_since(*at) <= TTL);
         names.insert(pid, (Arc::clone(&name), now));
         Some(name)
     }
@@ -135,17 +120,16 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
 
     use super::*;
-    use crate::Res;
+    use crate::{Describe, Res};
 
     /// A loopback connection inside this process: `(client address, proxy
     /// port, both ends)`.
     fn connection() -> Res<(SocketAddr, u16, (TcpStream, TcpStream))> {
-        let io = |e: std::io::Error| e.to_string();
-        let listener = TcpListener::bind("127.0.0.1:0").map_err(io)?;
-        let port = listener.local_addr().map_err(io)?.port();
-        let client = TcpStream::connect(("127.0.0.1", port)).map_err(io)?;
-        let addr = client.local_addr().map_err(io)?;
-        let (accepted, _) = listener.accept().map_err(io)?;
+        let listener = TcpListener::bind("127.0.0.1:0").describe()?;
+        let port = listener.local_addr().describe()?.port();
+        let client = TcpStream::connect(("127.0.0.1", port)).describe()?;
+        let addr = client.local_addr().describe()?;
+        let (accepted, _) = listener.accept().describe()?;
         Ok((addr, port, (client, accepted)))
     }
 
@@ -177,7 +161,7 @@ mod tests {
         let (_, port, _ends) = connection()?;
         let origin = Origin::new(port);
         // Nothing was ever connected from this port.
-        let nobody: SocketAddr = "127.0.0.1:9".parse().map_err(|e| format!("{e}"))?;
+        let nobody: SocketAddr = "127.0.0.1:9".parse().describe()?;
         assert_eq!(origin.exe_for_client(nobody), None);
         Ok(())
     }
@@ -227,19 +211,21 @@ mod tests {
     }
 
     #[test]
-    fn exe_names_are_remembered_for_a_minute() {
+    fn exe_names_are_remembered_for_ten_seconds() {
         let origin = Origin::new(1);
         let t0 = Instant::now();
         let own = std::process::id();
         let name = origin.name_of(t0, own);
         assert_eq!(name.as_deref(), Some(own_exe().as_str()));
+        // A process id is reused by another program once its process has ended: what is
+        // remembered for it must not outlive the connections that asked.
         lock(&origin.names).insert(own, (Arc::from("stale.exe"), t0));
         assert_eq!(
-            origin.name_of(t0 + Duration::from_secs(59), own).as_deref(),
+            origin.name_of(t0 + Duration::from_secs(9), own).as_deref(),
             Some("stale.exe")
         );
         assert_eq!(
-            origin.name_of(t0 + Duration::from_secs(61), own).as_deref(),
+            origin.name_of(t0 + Duration::from_secs(11), own).as_deref(),
             Some(own_exe().as_str())
         );
     }

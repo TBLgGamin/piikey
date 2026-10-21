@@ -7,8 +7,8 @@
 //! scanned PDFs, [`service`] the named-pipe server and client. [`api`] is the one API (a
 //! request type, a reply envelope, an in-process handler and the loopback HTTP server) that the
 //! command line, the pipe and the app share. [`policy`] is the saved
-//! settings and [`sys`] the Windows plumbing (data folder, atomic writes,
-//! System32 tools) the CLI and the app share. [`files`] turns inputs into
+//! settings and [`sys`] the Windows plumbing (data folder, atomic and exclusive writes, file
+//! locks, DPAPI, System32 tools) the CLI and the app share. [`files`] turns inputs into
 //! file jobs, [`inventory`] keeps what a scan of the user's folders found
 //! and [`subject`] looks for one person's values in files.
 

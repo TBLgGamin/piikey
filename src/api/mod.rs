@@ -15,9 +15,10 @@
 //! ignore any).
 //!
 //! The reply is an envelope, `{"ok":true,"result":<value>}` or
-//! `{"ok":false,"error":{"code":"<code>","message":"..."}}`; see [`envelope`]. The codes are
-//! `bad_request`, `app_required`, `not_found`, `busy`, `io`, `vault`, `unsupported`, `model` and
-//! `internal`.
+//! `{"ok":false,"error":{"code":"<code>","message":"..."}}`; see [`envelope`]. What `result` holds
+//! for each op is a type of [`reply`]: the handlers write it and the command line reads it. The
+//! codes are `bad_request`, `app_required`, `not_found`, `busy`, `io`, `vault`, `unsupported`,
+//! `model` and `internal`.
 //!
 //! Paths in a request are absolute: the answering process may not be the one the request came
 //! from, and a relative path would mean its working folder. Offsets of text spans are UTF-8
@@ -25,13 +26,22 @@
 
 pub mod http;
 mod local;
+pub mod reply;
+mod token;
 
-use std::{fmt, path::PathBuf};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub use self::local::{EngineSource, Local, read_or_create_token, token_path};
+pub use self::{
+    local::{DownloadProgress, EngineSource, Local, PolicySource},
+    token::read_or_create_token,
+};
 use crate::{Error, policy::SettingsPatch, vault::ExportFormat};
 
 /// How an export or a report is written.
@@ -58,8 +68,8 @@ fn yes() -> bool {
     true
 }
 
-/// One operation and what it needs. The doc of each variant says what the reply's `result`
-/// holds.
+/// One operation and what it needs. The doc of each variant says which type of [`reply`] the
+/// reply's `result` is.
 ///
 /// `Debug` shows the op and nothing else: texts, values and queries are personal data and must
 /// not end up in a log.
@@ -67,31 +77,27 @@ fn yes() -> bool {
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
     /// What the detector finds in each text, without changing anything (the vault is left as it
-    /// is, and stand-ins piikey issued are not counted). Result:
-    /// `{"results":[[{"start","end","kind","value"}]]}`, one list per text; `start` and `end`
-    /// are UTF-8 byte offsets.
+    /// is, and stand-ins piikey issued are not counted). Result: [`reply::Spans`].
     ScanText { texts: Vec<String> },
-    /// Masks the personal data in each text. Result: `{"texts":[..]}`.
+    /// Masks the personal data in each text. Result: [`reply::Texts`].
     Anonymize { texts: Vec<String> },
     /// Restores the masked values in each text. With `tolerant`, also stand-ins that came back
-    /// with a typo and names that came back alone. Result: `{"texts":[..]}`.
+    /// with a typo and names that came back alone. Result: [`reply::Texts`].
     Deanonymize {
         texts: Vec<String>,
         #[serde(default)]
         tolerant: bool,
     },
     /// Scans files and folders (recursively). With `record`, what was found is also kept in
-    /// the inventory. Result: `{"files":[{"path","size","modified","scanned","status","error"?,
-    /// "hits","counts":{kind:n}}],"hits":n}`.
+    /// the inventory. Result: [`reply::Scanned`].
     ScanFiles {
         paths: Vec<PathBuf>,
         #[serde(default = "yes")]
         record: bool,
     },
-    /// Masks files and folders into the folder `out`. Result:
-    /// `{"written":[{"input","output"}],"failed":[{"input","error"}]}`.
+    /// Masks files and folders into the folder `out`. Result: [`reply::Written`].
     AnonymizeFiles { paths: Vec<PathBuf>, out: PathBuf },
-    /// Restores files and folders into the folder `out`. Result as for `anonymize_files`.
+    /// Restores files and folders into the folder `out`. Result: [`reply::Written`].
     DeanonymizeFiles {
         paths: Vec<PathBuf>,
         out: PathBuf,
@@ -99,8 +105,7 @@ pub enum Request {
         tolerant: bool,
     },
     /// Which files hold the given values (a name, a phone number, an email address, ...); an
-    /// empty `paths` means the inventory's folders. Result:
-    /// `{"matches":[{"path","values":[index],"count"}]}`.
+    /// empty `paths` means the inventory's folders. Result: [`reply::Found`].
     SubjectSearch {
         values: Vec<String>,
         #[serde(default)]
@@ -108,8 +113,7 @@ pub enum Request {
     },
     /// The vault's records, the newest first, whose original or stand-in holds `query` (any
     /// letter case; all of them without a query), of one kind if `kind` says. `limit` is 100
-    /// unless given, at most 10,000. Result: `{"records":[{"kind","original","proxy"}],"total":n}`,
-    /// where `total` counts every match, not only the page.
+    /// unless given, at most 10,000. Result: [`reply::Records`].
     VaultList {
         #[serde(skip_serializing_if = "Option::is_none")]
         query: Option<String>,
@@ -121,26 +125,25 @@ pub enum Request {
         offset: usize,
     },
     /// Removes the records whose original or stand-in is one of `values`; the vault file is
-    /// rewritten without them. Result: `{"forgotten":n}`.
+    /// rewritten without them. Result: [`reply::Forgotten`].
     VaultForget { values: Vec<String> },
     /// Writes every record of the vault to a new file `path` (an existing file is an error).
-    /// Result: `{"records":n,"path"}`.
+    /// Result: [`reply::Exported`].
     VaultExport {
         path: PathBuf,
         #[serde(default)]
         format: Format,
     },
     /// Removes every record of the vault; the key stays. Needs `confirm: true`. Result:
-    /// `{"forgotten":n}`.
+    /// [`reply::Forgotten`].
     VaultWipe {
         #[serde(default)]
         confirm: bool,
     },
-    /// The inventory in numbers. Result:
-    /// `{"enabled","roots":[..],"files","files_with_pii","hits","scanning":{"done","total"}|null}`.
+    /// The inventory in numbers. Result: [`reply::InventoryStatus`].
     InventoryStatus,
     /// The inventory's files that hold personal data, the one with the most first, at and
-    /// under `under`. Result: `{"entries":[..],"total":n}`, entries shaped as in `scan_files`.
+    /// under `under`. `limit` is 100 unless given, at most 10,000. Result: [`reply::Entries`].
     InventoryList {
         #[serde(skip_serializing_if = "Option::is_none")]
         under: Option<PathBuf>,
@@ -150,45 +153,44 @@ pub enum Request {
         offset: usize,
     },
     /// The treemap's tiles at one level: what lies directly under `under`, or the watched
-    /// folders without it. Result: `{"nodes":[{"path","name","is_dir","hits","files","counts"}]}`.
+    /// folders without it. Result: [`reply::Nodes`].
     InventoryTree {
         #[serde(skip_serializing_if = "Option::is_none")]
         under: Option<PathBuf>,
     },
-    /// Scans the inventory's folders now. Result: `{"files","files_with_pii","hits"}`.
+    /// Scans the inventory's folders now. Result: the inventory's
+    /// [`Totals`](crate::inventory::Totals).
     InventoryRescan,
-    /// Writes the inventory's findings to a new file `path`. Result: `{"rows":n,"path"}`.
+    /// Writes the inventory's findings to a new file `path`. Result: [`reply::Reported`].
     InventoryReport {
         path: PathBuf,
         #[serde(default)]
         format: Format,
     },
-    /// The saved settings. Result: the settings as an object, see `Policy`.
+    /// The saved settings. Result: the [`Policy`](crate::policy::Policy).
     SettingsGet,
-    /// Changes the given settings, validated as a whole. Result: the settings as saved.
+    /// Changes the given settings, validated as a whole. Result: the settings as saved, a
+    /// [`Policy`](crate::policy::Policy).
     SettingsSet { settings: SettingsPatch },
-    /// Every kind of personal data. Result: `[{"kind","label","group","enabled"}]`.
+    /// Every kind of personal data. Result: a list of [`reply::Kind`].
     Kinds,
-    /// Where the detection model stands. Result:
-    /// `{"state":"missing"|"unloaded"|"ready"|"failed","device":"cpu"|"hybrid"|null,"error"?,"dir"}`.
+    /// Where the detection model stands. Result: [`reply::Model`].
     ModelStatus,
     /// Downloads the detection model. Result: `{}`.
     ModelDownload,
     /// The token the HTTP API wants as `Authorization: Bearer <token>`; `rotate` makes a new
-    /// one first. Result: `{"token"}`.
+    /// one first. Result: [`reply::Token`].
     ApiToken {
         #[serde(default)]
         rotate: bool,
     },
-    /// How piikey is doing. Result:
-    /// `{"app","protection","version","vault_records","model","highlight","explorer_menu",
-    /// "inventory","http_api"}`; `protection` is `null` when the app is not running.
+    /// How piikey is doing. Result: [`reply::Status`].
     Status,
     /// Switches protection (masking what goes to the protected sites and programs) on or off.
-    /// Needs the app.
+    /// Needs the app. Result: [`reply::Protection`].
     Protection { on: bool },
     /// Scans files and folders as Explorer's "Scan for PII" does and shows the result in the
-    /// app. Needs the app.
+    /// app. Needs the app. Result: `{}`.
     ExplorerScan { paths: Vec<PathBuf> },
 }
 
@@ -264,28 +266,72 @@ impl fmt::Debug for Request {
     }
 }
 
-/// Every code of an [`ApiError`].
-const CODES: [&str; 9] = [
-    "bad_request",
-    "app_required",
-    "not_found",
-    "busy",
-    "io",
-    "vault",
-    "unsupported",
-    "model",
-    "internal",
-];
+/// What kind of failure an [`ApiError`] is. The name is the `code` of the reply's error, and the
+/// HTTP API answers each with a status of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Code {
+    /// The request is wrong.
+    BadRequest,
+    /// The request needs the piikey app to be running.
+    AppRequired,
+    /// There is no such op, file or record.
+    NotFound,
+    /// What the request needs is in use.
+    Busy,
+    /// Reading or writing a file failed.
+    Io,
+    /// The vault could not be opened, read or written.
+    Vault,
+    /// A file is in a format piikey cannot read.
+    Unsupported,
+    /// The detection model is missing or failed.
+    Model,
+    /// Something went wrong that the request did not cause.
+    Internal,
+}
+
+impl Code {
+    const ALL: [Self; 9] = [
+        Self::BadRequest,
+        Self::AppRequired,
+        Self::NotFound,
+        Self::Busy,
+        Self::Io,
+        Self::Vault,
+        Self::Unsupported,
+        Self::Model,
+        Self::Internal,
+    ];
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::BadRequest => "bad_request",
+            Self::AppRequired => "app_required",
+            Self::NotFound => "not_found",
+            Self::Busy => "busy",
+            Self::Io => "io",
+            Self::Vault => "vault",
+            Self::Unsupported => "unsupported",
+            Self::Model => "model",
+            Self::Internal => "internal",
+        }
+    }
+
+    /// The code `name` spells, if this version has it.
+    fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|code| code.as_str() == name)
+    }
+}
 
 /// Why a request failed: a code a program can act on, and a message for a person.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiError {
-    code: &'static str,
+    code: Code,
     message: String,
 }
 
 impl ApiError {
-    fn new(code: &'static str, message: impl Into<String>) -> Self {
+    fn new(code: Code, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
@@ -295,38 +341,38 @@ impl ApiError {
     /// The request is wrong: a bad value, a missing confirmation, a path that is not absolute.
     #[must_use]
     pub fn bad_request(message: impl Into<String>) -> Self {
-        Self::new("bad_request", message)
+        Self::new(Code::BadRequest, message)
     }
 
     /// The request needs the piikey app to be running.
     #[must_use]
     pub fn app_required(message: impl Into<String>) -> Self {
-        Self::new("app_required", message)
+        Self::new(Code::AppRequired, message)
     }
 
     /// There is no such op, file or record.
     #[must_use]
     pub fn not_found(message: impl Into<String>) -> Self {
-        Self::new("not_found", message)
+        Self::new(Code::NotFound, message)
     }
 
     /// What the request needs is in use: a scan that is already running.
     #[must_use]
     pub fn busy(message: impl Into<String>) -> Self {
-        Self::new("busy", message)
+        Self::new(Code::Busy, message)
     }
 
     /// Something went wrong that the request did not cause.
     #[must_use]
     pub fn internal(message: impl Into<String>) -> Self {
-        Self::new("internal", message)
+        Self::new(Code::Internal, message)
     }
 
     /// One of `bad_request`, `app_required`, `not_found`, `busy`, `io`, `vault`, `unsupported`,
     /// `model` and `internal`.
     #[must_use]
     pub const fn code(&self) -> &'static str {
-        self.code
+        self.code.as_str()
     }
 
     /// What went wrong, for a person.
@@ -347,22 +393,22 @@ impl std::error::Error for ApiError {}
 impl From<Error> for ApiError {
     fn from(error: Error) -> Self {
         let code = match &error {
-            Error::Io(e) if e.kind() == std::io::ErrorKind::NotFound => "not_found",
-            Error::Io(_) => "io",
+            Error::Io(e) if e.kind() == std::io::ErrorKind::NotFound => Code::NotFound,
+            Error::Io(_) => Code::Io,
             Error::Dpapi(_)
             | Error::VaultCorrupt { .. }
             | Error::VaultPathUnavailable
-            | Error::ProxyExhausted { .. } => "vault",
+            | Error::ProxyExhausted { .. } => Code::Vault,
             Error::UnsupportedFormat(_)
             | Error::Zip(_)
             | Error::Xml(_)
             | Error::Pdf(_)
             | Error::Ocr(_)
-            | Error::Mail(_) => "unsupported",
-            Error::Protocol(_) | Error::BadRequest(_) => "bad_request",
-            Error::Model(_) => "model",
-            Error::Busy(_) => "busy",
-            Error::Tool(_) | Error::Poisoned => "internal",
+            | Error::Mail(_) => Code::Unsupported,
+            Error::Protocol(_) | Error::BadRequest(_) => Code::BadRequest,
+            Error::Model(_) => Code::Model,
+            Error::Busy(_) => Code::Busy,
+            Error::Tool(_) | Error::Poisoned => Code::Internal,
         };
         Self::new(code, error.to_string())
     }
@@ -381,8 +427,33 @@ pub trait Handler: Send + Sync {
     fn handle(&self, request: Request) -> Result<Value, ApiError>;
 }
 
+/// `value` as the JSON of a reply.
+///
+/// # Errors
+/// `internal` when the value cannot be encoded, which is a bug.
+pub fn to_json<T: Serialize + ?Sized>(value: &T) -> Result<Value, ApiError> {
+    serde_json::to_value(value)
+        .map_err(|e| ApiError::internal(format!("cannot encode the result: {e}")))
+}
+
+/// Checks that `path` of a request is absolute: the process that answers is not always the one
+/// that asked, and a relative path would mean the folder it runs in.
+///
+/// # Errors
+/// `bad_request` for a path that is not absolute.
+pub fn require_absolute(path: &Path) -> Result<(), ApiError> {
+    if path.is_absolute() {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request(format!(
+            "{} is not an absolute path: it must start with a drive or a share",
+            path.display()
+        )))
+    }
+}
+
 /// A JSON object of `fields`, in the order given.
-pub(crate) fn object<const N: usize>(fields: [(&'static str, Value); N]) -> Value {
+fn object<const N: usize>(fields: [(&'static str, Value); N]) -> Value {
     Value::Object(
         fields
             .into_iter()
@@ -403,7 +474,7 @@ pub fn envelope(reply: Result<Value, ApiError>) -> Value {
             (
                 "error",
                 object([
-                    ("code", error.code.into()),
+                    ("code", error.code().into()),
                     ("message", error.message.into()),
                 ]),
             ),
@@ -427,9 +498,8 @@ pub fn open_envelope(envelope: Value) -> Result<Value, ApiError> {
             let code = error
                 .get("code")
                 .and_then(Value::as_str)
-                .and_then(|code| CODES.iter().find(|known| **known == code))
-                .copied()
-                .unwrap_or("internal");
+                .and_then(Code::parse)
+                .unwrap_or(Code::Internal);
             let message = error
                 .get("message")
                 .and_then(Value::as_str)
@@ -438,6 +508,48 @@ pub fn open_envelope(envelope: Value) -> Result<Value, ApiError> {
         }
         _ => Err(ApiError::internal("the reply is not a piikey reply")),
     }
+}
+
+/// What a reply that cannot be encoded is replaced with.
+const UNENCODABLE: &[u8] =
+    br#"{"ok":false,"error":{"code":"internal","message":"the reply could not be encoded"}}"#;
+
+/// The bytes of the [`envelope`] of `reply`, for the pipe and for an HTTP body.
+pub(crate) fn encode(reply: Result<Value, ApiError>) -> Vec<u8> {
+    // A `Value` always encodes; the replacement is for the case that never is.
+    serde_json::to_vec(&envelope(reply)).unwrap_or_else(|_| UNENCODABLE.to_vec())
+}
+
+/// A request that was answered: the bytes of its reply's [`envelope`], and the error when the
+/// reply is one.
+pub(crate) struct Answered {
+    pub error: Option<ApiError>,
+    pub body: Vec<u8>,
+}
+
+/// Has `handler` answer the request that `decode` makes, on a thread that may block: decoding a
+/// big request, answering it and encoding a big reply are work, a scan of a big folder takes
+/// long, and the thread of the server must stay free for its other clients. A handler that
+/// panics fails that request and nothing else.
+pub(crate) async fn answer(
+    handler: Arc<dyn Handler>,
+    decode: impl FnOnce() -> Result<Request, ApiError> + Send + 'static,
+) -> Answered {
+    tokio::task::spawn_blocking(move || {
+        let reply = decode().and_then(|request| handler.handle(request));
+        Answered {
+            error: reply.as_ref().err().cloned(),
+            body: encode(reply),
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        let error = ApiError::internal("the request failed unexpectedly");
+        Answered {
+            body: encode(Err(error.clone())),
+            error: Some(error),
+        }
+    })
 }
 
 #[cfg(test)]
@@ -645,8 +757,95 @@ mod tests {
             let api = ApiError::from(error);
             assert_eq!(api.code(), code, "{shown}");
             assert_eq!(api.message(), shown);
-            assert!(CODES.contains(&api.code()));
         }
+    }
+
+    #[test]
+    fn every_code_is_named_once_and_found_by_its_name() {
+        for code in Code::ALL {
+            assert_eq!(Code::parse(code.as_str()), Some(code));
+        }
+        let mut names = Code::ALL.map(Code::as_str);
+        names.sort_unstable();
+        assert!(names.windows(2).all(|pair| pair[0] != pair[1]));
+        assert_eq!(Code::parse("made_up"), None);
+    }
+
+    #[test]
+    fn only_a_path_with_a_drive_or_a_share_is_absolute() {
+        for good in [r"C:\data", r"\\server\share\data"] {
+            assert!(require_absolute(Path::new(good)).is_ok(), "{good}");
+        }
+        for bad in ["data", r"data\a.txt", r"\rooted", "C:drive-relative", ""] {
+            let error = require_absolute(Path::new(bad)).err();
+            assert_eq!(error.map(|e| e.code()), Some("bad_request"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_bytes_of_a_reply_are_its_envelope() -> TestResult {
+        for reply in [Ok(json!({"a": 1})), Err(ApiError::busy("not now"))] {
+            assert_eq!(
+                serde_json::from_slice::<Value>(&encode(reply.clone()))?,
+                envelope(reply)
+            );
+        }
+        // What stands in for a reply that cannot be encoded is an envelope too.
+        let stand_in = open_envelope(serde_json::from_slice(UNENCODABLE)?);
+        assert_eq!(stand_in.err().map(|e| e.code()), Some("internal"));
+        Ok(())
+    }
+
+    /// Answers a status, refuses a wipe, and panics on anything else.
+    struct Stub;
+
+    impl Handler for Stub {
+        fn handle(&self, request: Request) -> Result<Value, ApiError> {
+            match request {
+                Request::Status => Ok(json!({"fine": true})),
+                Request::VaultWipe { .. } => Err(ApiError::busy("not now")),
+                _ => panic!("the stub was told to panic"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_request_is_answered_whatever_becomes_of_it() -> TestResult {
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        let answered = |request: Result<Request, ApiError>| {
+            runtime.block_on(answer(Arc::new(Stub), move || request))
+        };
+        let wipe = Request::VaultWipe { confirm: true };
+        let cases = [
+            (
+                Ok(Request::Status),
+                None,
+                json!({"ok": true, "result": {"fine": true}}),
+            ),
+            (
+                Ok(wipe),
+                Some("busy"),
+                envelope(Err(ApiError::busy("not now"))),
+            ),
+            // A body that is no request never reaches the handler.
+            (
+                Err(ApiError::bad_request("no op")),
+                Some("bad_request"),
+                envelope(Err(ApiError::bad_request("no op"))),
+            ),
+            // A handler that panics fails its request only.
+            (
+                Ok(Request::ModelDownload),
+                Some("internal"),
+                envelope(Err(ApiError::internal("the request failed unexpectedly"))),
+            ),
+        ];
+        for (request, code, envelope) in cases {
+            let got = answered(request);
+            assert_eq!(got.error.as_ref().map(ApiError::code), code);
+            assert_eq!(serde_json::from_slice::<Value>(&got.body)?, envelope);
+        }
+        Ok(())
     }
 
     #[test]

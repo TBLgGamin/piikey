@@ -90,6 +90,14 @@ def throttle() -> None:
         time.sleep(wait)
 
 
+def retry_after(headers: Any) -> float:
+    """The seconds a `Retry-After` header asks for; 0 when it is absent or an HTTP date."""
+    try:
+        return float(headers.get("Retry-After") or 0)
+    except ValueError:
+        return 0.0
+
+
 def get_json(url: str, tries: int = 8) -> Any:
     """GETs `url` as JSON, retrying rate limits, server errors and the index-is-loading answer."""
     delay = 2.0
@@ -103,7 +111,7 @@ def get_json(url: str, tries: int = 8) -> Any:
             retriable = e.code in (429, 500, 502, 503, 504)
             if not retriable or attempt == tries - 1:
                 raise
-            wait = max(float(e.headers.get("Retry-After") or 0), delay)
+            wait = max(retry_after(e.headers), delay)
         except (urllib.error.URLError, TimeoutError, ConnectionError):
             if attempt == tries - 1:
                 raise
@@ -124,14 +132,20 @@ class Pager:
 
     def __init__(self, dataset: str, split: str, cache: Path, columns: tuple[str, ...]) -> None:
         self.dataset, self.split, self.cache, self.columns = dataset, split, cache, columns
-        self.truncated = 0
+        self._truncated: dict[str, int] = {}  # per page: rows the API cut short
         cache.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def truncated(self) -> int:
+        """Rows skipped because a cell the API cut short is unusable (cached pages included)."""
+        return sum(self._truncated.values())
 
     def rows(self, offset: int, length: int) -> tuple[list[dict], int]:
         """`(rows, total)`: rows `offset..offset+length` as `{"idx": row_idx, "row": {...}}`."""
         path = self.cache / f"{self.split}-{offset}-{length}.json"
         if path.exists():
             data = json.loads(path.read_text(encoding="utf-8"))
+            self._truncated[path.name] = data.get("truncated", 0)
             return data["rows"], data["total"]
         query = urllib.parse.urlencode(
             {"dataset": self.dataset, "config": "default", "split": self.split,
@@ -139,13 +153,21 @@ class Pager:
         )  # fmt: skip
         page = get_json(f"{API}/rows?{query}")
         rows = []
+        truncated = 0
         for item in page["rows"]:
             if set(item.get("truncated_cells") or []) & set(self.columns):
-                self.truncated += 1  # a cell the API cut short is unusable
+                truncated += 1
                 continue
             rows.append({"idx": item["row_idx"], "row": {c: item["row"].get(c) for c in self.columns}})
         total = page["num_rows_total"]
-        path.write_text(json.dumps({"rows": rows, "total": total}, ensure_ascii=False), encoding="utf-8")
+        # Written aside and renamed: a run killed mid-write must not leave a page that cannot be read.
+        partial = path.with_suffix(".tmp")
+        partial.write_text(
+            json.dumps({"rows": rows, "total": total, "truncated": truncated}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        partial.replace(path)
+        self._truncated[path.name] = truncated
         return rows, total
 
 
@@ -196,7 +218,7 @@ def convert_finance(item: dict, label_map: dict[str, str], stats: SpanStats) -> 
     return {
         "id": f"finance_multilingual-{item['idx']}",
         "source": "finance_multilingual",
-        "lang": FINANCE_LANGS.get(row["language"], row["language"].lower()),
+        "lang": FINANCE_LANGS[row["language"]],  # fetch_finance pooled only the languages it knows
         "group": row.get("document_type") or "",
         "text": text,
         "spans": char_spans_to_byte_spans(text, spans, label_map, stats),
@@ -314,6 +336,8 @@ def openpii_blocks(pager: Pager) -> dict[str, tuple[int, int]]:
         blocks[lang] = (first, freq[lang])
         first += freq[lang]
     for lang in OPENPII_WEIGHTS:
+        if lang not in blocks:
+            return {}
         start, count = blocks[lang]
         for idx in (start, start + count - 1):
             rows, _ = pager.rows(idx, 1)

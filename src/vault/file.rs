@@ -14,15 +14,15 @@
 //! short, zero-filled, or fails authentication is forgiven only when nothing valid follows
 //! it. Damage anywhere else is `VaultCorrupt`, except after a forget, which rewrites the
 //! whole file under a new `vault_id`: it keeps the new file in `<vault>.compact` until it is
-//! in place, and `Vault::open` repairs the vault from that copy.
+//! in place, and `Vault::open`, or the next write of any process that has the vault open,
+//! repairs the vault from that copy.
 
 use std::{fs::File, io, ops::Range, os::windows::fs::FileExt, sync::Arc};
 
 use chacha20poly1305::{AeadInOut, XChaCha20Poly1305, XNonce, aead::inout::InOutBuf};
 use rayon::prelude::*;
 
-use super::keys::fill_random;
-use crate::{Error, Result, detect::EntityKind};
+use crate::{Error, Result, detect::EntityKind, sys};
 
 const MAGIC: &[u8; 4] = b"PKV1";
 /// `MAGIC` + `u32 dpapi_len` + `vault_id`: the header without the DPAPI blob.
@@ -48,6 +48,7 @@ pub(super) fn invalid(msg: &'static str) -> Error {
 }
 
 /// One issued mapping.
+#[derive(Clone)]
 pub(super) struct Entry {
     pub(super) kind: EntityKind,
     pub(super) original: Arc<str>,
@@ -187,8 +188,11 @@ pub(super) fn seal(
         .map(|e| FRAME_HEAD + MIN_PLAIN + e.original.len() + e.proxy.len() + TAG_LEN)
         .sum();
     let mut out = Vec::with_capacity(capacity);
-    for (index, entry) in (first_index..).zip(entries) {
-        seal_one(cipher, vault_id, index, entry, &mut out)?;
+    // One request to the system for every nonce of the batch, not one per record.
+    let mut nonces = vec![[0u8; NONCE_LEN]; entries.len()];
+    sys::fill_random(nonces.as_flattened_mut())?;
+    for ((index, entry), nonce) in (first_index..).zip(entries).zip(&nonces) {
+        seal_one(cipher, vault_id, index, entry, nonce, &mut out)?;
     }
     Ok(out)
 }
@@ -198,6 +202,7 @@ fn seal_one(
     vault_id: &Id,
     index: u64,
     entry: &Entry,
+    nonce: &[u8; NONCE_LEN],
     out: &mut Vec<u8>,
 ) -> Result<()> {
     let too_long = || invalid("value longer than 65535 bytes");
@@ -205,11 +210,9 @@ fn seal_one(
     let proxy_len = u16::try_from(entry.proxy.len()).map_err(|_| too_long())?;
     let plain_len = MIN_PLAIN + entry.original.len() + entry.proxy.len();
     let ct_len = u32::try_from(plain_len + TAG_LEN).map_err(|_| too_long())?;
-    let mut nonce = [0u8; NONCE_LEN];
-    fill_random(&mut nonce)?;
 
     out.extend_from_slice(&ct_len.to_le_bytes());
-    out.extend_from_slice(&nonce);
+    out.extend_from_slice(nonce);
     let plain_start = out.len();
     out.push(entry.kind as u8);
     out.extend_from_slice(&original_len.to_le_bytes());
@@ -218,7 +221,7 @@ fn seal_one(
     out.extend_from_slice(entry.proxy.as_bytes());
     let tag = cipher
         .encrypt_inout_detached(
-            XNonce::cast_from_core(&nonce),
+            XNonce::cast_from_core(nonce),
             &aad(vault_id, index),
             InOutBuf::from(&mut out[plain_start..]),
         )
@@ -416,6 +419,8 @@ fn parse_plain(plain: &[u8]) -> Option<(EntityKind, &str, &str)> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use chacha20poly1305::{Key, KeyInit};
 
     use super::*;
@@ -527,19 +532,18 @@ mod tests {
 
     #[test]
     fn records_use_distinct_nonces() -> Result<()> {
-        let one = entry(EntityKind::Mac, "aa:bb:cc:dd:ee:ff", "aa:bb:cc:11:22:33");
-        let bytes = seal(&cipher(), &ID, 0, &[one])?;
-        let again = seal(
-            &cipher(),
-            &ID,
-            0,
-            &[entry(
-                EntityKind::Mac,
-                "aa:bb:cc:dd:ee:ff",
-                "aa:bb:cc:11:22:33",
-            )],
-        )?;
-        assert_ne!(bytes[4..FRAME_HEAD], again[4..FRAME_HEAD]);
+        // The same record sealed twice, and repeated within a batch: under one key a nonce
+        // used twice gives the plaintexts away.
+        let batch = vec![entry(EntityKind::Mac, "aa:bb:cc:dd:ee:ff", "aa:bb:cc:11:22:33"); 50];
+        let first = seal(&cipher(), &ID, 0, &batch)?;
+        let second = seal(&cipher(), &ID, 0, &batch)?;
+        let mut seen = HashSet::new();
+        for bytes in [&first, &second] {
+            for at in record_starts(bytes) {
+                assert!(seen.insert(bytes[at + 4..at + FRAME_HEAD].to_vec()));
+            }
+        }
+        assert_eq!(seen.len(), 100);
         Ok(())
     }
 
@@ -669,7 +673,7 @@ mod tests {
         );
         assert_eq!(parse_plain(&[0, 1, 0, b'a', 1, 0, b'b']), None, "kind 0");
         assert_eq!(
-            parse_plain(&[45, 1, 0, b'a', 1, 0, b'b']),
+            parse_plain(&[0xFF, 1, 0, b'a', 1, 0, b'b']),
             None,
             "unknown kind"
         );

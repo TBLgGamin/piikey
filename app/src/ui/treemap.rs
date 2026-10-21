@@ -26,12 +26,13 @@ impl Rect {
 ///
 /// The caller sorts the weights descending; that gives the best aspect ratios but is not needed
 /// for correctness. A weight that is zero, negative or not finite gets an empty rectangle at the
-/// area's corner. When no weight counts, or `area` is empty, the result is empty.
+/// area's corner. When no weight counts, or `area` is empty or not finite, the result is empty.
 #[must_use]
 pub fn squarify(weights: &[f64], area: Rect) -> Vec<Rect> {
     let counts = |w: f64| w.is_finite() && w > 0.0;
     let total: f64 = weights.iter().copied().filter(|&w| counts(w)).sum();
-    if total <= 0.0 || area.w <= 0.0 || area.h <= 0.0 {
+    // A NaN or infinite side would otherwise lay out NaN tiles: `NaN <= 0.0` is false.
+    if !(counts(total) && counts(area.w) && counts(area.h)) {
         return Vec::new();
     }
     let scale = area.w * area.h / total;
@@ -182,6 +183,16 @@ mod tests {
     fn nothing_to_lay_out_gives_nothing() {
         assert!(squarify(&[], AREA).is_empty());
         assert!(squarify(&[0.0, 0.0], AREA).is_empty());
+    }
+
+    #[test]
+    fn an_area_that_is_not_finite_gives_nothing() {
+        for (w, h) in [(f64::NAN, 420.0), (1000.0, f64::INFINITY), (-1.0, 420.0)] {
+            let area = Rect { w, h, ..AREA };
+            assert!(squarify(&WEIGHTS, area).is_empty(), "{area:?}");
+        }
+        // Weights whose sum overflows have no scale.
+        assert!(squarify(&[f64::MAX, f64::MAX], AREA).is_empty());
     }
 
     #[test]

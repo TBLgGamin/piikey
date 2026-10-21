@@ -14,7 +14,10 @@ use piikey::{
     engine::Engine,
 };
 
-use crate::{Res, data::Doc};
+use crate::{
+    Res,
+    data::{Doc, evenly},
+};
 
 /// A way of putting detectors together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -318,8 +321,7 @@ pub fn measure(
 
 /// Times `count` documents spread evenly over `docs`, each in a call of its own.
 fn time_single(det: &dyn Detector, docs: &[Doc], count: usize) -> Latency {
-    let step = (docs.len() / count.max(1)).max(1);
-    let sample: Vec<&Doc> = docs.iter().step_by(step).take(count).collect();
+    let sample = evenly(docs, count);
     let mut ms: Vec<f64> = sample
         .iter()
         .map(|d| {

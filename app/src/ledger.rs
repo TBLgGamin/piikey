@@ -107,7 +107,7 @@ impl Ledger {
     /// that site may send back as it is.
     #[must_use]
     pub fn sent_to(&self, host: &str) -> HashSet<Arc<str>> {
-        self.sent_at(Instant::now(), host).into_iter().collect()
+        self.latest_at(Instant::now(), host).into_keys().collect()
     }
 
     /// Changes whenever a proxy is recorded.
@@ -145,6 +145,13 @@ impl Ledger {
     /// Distinct proxies sent to `host` or one of its parent domains within
     /// [`TTL`] of `now`, least recently sent first.
     fn sent_at(&self, now: Instant, host: &str) -> Vec<Arc<str>> {
+        let mut sent: Vec<_> = self.latest_at(now, host).into_iter().collect();
+        sent.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        sent.into_iter().map(|(proxy, _)| proxy).collect()
+    }
+
+    /// The proxies of [`Ledger::sent_at`], each with when it was last sent.
+    fn latest_at(&self, now: Instant, host: &str) -> HashMap<Arc<str>, Instant> {
         let host = normalize_host(host);
         let mut latest: HashMap<Arc<str>, Instant> = HashMap::new();
         let mut hosts = self.lock();
@@ -160,9 +167,7 @@ impl Ledger {
                     .or_insert(sent);
             }
         }
-        let mut sent: Vec<_> = latest.into_iter().collect();
-        sent.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-        sent.into_iter().map(|(proxy, _)| proxy).collect()
+        latest
     }
 
     fn lock(&self) -> MutexGuard<'_, HashMap<String, HostLog>> {

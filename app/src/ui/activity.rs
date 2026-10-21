@@ -1,8 +1,8 @@
 //! Which stand-ins went where and when, for the activity feed. Kept in
 //! `%LOCALAPPDATA%\piikey\activity.cfg`, one line per stand-in, most recently sent first:
 //! `<ticks>\t<count>\t<host>\t<exe or ->\t<stand-in>`. `<ticks>` is local Windows file time (100 ns
-//! since 1601-01-01), as in [`stats`](super::stats). Only stand-ins are kept here; the values they
-//! stand for stay in the encrypted vault.
+//! since 1601-01-01). Only stand-ins are kept here; the values they stand for stay in the
+//! encrypted vault.
 
 use std::fmt::Write;
 
@@ -43,13 +43,10 @@ pub struct Activity {
 }
 
 impl Activity {
-    /// `proxy` was sent to `host` at `ticks`: it moves to the front.
+    /// `proxy` was sent to `host` at `ticks`: it moves to the front. What the file could not hold
+    /// is not kept.
     pub fn record(&mut self, proxy: &str, host: &str, exe: Option<&str>, ticks: i64) {
-        if [Some(proxy), Some(host), exe]
-            .iter()
-            .flatten()
-            .any(|s| unsafe_field(s))
-        {
+        if !keepable(proxy, host, exe) {
             return;
         }
         let count = match self.uses.iter().position(|u| u.proxy == proxy) {
@@ -74,15 +71,11 @@ impl Activity {
         self.uses.iter()
     }
 
-    /// Every host sent to, most recently first.
-    pub fn sites(&self) -> Vec<String> {
-        let mut sites: Vec<String> = Vec::new();
-        for u in &self.uses {
-            if !sites.contains(&u.host) {
-                sites.push(u.host.clone());
-            }
-        }
-        sites
+    /// Forgets the stand-ins `keep` says no to; whether there were any.
+    pub fn retain(&mut self, keep: impl FnMut(&Use) -> bool) -> bool {
+        let before = self.uses.len();
+        self.uses.retain(keep);
+        self.uses.len() != before
     }
 
     /// Reads the file text; lines that do not parse are skipped.
@@ -94,15 +87,15 @@ impl Activity {
                 let ticks = fields.next()?.parse().ok()?;
                 let count = fields.next()?.parse().ok()?;
                 let host = fields.next()?;
-                let exe = fields.next()?;
+                let exe = Some(fields.next()?).filter(|&exe| exe != "-");
                 let proxy = fields.next()?;
-                if fields.next().is_some() || host.is_empty() || proxy.is_empty() {
+                if fields.next().is_some() || !keepable(proxy, host, exe) {
                     return None;
                 }
                 Some(Use {
                     proxy: proxy.to_owned(),
                     host: host.to_owned(),
-                    exe: (exe != "-").then(|| exe.to_owned()),
+                    exe: exe.map(str::to_owned),
                     ticks,
                     count,
                 })
@@ -130,9 +123,16 @@ impl Activity {
     }
 }
 
-/// A field that would break the line format.
-fn unsafe_field(s: &str) -> bool {
-    s.contains(['\t', '\r', '\n'])
+/// Whether a send of `proxy` to `host` by `exe` can be kept: a field holds no tab or line break,
+/// which would break the line, and the file has no line without a stand-in or a site, which
+/// [`Activity::parse`] would drop at the next start.
+fn keepable(proxy: &str, host: &str, exe: Option<&str>) -> bool {
+    !proxy.is_empty()
+        && !host.is_empty()
+        && [Some(proxy), Some(host), exe]
+            .iter()
+            .flatten()
+            .all(|field| !field.contains(['\t', '\r', '\n']))
 }
 
 /// The local day of `ticks`.
@@ -183,7 +183,6 @@ mod tests {
             Ok(("Bram de Bouwman", "claude.ai", 2, 3))
         );
         assert_eq!(activity.iter().count(), 2);
-        assert_eq!(activity.sites(), ["claude.ai"]);
     }
 
     #[test]
@@ -217,6 +216,30 @@ mod tests {
         activity.record("tab\there", "a.com", None, 1);
         activity.record("p", "a.com", Some("line\nbreak"), 1);
         assert_eq!(activity.iter().count(), 0);
+    }
+
+    #[test]
+    fn what_the_file_would_lose_is_not_kept() {
+        // `parse` drops a line without a site or a stand-in: what the feed showed would be gone
+        // at the next start.
+        let mut activity = Activity::default();
+        activity.record("p", "", None, 1);
+        activity.record("", "a.com", None, 1);
+        assert_eq!(activity.iter().count(), 0);
+    }
+
+    #[test]
+    fn what_the_vault_lost_leaves_the_feed() {
+        let mut activity = Activity::default();
+        activity.record("kept", "a.com", None, 1);
+        activity.record("lost", "b.com", None, 2);
+        assert!(activity.retain(|u| u.proxy != "lost"));
+        assert!(
+            !activity.retain(|u| u.proxy != "lost"),
+            "nothing is left to drop"
+        );
+        let proxies: Vec<&str> = activity.iter().map(|u| u.proxy.as_str()).collect();
+        assert_eq!(proxies, ["kept"]);
     }
 
     #[test]

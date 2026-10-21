@@ -2,10 +2,10 @@
 //!
 //! The file is the source of truth and the in-memory `State` a cache of it.
 //! [`Vault::resolve`] appends records and [`Vault::forget`] removes them; those two are the
-//! only writers. Under the in-process mutex and the cross-process file lock each first merges
-//! what other processes did. `resolve` then picks proxies that collide with nothing (and that
-//! the caller does not turn down, see `resolve`), appends them in one write and syncs. `forget`
-//! rewrites the file: see there.
+//! only writers. Under the in-process mutex and the cross-process file lock each first finishes
+//! a forget that stopped halfway and merges what other processes did. `resolve` then picks
+//! proxies that collide with nothing (and that the caller does not turn down, see `resolve`),
+//! appends them in one write and syncs. `forget` rewrites the file: see there.
 //!
 //! No lock is ever held across a rayon call. A rayon worker that waits for its
 //! own parallel work runs other queued jobs meanwhile, and one of those may
@@ -22,7 +22,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, BufWriter, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, RwLock, RwLockReadGuard},
+    sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard},
 };
 
 use rayon::prelude::*;
@@ -74,10 +74,11 @@ struct State {
     by_proxy: HashMap<Arc<str>, (EntityKind, Arc<str>)>,
     /// Every original of every kind: no proxy may equal one of them.
     originals: HashSet<Arc<str>>,
-    /// Records in the file, which is also the next record's index.
-    count: u64,
-    /// Proxies in file order: the order they were issued in.
-    order: Vec<Arc<str>>,
+    /// Every record in file order, which is the order they were issued in. Their number is also
+    /// the next record's index.
+    records: Vec<Entry>,
+    /// Byte length of the longest proxy of any record, see [`VaultView::longest_proxy`].
+    longest_proxy: usize,
     /// How often the records were replaced wholesale since the vault was opened, see
     /// [`VaultView::generation`].
     generation: u64,
@@ -91,14 +92,19 @@ impl Default for State {
             by_original: std::array::from_fn(|_| HashMap::new()),
             by_proxy: HashMap::new(),
             originals: HashSet::new(),
-            count: 0,
-            order: Vec::new(),
+            records: Vec::new(),
+            longest_proxy: 0,
             generation: 0,
         }
     }
 }
 
 impl State {
+    /// Records in the file: the index of the next one.
+    fn count(&self) -> u64 {
+        self.records.len() as u64
+    }
+
     fn insert_all(&mut self, entries: Vec<Entry>) {
         let mut per_kind = [0usize; KINDS];
         for entry in &entries {
@@ -108,19 +114,18 @@ impl State {
             map.reserve(extra);
         }
         self.by_proxy.reserve(entries.len());
-        self.order.reserve(entries.len());
         self.originals.reserve(entries.len());
-        for Entry {
-            kind,
-            original,
-            proxy,
-        } in entries
-        {
-            self.by_original[slot(kind)].insert(Arc::clone(&original), Arc::clone(&proxy));
-            self.order.push(Arc::clone(&proxy));
-            self.by_proxy.insert(proxy, (kind, Arc::clone(&original)));
-            self.originals.insert(original);
-            self.count += 1;
+        self.records.reserve(entries.len());
+        for entry in entries {
+            self.longest_proxy = self.longest_proxy.max(entry.proxy.len());
+            self.by_original[slot(entry.kind)]
+                .insert(Arc::clone(&entry.original), Arc::clone(&entry.proxy));
+            self.by_proxy.insert(
+                Arc::clone(&entry.proxy),
+                (entry.kind, Arc::clone(&entry.original)),
+            );
+            self.originals.insert(Arc::clone(&entry.original));
+            self.records.push(entry);
         }
     }
 }
@@ -166,7 +171,7 @@ impl fmt::Debug for Vault {
 impl fmt::Debug for VaultView<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("VaultView")
-            .field("records", &self.state.count)
+            .field("records", &self.state.count())
             .finish_non_exhaustive()
     }
 }
@@ -281,45 +286,39 @@ impl Vault {
     /// writes it reloads the vault, while a process that only reads keeps the records it has until
     /// it is restarted. The order of the steps makes a crash at any point recoverable:
     ///
-    /// 1. the new file is written to `<vault>.compact.tmp`, synced and renamed to
+    /// 1. the new file is written to a temporary file, synced and renamed to
     ///    `<vault>.compact`, which is the point of no return;
     /// 2. the vault file is cut to the new length and the new contents are written over it;
     /// 3. `.compact` is deleted.
     ///
-    /// [`Vault::open`] finishes a forget that stopped after step 1.
+    /// A forget that stopped after step 1, by a crash or an `Io` error, is finished by the next
+    /// [`Vault::open`] and by the next write of any process that has the vault open, so nothing
+    /// is appended to the old contents it is about to replace.
     ///
     /// `gone` is asked about each record in turn while the vault's locks are held, so it must be
     /// cheap and must not call back into the vault.
     ///
     /// # Errors
     /// `Io`, `VaultCorrupt`, `Poisoned`. An `Io` after step 1 may leave the file half rewritten:
-    /// the next open repairs it.
+    /// the next open or write repairs it.
     pub fn forget(&self, gone: &dyn Fn(EntityKind, &str, &str) -> bool) -> Result<usize> {
-        let mut known_len = self.known_len.lock()?;
-        let _lock = FileLock::exclusive(&self.file)?;
-        self.merge_appended(&mut known_len)?;
+        let (mut known_len, _lock) = self.lock_current()?;
         let (kept, removed) = {
             let state = self.state.read()?;
-            let mut kept = Vec::with_capacity(state.order.len());
-            for proxy in &state.order {
-                if let Some((kind, original)) = state.by_proxy.get(proxy)
-                    && !gone(*kind, original, proxy)
-                {
-                    kept.push(Entry {
-                        kind: *kind,
-                        original: Arc::clone(original),
-                        proxy: Arc::clone(proxy),
-                    });
+            let mut kept = Vec::with_capacity(state.records.len());
+            for record in &state.records {
+                if !gone(record.kind, &record.original, &record.proxy) {
+                    kept.push(record.clone());
                 }
             }
-            let removed = state.order.len() - kept.len();
+            let removed = state.records.len() - kept.len();
             (kept, removed)
         };
         if removed == 0 {
             return Ok(0);
         }
         let mut id = [0u8; VAULT_ID_LEN];
-        keys::fill_random(&mut id)?;
+        sys::fill_random(&mut id)?;
         let mut image = file::encode_header(&self.wrapped, &id)?;
         image.extend_from_slice(&file::seal(&self.keys.records, &id, 0, &kept)?);
 
@@ -327,7 +326,7 @@ impl Vault {
         sys::write_atomic(&compact, &image)?;
         overwrite(&self.file, &image)?;
         // Best effort: a copy that stays is recognized for what it is, and removed, by the next
-        // open, see `finish_compaction`.
+        // open or write, see `finish_compaction`.
         let _ = fs::remove_file(&compact);
 
         self.replace_state(kept)?;
@@ -362,16 +361,14 @@ impl Vault {
     /// Runs `choose` against the up-to-date contents of the vault, then
     /// appends the entries it returns to the file.
     ///
-    /// Takes the in-process mutex, then the file lock, merges records other
-    /// processes appended since this one last looked, and only then calls
-    /// `choose`. Everything here is sequential: see the module docs.
+    /// Takes the locks and brings the vault up to date first, see
+    /// [`Self::lock_current`], and only then calls `choose`. Everything here is sequential: see
+    /// the module docs.
     fn locked_append<F>(&self, choose: F) -> Result<()>
     where
         F: FnOnce(&State) -> Result<Vec<Entry>>,
     {
-        let mut known_len = self.known_len.lock()?;
-        let _lock = FileLock::exclusive(&self.file)?;
-        self.merge_appended(&mut known_len)?;
+        let (mut known_len, _lock) = self.lock_current()?;
         let entries = {
             let state = self.state.read()?;
             choose(&state)?
@@ -380,6 +377,24 @@ impl Vault {
             return Ok(());
         }
         self.append(&mut known_len, entries)
+    }
+
+    /// Takes the in-process mutex, then the file lock, and brings this process up to date with
+    /// the file: first a forget that was interrupted is finished, then the records other
+    /// processes appended are merged. The locks are released when the guards drop, the file
+    /// lock first.
+    ///
+    /// A forget holds both locks from its first step to its last, so a `.compact` file that is
+    /// there once the lock is ours belongs to one that stopped. Left alone, the vault would be
+    /// appended to or cut as a torn tail in a state that the finishing then overwrites.
+    fn lock_current(&self) -> Result<(MutexGuard<'_, u64>, FileLock<'_>)> {
+        let mut known_len = self.known_len.lock()?;
+        let lock = FileLock::exclusive(&self.file)?;
+        if suffixed(&self.path, COMPACT_SUFFIX).try_exists()? {
+            finish_compaction(&self.file, &self.path)?;
+        }
+        self.merge_appended(&mut known_len)?;
+        Ok((known_len, lock))
     }
 
     /// Brings the in-memory state up to date with the file: with the records other processes
@@ -397,7 +412,7 @@ impl Vault {
         if len == *known_len {
             return Ok(());
         }
-        let first_index = self.state.read()?.count;
+        let first_index = self.state.read()?.count();
         if len < *known_len {
             // Records this process already read are gone.
             return Err(Error::VaultCorrupt {
@@ -424,8 +439,9 @@ impl Vault {
         Ok(id)
     }
 
-    /// Replaces everything this process knows with the file's contents, which another
-    /// process's [`Vault::forget`] rewrote under a new id. The file lock must be held.
+    /// Replaces everything this process knows with the file's contents, which a forget rewrote
+    /// under a new id: another process's, or one that stopped after its point of no return and
+    /// was finished by [`Vault::lock_current`]. The file lock must be held.
     fn reload(&self, known_len: &mut u64, len: u64) -> Result<()> {
         let header = file::read_header(&self.file, len)?;
         // A forget keeps the key. Another one means another vault, and its records would not
@@ -463,7 +479,7 @@ impl Vault {
     /// to the in-memory state. The file lock must be held and `known_len`
     /// must be the file's length.
     fn append(&self, known_len: &mut u64, entries: Vec<Entry>) -> Result<()> {
-        let first_index = self.state.read()?.count;
+        let first_index = self.state.read()?.count();
         let id = *self.id.read()?;
         let bytes = file::seal(&self.keys.records, &id, first_index, &entries)?;
         let written =
@@ -495,7 +511,7 @@ fn create_header(file: &File) -> Result<Head> {
     let master = keys::generate_master()?;
     let wrapped = keys::wrap(&master)?;
     let mut id = [0u8; VAULT_ID_LEN];
-    keys::fill_random(&mut id)?;
+    sys::fill_random(&mut id)?;
     let header = file::encode_header(&wrapped, &id)?;
     file::write_all_at(file, &header, 0)
         .and_then(|()| file.sync_data())
@@ -533,16 +549,19 @@ fn suffixed(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Makes `file` hold exactly `image`. It is cut to the new length first, so that a crash never
-/// leaves the new contents followed by what is left of the old ones.
+/// Makes `file` hold exactly `image`. It is cut to the new length first, and that is on disk
+/// before the new contents are written, so that a crash never leaves the new contents followed
+/// by what is left of the old ones.
 fn overwrite(file: &File, image: &[u8]) -> io::Result<()> {
     file.set_len(image.len() as u64)?;
+    file.sync_data()?;
     file::write_all_at(file, image, 0)?;
     file.sync_data()
 }
 
-/// Finishes a [`Vault::forget`] that a crash stopped, and sweeps what it left. The file lock
-/// must be held.
+/// Finishes a [`Vault::forget`] that stopped, and sweeps what it left: [`Vault::open`] does it
+/// first thing, and every write after it when it finds the `.compact` file. The file lock must
+/// be held.
 ///
 /// `<vault>.compact` is the complete file the forget was about to put in place, and it only
 /// exists once that was decided. The vault file is then in one of these states:
@@ -551,30 +570,49 @@ fn overwrite(file: &File, image: &[u8]) -> io::Result<()> {
 /// - the new file, with or without records appended since: nothing to do. That is also what a
 ///   forget that merely failed to delete `.compact` leaves, and the check is what keeps the
 ///   leftover from cutting off the records appended afterwards;
-/// - shorter than the new file, which none of the above ever is: the vault was deleted or
-///   swapped for another since, and `.compact` is not for it, so it must not bring back
-///   records.
+/// - shorter than the new file, which none of the above ever is, or with another key: the vault
+///   was deleted or swapped for another since, and `.compact` is not for it, so it must not
+///   bring back records or write over what is there.
 fn finish_compaction(file: &File, path: &Path) -> Result<()> {
     let compact = suffixed(path, COMPACT_SUFFIX);
-    // A forget that died while writing `.compact` left only this.
-    let _ = fs::remove_file(suffixed(&compact, ".tmp"));
+    // A forget that died while writing `.compact` left only temporary files of it.
+    sys::remove_temps(&compact);
     let image = match File::open(&compact) {
         Ok(image) => image,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e.into()),
     };
     let image_len = image.metadata()?.len();
-    file::read_header(&image, image_len).map_err(|e| match e {
+    let header = file::read_header(&image, image_len).map_err(|e| match e {
         Error::Io(e) => sys::io_context(&e, "use", &compact),
         other => other,
     })?;
     let bytes = file::read_range(&image, 0, image_len)?;
     drop(image);
-    if file.metadata()?.len() >= image_len && file::read_range(file, 0, image_len)? != bytes {
+    if is_unfinished(file, &bytes, header.len)? {
         overwrite(file, &bytes)?;
+    } else {
+        // The image may be in the cache only, if the forget was killed or failed before its own
+        // sync: the copy must not go before the vault is on disk.
+        file.sync_data()?;
     }
     let _ = fs::remove_file(&compact);
     Ok(())
+}
+
+/// Whether `file` is the vault that `image` (whose header is `header_len` bytes) was made from,
+/// still short of it. A vault keeps its key for good and a forget changes nothing in the
+/// header but the id at its end, so a file that is at least as long as `image`, starts like it
+/// up to that id and then differs is the old file or a new one written in part.
+fn is_unfinished(file: &File, image: &[u8], header_len: u64) -> Result<bool> {
+    let len = image.len() as u64;
+    if file.metadata()?.len() < len {
+        return Ok(false);
+    }
+    let current = file::read_range(file, 0, len)?;
+    let key_len =
+        usize::try_from(header_len).map_or(image.len(), |n| n.saturating_sub(VAULT_ID_LEN));
+    Ok(current[..key_len] == image[..key_len] && current != image)
 }
 
 /// A value waiting for a proxy.
@@ -689,12 +727,6 @@ impl VaultView<'_> {
         self.state.by_original[slot(kind)].values().map(|p| &**p)
     }
 
-    /// How many proxies of `kind` were issued.
-    #[must_use]
-    pub fn count_of(&self, kind: EntityKind) -> usize {
-        self.state.by_original[slot(kind)].len()
-    }
-
     /// Every record as `(kind, original, proxy)`, the newest first.
     pub fn newest_first(&self) -> impl Iterator<Item = (EntityKind, &str, &str)> {
         records(&self.state).rev()
@@ -728,19 +760,22 @@ impl VaultView<'_> {
     /// [`VaultView::record_count`].
     pub fn issued_since(&self, from: u64) -> impl Iterator<Item = (EntityKind, &str)> {
         let from = usize::try_from(from).unwrap_or(usize::MAX);
-        let proxies = self.state.order.get(from..).unwrap_or_default();
-        proxies.iter().filter_map(|proxy| {
-            self.state
-                .by_proxy
-                .get(proxy)
-                .map(|(kind, _)| (*kind, &**proxy))
-        })
+        let issued = self.state.records.get(from..).unwrap_or_default();
+        issued.iter().map(|record| (record.kind, &*record.proxy))
     }
 
     /// Records in the vault; changes whenever a proxy is issued.
     #[must_use]
     pub fn record_count(&self) -> u64 {
-        self.state.count
+        self.state.count()
+    }
+
+    /// Byte length of the longest proxy in the vault, of any kind; 0 when it has none. Kept as
+    /// records come and go, so it costs nothing however large the vault is: a text that is cut
+    /// further than this from where a proxy starts cannot have cut that proxy in two.
+    #[must_use]
+    pub fn longest_proxy(&self) -> usize {
+        self.state.longest_proxy
     }
 
     /// How often the vault's records were replaced wholesale (by a [`Vault::forget`], here or in
@@ -755,19 +790,31 @@ impl VaultView<'_> {
 
 /// The records of `state` as `(kind, original, proxy)`, in the order they were issued in.
 fn records(state: &State) -> impl DoubleEndedIterator<Item = (EntityKind, &str, &str)> {
-    state.order.iter().filter_map(|proxy| {
-        state
-            .by_proxy
-            .get(proxy)
-            .map(|(kind, original)| (*kind, &**original, &**proxy))
-    })
+    state
+        .records
+        .iter()
+        .map(|record| (record.kind, &*record.original, &*record.proxy))
 }
 
 /// Lower-cases `text` into `out`, replacing what it held. Per character, so the same text folds
 /// the same wherever it stands: `str::to_lowercase` reads a Greek final sigma by its position.
+/// The final sigma is folded to the small sigma, as the capital sigma is, so that a word in
+/// capitals and the same word in lower case agree. Nearly every record is ASCII, which is folded
+/// a byte at a time.
 fn fold_into(text: &str, out: &mut String) {
+    const FINAL_SIGMA: char = '\u{3C2}';
+    const SIGMA: char = '\u{3C3}';
     out.clear();
-    out.extend(text.chars().flat_map(char::to_lowercase));
+    if text.is_ascii() {
+        out.push_str(text);
+        out.make_ascii_lowercase();
+    } else {
+        out.extend(
+            text.chars()
+                .flat_map(char::to_lowercase)
+                .map(|c| if c == FINAL_SIGMA { SIGMA } else { c }),
+        );
+    }
 }
 
 /// One record as [`export`] writes it in JSON.
@@ -979,6 +1026,8 @@ mod tests {
         }
     }
 
+    /// The vault's place is part of the on-disk contract: another name would start an empty
+    /// vault beside the one the user already has.
     #[test]
     fn default_path_is_under_localappdata() -> Result<()> {
         match default_path() {
@@ -1059,9 +1108,9 @@ mod tests {
         let vault = Vault::open(&dir.vault_path())?;
         assert_eq!(newest(&vault)?, expected);
         let view = vault.read()?;
-        assert_eq!(view.count_of(EntityKind::Email), 3);
-        assert_eq!(view.count_of(EntityKind::Phone), 1);
-        assert_eq!(view.count_of(EntityKind::Iban), 0);
+        assert_eq!(view.proxies_of(EntityKind::Email).count(), 3);
+        assert_eq!(view.proxies_of(EntityKind::Phone).count(), 1);
+        assert_eq!(view.proxies_of(EntityKind::Iban).count(), 0);
         Ok(())
     }
 
@@ -1734,6 +1783,55 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn the_longest_proxy_follows_the_records() -> Result<()> {
+        let dir = TempDir::new()?;
+        let vault = Vault::open(&dir.vault_path())?;
+        let longest = |vault: &Vault| -> Result<usize> { Ok(vault.read()?.longest_proxy()) };
+        // What it has to be, found the slow way.
+        let by_hand = |vault: &Vault| -> Result<usize> {
+            Ok(vault
+                .read()?
+                .newest_first()
+                .map(|(_, _, proxy)| proxy.len())
+                .max()
+                .unwrap_or(0))
+        };
+        let email = "a.much.longer.proxy@example.net";
+        let name = "A Name That Is Longer Than The Email Proxy";
+        assert_eq!(longest(&vault)?, 0);
+
+        append(
+            &vault,
+            &[
+                (EntityKind::Email, "a@example.org", "x1@example.net"),
+                (EntityKind::Email, "b@example.org", email),
+            ],
+        )?;
+        assert_eq!(longest(&vault)?, email.len());
+
+        // A record another instance appended is found when this one writes next.
+        let other = Vault::open(&dir.vault_path())?;
+        append(&other, &[(EntityKind::Person, "Jan", name)])?;
+        append(
+            &vault,
+            &[(EntityKind::Email, "c@example.org", "x3@example.net")],
+        )?;
+        assert_eq!(longest(&vault)?, name.len());
+        assert_eq!(longest(&vault)?, by_hand(&vault)?);
+
+        // Forgetting the longest brings it down, and an instance that opens later knows it.
+        assert_eq!(vault.forget(&|_, original, _| original == "Jan")?, 1);
+        assert_eq!(longest(&vault)?, email.len());
+        drop((vault, other));
+        let vault = Vault::open(&dir.vault_path())?;
+        assert_eq!(longest(&vault)?, email.len());
+        assert_eq!(longest(&vault)?, by_hand(&vault)?);
+        assert_eq!(vault.wipe()?, 3);
+        assert_eq!(longest(&vault)?, 0);
+        Ok(())
+    }
+
     /// The vault id in the header of a vault file, found with the documented layout rather
     /// than the code under test.
     fn id_of(bytes: &[u8]) -> Vec<u8> {
@@ -1803,7 +1901,7 @@ mod tests {
                 None
             );
             assert_eq!(view.original_for("piet.bakker@orchardgate.org"), None);
-            assert_eq!(view.count_of(EntityKind::Email), 1);
+            assert_eq!(view.proxies_of(EntityKind::Email).count(), 1);
             assert_eq!(
                 view.proxy_for(EntityKind::Email, "b@example.org"),
                 Some("x2@example.net")
@@ -1825,8 +1923,14 @@ mod tests {
         for (&start, &end) in starts.iter().zip(&ends) {
             assert!(!contains_bytes(&after, &before[start..end]));
         }
-        assert!(!compact_of(&dir).exists());
-        assert!(!suffixed(&compact_of(&dir), ".tmp").exists());
+        let files: Vec<_> = std::fs::read_dir(&dir.0)?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<io::Result<_>>()?;
+        assert_eq!(
+            files,
+            ["vault.pkv"],
+            "no .compact or temporary file is left"
+        );
 
         // The vault goes on under its new id.
         append(
@@ -1945,22 +2049,26 @@ mod tests {
         Ok(())
     }
 
+    /// The vault file as a crash between the rename of `.compact` and the end of the rewrite can
+    /// leave it, given the file before the forget and after (two records of the three left).
+    fn crash_states(before: &[u8], after: &[u8]) -> [(&'static str, Vec<u8>); 5] {
+        let starts = record_starts(after);
+        // The new bytes up to `upto`, the old ones after.
+        let mixed = |upto: usize| [&after[..upto], &before[upto..after.len()]].concat();
+        [
+            ("untouched", before.to_vec()),
+            ("cut to the new length", before[..after.len()].to_vec()),
+            ("new header, old records", mixed(starts[0])),
+            ("new header and first record", mixed(starts[1])),
+            ("complete", after.to_vec()),
+        ]
+    }
+
     #[test]
     fn a_forget_stopped_after_its_point_of_no_return_is_finished_on_open() -> Result<()> {
         let dir = TempDir::new()?;
         let (before, after) = forget_b(&dir)?;
-        let halfway = after.len() / 2;
-        // What a crash between the rename of `.compact` and the end of the rewrite can leave.
-        let states = [
-            ("untouched", before.clone()),
-            ("cut to the new length", before[..after.len()].to_vec()),
-            (
-                "partly written",
-                [&after[..halfway], &before[halfway..after.len()]].concat(),
-            ),
-            ("complete", after.clone()),
-        ];
-        for (what, state) in states {
+        for (what, state) in crash_states(&before, &after) {
             std::fs::write(dir.vault_path(), &state)?;
             std::fs::write(compact_of(&dir), &after)?;
             let vault = Vault::open(&dir.vault_path())?;
@@ -1972,6 +2080,36 @@ mod tests {
             drop(vault);
             assert!(!compact_of(&dir).exists(), "{what}: .compact was left");
             assert_eq!(std::fs::read(dir.vault_path())?, after, "{what}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_forget_stopped_after_its_point_of_no_return_is_finished_by_a_write_of_an_open_vault()
+    -> Result<()> {
+        let dir = TempDir::new()?;
+        let (before, after) = forget_b(&dir)?;
+        let expected = ["d@example.org", "c@example.org", "a@example.org"];
+        for (what, state) in crash_states(&before, &after) {
+            // An instance that is open when the forget stops: it knows the three records.
+            std::fs::write(dir.vault_path(), &before)?;
+            let live = Vault::open(&dir.vault_path())?;
+            assert_eq!(dump(&live)?.len(), 3, "{what}");
+            std::fs::write(dir.vault_path(), &state)?;
+            std::fs::write(compact_of(&dir), &after)?;
+
+            // Its record belongs after the ones that stay. Appended to the old contents, it would
+            // be written over by the finishing at the next open; cut as a torn tail of the new
+            // ones, the records that stay would be lost.
+            append(
+                &live,
+                &[(EntityKind::Email, "d@example.org", "x4@example.net")],
+            )?;
+            assert_eq!(originals_newest_first(&live)?, expected, "{what}");
+            drop(live);
+            assert!(!compact_of(&dir).exists(), "{what}: .compact was left");
+            let vault = Vault::open(&dir.vault_path())?;
+            assert_eq!(originals_newest_first(&vault)?, expected, "{what}");
         }
         Ok(())
     }
@@ -2029,6 +2167,30 @@ mod tests {
     }
 
     #[test]
+    fn a_compact_file_does_not_overwrite_another_vault_that_took_the_place() -> Result<()> {
+        let dir = TempDir::new()?;
+        let (_, after) = forget_b(&dir)?;
+        // Another vault, with a key of its own and records enough to be longer than the file
+        // `.compact` holds, put there while the app was closed.
+        let elsewhere = TempDir::new()?;
+        three(&Vault::open(&elsewhere.vault_path())?)?;
+        let theirs = std::fs::read(elsewhere.vault_path())?;
+        assert!(theirs.len() > after.len());
+        std::fs::write(dir.vault_path(), &theirs)?;
+        std::fs::write(compact_of(&dir), &after)?;
+
+        let vault = Vault::open(&dir.vault_path())?;
+        assert_eq!(
+            originals_newest_first(&vault)?,
+            ["c@example.org", "b@example.org", "a@example.org"]
+        );
+        drop(vault);
+        assert!(!compact_of(&dir).exists());
+        assert_eq!(std::fs::read(dir.vault_path())?, theirs);
+        Ok(())
+    }
+
+    #[test]
     fn a_compact_file_that_is_not_a_vault_is_refused_and_overwrites_nothing() -> Result<()> {
         let dir = TempDir::new()?;
         three(&Vault::open(&dir.vault_path())?)?;
@@ -2040,14 +2202,22 @@ mod tests {
     }
 
     #[test]
-    fn a_partial_compact_temp_file_is_swept_on_open() -> Result<()> {
+    fn temporary_files_of_an_interrupted_forget_are_swept_on_open() -> Result<()> {
         let dir = TempDir::new()?;
         three(&Vault::open(&dir.vault_path())?)?;
-        let tmp = suffixed(&compact_of(&dir), ".tmp");
-        std::fs::write(&tmp, b"PKV1 cut short")?;
+        // The name a temporary file of `.compact` has now, and the one older versions used.
+        let temps = [
+            suffixed(&compact_of(&dir), ".4242-1.tmp"),
+            suffixed(&compact_of(&dir), ".tmp"),
+        ];
+        for tmp in &temps {
+            std::fs::write(tmp, b"PKV1 cut short")?;
+        }
         let vault = Vault::open(&dir.vault_path())?;
         assert_eq!(dump(&vault)?.len(), 3);
-        assert!(!tmp.exists());
+        for tmp in &temps {
+            assert!(!tmp.exists(), "{tmp:?} was left");
+        }
         Ok(())
     }
 
@@ -2245,6 +2415,41 @@ mod tests {
         assert!(found("quinn", Some(EntityKind::Email)).is_empty());
         assert_eq!(found("+316", Some(EntityKind::Phone)), ["+31612345678"]);
         assert!(found("nobody", None).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn search_treats_the_greek_final_sigma_as_a_sigma() -> Result<()> {
+        let dir = TempDir::new()?;
+        let vault = Vault::open(&dir.vault_path())?;
+        // `\u{3A3}` is the capital sigma and `\u{3C2}` the final one: the same word as capitals
+        // and as lower case, which spells its last letter differently.
+        let capitals =
+            "\u{393}\u{399}\u{3A9}\u{3A1}\u{393}\u{39F}\u{3A3} \u{3A3}\u{399}\u{3A9}\u{3A3}";
+        let small = "\u{3B3}\u{3B9}\u{3C9}\u{3C1}\u{3B3}\u{3BF}\u{3C2}";
+        append(
+            &vault,
+            &[
+                (EntityKind::Person, capitals, "Haley Quinn"),
+                (EntityKind::Person, small, "Jan Brooks"),
+            ],
+        )?;
+        let view = vault.read()?;
+        let found = |query: &str| -> Vec<String> {
+            view.search(query, None)
+                .map(|(_, original, _)| original.to_owned())
+                .collect()
+        };
+        for query in [
+            small,
+            "\u{393}\u{399}\u{3A9}\u{3A1}\u{393}\u{39F}\u{3A3}",
+            "\u{3B3}\u{3B9}\u{3C9}\u{3C1}\u{3B3}\u{3BF}\u{3C3}",
+        ] {
+            assert_eq!(found(query), [small, capitals], "{query}");
+        }
+        // A part of a word is found wherever it stands in the other.
+        assert_eq!(found("\u{3A3}\u{399}\u{3A9}\u{3A3}"), [capitals]);
+        assert_eq!(found("\u{3C3}\u{3B9}\u{3C9}\u{3C2}"), [capitals]);
         Ok(())
     }
 

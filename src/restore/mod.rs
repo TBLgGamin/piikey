@@ -11,7 +11,10 @@
 //!    boundary is ASCII only: an alphanumeric byte next to the match, or `.`, `-`, `_`, `+`,
 //!    `@` or `'` followed by one, glues the match to a longer word and rejects it
 //!    (`Haley.Brooks`, `xlotte@a.nl`). A trailing possessive `'s` / `’s` stays after the
-//!    replacement.
+//!    replacement. Proxies that differ only in case (`Haley Brooks`, `HALEY BROOKS`) stand
+//!    for their own originals where the text spells them as the scope does; any other
+//!    casing restores when they all stand for the same original, and is ambiguous otherwise,
+//!    like a typo or a name part of them: nothing is replaced.
 //! 2. **Typo.** A token (`[A-Za-z0-9@._+'-]+`), or up to six tokens separated by single
 //!    spaces, of at least 6 bytes that is within one edit (two from 12 bytes up) of a
 //!    scoped *text* proxy (email, person, URL credential): Optimal String Alignment
@@ -21,34 +24,53 @@
 //! 3. **Component.** A bare token equal to one part of a scoped person or email proxy: the
 //!    first or last name, either end of a one-word name (`Haley` of `Haley-Marian`), or the
 //!    local part of an email. It becomes the same part of the original, but only when that
-//!    part belongs to exactly one proxy, has three or more letters, is no [`STOPWORDS`]
-//!    entry, and is capitalized when the proxy's part is (`Long` the surname, not `long`
-//!    the word). Name parts are not proxies of their own, so `Haley Brooks` in the scope
-//!    makes a bare `Haley` ambiguous. A first name that another capitalized word follows
-//!    (`Haley Brooks`, `Haley van der Berg`) is a different person and stays, unless that
-//!    word is a part of the same proxy (`Haley Zessen`).
+//!    part belongs to exactly one proxy, has three or more letters, is no stop word, and is
+//!    capitalized when the proxy's part is (`Long` the surname, not `long` the word). Name
+//!    parts are not proxies of their own, so `Haley Brooks` in the scope makes a bare `Haley`
+//!    ambiguous. A first name that another capitalized word follows (`Haley Brooks`,
+//!    `Haley van der Berg`) is a different person and stays, unless that word is a part of
+//!    the same proxy (`Haley Zessen`).
 //!
 //! Whitespace must match: a name wrapped over two lines or split by a double space is only
 //! restored part by part, and a hyphen that wraps a word across lines is not undone
 //! (`Zes-\nsen` stays as it is).
 //!
-//! [`Restorer::feed`] restores a stream chunk by chunk and emits the same bytes as one
-//! [`Restorer::restore`] over the whole text, however the text is chunked (unless one token
-//! runs past 1 MiB: that is cut anyway).
+//! The scope is what one conversation sent; the vault knows every proxy it ever issued. The
+//! `_with` methods ([`Restorer::restore_with`], [`Restorer::plan_with`], [`Restorer::feed_with`]
+//! and [`Restorer::flush_with`]) restore those too: a [`ProxyFinder`] (the engine is one) looks
+//! for them in the very text the three tiers read, and what it finds comes with the exact tier,
+//! so that every part of the text is restored once. Two passes one after the other would restore
+//! a value twice when it equals a proxy issued for another value: the first pass writes it, the
+//! second reads it as that proxy.
+//!
+//! [`Restorer::feed_with`] restores a stream chunk by chunk and emits the same bytes as one
+//! [`Restorer::restore_with`] over the whole text, however the text is chunked (unless one token
+//! runs past 1 MiB, which is cut anyway, or a proxy of the finder is longer than its `longest`
+//! and a cut falls inside it).
 
+use std::cell::OnceCell;
+use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::collections::hash_map::Entry as MapEntry;
-use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, Input, MatchKind};
 use rayon::prelude::*;
 
 use crate::detect::EntityKind;
+use crate::engine::Replacement;
+use crate::proxy::is_particle;
 use crate::{Error, Result};
 
+mod finder;
 mod stopwords;
 
-pub use stopwords::STOPWORDS;
+pub use finder::ProxyFinder;
+pub(crate) use stopwords::STOPWORDS;
+
+/// Held back on top of the longest proxy a [`ProxyFinder`] can find, so that the text after a
+/// proxy is visible before the proxy is judged complete.
+const FINDER_SLACK: usize = 16;
 
 /// Most tokens that make up one typo candidate.
 const MAX_SEQUENCE: usize = 6;
@@ -85,12 +107,6 @@ const CHUNK: usize = 1 << 20;
 /// How far past an even split point to look for a place that can be cut.
 const SPLIT_SEARCH: usize = 1 << 16;
 
-/// Name particles. They stay verbatim in person proxies, so they never stand for a name.
-const PARTICLES: [&str; 21] = [
-    "van", "de", "der", "den", "het", "von", "zu", "du", "da", "la", "le", "di", "del", "bin",
-    "ibn", "al", "el", "ter", "ten", "'t", "op",
-];
-
 /// One proxy this app sent, with its original.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopeEntry {
@@ -120,9 +136,11 @@ impl Scope {
 }
 
 /// Restores exact, typo'd and partial mentions of scoped proxies, one-shot
-/// or over a chunked stream.
+/// or over a chunked stream, and with a [`ProxyFinder`] every proxy of the vault in the same
+/// pass.
 pub struct Restorer {
-    /// `None` when the scope has nothing to restore: text then passes through untouched.
+    /// `None` when the scope has nothing to restore: text then passes through untouched, or
+    /// carries only what a finder finds.
     matcher: Option<Matcher>,
     /// Streamed bytes not yet emitted; always starts at a cut (or the start of the stream).
     tail: Vec<u8>,
@@ -157,56 +175,116 @@ impl Restorer {
         })
     }
 
-    /// One-shot restore.
+    /// One-shot restore of the scope's proxies and of the proxies `finder` finds, in one pass
+    /// over `text`: each part of it is restored once, and what is restored is never read again.
+    /// Where what the finder found and the exact tier's matches overlap, the one that starts
+    /// first stays, the longer one when they start together, and the finder's when they are the
+    /// same span. The typo and component tiers look at what is left between them.
     #[must_use]
-    pub fn restore(&self, text: &[u8]) -> Vec<u8> {
-        self.matcher
-            .as_ref()
-            .map_or_else(|| text.to_vec(), |m| m.restore(text).0)
+    pub fn restore_with(&self, text: &[u8], finder: &dyn ProxyFinder) -> Vec<u8> {
+        let found = find(finder, text);
+        let found = edits_of(&found, text);
+        match &self.matcher {
+            Some(matcher) => matcher.restore(text, &found).0,
+            None => apply(text, &found).0,
+        }
     }
 
-    /// Streaming: returns the restored output that is safe to emit now.
+    /// The replacements [`Restorer::restore_with`] makes in `text`, as byte offsets into it:
+    /// sorted, none overlapping another. For a caller that has to make them itself, in the text
+    /// nodes of a document, say.
+    #[must_use]
+    pub fn plan_with(&self, text: &[u8], finder: &dyn ProxyFinder) -> Vec<Replacement> {
+        let found = find(finder, text);
+        let found = edits_of(&found, text);
+        let edits = match &self.matcher {
+            Some(matcher) => matcher.plan_all(text, &found),
+            None => found,
+        };
+        edits
+            .iter()
+            .map(|edit| Replacement {
+                start: edit.start,
+                end: edit.end,
+                with: edit.with.into(),
+            })
+            .collect()
+    }
+
+    /// Streaming [`Restorer::restore_with`]: returns the restored output that is safe to emit
+    /// now.
     ///
     /// The end of the stream is held back while later bytes could still complete or change a
-    /// mention there: always the last `2 * longest proxy + 8` bytes, and more while a token
-    /// or a run of space-separated words is still open (a token longer than 1 MiB is cut
-    /// anyway). [`Self::flush`] releases the rest.
-    pub fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
-        let Some(matcher) = &self.matcher else {
-            return chunk.to_vec();
+    /// mention there: always the last `2 * longest proxy + 8` bytes (at least 56, to see what
+    /// follows a bare first name; with a finder, at least the longest proxy it can find and 16
+    /// more), and more while a token is longer than that or a replacement runs across the place
+    /// to cut (a token longer than 1 MiB is cut anyway). [`Self::flush_with`] releases the rest.
+    pub fn feed_with(&mut self, chunk: &[u8], finder: &dyn ProxyFinder) -> Vec<u8> {
+        let reach = finder.longest();
+        let finder_margin = if reach == 0 {
+            0
+        } else {
+            reach.saturating_add(FINDER_SLACK)
         };
+        let margin = self
+            .matcher
+            .as_ref()
+            .map_or(0, |matcher| matcher.margin)
+            .max(finder_margin);
+        if margin == 0 {
+            // Nothing to look for: what an earlier call still holds goes out with the chunk.
+            let mut out = std::mem::take(&mut self.tail);
+            self.probed = 0;
+            out.extend_from_slice(chunk);
+            return out;
+        }
         self.tail.extend_from_slice(chunk);
         // A cut at `i` needs `len - i > margin`: every mention that could straddle it is
         // then fully visible, and so is the context its boundary checks look at.
-        let limit = self.tail.len().saturating_sub(matcher.margin);
+        let limit = self.tail.len().saturating_sub(margin);
         let floor = self.probed.max(1);
         if limit <= floor {
             return Vec::new();
         }
-        let mut edits = None;
+        // Both are made when the first place to cut is found, not before: a long token with no
+        // place to cut is not scanned again by every chunk.
+        let found = OnceCell::new();
+        let planned = OnceCell::new();
+        let plan = || {
+            planned.get_or_init(|| {
+                let found = found.get_or_init(|| find(finder, &self.tail));
+                let found = edits_of(found, &self.tail);
+                plan_edits(self.matcher.as_ref(), &self.tail, &found)
+            })
+        };
+        // A finder reads the byte before a proxy, and the one before a cut is gone from the next
+        // tail: with a finder, a cut at a byte a proxy can start with (anything but white space)
+        // needs a byte before it that is no letter or digit.
+        let lookback = finder_margin > 0;
         let mut hi = limit;
         let cut = loop {
             if hi <= floor {
                 break None;
             }
-            let Some(at) = self.tail[floor..hi].iter().rposition(|&b| is_cut_byte(b)) else {
+            let Some(at) = (floor..hi).rev().find(|&i| {
+                let byte = self.tail[i];
+                is_cut_byte(byte)
+                    && !(lookback
+                        && !byte.is_ascii_whitespace()
+                        && self.tail[i - 1].is_ascii_alphanumeric())
+            }) else {
                 break None;
             };
-            let at = floor + at;
-            let edits = edits.get_or_insert_with(|| matcher.plan(&self.tail));
-            match straddler(edits, at) {
+            match straddler(plan(), at) {
                 None => break Some(at),
                 Some(start) => hi = start + 1,
             }
         };
         let cut = match cut {
-            None if self.tail.len() > MAX_HELD => {
-                let edits = edits.get_or_insert_with(|| matcher.plan(&self.tail));
-                forced_cut(&self.tail, edits, limit)
-            }
+            None if self.tail.len() > MAX_HELD => forced_cut(&self.tail, plan(), limit),
             cut => cut,
         };
-        let (Some(cut), Some(edits)) = (cut, edits) else {
+        let (Some(cut), Some(edits)) = (cut, planned.get()) else {
             self.probed = limit;
             return Vec::new();
         };
@@ -224,19 +302,24 @@ impl Restorer {
         out
     }
 
-    /// Emits everything held back.
-    pub fn flush(&mut self) -> Vec<u8> {
+    /// Emits everything held back, restored with `finder` as [`Restorer::feed_with`] does.
+    pub fn flush_with(&mut self, finder: &dyn ProxyFinder) -> Vec<u8> {
         let tail = std::mem::take(&mut self.tail);
         self.probed = 0;
-        let Some(matcher) = &self.matcher else {
+        if tail.is_empty() {
             return tail;
+        }
+        let found = find(finder, &tail);
+        let found = edits_of(&found, &tail);
+        let (out, restored) = match &self.matcher {
+            Some(matcher) => matcher.restore_serial(&tail, &found),
+            None => apply(&tail, &found),
         };
-        let (out, restored) = matcher.restore_serial(&tail);
         self.restored += restored;
         out
     }
 
-    /// Replacements made so far by `feed`/`flush`.
+    /// Replacements made so far by `feed_with`/`flush_with`.
     #[must_use]
     pub fn restored_count(&self) -> usize {
         self.restored
@@ -411,12 +494,23 @@ impl TypoIndex {
     }
 }
 
+/// A proxy as the scope spells it, with its original.
+struct Spelled {
+    proxy: Box<str>,
+    original: Box<str>,
+}
+
 /// The compiled scope.
 struct Matcher {
-    /// Exact tier: every proxy, ASCII case-insensitive, leftmost-longest.
+    /// Exact tier: every proxy, ASCII case-insensitive, leftmost-longest. A proxy that differs
+    /// from an earlier one only in case is not in it.
     ac: AhoCorasick,
-    /// Indexed by Aho-Corasick pattern id.
+    /// The first `ac.patterns_len()` are indexed by Aho-Corasick pattern id; the proxies that
+    /// differ from one of those only in case follow, for the typo and component tiers.
     entries: Vec<Entry>,
+    /// For an entry that has such variants: it and they, each as the scope spells the proxy and
+    /// with its original. Rare, so a side table.
+    spellings: HashMap<usize, Vec<Spelled>>,
     typo: TypoIndex,
     components: Components,
     /// Length of the longest proxy: no mention is longer, a typo'd one at most 2 more.
@@ -434,49 +528,122 @@ struct Edit<'a> {
     with: &'a str,
 }
 
+/// What [`Matcher::build`] gathers from the scope before the automaton is compiled.
+struct Collected {
+    entries: Vec<Entry>,
+    /// `entries[i]`'s proxy as the scope spells it.
+    spelled: Vec<Box<str>>,
+    /// Whether `entries[i]` is a kind the typo tier looks at, and one it can compare: it counts
+    /// bytes, so a proxy with a non-ASCII byte (`\u{2019}t`) is matched exactly only.
+    text_kind: Vec<bool>,
+    components: Components,
+    longest: usize,
+}
+
+impl Collected {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(capacity),
+            spelled: Vec::with_capacity(capacity),
+            text_kind: Vec::with_capacity(capacity),
+            components: Components::default(),
+            longest: 0,
+        }
+    }
+
+    /// Adds `scoped` as the entry after the last; `lower` is its proxy in ASCII lower case.
+    fn add(&mut self, scoped: ScopeEntry, lower: Box<str>) {
+        let ScopeEntry {
+            kind,
+            proxy,
+            original,
+        } = scoped;
+        let id = self.entries.len();
+        self.longest = self.longest.max(lower.len());
+        self.text_kind.push(
+            lower.is_ascii()
+                && matches!(
+                    kind,
+                    EntityKind::Email | EntityKind::Person | EntityKind::UrlCredential
+                ),
+        );
+        match kind {
+            EntityKind::Person => self.components.add_person(id, &proxy, &original),
+            EntityKind::Email => self.components.add_email(id, &proxy, &original),
+            _ => {}
+        }
+        self.entries.push(Entry { lower, original });
+        self.spelled.push(proxy);
+    }
+}
+
 impl Matcher {
     fn build(raw: Vec<ScopeEntry>) -> Result<Option<Self>> {
-        let mut seen = HashSet::new();
-        let mut entries: Vec<Entry> = Vec::with_capacity(raw.len());
-        let mut text_kind = Vec::new();
-        let mut components = Components::default();
-        let mut longest = 0;
+        let mut collected = Collected::with_capacity(raw.len());
+        // The first entry of each proxy, by the proxy in lower case.
+        let mut first_of: HashMap<String, usize> = HashMap::with_capacity(raw.len());
+        // Proxies that differ from an earlier one only in case, with that entry.
+        let mut cased = Vec::new();
         for scoped in raw {
-            let ScopeEntry {
-                kind,
-                proxy,
-                original,
-            } = scoped;
-            if proxy.is_empty() || original.is_empty() || proxy == original {
+            if scoped.proxy.is_empty()
+                || scoped.original.is_empty()
+                || scoped.proxy == scoped.original
+            {
                 continue;
             }
-            let lower = proxy.to_ascii_lowercase();
-            if !seen.insert(lower.clone()) {
-                continue;
+            match first_of.entry(scoped.proxy.to_ascii_lowercase()) {
+                MapEntry::Vacant(slot) => {
+                    let lower = Box::from(slot.key().as_str());
+                    slot.insert(collected.entries.len());
+                    collected.add(scoped, lower);
+                }
+                // Seen before: the same spelling again changes nothing, another casing is kept
+                // apart.
+                MapEntry::Occupied(slot) => {
+                    if collected.spelled[*slot.get()] != scoped.proxy {
+                        cased.push((*slot.get(), scoped));
+                    }
+                }
             }
-            let id = entries.len();
-            longest = longest.max(lower.len());
-            text_kind.push(matches!(
-                kind,
-                EntityKind::Email | EntityKind::Person | EntityKind::UrlCredential
-            ));
-            match kind {
-                EntityKind::Person => components.add_person(id, &proxy, &original),
-                EntityKind::Email => components.add_email(id, &proxy, &original),
-                _ => {}
-            }
-            entries.push(Entry {
-                lower: lower.into_boxed_str(),
-                original,
-            });
         }
+        drop(first_of);
+        let patterns = collected.entries.len();
+        let mut spellings: HashMap<usize, Vec<Spelled>> = HashMap::new();
+        for (first, scoped) in cased {
+            let group = spellings.entry(first).or_insert_with(|| {
+                vec![Spelled {
+                    proxy: std::mem::take(&mut collected.spelled[first]),
+                    original: collected.entries[first].original.clone(),
+                }]
+            });
+            // The same original as one that is there: nothing to tell apart, and a second entry
+            // would only make a typo or a name part of the proxy a tie.
+            if group.iter().any(|s| s.original == scoped.original) {
+                continue;
+            }
+            group.push(Spelled {
+                proxy: scoped.proxy.clone(),
+                original: scoped.original.clone(),
+            });
+            let lower = collected.entries[first].lower.clone();
+            collected.add(scoped, lower);
+        }
+        // The spellings that matter are in `spellings`; the automaton is the big allocation.
+        let Collected {
+            entries,
+            spelled,
+            text_kind,
+            components,
+            longest,
+        } = collected;
+        drop(spelled);
         if entries.is_empty() {
             return Ok(None);
         }
         let ac = AhoCorasickBuilder::new()
             .ascii_case_insensitive(true)
             .match_kind(MatchKind::LeftmostLongest)
-            .build(entries.iter().map(|e| e.lower.as_bytes()))
+            .build(entries[..patterns].iter().map(|e| e.lower.as_bytes()))
             .map_err(|e| Error::Io(std::io::Error::other(e)))?;
         let typo = TypoIndex::build(
             entries
@@ -488,6 +655,7 @@ impl Matcher {
         Ok(Some(Self {
             ac,
             entries,
+            spellings,
             typo,
             components,
             longest,
@@ -495,44 +663,68 @@ impl Matcher {
         }))
     }
 
-    /// Restores a whole text; returns it with the number of replacements. A long text is
-    /// split across rayon tasks at places where the pieces cannot influence each other.
-    fn restore(&self, text: &[u8]) -> (Vec<u8>, usize) {
+    /// What the proxy found at `matched` as entry `id` stands for. `None` when proxies that
+    /// differ only in case stand for different originals and the text spells none of them as the
+    /// scope does: there is no telling which one was meant.
+    fn original_of(&self, id: usize, matched: &[u8]) -> Option<&str> {
+        let Some(group) = self.spellings.get(&id) else {
+            return Some(&self.entries[id].original);
+        };
+        let first = &group.first()?.original;
+        match group.iter().find(|s| s.proxy.as_bytes() == matched) {
+            Some(spelled) => Some(&spelled.original),
+            None => group
+                .iter()
+                .all(|s| s.original == *first)
+                .then_some(&**first),
+        }
+    }
+
+    /// Restores a whole text, in which a finder found `found` (sorted, none overlapping);
+    /// returns it with the number of replacements.
+    fn restore(&self, text: &[u8], found: &[Edit<'_>]) -> (Vec<u8>, usize) {
+        apply(text, &self.plan_all(text, found))
+    }
+
+    /// Every replacement in a whole text, in which a finder found `found`. A long text is split
+    /// across rayon tasks at places where the pieces cannot influence each other.
+    fn plan_all<'a>(&'a self, text: &[u8], found: &[Edit<'a>]) -> Vec<Edit<'a>> {
         let parts = if text.len() > PARALLEL_FROM {
             text.len() / CHUNK
         } else {
             1
         };
-        self.restore_split(text, parts)
+        self.plan_split(text, parts, found)
     }
 
-    /// [`Self::restore`] over about `parts` pieces; always equal to [`Self::restore_serial`].
-    fn restore_split(&self, text: &[u8], parts: usize) -> (Vec<u8>, usize) {
-        let cuts = self.cuts(text, parts);
+    /// [`Self::plan`] over about `parts` pieces; always equal to it.
+    fn plan_split<'a>(&'a self, text: &[u8], parts: usize, found: &[Edit<'a>]) -> Vec<Edit<'a>> {
+        let cuts = self.cuts(text, parts, found);
         if cuts.len() <= 2 {
-            return self.restore_serial(text);
+            return self.plan(text, found);
         }
-        let pieces: Vec<(Vec<u8>, usize)> = cuts
+        let pieces: Vec<Vec<Edit<'a>>> = cuts
             .par_windows(2)
-            .map(|w| self.restore_serial(&text[w[0]..w[1]]))
+            .map(|w| {
+                let mut edits = self.plan(&text[w[0]..w[1]], &edits_in(found, w[0], w[1]));
+                for edit in &mut edits {
+                    edit.start += w[0];
+                    edit.end += w[0];
+                }
+                edits
+            })
             .collect();
-        let mut out = Vec::with_capacity(pieces.iter().map(|(piece, _)| piece.len()).sum());
-        let mut restored = 0;
-        for (piece, n) in &pieces {
-            out.extend_from_slice(piece);
-            restored += n;
-        }
-        (out, restored)
+        pieces.concat()
     }
 
     /// `0`, then up to `parts - 1` offsets near the even split points where `text` can be
     /// cut, then `text.len()`.
-    fn cuts(&self, text: &[u8], parts: usize) -> Vec<usize> {
+    fn cuts(&self, text: &[u8], parts: usize, found: &[Edit<'_>]) -> Vec<usize> {
         let mut cuts = vec![0];
         for k in 1..parts {
             let from = text.len() / parts * k;
             let to = text.len().min(from + SPLIT_SEARCH);
-            if let Some(at) = (from..to).find(|&i| self.can_cut(text, i))
+            if let Some(at) = (from..to).find(|&i| self.can_cut(text, i, found))
                 && cuts.last().is_some_and(|&last| at > last)
             {
                 cuts.push(at);
@@ -542,57 +734,64 @@ impl Matcher {
         cuts
     }
 
-    /// Whether a text can be cut at `at` without changing the result: `text[at]` is a byte
-    /// no token or space-separated run can contain, and no proxy occurs near enough to
-    /// straddle it, whether or not it would be accepted.
-    fn can_cut(&self, text: &[u8], at: usize) -> bool {
+    /// Whether a text can be cut at `at` without changing the result: `text[at]` is an ASCII
+    /// byte no token or space-separated run can contain (a name before a `\u{2019}t` would lose
+    /// its particle), and no proxy occurs near enough to straddle it, whether or not it would be
+    /// accepted, and none found by a finder.
+    fn can_cut(&self, text: &[u8], at: usize, found: &[Edit<'_>]) -> bool {
         let b = text[at];
         let window = at.saturating_sub(self.longest)..text.len().min(at + self.longest);
         is_cut_byte(b)
+            && b.is_ascii()
             && b != b' '
+            && straddler(found, at).is_none()
             && matches!(self.ac.try_find(Input::new(text).range(window)), Ok(None))
     }
 
     /// Restores a whole text on this thread.
-    fn restore_serial(&self, text: &[u8]) -> (Vec<u8>, usize) {
-        let edits = self.plan(text);
-        let mut out = Vec::with_capacity(text.len());
-        let mut pos = 0;
-        for edit in &edits {
-            out.extend_from_slice(&text[pos..edit.start]);
-            out.extend_from_slice(edit.with.as_bytes());
-            pos = edit.end;
-        }
-        out.extend_from_slice(&text[pos..]);
-        (out, edits.len())
+    fn restore_serial(&self, text: &[u8], found: &[Edit<'_>]) -> (Vec<u8>, usize) {
+        apply(text, &self.plan(text, found))
     }
 
     /// Every replacement in `text`, in order and without overlap.
     ///
-    /// The exact tier cuts the text into matches and the gaps between them; the typo and
-    /// component tiers only look inside the gaps.
-    fn plan(&self, text: &[u8]) -> Vec<Edit<'_>> {
-        let mut edits = Vec::new();
+    /// The exact tier, which is what `found` (sorted, none overlapping) joins, cuts the text
+    /// into matches and the gaps between them; the typo and component tiers only look inside
+    /// the gaps.
+    fn plan<'a>(&'a self, text: &[u8], found: &[Edit<'a>]) -> Vec<Edit<'a>> {
+        let exact = merge_exact(self.exact_tier(text), found);
+        let mut edits = Vec::with_capacity(exact.len());
         let mut scratch = Vec::new();
         let mut gap = 0;
+        for edit in exact {
+            self.plan_gap(text, gap, edit.start, &mut edits, &mut scratch);
+            gap = edit.end;
+            edits.push(edit);
+        }
+        self.plan_gap(text, gap, text.len(), &mut edits, &mut scratch);
+        edits
+    }
+
+    /// The matches of the scope's proxies, in order and without overlap.
+    fn exact_tier(&self, text: &[u8]) -> Vec<Edit<'_>> {
+        let mut edits = Vec::new();
         let mut from = 0;
         while let Ok(Some(found)) = self.ac.try_find(Input::new(text).range(from..)) {
             let (start, end) = (found.start(), found.end());
-            if bounded(text, start, end) {
-                self.plan_gap(text, gap, start, &mut edits, &mut scratch);
-                edits.push(Edit {
-                    start,
-                    end,
-                    with: &self.entries[found.pattern().as_usize()].original,
-                });
-                gap = end;
+            let with = if bounded(text, start, end) {
+                self.original_of(found.pattern().as_usize(), &text[start..end])
+            } else {
+                None
+            };
+            if let Some(with) = with {
+                edits.push(Edit { start, end, with });
                 from = end;
             } else {
-                // Glued to a longer word; a match that starts inside it may still be fine.
+                // Glued to a longer word, or one of proxies that differ only in case with
+                // none spelled like the text; a match that starts inside may still be fine.
                 from = start + 1;
             }
         }
-        self.plan_gap(text, gap, text.len(), &mut edits, &mut scratch);
         edits
     }
 
@@ -617,7 +816,7 @@ impl Matcher {
             if let Some((resume, edit)) = self.typo_at(text, (a, b), start, hi) {
                 edits.push(edit);
                 at = resume;
-            } else if let Some(edit) = self.component_at(text, hi, (a, b), (start, end), scratch) {
+            } else if let Some(edit) = self.component_at(text, (a, b), (start, end), scratch) {
                 edits.push(edit);
             }
         }
@@ -641,7 +840,13 @@ impl Matcher {
         while count < MAX_SEQUENCE {
             let after = runs[count - 1].1;
             if after + 1 < hi && text[after] == b' ' && is_token(text[after + 1]) {
-                runs[count] = (after + 1, run_end(text, after + 1, hi));
+                // A run that goes on into the exact match at `hi` is glued to it. How far it goes
+                // would depend on how much of that match a stream has seen, so it is left out.
+                let end = run_end(text, after + 1, text.len());
+                if end > hi {
+                    break;
+                }
+                runs[count] = (after + 1, end);
                 count += 1;
             } else {
                 break;
@@ -712,12 +917,10 @@ impl Matcher {
         best.filter(|_| !tied).map(|(_, id)| id)
     }
 
-    /// Component tier for the token core `text[start..end]` of the run `run`, in the gap that
-    /// ends at `hi`.
+    /// Component tier for the token core `text[start..end]` of the run `run`.
     fn component_at<'a>(
         &'a self,
         text: &[u8],
-        hi: usize,
         run: (usize, usize),
         (start, end): (usize, usize),
         scratch: &mut Vec<u8>,
@@ -736,7 +939,7 @@ impl Matcher {
                 capitalized,
                 first_name,
             } if (!*capitalized || text[start].is_ascii_uppercase())
-                && !(*first_name && end == run.1 && self.name_follows(text, run.1, hi, *entry)) =>
+                && !(*first_name && end == run.1 && self.name_follows(text, run.1, *entry)) =>
             {
                 Some(Edit {
                     start,
@@ -752,18 +955,31 @@ impl Matcher {
     /// space and at most [`MAX_PARTICLES`] particles, by a capitalized word that is no stop
     /// word and no part of that entry's name: `Haley Brooks` is somebody else.
     ///
-    /// Looks at most [`NAME_REACH`] bytes ahead, and not past `hi`. A word cut off by that
-    /// reach is not judged.
-    fn name_follows(&self, text: &[u8], from: usize, hi: usize, entry: usize) -> bool {
-        let reach = hi.min(from + NAME_REACH);
+    /// Looks at the text as it stands, at most [`NAME_REACH`] bytes ahead, whatever the exact
+    /// tier makes of it: a stream does not know yet where a match ahead ends. A word that the
+    /// reach cuts off is not judged.
+    fn name_follows(&self, text: &[u8], from: usize, entry: usize) -> bool {
+        let reach = text.len().min(from + NAME_REACH);
         let mut at = from;
         for _ in 0..=MAX_PARTICLES {
-            if at + 1 >= reach || text[at] != b' ' || !is_token(text[at + 1]) {
+            if at + 1 >= reach || text[at] != b' ' {
+                return false;
+            }
+            if let Some(len) = curly_particle(&text[at + 1..]) {
+                at += 1 + len;
+                continue;
+            }
+            if !is_token(text[at + 1]) {
                 return false;
             }
             let end = run_end(text, at + 1, reach);
-            if end == reach && reach < hi {
+            if end == reach && text.get(reach).copied().is_some_and(is_token) {
                 return false;
+            }
+            // The run as a whole: `core` would take the apostrophe off `'t` and see a letter.
+            if std::str::from_utf8(&text[at + 1..end]).is_ok_and(is_particle) {
+                at = end;
+                continue;
             }
             let Some((start, core_end)) = core(text, at + 1, end) else {
                 return false;
@@ -787,6 +1003,17 @@ impl Matcher {
         }
         false
     }
+}
+
+/// The length of `\u{2018}t` or `\u{2019}t` at the start of `rest` when it is a word of its
+/// own: the particle `'t` as word processors spell it, which no token can hold.
+fn curly_particle(rest: &[u8]) -> Option<usize> {
+    const SPELLINGS: [&[u8]; 2] = ["\u{2018}t".as_bytes(), "\u{2019}t".as_bytes()];
+    let len = SPELLINGS
+        .iter()
+        .find(|spelling| rest.starts_with(spelling))?
+        .len();
+    (!rest.get(len).copied().is_some_and(is_token)).then_some(len)
 }
 
 /// ASCII letters and digits.
@@ -892,7 +1119,7 @@ fn presence(bytes: &[u8]) -> u64 {
     })
 }
 
-/// Longest proxy [`within`] checks, in bytes; the rows live on the stack.
+/// Proxies of this many bytes or more are not checked by [`within`]; the rows live on the stack.
 const BAND_MAX: usize = 64;
 
 /// Whether the optimal string alignment distance of `a` and `b` is at most `limit`.
@@ -937,19 +1164,19 @@ fn within(a: &[u8], b: &[u8], limit: usize) -> bool {
     usize::from(prev[m]) <= limit
 }
 
-fn is_particle(token: &str) -> bool {
-    PARTICLES.iter().any(|p| p.eq_ignore_ascii_case(token))
-}
-
 /// Where to cut a stream that has no valid cut but grew past [`MAX_HELD`]: the last position
-/// before `limit` that no edit straddles and that is not inside a UTF-8 sequence.
+/// before `limit` that no edit straddles and that is not inside a UTF-8 sequence. A sequence has
+/// three continuation bytes at most: more of them are no UTF-8, and cut anywhere.
 fn forced_cut(tail: &[u8], edits: &[Edit<'_>], limit: usize) -> Option<usize> {
     let mut at = limit.checked_sub(1)?;
+    let mut continuation = 0;
     while at > 0 {
         if let Some(start) = straddler(edits, at) {
             at = start;
-        } else if tail[at] & 0xC0 == 0x80 {
+            continuation = 0;
+        } else if tail[at] & 0xC0 == 0x80 && continuation < 3 {
             at -= 1;
+            continuation += 1;
         } else {
             return Some(at);
         }
@@ -964,16 +1191,122 @@ fn straddler(edits: &[Edit<'_>], at: usize) -> Option<usize> {
     (edit.end > at).then_some(edit.start)
 }
 
+/// What `finder` finds in `text`; nothing when it has nothing to find at all.
+fn find(finder: &dyn ProxyFinder, text: &[u8]) -> Vec<Replacement> {
+    if finder.longest() == 0 {
+        Vec::new()
+    } else {
+        finder.find(text)
+    }
+}
+
+/// `found` as edits of `text`, sorted and with none overlapping another (of two that do the
+/// first, the longer one when they start together, stays): what a finder reports outside the
+/// text, or inside a character, is dropped.
+fn edits_of<'a>(found: &'a [Replacement], text: &[u8]) -> Vec<Edit<'a>> {
+    let boundary = |at: usize| at == text.len() || text.get(at).is_some_and(|&b| b & 0xC0 != 0x80);
+    let mut edits: Vec<Edit<'a>> = found
+        .iter()
+        .filter(|rep| {
+            rep.start < rep.end && rep.end <= text.len() && boundary(rep.start) && boundary(rep.end)
+        })
+        .map(|rep| Edit {
+            start: rep.start,
+            end: rep.end,
+            with: &rep.with,
+        })
+        .collect();
+    edits.sort_by_key(|edit| (edit.start, Reverse(edit.end)));
+    let mut taken = 0;
+    edits.retain(|edit| {
+        let free = edit.start >= taken;
+        if free {
+            taken = edit.end;
+        }
+        free
+    });
+    edits
+}
+
+/// The edits of `found` inside `lo..hi`, as edits of the text `text[lo..hi]`. No edit of
+/// `found` straddles either end: the text was cut where none does.
+fn edits_in<'a>(found: &[Edit<'a>], lo: usize, hi: usize) -> Vec<Edit<'a>> {
+    let from = found.partition_point(|edit| edit.start < lo);
+    let to = found.partition_point(|edit| edit.start < hi);
+    found[from..to]
+        .iter()
+        .map(|edit| Edit {
+            start: edit.start - lo,
+            end: edit.end - lo,
+            with: edit.with,
+        })
+        .collect()
+}
+
+/// The edits of the exact tier and the ones a finder found as one list, sorted and with none
+/// overlapping another. Of two that overlap the one that starts first stays, the longer one
+/// when they start together, and the finder's when they are the same span.
+fn merge_exact<'a>(own: Vec<Edit<'a>>, found: &[Edit<'a>]) -> Vec<Edit<'a>> {
+    if found.is_empty() {
+        return own;
+    }
+    let mut merged: Vec<Edit<'a>> = Vec::with_capacity(own.len() + found.len());
+    let mut own = own.into_iter().peekable();
+    let mut found = found.iter().copied().peekable();
+    loop {
+        let next = match (own.peek(), found.peek()) {
+            (Some(a), Some(b)) if (a.start, Reverse(a.end)) < (b.start, Reverse(b.end)) => {
+                own.next()
+            }
+            (_, Some(_)) => found.next(),
+            (Some(_), None) => own.next(),
+            (None, None) => break,
+        };
+        if let Some(next) = next
+            && merged.last().is_none_or(|last| last.end <= next.start)
+        {
+            merged.push(next);
+        }
+    }
+    merged
+}
+
+/// The edits for `text`: what the scope's tiers make of it when there is a matcher, with `found`
+/// joining the exact tier; `found` alone when there is none.
+fn plan_edits<'a>(matcher: Option<&'a Matcher>, text: &[u8], found: &[Edit<'a>]) -> Vec<Edit<'a>> {
+    match matcher {
+        Some(matcher) => matcher.plan(text, found),
+        None => found.to_vec(),
+    }
+}
+
+/// `text` with `edits` (sorted, none overlapping) made, and how many there were.
+fn apply(text: &[u8], edits: &[Edit<'_>]) -> (Vec<u8>, usize) {
+    let mut out = Vec::with_capacity(text.len());
+    let mut pos = 0;
+    for edit in edits {
+        out.extend_from_slice(&text[pos..edit.start]);
+        out.extend_from_slice(edit.with.as_bytes());
+        pos = edit.end;
+    }
+    out.extend_from_slice(&text[pos..]);
+    (out, edits.len())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
 
-    use super::{Restorer, STOPWORDS, Scope, ScopeEntry};
+    use super::{ProxyFinder, Restorer, STOPWORDS, Scope, ScopeEntry, apply, edits_of};
     use crate::detect::EntityKind::{
         self, Email, Iban, Ipv6, Person, Phone, Secret, UrlCredential,
     };
+    use crate::engine::{Engine, Replacement};
 
     type Entries<'a> = &'a [(EntityKind, &'a str, &'a str)];
+
+    /// No finder: the scope alone.
+    const NONE: &dyn ProxyFinder = &();
 
     fn restorer(entries: Entries<'_>) -> Restorer {
         let scope = Scope::from_pairs(entries.iter().map(|&(kind, proxy, original)| ScopeEntry {
@@ -988,19 +1321,19 @@ mod tests {
     }
 
     fn restore(r: &Restorer, text: &str) -> String {
-        String::from_utf8_lossy(&r.restore(text.as_bytes())).into_owned()
+        String::from_utf8_lossy(&r.restore_with(text.as_bytes(), NONE)).into_owned()
     }
 
-    /// Everything `feed` and `flush` emit for `chunks`, the replacements made, and how many
+    /// Everything `feed_with` and `flush_with` emit for `chunks`, the replacements made, and how many
     /// bytes came out before the flush. A flushed restorer starts a new stream.
     fn stream(r: &mut Restorer, chunks: &[&[u8]]) -> (Vec<u8>, usize, usize) {
         let before = r.restored_count();
         let mut out = Vec::new();
         for chunk in chunks {
-            out.extend(r.feed(chunk));
+            out.extend(r.feed_with(chunk, NONE));
         }
         let early = out.len();
-        out.extend(r.flush());
+        out.extend(r.flush_with(NONE));
         (out, r.restored_count() - before, early)
     }
 
@@ -1119,11 +1452,56 @@ mod tests {
     }
 
     #[test]
+    fn proxies_that_differ_only_in_case_restore_each_to_its_own_original() {
+        // The vault hands a scope out in hash order, so neither order may matter.
+        for scope in [
+            [
+                (Person, "Haley Brooks", "Anna Boer"),
+                (Person, "HALEY BROOKS", "ANNA DE JONG"),
+            ],
+            [
+                (Person, "HALEY BROOKS", "ANNA DE JONG"),
+                (Person, "Haley Brooks", "Anna Boer"),
+            ],
+        ] {
+            let r = restorer(&scope);
+            let text = "Haley Brooks, HALEY BROOKS and Haley Brooks's cat";
+            let want = "Anna Boer, ANNA DE JONG and Anna Boer's cat";
+            assert_eq!(restore(&r, text), want);
+            // Streamed byte by byte, the result is the same.
+            let mut s = restorer(&scope);
+            let chunks: Vec<&[u8]> = text.as_bytes().chunks(1).collect();
+            assert_eq!(stream(&mut s, &chunks).0, want.as_bytes());
+
+            // Any other casing could be either person, and so could a typo or a first name.
+            for text in [
+                "haley brooks",
+                "HaLey BrooKs",
+                "Haley Brook",
+                "HALEY BROOK",
+                "Haley said",
+            ] {
+                assert_eq!(restore(&r, text), text);
+            }
+        }
+    }
+
+    #[test]
+    fn proxies_that_differ_only_in_case_and_share_an_original_restore_in_any_casing() {
+        let r = restorer(&[
+            (Person, "Haley Brooks", "Anna Boer"),
+            (Person, "HALEY BROOKS", "Anna Boer"),
+        ]);
+        assert_eq!(restore(&r, "haley brooks"), "Anna Boer");
+        assert_eq!(restore(&r, "HALEY BROOKS"), "Anna Boer");
+    }
+
+    #[test]
     fn empty_scope_changes_nothing() {
         let mut r = restorer(&[]);
         assert_eq!(restore(&r, "Haley van Zessen"), "Haley van Zessen");
-        assert_eq!(r.feed(b"abc"), b"abc");
-        assert!(r.flush().is_empty());
+        assert_eq!(r.feed_with(b"abc", NONE), b"abc");
+        assert!(r.flush_with(NONE).is_empty());
         assert_eq!(r.restored_count(), 0);
     }
 
@@ -1366,9 +1744,9 @@ mod tests {
     #[test]
     fn feed_without_scope_passes_through_immediately() {
         let mut r = restorer(&[]);
-        assert_eq!(r.feed(b"Hello "), b"Hello ");
-        assert_eq!(r.feed(b"world"), b"world");
-        assert!(r.flush().is_empty());
+        assert_eq!(r.feed_with(b"Hello ", NONE), b"Hello ");
+        assert_eq!(r.feed_with(b"world", NONE), b"world");
+        assert!(r.flush_with(NONE).is_empty());
     }
 
     #[test]
@@ -1381,12 +1759,12 @@ mod tests {
         let mut emitted = Vec::new();
         let mut early = false;
         for _ in 0..20 {
-            let out = s.feed(line.as_bytes());
+            let out = s.feed_with(line.as_bytes(), NONE);
             early |= !out.is_empty();
             emitted.extend(out);
         }
         assert!(early, "nothing was emitted before the end of the stream");
-        emitted.extend(s.flush());
+        emitted.extend(s.flush_with(NONE));
         let want = line
             .replace("jeroen@test.nl", "jan@acme.nl")
             .replace("Haley van Zessen", "Jeroen de Vries")
@@ -1399,9 +1777,9 @@ mod tests {
     fn feed_holds_back_an_unfinished_mention() {
         let mut s = restorer(&[(Email, "jeroen@test.nl", "jan@acme.nl")]);
         let filler = "x, ".repeat(30);
-        let mut out = s.feed(format!("{filler}jeroen@te").as_bytes());
-        out.extend(s.feed(b"st.nl and more"));
-        out.extend(s.flush());
+        let mut out = s.feed_with(format!("{filler}jeroen@te").as_bytes(), NONE);
+        out.extend(s.feed_with(b"st.nl and more", NONE));
+        out.extend(s.flush_with(NONE));
         assert_eq!(
             String::from_utf8_lossy(&out),
             format!("{filler}jan@acme.nl and more")
@@ -1412,12 +1790,12 @@ mod tests {
     fn long_token_runs_are_not_rescanned_per_chunk() {
         let mut s = restorer(&[(Email, "jeroen@test.nl", "jan@acme.nl")]);
         let chunk = vec![b'a'; 1024];
-        let mut out = s.feed(b"start ");
+        let mut out = s.feed_with(b"start ", NONE);
         for _ in 0..400 {
-            out.extend(s.feed(&chunk));
+            out.extend(s.feed_with(&chunk, NONE));
         }
-        out.extend(s.feed(b" end"));
-        out.extend(s.flush());
+        out.extend(s.feed_with(b" end", NONE));
+        out.extend(s.flush_with(NONE));
         assert_eq!(out.len(), 6 + 400 * 1024 + 4);
     }
 
@@ -1426,10 +1804,10 @@ mod tests {
         let mut s = restorer(&[(Email, "jeroen@test.nl", "jan@acme.nl")]);
         let text = "héllo wörld — jeroen@test.nl 😀 ünïcödé, ".repeat(30);
         for chunk in text.as_bytes().chunks(1) {
-            let piece = s.feed(chunk);
+            let piece = s.feed_with(chunk, NONE);
             assert!(std::str::from_utf8(&piece).is_ok());
         }
-        assert!(std::str::from_utf8(&s.flush()).is_ok());
+        assert!(std::str::from_utf8(&s.flush_with(NONE)).is_ok());
     }
 
     struct Rng(u64);
@@ -1613,7 +1991,7 @@ mod tests {
         for round in 0..200 {
             let text = random_text(&mut rng);
             let (want, count) = match &r.matcher {
-                Some(m) => m.restore(text.as_bytes()),
+                Some(m) => m.restore(text.as_bytes(), &[]),
                 None => panic!("rich scope has a matcher"),
             };
             replaced += count;
@@ -1654,7 +2032,7 @@ mod tests {
                     text.push(rng.pick(alphabet));
                 }
             }
-            let want = r.restore(&text);
+            let want = r.restore_with(&text, NONE);
             for mode in [1, 2, 3, 4] {
                 let chunks = chunked(&mut rng, &text, mode);
                 let (got, _, _) = stream(&mut s, &chunks);
@@ -1684,7 +2062,7 @@ mod tests {
                     "y".repeat(pad % 2),
                     "z. ".repeat(40)
                 );
-                let want = r.restore(text.as_bytes());
+                let want = r.restore_with(text.as_bytes(), NONE);
                 for size in [1, 2, 3, 5, 8, 13, 64] {
                     let chunks: Vec<&[u8]> = text.as_bytes().chunks(size).collect();
                     let (got, _, early) = stream(&mut s, &chunks);
@@ -1698,15 +2076,25 @@ mod tests {
         }
     }
 
-    /// The edits a plan returns are in order, disjoint and inside the text.
+    /// The edits a plan returns are in order, disjoint and inside the text, and on character
+    /// boundaries when the text is UTF-8: a caller applies them to a `str`.
     fn assert_plan_sound(r: &Restorer, text: &[u8]) {
         let Some(m) = &r.matcher else {
             return;
         };
-        let edits = m.plan(text);
+        let edits = m.plan(text, &[]);
+        let valid = std::str::from_utf8(text).ok();
         let mut end = 0;
         for edit in &edits {
             assert!(edit.start >= end && edit.start < edit.end && edit.end <= text.len());
+            if let Some(valid) = valid {
+                assert!(
+                    valid.is_char_boundary(edit.start) && valid.is_char_boundary(edit.end),
+                    "edit {}..{} is not on a character boundary",
+                    edit.start,
+                    edit.end
+                );
+            }
             end = edit.end;
         }
     }
@@ -1734,13 +2122,13 @@ mod tests {
                 text.push_str(&random_text(&mut rng));
                 text.push('\n');
             }
-            let want = m.restore_serial(text.as_bytes());
+            let want = m.restore_serial(text.as_bytes(), &[]);
             for parts in [2, 3, 8, 40] {
-                if m.cuts(text.as_bytes(), parts).len() > 2 {
+                if m.cuts(text.as_bytes(), parts, &[]).len() > 2 {
                     split += 1;
                 }
                 assert_eq!(
-                    m.restore_split(text.as_bytes(), parts),
+                    apply(text.as_bytes(), &m.plan_split(text.as_bytes(), parts, &[])),
                     want,
                     "parts {parts}"
                 );
@@ -1761,15 +2149,15 @@ mod tests {
             text.extend_from_slice(random_text(&mut rng).as_bytes());
             text.push(b'\n');
         }
-        assert!(m.cuts(&text, text.len() / super::CHUNK).len() > 2);
-        assert_eq!(m.restore(&text), m.restore_serial(&text));
-        assert_eq!(r.restore(&text), m.restore_serial(&text).0);
+        assert!(m.cuts(&text, text.len() / super::CHUNK, &[]).len() > 2);
+        assert_eq!(m.restore(&text, &[]), m.restore_serial(&text, &[]));
+        assert_eq!(r.restore_with(&text, NONE), m.restore_serial(&text, &[]).0);
     }
 
     #[test]
     fn debug_output_never_shows_originals() {
         let mut r = restorer(&[(Email, "jeroen@test.nl", "secret.original@example.org")]);
-        let _ = r.feed(b"jeroen@test.nl");
+        let _ = r.feed_with(b"jeroen@test.nl", NONE);
         let shown = format!("{r:?}");
         assert!(!shown.contains("secret.original"), "{shown}");
         assert!(!shown.contains("jeroen@test.nl"), "{shown}");
@@ -2000,6 +2388,21 @@ mod tests {
     }
 
     #[test]
+    fn component_first_name_followed_by_an_apostrophe_particle_is_somebody_else() {
+        // `'t` is a particle like `van`, though its apostrophe is not a letter.
+        let r = restorer(&[(Person, "Haley van Zessen", "Jeroen de Vries")]);
+        assert_eq!(restore(&r, "Haley 't Hart called"), "Haley 't Hart called");
+        assert_eq!(
+            restore(&r, "Haley 't van Hart called"),
+            "Haley 't van Hart called"
+        );
+        assert_eq!(
+            restore(&r, "Haley 't brooks called"),
+            "Jeroen 't brooks called"
+        );
+    }
+
+    #[test]
     fn component_first_name_check_applies_to_one_word_names() {
         let r = restorer(&[(Person, "Haley-Marian", "Jeroen")]);
         assert_eq!(restore(&r, "Haley Brooks called"), "Haley Brooks called");
@@ -2060,7 +2463,7 @@ mod tests {
             let words = 3 + rng.below(40);
             let text = veto_text(&mut rng, words);
             let (want, count) = match &r.matcher {
-                Some(m) => m.restore_serial(text.as_bytes()),
+                Some(m) => m.restore_serial(text.as_bytes(), &[]),
                 None => panic!("no matcher"),
             };
             restored += count;
@@ -2089,13 +2492,13 @@ mod tests {
                 text.push_str(&veto_text(&mut rng, 30));
                 text.push('\n');
             }
-            let want = m.restore_serial(text.as_bytes());
+            let want = m.restore_serial(text.as_bytes(), &[]);
             for parts in [2, 5, 40] {
-                if m.cuts(text.as_bytes(), parts).len() > 2 {
+                if m.cuts(text.as_bytes(), parts, &[]).len() > 2 {
                     split += 1;
                 }
                 assert_eq!(
-                    m.restore_split(text.as_bytes(), parts),
+                    apply(text.as_bytes(), &m.plan_split(text.as_bytes(), parts, &[])),
                     want,
                     "parts {parts}"
                 );
@@ -2119,7 +2522,7 @@ mod tests {
                     "x ".repeat(pad / 2),
                     "z. ".repeat(30)
                 );
-                let want = r.restore(text.as_bytes());
+                let want = r.restore_with(text.as_bytes(), NONE);
                 for size in [1, 2, 3, 7, 16] {
                     let chunks: Vec<&[u8]> = text.as_bytes().chunks(size).collect();
                     let (got, _, _) = stream(&mut s, &chunks);
@@ -2161,7 +2564,7 @@ mod tests {
                         text.push_str(rng.pick(&PIECES));
                     }
                 }
-                let want = r.restore(text.as_bytes());
+                let want = r.restore_with(text.as_bytes(), NONE);
                 assert_plan_sound(&r, text.as_bytes());
                 for mode in [1, 2, 3, 4] {
                     let chunks = chunked(&mut rng, text.as_bytes(), mode);
@@ -2183,19 +2586,498 @@ mod tests {
             (Phone, "+31 6 29554691", "+31 6 12345678"),
         ]);
         let chunk = vec![b'a'; 1 << 16];
-        let mut out = s.feed(b"first jeroen@test.nl ");
+        let mut out = s.feed_with(b"first jeroen@test.nl ", NONE);
         let mut most_held = 0;
         for _ in 0..40 {
-            out.extend(s.feed(&chunk));
+            out.extend(s.feed_with(&chunk, NONE));
             most_held = most_held.max(s.tail.len());
         }
-        out.extend(s.feed(b" last jeroen@test.nl and +31 6 29554691"));
-        out.extend(s.flush());
+        out.extend(s.feed_with(b" last jeroen@test.nl and +31 6 29554691", NONE));
+        out.extend(s.flush_with(NONE));
         assert!(most_held <= super::MAX_HELD + chunk.len(), "{most_held}");
         let text = String::from_utf8_lossy(&out);
         assert!(text.starts_with("first jan@acme.nl a"), "{}", &text[..40]);
         assert!(text.ends_with("a last jan@acme.nl and +31 6 12345678"));
         assert_eq!(out.len(), 18 + 40 * chunk.len() + 36);
         assert_eq!(s.restored_count(), 3);
+    }
+
+    // --- a finder: the vault's own lookup, in the same pass ---------------------------
+
+    /// The vault's lookup as a test can make it: these proxies, in the case they are written
+    /// in, wherever one stands alone (no ASCII letter or digit next to it). Of the ones that
+    /// start together the longest is found.
+    struct Lookup(&'static [(&'static str, &'static str)]);
+
+    impl ProxyFinder for Lookup {
+        fn longest(&self) -> usize {
+            self.0
+                .iter()
+                .map(|(proxy, _)| proxy.len())
+                .max()
+                .unwrap_or(0)
+        }
+
+        fn find(&self, text: &[u8]) -> Vec<Replacement> {
+            let alnum = |at: Option<usize>| {
+                at.and_then(|at| text.get(at))
+                    .is_some_and(u8::is_ascii_alphanumeric)
+            };
+            let mut found = Vec::new();
+            let mut at = 0;
+            while at < text.len() {
+                let hit = self
+                    .0
+                    .iter()
+                    .filter(|(proxy, _)| {
+                        text[at..].starts_with(proxy.as_bytes())
+                            && !alnum(at.checked_sub(1))
+                            && !alnum(Some(at + proxy.len()))
+                    })
+                    .max_by_key(|(proxy, _)| proxy.len());
+                if let Some((proxy, original)) = hit {
+                    found.push(Replacement {
+                        start: at,
+                        end: at + proxy.len(),
+                        with: (*original).into(),
+                    });
+                    at += proxy.len();
+                } else {
+                    at += 1;
+                }
+            }
+            found
+        }
+    }
+
+    fn restore_with(r: &Restorer, text: &str, finder: &dyn ProxyFinder) -> String {
+        String::from_utf8_lossy(&r.restore_with(text.as_bytes(), finder)).into_owned()
+    }
+
+    /// [`stream`] with a finder.
+    fn stream_with(
+        r: &mut Restorer,
+        chunks: &[&[u8]],
+        finder: &dyn ProxyFinder,
+    ) -> (Vec<u8>, usize, usize) {
+        let before = r.restored_count();
+        let mut out = Vec::new();
+        for chunk in chunks {
+            out.extend(r.feed_with(chunk, finder));
+        }
+        let early = out.len();
+        out.extend(r.flush_with(finder));
+        (out, r.restored_count() - before, early)
+    }
+
+    #[test]
+    fn a_value_that_is_a_proxy_of_another_is_restored_once() {
+        // The vault holds `Pieter Jansen` as the stand-in for `Jan Smit`, and `Haley Brooks` as
+        // the stand-in for somebody who really is called `Pieter Jansen`: text equal to an
+        // earlier proxy is masked like any other value.
+        const VAULT: &[(&str, &str)] = &[
+            ("Pieter Jansen", "Jan Smit"),
+            ("Haley Brooks", "Pieter Jansen"),
+        ];
+        let finder = Lookup(VAULT);
+        let reply = "Pieter Jansen and Haley Brooks";
+        let want = "Jan Smit and Pieter Jansen";
+        // What was sent to the host, or only part of it.
+        for scope in [
+            &[
+                (Person, "Pieter Jansen", "Jan Smit"),
+                (Person, "Haley Brooks", "Pieter Jansen"),
+            ][..],
+            &[(Person, "Haley Brooks", "Pieter Jansen")][..],
+            &[(Person, "Pieter Jansen", "Jan Smit")][..],
+            &[][..],
+        ] {
+            let r = restorer(scope);
+            assert_eq!(restore_with(&r, reply, &finder), want, "{scope:?}");
+            let mut s = restorer(scope);
+            for mode in 1..4 {
+                let chunks = chunked(&mut Rng(7), reply.as_bytes(), mode);
+                let (got, restored, _) = stream_with(&mut s, &chunks, &finder);
+                assert_eq!(String::from_utf8_lossy(&got), want, "{scope:?} mode {mode}");
+                assert_eq!(restored, 2);
+            }
+        }
+
+        // Two passes, one after the other, would not: the second reads the `Pieter Jansen` the
+        // first wrote as the stand-in it also is.
+        let r = restorer(&[(Person, "Pieter Jansen", "Jan Smit")]);
+        let first = Engine::apply(reply, &Lookup(VAULT).find(reply.as_bytes()));
+        assert_eq!(first, want);
+        assert_eq!(restore(&r, &first), "Jan Smit and Jan Smit");
+    }
+
+    /// Proxies the vault knows and the scope of `RICH` does not. One stands for a value that is a
+    /// proxy of the scope (`Haley Brooks`), one starts like another and one like a scope proxy.
+    const KNOWN: &[(&str, &str)] = &[
+        ("Mirjam Peeters", "Haley Brooks"),
+        ("zx-99-q", "real code"),
+        ("(555) 987-6543", "(202) 555-0199"),
+        ("Haley Brooks Jr", "Brooks Junior"),
+        ("Mirjam", "M."),
+        (
+            "long.vault.only.address.with.many.parts@some.very.long.domain.example",
+            "x@y.nl",
+        ),
+    ];
+
+    /// `text` with some of `known` put in between its words.
+    fn with_known(rng: &mut Rng, text: &str) -> String {
+        let mut out = String::new();
+        for word in text.split(' ') {
+            if rng.below(4) == 0 {
+                out.push_str(rng.pick(KNOWN).0);
+                out.push_str(rng.pick(&[" ", " ", "", ", ", "-"]));
+            }
+            out.push_str(word);
+            out.push(' ');
+        }
+        out
+    }
+
+    #[test]
+    fn streaming_with_a_finder_equals_one_shot_for_random_texts_and_chunkings() {
+        let finder = Lookup(KNOWN);
+        let r = restorer(RICH);
+        let mut s = restorer(RICH);
+        let mut rng = Rng(0xF1D0_5EED_0000_1234);
+        let (mut found, mut early_bytes) = (0, 0);
+        for round in 0..200 {
+            let base = random_text(&mut rng);
+            let text = with_known(&mut rng, &base);
+            let want = r.restore_with(text.as_bytes(), &finder);
+            found += finder.find(text.as_bytes()).len();
+            for mode in 0..5 {
+                let chunks = chunked(&mut rng, text.as_bytes(), mode);
+                let (got, restored, early) = stream_with(&mut s, &chunks, &finder);
+                assert_eq!(
+                    String::from_utf8_lossy(&got),
+                    String::from_utf8_lossy(&want),
+                    "round {round} mode {mode} text {text:?}"
+                );
+                assert_eq!(
+                    restored,
+                    restored_by(&r, &finder, &text),
+                    "round {round} mode {mode}"
+                );
+                early_bytes += early;
+            }
+        }
+        assert!(found > 200, "{found} proxies of the finder in the texts");
+        assert!(
+            early_bytes > 0,
+            "everything was held to the end of the streams"
+        );
+    }
+
+    /// How many replacements a one-shot restore makes: those of the plan.
+    fn restored_by(r: &Restorer, finder: &dyn ProxyFinder, text: &str) -> usize {
+        let found = finder.find(text.as_bytes());
+        let found = edits_of(&found, text.as_bytes());
+        match &r.matcher {
+            Some(m) => m.restore_serial(text.as_bytes(), &found).1,
+            None => found.len(),
+        }
+    }
+
+    #[test]
+    fn splitting_a_text_with_a_finder_changes_nothing() {
+        let finder = Lookup(KNOWN);
+        let r = restorer(RICH);
+        let Some(m) = &r.matcher else {
+            panic!("no matcher");
+        };
+        let mut rng = Rng(0x5911_7F1D_0000_0042);
+        let (mut split, mut found_edits) = (0, 0);
+        for _ in 0..30 {
+            let mut text = String::new();
+            while text.len() < 20_000 {
+                let base = random_text(&mut rng);
+                text.push_str(&with_known(&mut rng, &base));
+                text.push('\n');
+            }
+            let found = finder.find(text.as_bytes());
+            let found = edits_of(&found, text.as_bytes());
+            found_edits += found.len();
+            let want = m.restore_serial(text.as_bytes(), &found);
+            for parts in [2, 3, 8, 40] {
+                if m.cuts(text.as_bytes(), parts, &found).len() > 2 {
+                    split += 1;
+                }
+                assert_eq!(
+                    apply(
+                        text.as_bytes(),
+                        &m.plan_split(text.as_bytes(), parts, &found)
+                    ),
+                    want,
+                    "parts {parts}"
+                );
+            }
+        }
+        assert!(split > 0, "no text was ever split");
+        assert!(found_edits > 1000, "{found_edits} proxies of the finder");
+    }
+
+    #[test]
+    fn the_plan_of_a_restore_is_what_it_makes() {
+        let finder = Lookup(KNOWN);
+        let r = restorer(RICH);
+        let mut rng = Rng(0x71A4_0000_0000_0007);
+        let mut planned = 0;
+        for _ in 0..100 {
+            let base = random_text(&mut rng);
+            let text = with_known(&mut rng, &base);
+            let plan = r.plan_with(text.as_bytes(), &finder);
+            planned += plan.len();
+            assert_eq!(
+                Engine::apply(&text, &plan).as_bytes(),
+                r.restore_with(text.as_bytes(), &finder)
+            );
+            let mut end = 0;
+            for rep in &plan {
+                assert!(rep.start >= end && rep.start < rep.end && rep.end <= text.len());
+                end = rep.end;
+            }
+        }
+        assert!(planned > 200, "{planned} replacements in the texts");
+        // Without a scope, the finder's alone.
+        let text = "Mirjam Peeters, zx-99-q and Mirjam";
+        let plan = restorer(&[]).plan_with(text.as_bytes(), &finder);
+        assert_eq!(Engine::apply(text, &plan), "Haley Brooks, real code and M.");
+    }
+
+    #[test]
+    fn a_finder_restores_a_stream_without_a_scope_and_holds_back_its_longest_proxy() {
+        let finder = Lookup(&[("Mirjam Peeters", "Haley Brooks"), ("zx-99-q", "real code")]);
+        let text = format!("{} zx-99-q and Mirjam Peeters.", "word ".repeat(20));
+        let want = format!("{} real code and Haley Brooks.", "word ".repeat(20));
+        let r = restorer(&[]);
+        assert_eq!(restore_with(&r, &text, &finder), want);
+        let mut s = restorer(&[]);
+        for mode in 1..5 {
+            let chunks = chunked(&mut Rng(11), text.as_bytes(), mode);
+            let (got, restored, early) = stream_with(&mut s, &chunks, &finder);
+            assert_eq!(String::from_utf8_lossy(&got), want, "mode {mode}");
+            assert_eq!(restored, 2);
+            assert!(early > 0, "mode {mode}: held to the end of the stream");
+        }
+
+        // The longest proxy and 16 bytes more are held back, however the text goes; without a
+        // finder nothing is.
+        let filler = "w ".repeat(60);
+        let early = s.feed_with(filler.as_bytes(), &finder);
+        assert!(!early.is_empty());
+        assert!(
+            filler.len() - early.len() >= finder.longest() + 16,
+            "{}",
+            early.len()
+        );
+        assert_eq!(early.len() + s.flush_with(&finder).len(), filler.len());
+        assert_eq!(s.feed_with(filler.as_bytes(), NONE).len(), filler.len());
+        // A finder that has nothing to find at all is not asked.
+        assert_eq!(s.feed_with(b"abc", &Lookup(&[])), b"abc");
+    }
+
+    #[test]
+    fn where_the_finder_and_the_scope_overlap_the_first_and_longer_one_wins() {
+        let person = restorer(&[(Person, "Haley Brooks", "Anna Boer")]);
+        // Together at the start: the longer one.
+        let finds = Lookup(&[("Haley Brooks Jr", "Brooks Junior")]);
+        assert_eq!(
+            restore_with(&person, "Haley Brooks Jr said", &finds),
+            "Brooks Junior said"
+        );
+        let scoped = restorer(&[(Person, "Haley Brooks Jr", "Anna Boer")]);
+        let finds = Lookup(&[("Haley Brooks", "Somebody")]);
+        assert_eq!(
+            restore_with(&scoped, "Haley Brooks Jr said", &finds),
+            "Anna Boer said"
+        );
+
+        // The same span: the finder's.
+        let finds = Lookup(&[("Haley Brooks", "Somebody Else")]);
+        assert_eq!(
+            restore_with(&person, "Haley Brooks said", &finds),
+            "Somebody Else said"
+        );
+
+        // Starting first: that one, and what is left of the other is not restored.
+        let phone = restorer(&[(Phone, "+31 6 29554691", "+31 6 12345678")]);
+        let finds = Lookup(&[("xx +31", "Y")]);
+        assert_eq!(
+            restore_with(&phone, "xx +31 6 29554691", &finds),
+            "Y 6 29554691"
+        );
+        let finds = Lookup(&[("6 29554691 yy", "Z")]);
+        assert_eq!(
+            restore_with(&phone, "+31 6 29554691 yy", &finds),
+            "+31 6 12345678 yy"
+        );
+    }
+
+    #[test]
+    fn what_a_finder_reports_outside_the_text_or_twice_is_ignored() {
+        struct Odd;
+        impl ProxyFinder for Odd {
+            fn longest(&self) -> usize {
+                9
+            }
+
+            fn find(&self, _text: &[u8]) -> Vec<Replacement> {
+                let rep = |start, end, with: &str| Replacement {
+                    start,
+                    end,
+                    with: with.into(),
+                };
+                // Out of order, overlapping, empty, inside out and past the end.
+                vec![
+                    rep(8, 11, "C"),
+                    rep(0, 3, "A"),
+                    rep(1, 4, "B"),
+                    rep(5, 5, "-"),
+                    rep(9, 8, "-"),
+                    rep(8, 99, "-"),
+                ]
+            }
+        }
+        let r = restorer(&[]);
+        assert_eq!(restore_with(&r, "abc def ghi", &Odd), "A def C");
+        let mut s = restorer(&[]);
+        let mut out = s.feed_with(b"abc def ghi", &Odd);
+        out.extend(s.flush_with(&Odd));
+        assert_eq!(String::from_utf8_lossy(&out), "A def C");
+    }
+
+    // --- what the random texts do not reach --------------------------------------------
+
+    /// What `text` becomes streamed byte by byte, and what it becomes in one go.
+    fn streamed_and_whole(
+        entries: Entries<'_>,
+        finder: &dyn ProxyFinder,
+        text: &str,
+    ) -> (String, String) {
+        let whole = restorer(entries).restore_with(text.as_bytes(), finder);
+        let mut s = restorer(entries);
+        let chunks: Vec<&[u8]> = text.as_bytes().chunks(1).collect();
+        let (streamed, _, _) = stream_with(&mut s, &chunks, finder);
+        (
+            String::from_utf8_lossy(&streamed).into_owned(),
+            String::from_utf8_lossy(&whole).into_owned(),
+        )
+    }
+
+    #[test]
+    fn a_typo_sequence_that_ends_in_a_run_glued_to_a_match_is_the_same_streamed_and_whole() {
+        // The run after `Zesen` is punctuation up to the phone number, which arrives in pieces.
+        let scope: Entries<'_> = &[
+            (Person, "Haley van Zessen", "Jeroen de Vries"),
+            (Phone, "+31 6 29554691", "+31 6 12345678"),
+        ];
+        for dashes in [1, 5, 45, 90] {
+            let text = format!("Haley van Zesen{}+31 6 29554691 called", "-".repeat(dashes));
+            let (streamed, whole) = streamed_and_whole(scope, NONE, &text);
+            assert_eq!(streamed, whole, "{dashes} dashes");
+        }
+    }
+
+    #[test]
+    fn a_long_word_after_a_first_name_is_judged_the_same_streamed_and_whole() {
+        // The word ends exactly where the name check stops looking, 48 bytes after `Haley`, and
+        // a phone number starts right there.
+        let scope: Entries<'_> = &[
+            (Person, "Haley van Zessen", "Jeroen de Vries"),
+            (Phone, "(555) 123-4567", "(202) 555-0100"),
+        ];
+        let word = "Brooks-Fleming-Smits-Jansen-Bakkers-Vissers-Vos";
+        assert_eq!(word.len(), 47);
+        for (glue, tail) in [("", "(555) 123-4567 called"), (", ", "said hi")] {
+            let text = format!("Haley {word}{glue}{tail}");
+            let (streamed, whole) = streamed_and_whole(scope, NONE, &text);
+            assert_eq!(streamed, whole, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn splitting_a_text_where_a_long_word_ends_at_the_name_reach_changes_nothing() {
+        let r = restorer(&[(Person, "Haley van Zessen", "Jeroen de Vries")]);
+        let Some(m) = &r.matcher else {
+            panic!("no matcher");
+        };
+        let text = b"Haley Brooks-Fleming-Smits-Jansen-Bakkers-Vissers-Vos, said hi";
+        // Cut at the comma, which is where the check stops looking.
+        let cuts = m.cuts(text, 2, &[]);
+        assert_eq!(cuts, [0, 53, text.len()]);
+        assert_eq!(
+            apply(text, &m.plan_split(text, 2, &[])),
+            m.restore_serial(text, &[])
+        );
+    }
+
+    #[test]
+    fn bytes_that_are_not_utf8_do_not_make_a_stream_grow_without_end() {
+        let mut s = restorer(&[(Email, "jeroen@test.nl", "jan@acme.nl")]);
+        let chunk = vec![0x80u8; 1 << 16];
+        let mut most_held = 0;
+        let mut out = Vec::new();
+        for _ in 0..40 {
+            out.extend(s.feed_with(&chunk, NONE));
+            most_held = most_held.max(s.tail.len());
+        }
+        out.extend(s.flush_with(NONE));
+        assert!(most_held <= super::MAX_HELD + chunk.len(), "{most_held}");
+        assert_eq!(out.len(), 40 * chunk.len());
+    }
+
+    #[test]
+    fn a_proxy_that_starts_with_punctuation_is_found_only_where_the_finder_would_find_it() {
+        // The finder wants a break before a proxy, and `x` is none: cutting the stream at the
+        // bracket would give the proxy one.
+        let finder = Lookup(&[("(555) 987-6543", "(202) 555-0199")]);
+        let text = "x(555) 987-6543 and so on and so on and so on and so on";
+        let (streamed, whole) = streamed_and_whole(&[], &finder, text);
+        assert_eq!(whole, text);
+        assert_eq!(streamed, whole);
+        let text = "x (555) 987-6543 and so on and so on and so on and so on";
+        let (streamed, whole) = streamed_and_whole(&[], &finder, text);
+        assert!(whole.starts_with("x (202) 555-0199 and"));
+        assert_eq!(streamed, whole);
+    }
+
+    #[test]
+    fn a_first_name_before_a_curly_particle_and_a_name_is_somebody_else() {
+        let r = restorer(&[(Person, "Haley van Zessen", "Jeroen de Vries")]);
+        for text in ["Haley 't Hart called", "Haley \u{2019}t Hart called"] {
+            assert_eq!(restore(&r, text), text);
+        }
+        assert_eq!(restore(&r, "Haley \u{2019}t said"), "Jeroen \u{2019}t said");
+    }
+
+    #[test]
+    fn proxies_that_differ_only_in_case_and_share_an_original_keep_their_typos_and_name_parts() {
+        let r = restorer(&[
+            (Person, "Haley Brooks", "Anna Boer"),
+            (Person, "HALEY BROOKS", "Anna Boer"),
+        ]);
+        assert_eq!(restore(&r, "Haley Brook called"), "Anna Boer called");
+        assert_eq!(restore(&r, "Brooks said"), "Boer said");
+    }
+
+    #[test]
+    fn a_proxy_with_a_non_ascii_apostrophe_is_matched_exactly_and_not_as_a_typo() {
+        let r = restorer(&[(Person, "Haley \u{2019}t Zessen", "Jeroen de Vries")]);
+        assert_eq!(
+            restore(&r, "Haley \u{2019}t Zessen called"),
+            "Jeroen de Vries called"
+        );
+        // The typo tier counts bytes, and `\u{2019}` is three of them: the whole name is not
+        // matched as a typo, only its parts are restored.
+        assert_eq!(
+            restore(&r, "Haley 't Zessen called"),
+            "Jeroen 't Vries called"
+        );
     }
 }

@@ -7,12 +7,15 @@ use std::borrow::Cow;
 use super::{Output, Pass};
 use crate::{Error, Result, engine::Engine};
 
-const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
-const UTF16LE_BOM: [u8; 2] = [0xFF, 0xFE];
-const UTF16BE_BOM: [u8; 2] = [0xFE, 0xFF];
+pub(super) const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+pub(super) const UTF16LE_BOM: [u8; 2] = [0xFF, 0xFE];
+pub(super) const UTF16BE_BOM: [u8; 2] = [0xFE, 0xFF];
+const UTF32LE_BOM: [u8; 4] = [0xFF, 0xFE, 0x00, 0x00];
+const UTF32BE_BOM: [u8; 4] = [0x00, 0x00, 0xFE, 0xFF];
 
-/// Share of odd-offset bytes that must be NUL before BOM-less data counts as UTF-16LE.
-const UTF16LE_NUL_SHARE: usize = 30;
+/// Share of the high bytes of 16-bit units that must be NUL before BOM-less data counts as
+/// UTF-16.
+const UTF16_NUL_SHARE: usize = 30;
 
 /// Characters Windows-1252 puts at 0x80..=0x9F. The five undefined bytes map
 /// to the C1 control of the same value, so every byte round-trips.
@@ -31,21 +34,41 @@ pub(super) enum Encoding {
     /// UTF-16LE found by NUL density, no BOM.
     Utf16Le,
     Utf16LeBom,
+    /// UTF-16BE found by NUL density, no BOM.
+    Utf16Be,
     Utf16BeBom,
     Windows1252,
 }
 
-/// Decodes `bytes`, trying in order: UTF-8 BOM, UTF-16 BOMs, BOM-less UTF-16LE,
-/// valid UTF-8, then Windows-1252 for data without NUL bytes.
+impl Encoding {
+    /// Whether the text is spelled in 16-bit units.
+    pub(super) fn is_utf16(self) -> bool {
+        matches!(
+            self,
+            Self::Utf16Le | Self::Utf16LeBom | Self::Utf16Be | Self::Utf16BeBom
+        )
+    }
+}
+
+/// Decodes `bytes`, trying in order: UTF-8 BOM, UTF-16 BOMs, BOM-less UTF-16 (little endian,
+/// then big), valid UTF-8, then Windows-1252 for data without NUL bytes.
 ///
-/// BOM-less UTF-16LE is tried before UTF-8 because ASCII text in UTF-16LE is
-/// also valid UTF-8 (every other byte is NUL) and would otherwise hide all its
-/// PII from the detector. Real UTF-8 text has no NULs.
+/// BOM-less UTF-16 is tried before UTF-8 because ASCII text in UTF-16 is also valid UTF-8
+/// (every other byte is NUL) and would otherwise hide all its PII from the detector. Real
+/// UTF-8 text has no NULs.
+///
+/// # Errors
+/// `UnsupportedFormat` for UTF-32, which is not read, and for invalid or binary data.
 pub(super) fn decode(bytes: &[u8]) -> Result<(Cow<'_, str>, Encoding)> {
     if let Some(rest) = bytes.strip_prefix(&UTF8_BOM) {
         let text =
             std::str::from_utf8(rest).map_err(|_| Error::UnsupportedFormat("invalid UTF-8"))?;
         return Ok((Cow::Borrowed(text), Encoding::Utf8Bom));
+    }
+    // The UTF-32LE BOM starts with the UTF-16LE one: read as UTF-16 the text would be full of
+    // NULs, and its PII would stay hidden.
+    if bytes.starts_with(&UTF32LE_BOM) || bytes.starts_with(&UTF32BE_BOM) {
+        return Err(Error::UnsupportedFormat("UTF-32"));
     }
     if let Some(rest) = bytes.strip_prefix(&UTF16LE_BOM) {
         let text = utf16(rest, u16::from_le_bytes)?;
@@ -55,10 +78,15 @@ pub(super) fn decode(bytes: &[u8]) -> Result<(Cow<'_, str>, Encoding)> {
         let text = utf16(rest, u16::from_be_bytes)?;
         return Ok((Cow::Owned(text), Encoding::Utf16BeBom));
     }
-    if looks_like_utf16le(bytes)
+    if looks_like_utf16(bytes, 1)
         && let Ok(text) = utf16(bytes, u16::from_le_bytes)
     {
         return Ok((Cow::Owned(text), Encoding::Utf16Le));
+    }
+    if looks_like_utf16(bytes, 0)
+        && let Ok(text) = utf16(bytes, u16::from_be_bytes)
+    {
+        return Ok((Cow::Owned(text), Encoding::Utf16Be));
     }
     if let Ok(text) = std::str::from_utf8(bytes) {
         return Ok((Cow::Borrowed(text), Encoding::Utf8));
@@ -84,6 +112,7 @@ pub(super) fn encode(text: String, encoding: Encoding) -> Result<Vec<u8>> {
         }
         Encoding::Utf16Le => Ok(utf16_bytes(&text, &[], u16::to_le_bytes)),
         Encoding::Utf16LeBom => Ok(utf16_bytes(&text, &UTF16LE_BOM, u16::to_le_bytes)),
+        Encoding::Utf16Be => Ok(utf16_bytes(&text, &[], u16::to_be_bytes)),
         Encoding::Utf16BeBom => Ok(utf16_bytes(&text, &UTF16BE_BOM, u16::to_be_bytes)),
         Encoding::Windows1252 => text.chars().map(cp1252_byte).collect(),
     }
@@ -100,14 +129,20 @@ pub(super) fn process(pass: &Pass<'_>, bytes: &[u8]) -> Result<Output> {
     Ok(Output::Same(encode(out, encoding)?))
 }
 
-/// True when at least `UTF16LE_NUL_SHARE` percent of the bytes at odd offsets are NUL.
-fn looks_like_utf16le(bytes: &[u8]) -> bool {
+/// True when at least `UTF16_NUL_SHARE` percent of the high bytes of the 16-bit units (at
+/// offset `high` in each pair) are NUL.
+fn looks_like_utf16(bytes: &[u8], high: usize) -> bool {
     if bytes.is_empty() || !bytes.len().is_multiple_of(2) {
         return false;
     }
     let units = bytes.len() / 2;
-    let nuls = bytes.iter().skip(1).step_by(2).filter(|&&b| b == 0).count();
-    nuls * 100 >= units * UTF16LE_NUL_SHARE
+    let nuls = bytes
+        .iter()
+        .skip(high)
+        .step_by(2)
+        .filter(|&&b| b == 0)
+        .count();
+    nuls * 100 >= units * UTF16_NUL_SHARE
 }
 
 fn utf16(bytes: &[u8], unit: fn([u8; 2]) -> u16) -> Result<String> {
@@ -190,18 +225,39 @@ mod tests {
     }
 
     #[test]
-    fn bomless_utf16le_beats_utf8() -> TestResult {
-        // ASCII in UTF-16LE is valid UTF-8 too; the NUL density must win.
-        let bytes: Vec<u8> = "mail jan@example.org"
-            .encode_utf16()
-            .flat_map(u16::to_le_bytes)
-            .collect();
-        assert!(std::str::from_utf8(&bytes).is_ok());
-        assert_eq!(
-            round_trip(&bytes)?,
-            ("mail jan@example.org".into(), Encoding::Utf16Le)
-        );
+    fn bomless_utf16_beats_utf8_in_both_orders() -> TestResult {
+        // ASCII in UTF-16 is valid UTF-8 too; the NUL density must win.
+        let text = "mail jan@example.org";
+        let le: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let be: Vec<u8> = text.encode_utf16().flat_map(u16::to_be_bytes).collect();
+        for bytes in [&le, &be] {
+            assert!(std::str::from_utf8(bytes).is_ok());
+        }
+        assert_eq!(round_trip(&le)?, (text.into(), Encoding::Utf16Le));
+        assert_eq!(round_trip(&be)?, (text.into(), Encoding::Utf16Be));
         Ok(())
+    }
+
+    #[test]
+    fn utf32_is_refused_instead_of_read_as_text_full_of_nuls() {
+        let mut le = UTF32LE_BOM.to_vec();
+        le.extend(
+            "mail jan@example.org"
+                .chars()
+                .flat_map(|c| u32::from(c).to_le_bytes()),
+        );
+        let mut be = UTF32BE_BOM.to_vec();
+        be.extend(
+            "mail jan@example.org"
+                .chars()
+                .flat_map(|c| u32::from(c).to_be_bytes()),
+        );
+        for bytes in [le, be] {
+            assert!(matches!(
+                decode(&bytes),
+                Err(Error::UnsupportedFormat("UTF-32"))
+            ));
+        }
     }
 
     #[test]

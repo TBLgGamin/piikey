@@ -2,14 +2,11 @@
 //! Windows proxy settings from the first, and its clean-up at launch would undo the first one's
 //! work.
 
-use std::{
-    fs::{File, OpenOptions, TryLockError},
-    path::Path,
-    thread,
-    time::{Duration, Instant},
-};
+use std::{path::Path, time::Duration};
 
-use crate::Res;
+use piikey::sys::{FileLock, lock_within};
+
+use crate::{Describe, Res};
 
 // The file name is kept for existing installs, so an old and a new build still lock each other out.
 const FILE_NAME: &str = "guard.lock";
@@ -18,11 +15,8 @@ const FILE_NAME: &str = "guard.lock";
 /// however it ends, so an app that crashed never keeps the next one out.
 #[derive(Debug)]
 pub struct Instance {
-    _lock: File,
+    _lock: FileLock,
 }
-
-/// How often [`Instance::acquire`] tries again while it waits.
-const RETRY: Duration = Duration::from_millis(50);
 
 impl Instance {
     /// Takes the lock in `folder`, trying for up to `wait`; `Ok(None)` when another process still
@@ -31,29 +25,15 @@ impl Instance {
     /// # Errors
     /// The lock file cannot be created or locked.
     pub fn acquire(folder: &Path, wait: Duration) -> Res<Option<Self>> {
-        let path = folder.join(FILE_NAME);
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&path)
-            .map_err(|error| format!("could not open {}: {error}", path.display()))?;
-        let deadline = Instant::now() + wait;
-        loop {
-            match file.try_lock() {
-                Ok(()) => return Ok(Some(Self { _lock: file })),
-                Err(TryLockError::WouldBlock) if Instant::now() < deadline => thread::sleep(RETRY),
-                Err(TryLockError::WouldBlock) => return Ok(None),
-                Err(TryLockError::Error(error)) => {
-                    return Err(format!("could not lock {}: {error}", path.display()));
-                }
-            }
-        }
+        let lock = lock_within(&folder.join(FILE_NAME), wait).describe()?;
+        Ok(lock.map(|lock| Self { _lock: lock }))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+
     use super::*;
     use crate::ui::testing::TempDir;
 

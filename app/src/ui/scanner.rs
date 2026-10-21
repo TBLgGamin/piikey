@@ -116,6 +116,15 @@ impl Jobs {
         Job { kind, cancel }
     }
 
+    /// The scan `job` is over, to the end or cancelled: only one that ran to the end counts
+    /// for the watched folders' next turn.
+    fn finish(&mut self, job: &Job, now: Instant) {
+        self.running = None;
+        if job.kind == Kind::Watched && !job.cancelled() {
+            self.last = Some(now);
+        }
+    }
+
     /// Stops the scan of the watched folders if that is what runs; whether it was.
     fn interrupt(&self) -> bool {
         match &self.running {
@@ -206,11 +215,7 @@ impl Scanner {
 
     /// The scan `next` returned is over, to the end or [cancelled](Job::cancelled).
     pub fn done(&self, job: &Job) {
-        let mut jobs = self.lock();
-        jobs.running = None;
-        if job.kind == Kind::Watched && !job.cancelled() {
-            jobs.last = Some(Instant::now());
-        }
+        self.lock().finish(job, Instant::now());
     }
 
     /// Ends the thread, and stops the scan that runs.
@@ -248,13 +253,6 @@ mod tests {
             Pick::Run(job) => Ok(job),
             Pick::Wait(left) => Err(format!("waits for {left:?}")),
             Pick::Stop => Err("stops".to_owned()),
-        }
-    }
-
-    fn finish(jobs: &mut Jobs, job: &Job, now: Instant) {
-        jobs.running = None;
-        if job.kind == Kind::Watched && !job.cancelled() {
-            jobs.last = Some(now);
         }
     }
 
@@ -297,7 +295,7 @@ mod tests {
         let start = Instant::now();
         let job = run(&mut jobs, start)?;
         assert_eq!(job.kind, Kind::Watched);
-        finish(&mut jobs, &job, start);
+        jobs.finish(&job, start);
 
         let soon = start + Duration::from_mins(1);
         match jobs.pick(soon) {
@@ -319,7 +317,7 @@ mod tests {
             let mut jobs = scanner.lock();
             jobs.watching = true;
             let job = run(&mut jobs, start)?;
-            finish(&mut jobs, &job, start);
+            jobs.finish(&job, start);
             assert!(matches!(jobs.pick(start), Pick::Wait(Some(_))));
         }
         scanner.watch(true);
@@ -342,11 +340,11 @@ mod tests {
             "the user waits: the background scan yields"
         );
         let mut jobs = scanner.lock();
-        finish(&mut jobs, &watched, now);
+        jobs.finish(&watched, now);
         let asked = run(&mut jobs, now)?;
         assert_eq!(asked.kind, Kind::Asked(request("a")));
         assert!(!asked.cancelled());
-        finish(&mut jobs, &asked, now);
+        jobs.finish(&asked, now);
         // The interrupted scan did not count as a scan to the end: it is due again.
         assert_eq!(run(&mut jobs, now)?.kind, Kind::Watched);
         Ok(())
@@ -372,7 +370,7 @@ mod tests {
         scanner.ask(request("a"));
         let mut jobs = scanner.lock();
         let asked = run(&mut jobs, now)?;
-        finish(&mut jobs, &asked, now);
+        jobs.finish(&asked, now);
         assert!(matches!(jobs.pick(now), Pick::Wait(None)));
         Ok(())
     }
@@ -386,7 +384,7 @@ mod tests {
         scanner.watch(false);
         assert!(watched.cancelled());
         let mut jobs = scanner.lock();
-        finish(&mut jobs, &watched, now);
+        jobs.finish(&watched, now);
         assert!(matches!(jobs.pick(now), Pick::Wait(None)));
         Ok(())
     }

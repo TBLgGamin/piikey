@@ -15,16 +15,16 @@ use hudsucker::{
     decode_request, decode_response,
     hyper::{
         Method, Request, Response, StatusCode,
+        body::Body as _,
         header::{
             ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HOST, HeaderMap,
-            HeaderValue, TRANSFER_ENCODING,
+            HeaderName, HeaderValue, SEC_WEBSOCKET_EXTENSIONS, TRANSFER_ENCODING,
         },
     },
     rustls::server::ClientHello,
     tokio_tungstenite::tungstenite::Message,
 };
 use piikey::{
-    detect::Mode,
     engine::{Engine, Resent},
     policy::{Policy, normalize_host},
     restore::Restorer,
@@ -40,6 +40,8 @@ use super::{
 
 /// The largest request body that is read and anonymized.
 const MAX_BODY: usize = 64 << 20;
+/// What a browser says a request is for.
+static SEC_FETCH_DEST: HeaderName = HeaderName::from_static("sec-fetch-dest");
 
 /// Everything the handlers share. Cheap to clone.
 #[derive(Clone)]
@@ -136,12 +138,20 @@ impl Env {
         target: &Target,
         mut req: Request<Body>,
     ) -> Result<Request<Body>, Response<Body>> {
-        // Compressed replies could not be restored.
-        req.headers_mut()
-            .insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+        // Compressed replies could not be restored. The scripts, styles, images, fonts and media
+        // of a page are never text the proxy restores, so they keep the browser's compression.
+        if !loads_an_asset(req.headers()) {
+            req.headers_mut()
+                .insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+        }
         let Some(kind) = ContentType::of(req.headers()).and_then(|ct| ct.body_kind()) else {
             return Ok(req);
         };
+        // A `GET` that names a content type has no body to check; reading it would only add a
+        // `Content-Length: 0` the browser never sent.
+        if req.body().is_end_stream() {
+            return Ok(req);
+        }
         if declared_length(req.headers()).is_some_and(|len| len > MAX_BODY as u64) {
             return Err(too_large());
         }
@@ -310,12 +320,15 @@ impl Interceptor {
     }
 
     /// One request from `client`: anonymized when it is intercepted.
-    async fn request(&mut self, client: SocketAddr, req: Request<Body>) -> RequestOrResponse {
+    async fn request(&mut self, client: SocketAddr, mut req: Request<Body>) -> RequestOrResponse {
         self.pending = None;
         // The tunnel itself: nothing to anonymize, hudsucker sets it up.
         if req.method() == Method::CONNECT {
             return req.into();
         }
+        // Whatever the site, the proxy reads the frames of a WebSocket itself and cannot inflate
+        // them: no server may be offered compression, or its first frame would break the socket.
+        req.headers_mut().remove(SEC_WEBSOCKET_EXTENSIONS);
         let target = match self.conn.clone() {
             // Inside a decrypted connection; the policy may have changed
             // since it was opened.
@@ -474,9 +487,10 @@ struct FrameRestore {
     count: usize,
 }
 
-/// Restores `text` with the proxies sent to `host`, then with every proxy
-/// the vault knows. `cached` is reused when the ledger has not changed since
-/// it was built, so a chatty socket does not rebuild the matcher per frame.
+/// Restores `text` in one pass: the proxies sent to `host` (typo'd and partial mentions too) and
+/// every proxy the vault knows, which covers what the ledger no longer does. `cached` is reused
+/// when the ledger has not changed since it was built, so a chatty socket does not rebuild the
+/// matcher per frame.
 fn restore_text(
     engine: &Engine,
     shared: &Shared,
@@ -485,28 +499,16 @@ fn restore_text(
     text: &str,
 ) -> Option<FrameRestore> {
     let generation = shared.ledger.generation();
-    let mut matcher = match cached {
+    let matcher = match cached {
         Some((built_for, matcher)) if built_for == generation => matcher,
         _ => Restorer::new(shared.ledger.scope_for(host, engine.vault())).ok()?,
     };
-    let before = matcher.restored_count();
-    let mut out = matcher.feed(text.as_bytes());
-    out.extend(matcher.flush());
-    let mut count = matcher.restored_count() - before;
-    let mut text = String::from_utf8(out).ok()?;
-    // Whatever the ledger no longer knows, the vault still does.
-    let plans = engine.plan(Mode::Deanonymize, &[text.as_str()]).ok();
-    if let Some(reps) = plans.as_ref().and_then(|plans| plans.first())
-        && !reps.is_empty()
-    {
-        count += reps.len();
-        text = Engine::apply(&text, reps);
-    }
+    let reps = matcher.plan_with(text.as_bytes(), engine);
     Some(FrameRestore {
         generation,
+        text: Engine::apply(text, &reps),
+        count: reps.len(),
         matcher,
-        text,
-        count,
     })
 }
 
@@ -541,8 +543,10 @@ impl WebSocketHandler for WsInterceptor {
             self.mask_frame(&target, text).await.map(Message::text)
         } else {
             // A frame that cannot be restored is forwarded as it is.
-            let restored = self.restore_frame(&target, text.clone()).await;
-            Some(Message::text(restored.unwrap_or(text)))
+            match self.restore_frame(&target, text).await {
+                Some(restored) => Some(Message::text(restored)),
+                None => Some(message),
+            }
         }
     }
 }
@@ -554,6 +558,18 @@ fn request_host(req: &Request<Body>) -> Option<String> {
             .get(HOST)
             .and_then(|value| value.to_str().ok())
             .map(normalize_host)
+    })
+}
+
+/// Whether the browser says the request loads something a page only uses: a script, style sheet,
+/// image, font or media file (`Sec-Fetch-Dest`). A request that does not say, as those of
+/// programs other than browsers, may load anything.
+fn loads_an_asset(headers: &HeaderMap) -> bool {
+    headers.get(&SEC_FETCH_DEST).is_some_and(|dest| {
+        matches!(
+            dest.as_bytes(),
+            b"script" | b"style" | b"image" | b"font" | b"audio" | b"video"
+        )
     })
 }
 
@@ -599,7 +615,10 @@ fn refuse(status: StatusCode, message: &str) -> Response<Body> {
 fn too_large() -> Response<Body> {
     refuse(
         StatusCode::PAYLOAD_TOO_LARGE,
-        "the request body is larger than 64 MiB and cannot be checked for personal data",
+        &format!(
+            "the request body is larger than {} MiB and cannot be checked for personal data",
+            MAX_BODY >> 20
+        ),
     )
 }
 
@@ -670,7 +689,10 @@ mod tests {
 
     use piikey::detect::EntityKind;
 
-    use crate::{ledger::Ledger, proxy::Typed};
+    use crate::{
+        ledger::Ledger,
+        proxy::{Typed, test_names},
+    };
 
     const CLIENT: &str = "127.0.0.1:1";
 
@@ -973,6 +995,123 @@ mod tests {
         Ok(())
     }
 
+    /// The headers of a `GET` to `url` with these extra ones as they reach the server; none when
+    /// the request was refused.
+    async fn headers_sent(
+        interceptor: &mut Interceptor,
+        url: &str,
+        extra: &[(&'static str, &'static str)],
+    ) -> HeaderMap {
+        let mut req = request(Method::GET, url, "text/plain", "");
+        for &(name, value) in extra {
+            req.headers_mut().insert(
+                HeaderName::from_static(name),
+                HeaderValue::from_static(value),
+            );
+        }
+        match interceptor.request(client(), req).await {
+            RequestOrResponse::Request(req) => req.headers().clone(),
+            RequestOrResponse::Response(_) => HeaderMap::new(),
+        }
+    }
+
+    fn accept_encoding(headers: &HeaderMap) -> Option<&str> {
+        headers
+            .get(ACCEPT_ENCODING)
+            .and_then(|value| value.to_str().ok())
+    }
+
+    #[tokio::test]
+    async fn a_websocket_handshake_offers_no_extension_the_proxy_cannot_read() -> piikey::Result<()>
+    {
+        let (env, _events) = make_env("ws-extensions", policy(&["chat.example.com"], &[]), 1)?;
+        // A server that accepted permessage-deflate would send frames the proxy cannot read:
+        // the proxy reads the frames of every WebSocket, protected site or not.
+        let offer = [(
+            "sec-websocket-extensions",
+            "permessage-deflate; client_max_window_bits",
+        )];
+        let mut protected = Interceptor::new(env.clone());
+        assert!(
+            protected
+                .decide_tls(client(), Some("chat.example.com".into()))
+                .await
+        );
+        let sent = headers_sent(&mut protected, "https://chat.example.com/ws", &offer).await;
+        assert_eq!(accept_encoding(&sent), Some("identity"), "it was forwarded");
+        assert!(sent.get(SEC_WEBSOCKET_EXTENSIONS).is_none());
+
+        let mut elsewhere = Interceptor::new(env);
+        let sent = headers_sent(&mut elsewhere, "http://elsewhere.example/ws", &offer).await;
+        assert!(
+            sent.get(ACCEPT_ENCODING).is_none(),
+            "it was not intercepted"
+        );
+        assert!(sent.get(SEC_WEBSOCKET_EXTENSIONS).is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn only_what_may_carry_restorable_text_is_asked_for_in_plain() -> piikey::Result<()> {
+        let (env, _events) = make_env("assets", policy(&["chat.example.com"], &[]), 1)?;
+        let mut interceptor = Interceptor::new(env);
+        assert!(
+            interceptor
+                .decide_tls(client(), Some("chat.example.com".into()))
+                .await
+        );
+        let url = "https://chat.example.com/x";
+        for (dest, plain) in [
+            ("script", false),
+            ("style", false),
+            ("image", false),
+            ("font", false),
+            ("audio", false),
+            ("video", false),
+            ("empty", true),
+            ("document", true),
+            ("iframe", true),
+        ] {
+            let sent = headers_sent(
+                &mut interceptor,
+                url,
+                &[("accept-encoding", "gzip, br"), ("sec-fetch-dest", dest)],
+            )
+            .await;
+            let want = if plain { "identity" } else { "gzip, br" };
+            assert_eq!(accept_encoding(&sent), Some(want), "{dest}");
+        }
+        // A program that says nothing about what it loads is asked for plain replies.
+        let sent = headers_sent(&mut interceptor, url, &[("accept-encoding", "gzip, br")]).await;
+        assert_eq!(accept_encoding(&sent), Some("identity"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_request_without_a_body_is_forwarded_as_it_is() -> piikey::Result<()> {
+        let (env, events) = make_env("bodiless", policy(&["chat.example.com"], &[]), 1)?;
+        let mut interceptor = Interceptor::new(env);
+        assert!(
+            interceptor
+                .decide_tls(client(), Some("chat.example.com".into()))
+                .await
+        );
+        // Many pages name a content type on a `GET`; the browser sent no `Content-Length`.
+        let req = request(
+            Method::GET,
+            "https://chat.example.com/backend-api/conversations",
+            "application/json",
+            "",
+        );
+        let Ok((sent, body)) = forwarded(interceptor.request(client(), req).await).await else {
+            panic!("the request was refused");
+        };
+        assert!(body.is_empty());
+        assert!(sent.headers().get(CONTENT_LENGTH).is_none());
+        assert!(events.try_recv().is_err());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn replies_without_a_text_body_are_not_wrapped() -> piikey::Result<()> {
         let (env, _events) = make_env("no-wrap", policy(&["chat.example.com"], &[]), 1)?;
@@ -1126,6 +1265,32 @@ mod tests {
             ws.restorer.as_ref().map(|(generation, _)| *generation),
             Some(shared.ledger.generation())
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_frame_with_a_value_equal_to_another_stand_in_restores_it_once() -> piikey::Result<()>
+    {
+        let (env, events) = make_env("ws-lookalike", policy(&["chat.example.com"], &[]), 1)?;
+        let (first, second) = test_names::lookalike_stand_ins(&env.engine())?;
+        // This app sent the host `first` only: the vault knows `second` as well.
+        env.shared.ledger.touch("chat.example.com", &first);
+        let mut ws = WsInterceptor::new(env);
+        let target = Target {
+            host: Arc::from("chat.example.com"),
+            exe: None,
+        };
+        let restored = ws
+            .restore_frame(&target, format!("{first} and {second}"))
+            .await;
+        assert_eq!(
+            restored.as_deref(),
+            Some(format!("Jan Smit and {first}").as_str())
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Ok(Event::Restored { count: 2, .. })
+        ));
         Ok(())
     }
 

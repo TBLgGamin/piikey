@@ -25,7 +25,7 @@ use super::{
     controller::{Backend, Running},
 };
 use crate::{
-    Res, ca,
+    Describe, Res, ca,
     capture::{self, Capture},
     highlight::Overlay,
     proxy::{self, Event, ProxyHandle, Shared},
@@ -80,15 +80,15 @@ impl Backend for System {
     }
 
     fn save_policy(&self, policy: &Policy) -> Res<()> {
-        policy.save().map_err(|error| error.to_string())
+        policy.save().describe()
     }
 
     fn open_engine(&self) -> Res<Engine> {
-        Engine::open_with_model(&self.vault, self.ner.clone()).map_err(|error| error.to_string())
+        Engine::open_with_model(&self.vault, self.ner.clone()).describe()
     }
 
     fn open_inventory(&self) -> Res<Inventory> {
-        let path = Inventory::default_path().map_err(|error| error.to_string())?;
+        let path = Inventory::default_path().describe()?;
         Inventory::open(&path).map_err(|error| format!("{}: {error}", path.display()))
     }
 
@@ -102,21 +102,24 @@ impl Backend for System {
         ner::fetch(&self.model_dir, &|done, total| {
             (progress.borrow_mut())(done, total);
         })
-        .map_err(|error| error.to_string())
+        .describe()
     }
 
     fn load_model(&self) -> Res<()> {
-        self.ner.load().map(drop).map_err(|error| error.to_string())
+        self.ner.load().map(drop).describe()
     }
 
     fn release_model(&self) {
         self.ner.release();
     }
 
-    fn start_http(&self, port: u16) -> Res<Box<dyn Running>> {
+    fn token(&self, rotate: bool) -> Res<String> {
+        api::read_or_create_token(rotate).describe()
+    }
+
+    fn start_http(&self, port: u16, token: String) -> Res<Box<dyn Running>> {
         let handler = self.api.get().cloned().ok_or("the API is not ready yet")?;
-        let token = api::read_or_create_token(false).map_err(|error| error.to_string())?;
-        let server = api::http::spawn(handler, port, token).map_err(|error| error.to_string())?;
+        let server = api::http::spawn(handler, port, token).describe()?;
         Ok(Box::new(server))
     }
 
@@ -153,8 +156,8 @@ impl Backend for System {
 
 /// Writes `text` to the file `name` in the data folder, so a reader sees the old or the new file.
 fn write_data(name: &str, text: &str) -> Res<()> {
-    let path = data_dir().map_err(|error| error.to_string())?.join(name);
-    write_atomic(&path, text.as_bytes()).map_err(|error| error.to_string())
+    let path = data_dir().describe()?.join(name);
+    write_atomic(&path, text.as_bytes()).describe()
 }
 
 impl Running for ProxyHandle {

@@ -9,7 +9,8 @@ use crate::detect::EntityKind;
 pub enum Error {
     /// File or pipe I/O failed.
     Io(std::io::Error),
-    /// DPAPI refused to wrap or unwrap the vault key (wrong user/machine).
+    /// DPAPI refused to wrap or unwrap a key (the vault's or the app's certificate key): a
+    /// different user or machine, or a damaged blob.
     Dpapi(String),
     /// A vault record other than the last failed authentication.
     VaultCorrupt { record: u64 },
@@ -33,8 +34,8 @@ pub enum Error {
     Protocol(&'static str),
     /// The detection model is missing or failed to load or run.
     Model(String),
-    /// A System32 tool (`curl.exe`, `certutil.exe`, `reg.exe`) was missing, could not be started
-    /// or could not be watched. The message is complete and fit for the user.
+    /// A System32 tool (`curl.exe`, `certutil.exe`) was missing, could not be started or could
+    /// not be watched. The message is complete and fit for the user.
     Tool(String),
     /// What this needs is in use by another piikey process (an inventory scan, the API pipe).
     /// The message is complete and fit for the user.
@@ -67,6 +68,25 @@ impl fmt::Display for Error {
             Self::Tool(e) | Self::Busy(e) | Self::BadRequest(e) => f.write_str(e),
             Self::Poisoned => f.write_str("internal lock poisoned"),
         }
+    }
+}
+
+impl Error {
+    /// Whether the input itself cannot be read: a format piikey does not read, or a document,
+    /// picture or message that is damaged. Reading it again fails the same way, unlike a failure
+    /// of the vault, the model, a lock or the disk. (A picture that cannot be read because no OCR
+    /// language is installed counts too: that is not told apart.)
+    #[must_use]
+    pub fn is_unreadable(&self) -> bool {
+        matches!(
+            self,
+            Self::UnsupportedFormat(_)
+                | Self::Zip(_)
+                | Self::Xml(_)
+                | Self::Pdf(_)
+                | Self::Ocr(_)
+                | Self::Mail(_)
+        )
     }
 }
 
@@ -128,5 +148,16 @@ mod tests {
             let message = "a complete sentence for the user";
             assert_eq!(make(message.to_owned()).to_string(), message);
         }
+    }
+
+    #[test]
+    fn only_unreadable_input_is_unreadable() {
+        assert!(Error::UnsupportedFormat("binary").is_unreadable());
+        assert!(Error::Zip("bad".into()).is_unreadable());
+        assert!(Error::Ocr("none".into()).is_unreadable());
+        assert!(!Error::Poisoned.is_unreadable());
+        assert!(!Error::VaultPathUnavailable.is_unreadable());
+        assert!(!Error::Model("not loaded".into()).is_unreadable());
+        assert!(!Error::Io(std::io::Error::other("disk")).is_unreadable());
     }
 }

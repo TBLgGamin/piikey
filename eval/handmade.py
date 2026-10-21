@@ -15,10 +15,9 @@ Run: python eval/handmade.py   (stdlib only; rewrites eval/handmade.jsonl)
 import json
 import re
 import sys
-import tomllib
-from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
+from common import EVAL_DIR, load_labels, source_map, validate_doc
+
 MARK = re.compile(r"\[\[([A-Z_]+):(.+?)\]\]", re.S)
 
 # (lang, marked text). Valid checksums where a real value would have one: IBANs pass mod-97,
@@ -195,16 +194,8 @@ def expand() -> list[tuple[str, str]]:
             out.append((lang, template.format(**fill)))
     return out
 
-LABELS = None
 
-
-def load_labels() -> set[str]:
-    with open(HERE / "labels.toml", "rb") as f:
-        table = tomllib.load(f)
-    return set(table["source"]["handmade"])
-
-
-def build(index: int, lang: str, marked: str) -> dict:
+def build(index: int, lang: str, marked: str, label_map: dict[str, str]) -> dict:
     text = []
     spans = []
     at = 0  # bytes written so far
@@ -214,7 +205,7 @@ def build(index: int, lang: str, marked: str) -> dict:
         text.append(before)
         at += len(before.encode())
         label, value = m.group(1), m.group(2)
-        if label not in LABELS:
+        if label not in label_map:
             raise SystemExit(f"item {index}: unknown label {label}")
         if value != value.strip():
             raise SystemExit(f"item {index}: span {value!r} has outer whitespace")
@@ -227,18 +218,18 @@ def build(index: int, lang: str, marked: str) -> dict:
     out = "".join(text)
     if "[[" in out or "]]" in out:
         raise SystemExit(f"item {index}: unbalanced mark")
-    raw = out.encode()
-    for s in spans:  # the offsets must slice back to the marked value
-        raw[s["start"] : s["end"]].decode()
-    return {"id": f"handmade-{index:03d}", "source": "handmade", "lang": lang, "text": out, "spans": spans}
+    record = {"id": f"handmade-{index:03d}", "source": "handmade", "lang": lang, "text": out, "spans": spans}
+    problems = validate_doc(record, label_map)
+    if problems:
+        raise SystemExit(f"item {index}: {problems[0]}")
+    return record
 
 
 def main() -> None:
-    global LABELS
-    LABELS = load_labels()
+    label_map = source_map(load_labels(), "handmade")
     items = ITEMS + expand()
-    records = [build(i, lang, marked) for i, (lang, marked) in enumerate(items)]
-    with open(HERE / "handmade.jsonl", "w", encoding="utf-8", newline="\n") as f:
+    records = [build(i, lang, marked, label_map) for i, (lang, marked) in enumerate(items)]
+    with open(EVAL_DIR / "handmade.jsonl", "w", encoding="utf-8", newline="\n") as f:
         for r in records:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
     gold = sum(len(r["spans"]) for r in records)

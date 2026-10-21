@@ -93,7 +93,7 @@ def char_spans_to_byte_spans(
         clean.append((s, e, label))
 
     accepted: list[tuple[int, int, str]] = []
-    # Longest first; the sort is stable and the input order breaks ties.
+    # Longest first; of two of the same length, the earlier start.
     for s, e, label in sorted(clean, key=lambda t: (-(t[1] - t[0]), t[0])):
         if any(s < a_end and a_start < e for a_start, a_end, _ in accepted):
             stats.dropped_overlap += 1

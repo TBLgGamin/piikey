@@ -1,9 +1,9 @@
-//! The report: Markdown for people, JSON for tools.
+//! The report: Markdown for people (here, with the verdict in [`verdict`]), JSON for tools
+//! ([`json`]).
 
-use std::{collections::BTreeMap, fmt::Write as _};
+use std::collections::{BTreeMap, HashMap};
 
 use piikey::detect::ner::Device;
-use serde_json::{Value, json};
 
 use crate::{
     bench::{Choice, Config, Speed},
@@ -16,9 +16,12 @@ use crate::{
 /// Appends formatted text to a `String`. Writing to a `String` cannot fail.
 macro_rules! put {
     ($out:expr, $($arg:tt)*) => {{
-        let _ = write!($out, $($arg)*);
+        let _ = ::std::fmt::Write::write_fmt(&mut $out, format_args!($($arg)*));
     }};
 }
+
+mod json;
+mod verdict;
 
 /// One detector configuration run over one corpus.
 #[derive(Debug)]
@@ -79,15 +82,12 @@ pub struct Report<'a> {
     pub json_examples: usize,
 }
 
-/// How a device is named in the report. The names come from the `Debug` form of the device, so a
-/// device the benchmark does not know yet still shows up under its own name.
+/// How a device is named in the report.
 #[must_use]
-pub fn device_name(device: Device) -> String {
-    match format!("{device:?}").as_str() {
-        "Cpu" => "CPU".to_owned(),
-        "Gpu" => "GPU (DirectML)".to_owned(),
-        "Hybrid" => "hybrid (CPU, the GPU for large calls)".to_owned(),
-        other => other.to_owned(),
+pub const fn device_name(device: Device) -> &'static str {
+    match device {
+        Device::Cpu => "CPU",
+        Device::Hybrid => "hybrid (CPU, the GPU for large calls)",
     }
 }
 
@@ -263,6 +263,12 @@ impl Report<'_> {
         format!("{} on {}", run.config.name(), self.source(run).name)
     }
 
+    /// The category's name, starred when piikey has no kind for it.
+    fn cat_label(&self, c: Cat) -> String {
+        let mark = if self.tax.supported(c) { "" } else { "*" };
+        format!("{}{mark}", self.tax.name(c))
+    }
+
     /// The reloads between measurements, over all runs: total seconds and count.
     fn reloads(&self) -> (f64, usize) {
         self.runs.iter().fold((0.0, 0), |(secs, n), r| {
@@ -364,7 +370,12 @@ impl Report<'_> {
             } else {
                 String::new()
             };
-            let note = self.meta.notes.get(&s.name);
+            let sha = format!("sha {}", s.fingerprint);
+            let mut data: Vec<&str> = Vec::new();
+            if let Some(n) = self.meta.notes.get(&s.name) {
+                data.extend([n.license.as_str(), n.note.as_str(), n.origin.as_str()]);
+            }
+            data.push(&sha);
             t.row([
                 s.name.clone(),
                 num(s.docs.len()),
@@ -377,19 +388,11 @@ impl Report<'_> {
                     "own labels only"
                 }
                 .to_owned(),
-                note.map_or_else(String::new, |n| {
-                    [
-                        n.license.as_str(),
-                        n.note.as_str(),
-                        n.origin.as_str(),
-                        &format!("sha {}", s.fingerprint),
-                    ]
-                    .iter()
+                data.iter()
                     .filter(|part| !part.is_empty())
                     .map(|part| cell(part, 160))
                     .collect::<Vec<_>>()
-                    .join("; ")
-                }),
+                    .join("; "),
             ]);
         }
         format!("\n## Corpora\n\n{}", t.render())
@@ -423,9 +426,8 @@ impl Report<'_> {
                     .iter()
                     .map(|k| k.as_str())
                     .collect();
-                let mark = if self.tax.supported(c) { "" } else { "*" };
                 t.row([
-                    format!("{}{mark}", self.tax.name(c)),
+                    self.cat_label(c),
                     labels.join(", "),
                     if kinds.is_empty() {
                         "none".to_owned()
@@ -510,8 +512,7 @@ impl Report<'_> {
                 if runs.iter().all(|r| r.agg.total.cats[c.0].gold == 0) {
                     continue;
                 }
-                let mark = if self.tax.supported(c) { "" } else { "*" };
-                let mut row = vec![format!("{}{mark}", self.tax.name(c))];
+                let mut row = vec![self.cat_label(c)];
                 row.extend(runs.iter().map(|r| {
                     let s = &r.agg.total.cats[c.0];
                     if s.gold == 0 {
@@ -601,8 +602,7 @@ impl Report<'_> {
             if s.gold == 0 && s.pred == 0 {
                 continue;
             }
-            let mark = if self.tax.supported(c) { "" } else { "*" };
-            t.row(row(format!("{}{mark}", self.tax.name(c)), s));
+            t.row(row(self.cat_label(c), s));
         }
         let supported = stats.sum(|c| self.tax.supported(c));
         t.row(row("ALL supported".to_owned(), &supported));
@@ -954,134 +954,16 @@ impl Report<'_> {
             t.render()
         )
     }
-}
-
-/// The examples of `list` in category `c`.
-fn of_cat(list: &[Example], c: Cat) -> Vec<&Example> {
-    list.iter().filter(|e| e.cat == c).collect()
-}
-
-/// The most common values of `examples`, as `` `value` ×n ``, `k` of them.
-fn top_values(source: &Source, examples: &[&Example], k: usize) -> String {
-    let mut seen: Vec<(String, usize)> = Vec::new();
-    for e in examples {
-        let value = source.docs[e.doc].text[e.start..e.end].to_owned();
-        match seen.iter_mut().find(|(v, _)| *v == value) {
-            Some((_, n)) => *n += 1,
-            None => seen.push((value, 1)),
-        }
-    }
-    // Most common first; ties keep the order they were found in (stable sort).
-    seen.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
-    seen.iter()
-        .take(k)
-        .map(|(v, n)| {
-            if *n > 1 {
-                format!("`{}` ×{n}", cell(v, 36))
-            } else {
-                format!("`{}`", cell(v, 36))
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-// --- verdict ---------------------------------------------------------------------------------------
-
-impl Report<'_> {
-    /// The run of `source` for the headline configuration: regex+model when it ran.
-    fn headline_run(&self, source: usize) -> Option<&Run> {
-        [Config::RegexModel, Config::Model, Config::Regex]
-            .into_iter()
-            .find_map(|c| {
-                self.runs
-                    .iter()
-                    .find(|r| r.source == source && r.config == c)
-            })
-    }
-
-    fn verdict(&self) -> String {
-        let mut t = Table::new(&[
-            ("corpus", false),
-            ("configuration", false),
-            ("strict F1", true),
-            ("overlap F1", true),
-            ("any-cat recall", true),
-            ("leak", true),
-            ("FP masked", true),
-            ("overlap F1, card types", true),
-            ("any-cat recall, card types", true),
-        ]); // fmt: skip
-        let mut reading = String::new();
-        for (i, s) in self.sources.iter().enumerate() {
-            let Some(run) = self.headline_run(i) else {
-                continue;
-            };
-            let total = &run.agg.total;
-            let sup = total.sum(|c| self.tax.supported(c));
-            let card = total.sum(|c| self.tax.supported(c) && self.tax.is_card_type(c));
-            t.row([
-                s.name.clone(),
-                run.config.name().to_owned(),
-                dec(sup.strict().f1()),
-                dec(sup.overlap().f1()),
-                dec(sup.any().r),
-                pct(sup.leak()),
-                pct(total.fp_rate()),
-                dec(card.overlap().f1()),
-                dec(card.any().r),
-            ]);
-            let nearest = COUNTERPARTS
-                .iter()
-                .find(|(name, _)| *name == s.name)
-                .map_or("none: no published number for this corpus", |(_, text)| {
-                    *text
-                });
-            put!(
-                reading,
-                "- **{}** ({}): overlap F1 {} over every supported category and {} over the card's type groups; \
-                 {} of the gold characters leak. Nearest published number: {nearest}.\n",
-                s.name,
-                run.config.name(),
-                dec(sup.overlap().f1()),
-                dec(card.overlap().f1()),
-                pct(sup.leak()),
-            );
-        }
-        let mut published = Table::new(&[
-            ("source", false),
-            ("measure", false),
-            ("number", true),
-            ("data", false),
-        ]);
-        for (source, measure, number, data) in PUBLISHED {
-            published.row([
-                (*source).to_owned(),
-                (*measure).to_owned(),
-                (*number).to_owned(),
-                (*data).to_owned(),
-            ]);
-        }
-        format!(
-            "\n## Verdict\n\nThis run (best configuration per corpus, categories piikey can produce). \
-             *card types* restricts the same scores to the categories that this benchmark reads the model \
-             card's seven type groups as (`[card]` in `labels.toml`).\n\n{}\n{reading}\n\
-             Published numbers, for orientation only:\n\n{}\n{VERDICT_CAVEATS}",
-            t.render(),
-            published.render()
-        )
-    }
 
     /// What the leaking gold values look like, over the categories piikey can produce.
     fn shapes(&self, run: &Run, source: &Source) -> String {
         let fail = &run.agg.failures;
         let mut counts: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
-        let value = |e: &Example| source.docs[e.doc].text[e.start..e.end].to_owned();
         for e in fail.missed.iter().filter(|e| self.tax.supported(e.cat)) {
-            counts.entry(shape(&value(e))).or_default().0 += 1;
+            counts.entry(shape(value(source, e))).or_default().0 += 1;
         }
         for e in fail.partial.iter().filter(|e| self.tax.supported(e.cat)) {
-            counts.entry(shape(&value(e))).or_default().1 += 1;
+            counts.entry(shape(value(source, e))).or_default().1 += 1;
         }
         if counts.is_empty() {
             return String::new();
@@ -1099,327 +981,40 @@ impl Report<'_> {
     }
 }
 
-/// The nearest published number for a corpus. `(corpus, what and where)`.
-const COUNTERPARTS: &[(&str, &str)] = &[
-    (
-        "finance_multilingual",
-        "the model card's 0.692 on the same dataset (strict, word level, 7 type groups, out of distribution)",
-    ),
-    (
-        "openpii",
-        "the model card's 0.997 on the same dataset (strict, word level, 7 type groups, its train split is in the training data)",
-    ),
-    (
-        "gretel_en",
-        "arXiv 2608.02616's 0.554 (OpenAI Privacy Filter) and 0.388 (Presidio) on the same dataset (zero-shot, English, n=2000, its own F1)",
-    ),
-];
-
-/// Numbers other people measured. `(source, measure, number, data)`.
-const PUBLISHED: &[(&str, &str, &str, &str)] = &[
-    (
-        "model card, bardsai/eu-pii-anonimization-multilang-v2",
-        "strict span F1, 7 coarse types, FP32",
-        "0.973",
-        "455 hand-checked spans of real web text (held-out domains)",
-    ),
-    (
-        "same model card",
-        "same, INT8 `model_quantized.onnx` (the file piikey ships)",
-        "0.968",
-        "same 455 spans",
-    ),
-    (
-        "same model card",
-        "span F1 on gretelai finance PII multilingual (out of distribution)",
-        "0.692",
-        "the corpus behind our `finance_multilingual`",
-    ),
-    (
-        "same model card",
-        "span F1 on nvidia/Nemotron-PII (its train split is in the training data)",
-        "0.933",
-        "not run here",
-    ),
-    (
-        "same model card",
-        "span F1 on ai4privacy OpenPII (its train split is in the training data)",
-        "0.997",
-        "the corpus behind our `openpii`",
-    ),
-    (
-        "arXiv 2608.02616",
-        "OpenAI Privacy Filter, zero-shot span F1 on AI4Privacy (Presidio 0.431)",
-        "0.855",
-        "English, n=2000",
-    ),
-    (
-        "arXiv 2608.02616",
-        "OpenAI Privacy Filter, zero-shot span F1 on gretel_en (Presidio 0.388)",
-        "0.554",
-        "English, n=2000",
-    ),
-];
-
-const VERDICT_CAVEATS: &str = "\
-These are not apples to apples, and none of them is a number to \"beat\":
-
-- **Matching.** The model card scores *strict at the word level over 7 coarse types* (a gold span \
-counts as found only if every letter and digit is predicted with the right type; a prediction is \
-right if it lies inside a gold span of the same type). The arXiv paper reports a span F1 of its own. \
-This benchmark reports three criteria over the categories of `labels.toml`, and its *strict* needs \
-the exact span too. None of the three is the card's scorer, and the *card types* columns only \
-restrict our scores to the categories the card's seven groups are read as here.
-- **Gold.** Our gold is after joining parts of an entity (`GIVENNAME` + `SURNAME`), only for the \
-categories piikey can produce, and a prediction in a category a corpus does not annotate is not \
-judged. The corpora label differently from each other and from the model: OpenPII calls every date \
-`DATE`, and the finance corpus labels timestamps, template fields such as `[Phone Number]`, plain \
-words such as `Damen` and fragments such as `:` as PII.
-- **Data.** The samples are language-balanced (Dutch, English, German weighted up), capped and fixed \
-by a seed; the published numbers are on full test sets or other samples. `openpii` is in-distribution: \
-the model was trained on its train split, so read it as an upper bound. `finance_multilingual` is \
-the one the card calls out of distribution.
-- **System.** piikey is not the bare model: the regex pass and its validators run first and win \
-overlaps, the model's types go through validators that can drop them (a name must look like a name), \
-the file is INT8 and its decoding is piikey's own port of the reference word decoder.
-- **Hand-made set.** 200 short prompts is small: one span moves a percentage by a fraction of a \
-point, a category with ten spans by ten. It is the only corpus that is labelled exhaustively, so \
-its false-positive numbers are the only ones that are not an upper bound.
-";
-
-// --- JSON ----------------------------------------------------------------------------------------
-
-fn ratio_json(v: Option<f64>) -> Value {
-    v.map_or(Value::Null, |x| json!(x))
+/// The examples of `list` in category `c`.
+fn of_cat(list: &[Example], c: Cat) -> Vec<&Example> {
+    list.iter().filter(|e| e.cat == c).collect()
 }
 
-fn prf_json(p: Prf) -> Value {
-    json!({ "precision": ratio_json(p.p), "recall": ratio_json(p.r), "f1": ratio_json(p.f1()) })
+/// The text an example points at.
+fn value<'a>(source: &'a Source, e: &Example) -> &'a str {
+    &source.docs[e.doc].text[e.start..e.end]
 }
 
-fn cat_json(s: &CatStats) -> Value {
-    json!({
-        "gold": s.gold,
-        "predicted": s.pred,
-        "unjudged_predictions": s.unjudged,
-        "strict": prf_json(s.strict()),
-        "overlap": prf_json(s.overlap()),
-        "any_category": prf_json(s.any()),
-        "leakage": ratio_json(s.leak()),
-        "fully_masked": ratio_json(s.full()),
-        "counts": {
-            "strict_matches": s.strict,
-            "gold_overlapped_with_category": s.gold_cat,
-            "gold_overlapped_any": s.gold_any,
-            "gold_fully_covered": s.gold_full,
-            "gold_chars": s.gold_chars,
-            "gold_chars_covered": s.covered_chars,
-            "pred_overlapping_gold_with_category": s.pred_cat,
-            "pred_overlapping_gold_any": s.pred_any,
-            "false_positive_chars": s.fp_chars,
-            "unjudged_chars": s.unjudged_chars,
-        },
-    })
-}
-
-impl Report<'_> {
-    fn stats_json(&self, s: &Stats) -> Value {
-        let mut cats = serde_json::Map::new();
-        for c in self.tax.all() {
-            let cs = &s.cats[c.0];
-            if cs.gold + cs.pred + cs.unjudged > 0 {
-                cats.insert(self.tax.name(c).to_owned(), cat_json(cs));
+/// The most common values of `examples`, as `` `value` ×n ``, `k` of them.
+fn top_values(source: &Source, examples: &[&Example], k: usize) -> String {
+    let mut seen: Vec<(&str, usize)> = Vec::new();
+    let mut at: HashMap<&str, usize> = HashMap::new();
+    for e in examples {
+        let i = *at.entry(value(source, e)).or_insert_with(|| {
+            seen.push((value(source, e), 0));
+            seen.len() - 1
+        });
+        seen[i].1 += 1;
+    }
+    // Most common first; ties keep the order they were found in (stable sort).
+    seen.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    seen.iter()
+        .take(k)
+        .map(|(v, n)| {
+            if *n > 1 {
+                format!("`{}` ×{n}", cell(v, 36))
+            } else {
+                format!("`{}`", cell(v, 36))
             }
-        }
-        json!({
-            "docs": s.docs,
-            "chars": s.chars,
-            "dropped_predictions": s.dropped,
-            "false_positive_rate": ratio_json(s.fp_rate()),
-            "unjudged_rate": ratio_json(s.unjudged_rate()),
-            "all_supported": cat_json(&s.sum(|c| self.tax.supported(c))),
-            "all": cat_json(&s.sum(|_| true)),
-            "categories": cats,
         })
-    }
-
-    /// An example with its value and a window of the text around it.
-    fn example_json(&self, source: &Source, e: &Example) -> Value {
-        let doc = &source.docs[e.doc];
-        let before: String = {
-            let mut chars: Vec<char> = doc.text[..e.start].chars().rev().take(40).collect();
-            chars.reverse();
-            chars.into_iter().collect()
-        };
-        let after: String = doc.text[e.end..].chars().take(40).collect();
-        json!({
-            "doc": doc.id,
-            "lang": doc.lang,
-            "category": self.tax.name(e.cat),
-            "tag": e.tag,
-            "value": cell(&doc.text[e.start..e.end], 200),
-            "context": format!("{before}[[{}]]{after}", cell(&doc.text[e.start..e.end], 200)),
-            "masked_as": e.other.map(|c| self.tax.name(c)),
-        })
-    }
-
-    fn run_json(&self, run: &Run) -> Value {
-        let keep = self.json_examples;
-        let source = self.source(run);
-        let fail = &run.agg.failures;
-        let list = |v: &[Example]| -> Vec<Value> {
-            v.iter()
-                .take(keep)
-                .map(|e| self.example_json(source, e))
-                .collect()
-        };
-        let confusion: Vec<Value> = fail
-            .confusion
-            .iter()
-            .map(|((gold, got), n)| {
-                json!({ "gold": self.tax.name(*gold), "covered_mostly_by": got.map(|c| self.tax.name(c)), "spans": n })
-            })
-            .collect();
-        let s = &run.speed;
-        json!({
-            "configuration": run.config.name(),
-            "corpus": source.name,
-            "scores": self.stats_json(&run.agg.total),
-            "by_language": run.agg.by_lang.iter().map(|(l, st)| (l.clone(), self.stats_json(st))).collect::<BTreeMap<_, _>>(),
-            "by_document_kind": run.agg.by_group.iter().map(|(g, st)| (g.clone(), self.stats_json(st))).collect::<BTreeMap<_, _>>(),
-            "failures": {
-                "counts": {
-                    "missed": fail.missed.len(),
-                    "partial": fail.partial.len(),
-                    "wrong_category": fail.wrong.len(),
-                    "false_positive": fail.false_pos.len(),
-                },
-                "missed": list(&fail.missed),
-                "partial": list(&fail.partial),
-                "wrong_category": list(&fail.wrong),
-                "false_positive": list(&fail.false_pos),
-                "confusion": confusion,
-            },
-            "speed": {
-                "docs": s.docs,
-                "bytes": s.bytes,
-                "cold_seconds": s.cold_secs,
-                "cold_docs_per_second": ratio_json((s.cold_secs > 0.0).then(|| f(s.docs) / s.cold_secs)),
-                "cold_mb_per_second": ratio_json((s.cold_secs > 0.0).then(|| mb(s.bytes) / s.cold_secs)),
-                "warm_seconds": s.warm_secs,
-                "warm_docs_per_second": ratio_json(s.warm_secs.filter(|w| *w > 0.0).map(|w| f(s.docs) / w)),
-                "warm_same_spans": s.warm_same,
-                "latency_ms": s.latency.as_ref().map(|l| json!({
-                    "docs": l.docs, "p50": l.p50_ms, "p95": l.p95_ms, "max": l.max_ms, "mean_bytes": l.mean_bytes,
-                })),
-                "reloads": { "count": s.reloads.count, "seconds": s.reloads.secs },
-            },
-            "round_trip": run.roundtrip.as_ref().map(|rt| self.round_trip_json(rt)),
-        })
-    }
-
-    fn round_trip_json(&self, rt: &RoundTrip) -> Value {
-        let by_cat = |m: &BTreeMap<Cat, usize>| -> BTreeMap<String, usize> {
-            m.iter()
-                .map(|(c, n)| (self.tax.name(*c).to_owned(), *n))
-                .collect()
-        };
-        json!({
-            "docs": rt.docs,
-            "changed_by_anonymize": rt.changed,
-            "exact": rt.exact,
-            "exact_of_changed": rt.exact_changed,
-            "engine_errors": rt.errors,
-            "engine_error_messages": rt.error_messages,
-            "docs_with_gold_value_left": rt.survivor_docs,
-            "gold_values_checked": by_cat(&rt.checked),
-            "gold_values_left": by_cat(&rt.survived),
-            "did_not_restore": rt.mismatches.iter().take(60).map(|m| json!({
-                "doc": m.doc, "original": m.original, "restored": m.restored, "trace": m.trace,
-            })).collect::<Vec<_>>(),
-            "left_verbatim": rt.survivors.iter().take(60).map(|s| json!({
-                "doc": s.doc, "category": self.tax.name(s.cat), "value": cell(&s.value, 200),
-            })).collect::<Vec<_>>(),
-        })
-    }
-
-    /// The whole report as JSON.
-    #[must_use]
-    pub fn json(&self) -> Value {
-        let m = &self.meta;
-        let categories: Vec<Value> = self
-            .tax
-            .cats
-            .iter()
-            .map(|c| {
-                json!({
-                    "name": c.name,
-                    "about": c.about,
-                    "piikey_kinds": c.kinds.iter().map(|k| k.as_str()).collect::<Vec<_>>(),
-                })
-            })
-            .collect();
-        let sources: Vec<Value> = self
-            .sources
-            .iter()
-            .map(|s| {
-                let labels: BTreeMap<&str, Value> = s
-                    .labels
-                    .iter()
-                    .map(|(l, (c, n))| {
-                        (
-                            l.as_str(),
-                            json!({ "category": self.tax.name(*c), "spans": n, "piikey_counterpart": self.tax.supported(*c) }),
-                        )
-                    })
-                    .collect();
-                let note = m.notes.get(&s.name);
-                json!({
-                    "name": s.name,
-                    "docs": s.docs.len(),
-                    "bytes": s.bytes,
-                    "gold_spans_after_merging": s.gold_spans(),
-                    "parts_merged": s.merged,
-                    "exhaustive": s.exhaustive,
-                    "fingerprint": s.fingerprint,
-                    "license": note.map(|n| n.license.as_str()),
-                    "note": note.map(|n| n.note.as_str()),
-                    "origin": note.map(|n| n.origin.as_str()),
-                    "labels": labels,
-                })
-            })
-            .collect();
-        json!({
-            "meta": {
-                "timestamp": m.timestamp,
-                "piikey": m.piikey,
-                "machine": m.machine,
-                "configurations": m.configs,
-                "batch": m.batch,
-                "latency_docs": m.latency_docs,
-                "roundtrip_docs": m.roundtrip_docs,
-                "wall_seconds": m.wall_secs,
-                "model": m.model.as_ref().map(|i| json!({
-                    "id": i.id,
-                    "dir": i.dir,
-                    "device": device_name(i.device),
-                    "first_load_seconds": i.first_load_secs,
-                    "calibrated_on_first_load": i.calibrated,
-                    "device_choice": match i.choice {
-                        Choice::Saved => "saved",
-                        Choice::Forced(_) => "forced",
-                        Choice::Measure => "re-measured",
-                    },
-                })),
-            },
-            "taxonomy": categories,
-            "corpora": sources,
-            "runs": self.runs.iter().map(|r| self.run_json(r)).collect::<Vec<_>>(),
-            "published": PUBLISHED.iter().map(|(s, me, n, d)| json!({
-                "source": s, "measure": me, "number": n, "data": d,
-            })).collect::<Vec<_>>(),
-        })
-    }
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]

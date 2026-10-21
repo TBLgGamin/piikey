@@ -214,10 +214,6 @@ impl Typed {
     /// Forgets every value kept and every text still waiting for detection, as when a value is
     /// deleted from the vault. Capture goes on: what is typed from now on is kept again. Waits
     /// for a flush under way, so what that one found does not come back.
-    #[allow(
-        dead_code,
-        reason = "the API handler calls it when values leave the vault"
-    )]
     pub fn clear(&self) {
         let _only_one = self.flushing.lock().unwrap_or_else(PoisonError::into_inner);
         *self.lock() = Inner::default();
