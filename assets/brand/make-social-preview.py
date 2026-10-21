@@ -18,9 +18,13 @@ SIZE = (1280, 640)
 PURPLE = "#6f49b1"
 LOGO_WIDTH = 560
 LOGO_TOP = 190
-TAGLINE = "The privacy layer between you and the internet."
-TAGLINE_SIZE = 40
-TAGLINE_TOP = 450
+TAGLINE_LINES = (
+    "Find, flag and mask your personal data, everywhere on your PC.",
+    "Local, fast, always in the background.",
+)
+TAGLINE_SIZE = 36
+TAGLINE_TOP = 430
+LINE_GAP = 14
 
 
 def main() -> None:
@@ -32,8 +36,11 @@ def main() -> None:
 
     draw = ImageDraw.Draw(canvas)
     font = ImageFont.truetype(str(FONT), TAGLINE_SIZE)
-    left, _, right, _ = draw.textbbox((0, 0), TAGLINE, font=font)
-    draw.text(((SIZE[0] - (right - left)) // 2 - left, TAGLINE_TOP), TAGLINE, font=font, fill="white")
+    top = TAGLINE_TOP
+    for line in TAGLINE_LINES:
+        left, box_top, right, box_bottom = draw.textbbox((0, 0), line, font=font)
+        draw.text(((SIZE[0] - (right - left)) // 2 - left, top), line, font=font, fill="white")
+        top += box_bottom - box_top + LINE_GAP
 
     canvas.save(OUT, optimize=True)
     print(f"wrote {OUT.relative_to(HERE.parent.parent)}")

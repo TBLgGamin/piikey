@@ -46,30 +46,86 @@ Sites and programs that are not protected are tunnelled untouched. Programs must
 proxy settings: browsers, Electron, .NET and curl do. The local certificate piikey uses to read
 protected HTTPS traffic is created for your Windows user only; Windows asks once before trusting it.
 
+## Highlight
+
+With highlight on, the same UI Automation reader that feeds the proxy also checks the field you are
+typing in, in any app. When it holds personal data, four thin bars in the theme's purple draw an
+outline around the field. They are topmost windows that take no clicks and no focus. The mode is
+`Off`, `Always` or `Hotkey`: with `Hotkey`, Ctrl+Alt+P checks the field once, and a field without
+personal data gets a short green flash. In `Always`, Ctrl+Alt+P pauses and resumes the outline. The
+check runs on your PC with the same detector as masking, even when protection is off, and nothing is
+stored. Password fields are never read.
+
+## Inventory and Explorer
+
+The inventory records which files hold personal data. A background loop scans your folders (the
+Documents, Desktop and Downloads folders unless you choose others) on a half-sized thread pool and
+skips files that did not change since the last scan. For each file, `inventory.jsonl` keeps how many
+values of each kind it holds, never the values, and the scan treats a file piikey masked as clean.
+Home shows the result as a treemap: one tile per folder or file, sized by the number of values, and
+clicking a folder opens it. A tile's side panel can open the file, show it in Explorer, rescan it,
+make a masked copy or exclude it.
+
+"Scan for PII" in Explorer's right-click menu (under "Show more options" on Windows 11) starts
+`piikey.exe --scan <path>`. It hands the paths to the running app, which scans them and, when the
+scan ends, brings its window forward on Home at the scanned path, also when the app was only a
+tray icon (a timer on the application thread looks four times a second); if the app is not
+running, the command starts it.
+
+## API
+
+The CLI, the app and scripts all use one JSON API. The app serves it on the named pipe
+`\\.\pipe\piikey-<user>` (requests are `P`, 2, a length and the JSON) and, when you switch it on,
+on `http://127.0.0.1:<port>/v1/<op>` with a bearer token that refuses browser origins.
+`piikey-cli` calls the app's pipe when it answers and otherwise does the same work in its own
+process. The operations, their results and the error codes are in the
+[README](../README.md#api).
+
+## Vault management
+
+You can search the vault, export it (JSON or CSV), forget values and wipe it. Forget and wipe
+rewrite the vault file: the kept records are sealed again under a new vault id and the new file
+replaces the old one through `vault.pkv.compact`, so a forgotten value is gone from disk and a crash
+in between is completed at the next open. The app clears its typed-value cache afterwards. A second
+process notices the new id and reloads.
+
 ## The app
 
-- **Home**: the on/off switch, key numbers (values keyed, masked and restored today, protected
-  sites and programs), a 14-day masked/restored chart, a by-kind chart and recent activity: the
-  values most recently sent, with where and when. Daily counts persist in
-  `%LOCALAPPDATA%\piikey\stats.cfg`.
+- **Home**: the on/off switch, key numbers (values keyed, files with personal data, values found in
+  files, protected sites and programs), the inventory treemap and recent activity: the values most
+  recently sent, with where and when. The treemap is described under Inventory and Explorer above.
 - **Keyed values**: an activity feed of every value in the vault next to its stand-in, the most
   recently sent first (including values first keyed long ago), then the ones never sent. Search
   matches values, stand-ins, sites and programs; filters narrow it to a kind, a site (subdomains
   included) or a time (today, last 7 days, last 30 days). The feed persists in
   `%LOCALAPPDATA%\piikey\activity.cfg`, which holds stand-ins, sites, programs and times only;
   the values themselves stay in the encrypted vault.
-- **Settings**: sites and programs to protect, which kinds of personal data piikey masks (every
-  kind has its own switch, all on by default; a value masked earlier still comes back after its
-  kind is switched off), and the local certificate.
+- **Settings**: seven tabs, picked in a bar under the title. The app opens on General and remembers
+  the tab you chose until the window closes.
+  - **General** has a card for each feature with its own control: masking (a switch; it stays off
+    until the certificate is installed, and the card says so), the highlight (off, always, or when
+    you press Ctrl+Alt+P), the Explorer menu, the inventory and the local HTTP API. A feature
+    with more settings links to its tab.
+  - **Masking**: the certificate, the sites and the programs to protect.
+  - **Detection**: which kinds of personal data piikey looks for (every kind has its own switch,
+    all on by default; a value masked earlier still comes back after its kind is switched off).
+    It applies to masking, the highlight, scans and the inventory.
+  - **Inventory**: the folders to scan, what is left out and Rescan now.
+  - **API**: the pipe name, the HTTP address with whether it listens, and the token (copy it or
+    make a new one).
+  - **Vault**: where the vault file is, how many records it holds, Export (CSV in Downloads) and
+    Wipe, which takes two clicks.
+  - **About**: the version and the state of the local proxy.
 
 Closing the window while the app is on leaves it running in the tray; Exit (tray) turns it off and
 gives Windows its previous proxy settings back.
 
 ## Model and devices
 
-The app loads the model only while protection is on and frees it when it turns off. Small calls (a
-chat message) run on the CPU; large ones (documents, many messages) are shared between the CPU and
-the GPU, which work through the batch from both ends. The first load checks whether the GPU helps
+The app loads the model while protection is on, highlighting is on or the inventory is on, and
+frees it when none is. Small calls (a chat message) run on the CPU; large ones (documents, many
+messages) are shared between the CPU and the GPU, which work through the batch from both ends. The
+first load checks whether the GPU helps
 on a large batch and remembers the answer (`hybrid` or `cpu`) in `device.cfg` next to the model;
 delete it to measure again, or write `cpu` to keep the GPU out. Both executables need
 `DirectML.dll` beside them (dev builds get it copied automatically).
@@ -94,7 +150,9 @@ Everything piikey keeps is in `%LOCALAPPDATA%\piikey`, readable only by your Win
 |---|---|
 | `vault.pkv` | the encrypted original↔stand-in pairs (XChaCha20-Poly1305, key wrapped with DPAPI) |
 | `models\` | the downloaded detection model and `device.cfg` |
-| `guard.cfg` | protected sites and programs, kinds switched off, on/off |
-| `activity.cfg`, `stats.cfg` | the activity feed (stand-ins only) and daily counts |
+| `guard.cfg` | protected sites and programs, kinds switched off, on/off, the highlight mode, the Explorer menu, inventory folders and the HTTP API |
+| `activity.cfg` | the activity feed (stand-ins only) |
+| `inventory.jsonl` | per file: size, change time and how many values of each kind it holds, never the values |
+| `api.token` | the token the local HTTP API asks for |
 | `ca.crt`, `ca.key` | the local certificate; the key is wrapped with DPAPI |
 | `proxy.prev` | the previous Windows proxy settings, only while piikey has them changed |

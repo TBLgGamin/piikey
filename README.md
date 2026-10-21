@@ -5,7 +5,7 @@
   <img alt="piikey" src="assets/brand/piikey-logo-kit/horizontal/piikey-horizontal-mono-6f49b1.svg" height="96">
 </picture>
 
-<h3>The privacy layer between you and the internet.</h3>
+<h3>Find, flag and mask your personal data, everywhere on your PC. Local, fast, always in the background.</h3>
 
 [![Release](https://img.shields.io/github/v/release/TBLgGamin/piikey?sort=semver&color=6f49b1&style=flat)](https://github.com/TBLgGamin/piikey/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/TBLgGamin/piikey/total?color=6f49b1&style=flat)](https://github.com/TBLgGamin/piikey/releases)
@@ -24,17 +24,27 @@
 
 [![Download for Windows x64](https://img.shields.io/badge/Download-Windows%20x64-6f49b1?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/TBLgGamin/piikey/releases/latest)
 
-[Features](#features) · [Install](#install) · [How it works](#how-it-works) · [CLI](#command-line) · [Build](#build-from-source) · [Contributing](#contributing)
+[Features](#features) · [Install](#install) · [How it works](#how-it-works) · [API](#api) · [CLI](#command-line) · [Build](#build-from-source) · [Contributing](#contributing)
 
 </div>
 
 ## What it is
 
-piikey sits between you and the sites and programs you choose: chatbots, webmail, forms, anything
-that goes through the Windows proxy. Before a message leaves your PC, it finds the names, emails,
-phone numbers, IBANs, card numbers, addresses and other personal data in it and swaps each one for a
-believable stand-in of the same shape. When the answer comes back, piikey puts your real values
-back in. Detection, the stand-ins and the vault that remembers them all stay on your machine.
+piikey is a personal-data manager that runs in the background on your PC. It finds names, emails,
+phone numbers, IBANs, card numbers, addresses and other personal data and puts you in charge of it,
+in four ways:
+
+- **Mask what you send.** For the sites and programs you choose (chatbots, webmail, forms, anything
+  that goes through the Windows proxy), piikey swaps each value for a believable stand-in of the same
+  shape before the message leaves your PC, and puts your real values back into the answer.
+- **Flag what you type.** The field you are typing in gets a purple outline when it holds personal
+  data, in any app, so you see it before you send it.
+- **Map what you store.** Scan files and folders, from Explorer's right-click menu or in the
+  background, and see on a treemap which of them hold personal data.
+- **Manage what is kept.** Search the vault, forget a value, export or wipe it, find every file that
+  mentions a person, and gate scripts and CI on personal data with the CLI and the API.
+
+Detection, the stand-ins and the vault that remembers them all stay on your machine.
 
 In the example above, the masked message is real `piikey-cli anonymize` output. The reply is turned
 back into your values by `piikey-cli deanonymize --tolerant`: the full names, the lone first name
@@ -42,30 +52,57 @@ back into your values by `piikey-cli deanonymize --tolerant`: the full names, th
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/home-dark.png">
-  <img alt="piikey's Home page: protection switch, values keyed, masked and restored today, a 14-day chart and a by-kind chart" src="docs/assets/screenshots/home-light.png" width="900">
+  <img alt="piikey's Home page: protection switch, key numbers, and a treemap of the folders and files that hold personal data" src="docs/assets/screenshots/home-light.png" width="900">
 </picture>
 
 ## Features
 
-- **Pattern detection with validation.** Emails, phone numbers, IBANs (mod-97), credit cards
-  (Luhn), IPv4/IPv6, MAC addresses, US SSNs, Dutch BSNs (11-proof), URL credentials, API keys and
-  JWTs.
-- **An on-device model for the rest.** A multilingual token classifier (24 EU languages) finds
-  names, addresses, organizations, IDs, dates of birth, account numbers and the GDPR special
-  categories. It runs on the CPU, and the GPU joins in through DirectML for large batches.
-- **Believable, format-preserving stand-ins.** Each value gets a replacement of the same kind and
-  shape, so the AI's answer still makes sense. The pattern kinds carry an invisible keyed watermark.
-- **An encrypted vault.** The original↔stand-in pairs are stored with XChaCha20-Poly1305 under a
-  key that Windows DPAPI protects for your user account.
-- **A restore that forgives.** Streamed replies, a stand-in the AI wrote with a typo, and a first or
-  last name on its own all come back as your original.
-- **Only what you type or paste.** The app reads the focused text field and the clipboard for the
-  sites and programs you protect, and replaces exactly those values. Scripts, IDs and telemetry are
-  left alone, password fields are never read, and you need no browser extension.
-- **Documents too.** DOCX, XLSX, PPTX and ODF (rewritten in place), PDF, images (Windows OCR), and
-  .eml/.msg.
-- **Nothing leaves your PC.** No cloud service or account. The project's own code is 100% safe Rust
-  (`unsafe` is forbidden).
+<table>
+  <tr>
+    <td width="48"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/icons/dark/mask.svg"><img src="docs/assets/icons/light/mask.svg" width="28" height="28" alt=""></picture></td>
+    <td><b>Masking for sites and programs</b><br>Replaces what you type or paste into the sites and programs you protect with format-preserving stand-ins, restores them in the (streamed) answer, and forgives typos and lone first names.</td>
+  </tr>
+  <tr>
+    <td><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/icons/dark/highlight.svg"><img src="docs/assets/icons/light/highlight.svg" width="28" height="28" alt=""></picture></td>
+    <td><b>Live highlight</b><br>Outlines the field you are typing in when it holds personal data, in any app, always or when you press Ctrl+Alt+P. Nothing is stored.</td>
+  </tr>
+  <tr>
+    <td><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/icons/dark/explorer.svg"><img src="docs/assets/icons/light/explorer.svg" width="28" height="28" alt=""></picture></td>
+    <td><b>"Scan for PII" in Explorer</b><br>Right-click a file or folder to see what personal data it holds.</td>
+  </tr>
+  <tr>
+    <td><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/icons/dark/inventory.svg"><img src="docs/assets/icons/light/inventory.svg" width="28" height="28" alt=""></picture></td>
+    <td><b>PII inventory</b><br>A treemap of your folders sized by the personal data in them, with actions per file: open, show in Explorer, rescan, make a masked copy, exclude, export a report.</td>
+  </tr>
+  <tr>
+    <td><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/icons/dark/subject.svg"><img src="docs/assets/icons/light/subject.svg" width="28" height="28" alt=""></picture></td>
+    <td><b>Subject search</b><br>Finds every file that mentions a person's name, email or phone number, for access requests (DSAR).</td>
+  </tr>
+  <tr>
+    <td><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/icons/dark/vault.svg"><img src="docs/assets/icons/light/vault.svg" width="28" height="28" alt=""></picture></td>
+    <td><b>An encrypted vault you control</b><br>Search it, export it, forget single values or wipe it. Forgetting rewrites the file, so the value is gone from disk. Records are sealed with XChaCha20-Poly1305 under a key that Windows DPAPI protects.</td>
+  </tr>
+  <tr>
+    <td><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/icons/dark/api.svg"><img src="docs/assets/icons/light/api.svg" width="28" height="28" alt=""></picture></td>
+    <td><b>JSON API</b><br>One API on a named pipe and, if you switch it on, on a token-protected HTTP port at 127.0.0.1.</td>
+  </tr>
+  <tr>
+    <td><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/icons/dark/terminal.svg"><img src="docs/assets/icons/light/terminal.svg" width="28" height="28" alt=""></picture></td>
+    <td><b>CLI and CI gate</b><br>Every API operation is a <code>piikey-cli</code> subcommand, and <code>scan --fail-on</code> fails a commit or a build that contains personal data.</td>
+  </tr>
+  <tr>
+    <td><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/icons/dark/documents.svg"><img src="docs/assets/icons/light/documents.svg" width="28" height="28" alt=""></picture></td>
+    <td><b>Documents, PDFs, images and mail</b><br>DOCX, XLSX, PPTX and ODF (rewritten in place), PDF, images (Windows OCR), and .eml/.msg.</td>
+  </tr>
+  <tr>
+    <td><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/icons/dark/model.svg"><img src="docs/assets/icons/light/model.svg" width="28" height="28" alt=""></picture></td>
+    <td><b>An on-device model</b><br>Validated patterns (IBAN mod-97, Luhn, Dutch BSN, JWTs and more) plus a multilingual token classifier for names, addresses, IDs and the GDPR special categories in 24 EU languages. It runs on the CPU, and the GPU joins in through DirectML for large batches.</td>
+  </tr>
+  <tr>
+    <td><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/icons/dark/local.svg"><img src="docs/assets/icons/light/local.svg" width="28" height="28" alt=""></picture></td>
+    <td><b>Nothing leaves your PC</b><br>No cloud service or account, no browser extension. The project's own code is 100% safe Rust (<code>unsafe</code> is forbidden).</td>
+  </tr>
+</table>
 
 ## How it works
 
@@ -85,10 +122,29 @@ sequenceDiagram
     App-->>You: you read the answer as if nothing happened
 ```
 
-piikey sets itself as the Windows proxy while the app runs. It only opens the traffic of sites and
-programs you protect; everything else passes through untouched. If the app crashes, a watchdog
-gives Windows its previous proxy settings back. Detection, the proxy, the app's pages and the files
-piikey keeps are described in [docs/how-it-works.md](docs/how-it-works.md).
+Background workers, and how the CLI, scripts and Explorer reach them:
+
+```mermaid
+flowchart LR
+    subgraph tray ["piikey.exe, in the tray"]
+        capture["capture: focused field and clipboard"] --> overlay["highlight overlay"]
+        capture --> typed["typed-value store"] --> proxy["proxy: mask and restore"]
+        loop["inventory loop"] --> inv[("inventory.jsonl")] --> home["Home treemap"]
+        api["API"]
+    end
+    explorer["Explorer: Scan for PII"] -->|pipe| api
+    cli["piikey-cli"] -->|pipe| api
+    scripts["scripts and CI"] -->|"HTTP and token"| api
+    api --> core["engine and vault"]
+    typed --> core
+    loop --> core
+```
+
+piikey sets itself as the Windows proxy while protection is on. It only opens the traffic of sites
+and programs you protect; everything else passes through untouched. If the app crashes, a watchdog
+gives Windows its previous proxy settings back. The highlight, the inventory and the API run in the
+same app and need no proxy. Detection, the proxy, the app's pages and the files piikey keeps are
+described in [docs/how-it-works.md](docs/how-it-works.md).
 
 ## Screenshots
 
@@ -103,13 +159,13 @@ piikey keeps are described in [docs/how-it-works.md](docs/how-it-works.md).
     <td width="50%">
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/settings-dark.png">
-        <img alt="Settings: the sites and programs to protect" src="docs/assets/screenshots/settings-light.png">
+        <img alt="Settings, General tab: a card for every feature with its switch, and tabs for masking, detection, the inventory, the API and the vault" src="docs/assets/screenshots/settings-light.png">
       </picture>
     </td>
   </tr>
   <tr>
     <td><b>Keyed values</b>: every value in the vault next to its stand-in, most recently sent first, with search and filters by kind, site and time.</td>
-    <td><b>Settings</b>: the sites and programs to protect, a switch for every kind of personal data, and the local certificate.</td>
+    <td><b>Settings</b>: seven tabs. General has a switch for each feature; Masking holds the certificate and the sites and programs to protect; Detection has a switch for every kind of personal data; Inventory the folders to scan; API the pipe, the HTTP address and the token; Vault export and wipe; About the version.</td>
   </tr>
 </table>
 
@@ -161,22 +217,141 @@ From the benchmark in [`eval/`](eval/README.md): regex pass plus model, on the C
 The regex pass alone handles 190,000 to 600,000 docs/s. The benchmark README lists the methods,
 the failure modes and how these numbers compare with published ones.
 
-## Command line
+## API
 
-`piikey-cli.exe` ships next to the app:
+Everything piikey does is one JSON API. The app serves it on a named pipe, and on an HTTP port at
+127.0.0.1 if you switch that on in Settings > General. `piikey-cli` is a client of the same API, so
+each operation below is also a subcommand. Without the app, `piikey-cli` runs the same operations in
+its own process (`--local`), except `protection` and `explorer_scan`, which answer `app_required`.
+
+| Operation (`op`) | Does | CLI |
+|---|---|---|
+| `scan_text` | Finds personal data in texts without changing the vault. Spans are UTF-8 byte offsets. | `scan` (stdin) |
+| `anonymize`, `deanonymize` | Masks or restores texts. `deanonymize` takes `tolerant`. | `anonymize`, `deanonymize` (stdin) |
+| `scan_files` | Scans files and folders, and records the result in the inventory unless `record` is false. | `scan PATH...` |
+| `anonymize_files`, `deanonymize_files` | Rewrites files into `out`. | `anonymize --out DIR PATH...`, `deanonymize ...` |
+| `subject_search` | Finds the files that mention the given `values` (no `paths`: the inventory folders). | `subject --value V` |
+| `vault_list` | Lists the vault, newest first, filtered by `query` and `kind`, paged by `limit` and `offset`. | `vault list` |
+| `vault_forget` | Forgets the records whose value or stand-in is one of `values`. | `vault forget VALUE...` |
+| `vault_export` | Writes the vault to a new file as JSON or CSV. | `vault export --out FILE` |
+| `vault_wipe` | Deletes every record. Needs `"confirm": true`. | `vault wipe --yes` |
+| `inventory_status` | Folders, file counts, hits and the scan in progress. | `inventory status` |
+| `inventory_list`, `inventory_tree` | The files with personal data, or the treemap's nodes under a path. | `inventory list`, `inventory tree` |
+| `inventory_rescan`, `inventory_report` | Scans the inventory folders now; writes a JSON or CSV report. | `inventory rescan`, `inventory report` |
+| `settings_get`, `settings_set` | Reads or changes the settings (the `guard.cfg` keys). | `settings get`, `settings set KEY=VALUE...` |
+| `kinds` | The kinds of personal data, their groups, and whether each is on. | `kinds` |
+| `model_status`, `model_download` | The detection model's state; downloads it. | `model status`, `model download` |
+| `api_token` | The HTTP token; `rotate` makes a new one. | `token [--rotate]` |
+| `status` | Whether the app runs, protection, version, vault size, model and feature switches. | `status` |
+| `protection` | Turns masking on or off. App only. | `protection on\|off` |
+| `explorer_scan` | Scans paths and shows them on Home. App only; the Explorer menu uses it. | none |
+
+**Replies** share one envelope: `{"ok": true, "result": ...}`, or `{"ok": false, "error": {"code":
+"...", "message": "..."}}`. The codes are `bad_request`, `app_required`, `not_found`, `busy`, `io`,
+`vault`, `unsupported`, `model` and `internal`.
+
+**Named pipe.** The pipe is `\\.\pipe\piikey-<USERNAME>`, where characters other than letters,
+digits, `.`, `_` and `-` in the name become `_`. Only local clients can connect. A request is the
+bytes `P`, `2`, `0`, `0`, a `u32` little-endian length, then the request JSON, for example
+`{"op": "scan_text", "texts": ["mail jan@acme.nl"]}`. The reply is a status byte (0 ok, 1 error),
+three zero bytes, a `u32` little-endian length and the envelope. Version 1 (binary) is no longer
+accepted.
+
+**HTTP.** Turn on "Local HTTP API" in Settings > General (default port 7980, loopback only). Send
+`POST /v1/<op>` with the request's fields as the JSON body (without `op`; `GET /v1/status` also
+works) and a bearer token from `piikey-cli token`. Requests with an `Origin` header are refused, so
+web pages cannot call it. Replies use the envelope, with the HTTP status 200, 400, 401, 403, 404,
+405, 409, 413 or 500.
 
 ```sh
-piikey-cli anonymize   [--vault PATH] [--out DIR] [PATH...]   # stdin -> stdout without paths
-piikey-cli deanonymize [--vault PATH] [--tolerant] [--out DIR] [PATH...]
-piikey-cli serve       [--vault PATH] [--pipe NAME]           # default \\.\pipe\piikey
-piikey-cli --version
+curl -H "Authorization: Bearer $(piikey-cli token)" \
+     -d '{"texts":["mail jan@acme.nl"]}' http://127.0.0.1:7980/v1/scan_text
+# {"ok":true,"result":{"results":[[{"start":5,"end":16,"kind":"email","value":"jan@acme.nl"}]]}}
 ```
 
-With paths, `--out DIR` is required and directories are walked recursively. `--tolerant` also
-restores stand-ins that came back with a typo, and first or last names that came back alone (text
-only, not zip documents). The default vault is `%LOCALAPPDATA%\piikey\vault.pkv`, which only the
-Windows user who created it can read. The CLI uses the detection model once the app has downloaded
-it, and masks patterns only until then.
+```python
+import json
+import subprocess
+import urllib.request
+
+token = subprocess.check_output(["piikey-cli", "token"], text=True).strip()
+request = urllib.request.Request(
+    "http://127.0.0.1:7980/v1/scan_text",
+    data=json.dumps({"texts": ["mail jan@acme.nl"]}).encode(),
+    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+)
+with urllib.request.urlopen(request) as reply:
+    print(json.load(reply)["result"]["results"])
+```
+
+## Command line
+
+`piikey-cli.exe` ships next to the app and has one subcommand per API operation:
+
+```
+piikey-cli scan [--fail-on KINDS|any] [--no-record] [PATH...]        no PATH: stdin text
+piikey-cli anonymize [--out DIR] [PATH...]                            no PATH: stdin -> stdout
+piikey-cli deanonymize [--tolerant] [--out DIR] [PATH...]
+piikey-cli subject --value V [--value V ...] [PATH...]
+piikey-cli vault list [--query Q] [--kind KIND] [--limit N] [--offset N]
+piikey-cli vault forget VALUE...
+piikey-cli vault export --out FILE [--format json|csv]
+piikey-cli vault wipe --yes
+piikey-cli inventory status | list [--under PATH] [--limit N] [--offset N] | tree [--under PATH] | rescan | report --out FILE [--format json|csv]
+piikey-cli settings get | settings set KEY=VALUE...      keys = guard.cfg keys; list keys repeat (site=a site=b)
+piikey-cli kinds | model status | model download | token [--rotate] | status | protection on|off
+piikey-cli serve [--http [--port N]] [--pipe NAME]
+global: --json  --local  --vault PATH  -h/--help  -V/--version
+```
+
+- With paths, `anonymize` and `deanonymize` need `--out DIR`, and folders are walked recursively
+  (symbolic links are skipped). `--tolerant` also restores stand-ins that came back with a typo, and
+  first or last names that came back alone (text only, not zip documents).
+- With no path, `scan`, `anonymize` and `deanonymize` read UTF-8 text from stdin, and the last two
+  write the result to stdout, as it came, line breaks and all. Give other encodings and documents
+  as paths.
+- `--json` prints the result as JSON, or an error as `{"code": ..., "message": ...}`; without it
+  you get a table. Paths may be relative: the CLI makes them absolute, so the app answers for the
+  same files.
+- The CLI asks the running app over the pipe first. `--local` skips that and works in its own
+  process, on the vault at `%LOCALAPPDATA%\piikey\vault.pkv`, which only the Windows user who
+  created it can read; `--vault PATH` does the same on the vault at PATH. `serve` serves the API
+  from the terminal when the app is not running.
+- The CLI uses the detection model once it is downloaded (`model download`, or the app does it),
+  and finds patterns only until then. Kinds switched off in Settings > Detection are off here too.
+
+**Exit codes:** 0 success; 1 personal data found under `--fail-on`; 2 usage error; 3 any API error.
+
+### Use it as a pre-commit / CI gate
+
+`scan --fail-on any` exits 1 when a file holds personal data, and `--fail-on email,iban` limits it
+to those kinds (see `piikey-cli kinds`). `--no-record` keeps the scan out of the inventory.
+
+`.git/hooks/pre-commit`:
+
+```sh
+#!/bin/sh
+git diff --cached --name-only -z --diff-filter=ACM | xargs -0 piikey-cli scan --local --no-record --fail-on any
+```
+
+GitHub Actions, on a Windows runner. The runner has no detection model, so this checks patterns
+only (emails, phone numbers, IBANs, cards and so on):
+
+```yaml
+- name: Download piikey
+  shell: pwsh
+  env:
+    GH_TOKEN: ${{ github.token }}
+  run: |
+    gh release download --repo TBLgGamin/piikey --pattern 'piikey-*-windows-x64.zip' --dir $env:RUNNER_TEMP
+    Expand-Archive "$env:RUNNER_TEMP\piikey-*-windows-x64.zip" -DestinationPath $env:RUNNER_TEMP
+- name: Scan for personal data
+  shell: bash
+  run: git ls-files -z | xargs -0 "$RUNNER_TEMP/piikey/piikey-cli.exe" scan --local --no-record --fail-on any
+```
+
+To find names, places and the other kinds that only the detection model sees, add a step that runs
+`piikey-cli.exe model download` first (about 340 MB, so cache the model folder between runs).
 
 ## Build from source
 
@@ -205,8 +380,13 @@ Checks: `cargo fmt-check`, `cargo lint`, and `cargo test --all-targets`.
 - Everything runs locally. piikey makes one network call of its own: the model download from
   Hugging Face, which is checked with SHA-256.
 - Your values exist in one place only, the encrypted vault in `%LOCALAPPDATA%\piikey`. The activity
-  feed and the statistics keep stand-ins, sites and counts.
-- Password fields are never read.
+  feed keeps stand-ins, sites and counts. The PII inventory keeps paths and counts per kind, never
+  values.
+- Masking and the highlight read the focused field only, never a password field, and the highlight
+  stores nothing.
+- The HTTP API is off by default. When on, it listens on loopback only, needs a token and refuses
+  browser origins. The pipe accepts local clients only.
+- Forgetting a value rewrites the vault, so the value is gone from disk.
 - The certificate piikey uses to read protected HTTPS traffic is created on your PC for your
   Windows user. Its key is wrapped with DPAPI, and the uninstaller removes it.
 
