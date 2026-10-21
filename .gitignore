@@ -6,6 +6,11 @@
 # Local scratch (playground, experiments)
 /.tmp
 /start.bat
+/todo.txt
+*.diff
+*.patch
+*.orig
+*.rej
 
 # Benchmark corpora (eval/fetch.py downloads them) and results (eval/results/*): regenerate
 /eval/data/
