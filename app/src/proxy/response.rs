@@ -569,11 +569,7 @@ mod tests {
     ];
 
     fn temp_vault(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("piikey-response-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::create_dir_all(&dir);
-        dir.join("vault.pkv")
+        crate::ui::testing::temp_dir(tag).join("vault.pkv")
     }
 
     /// An engine that finds `NAMES`, and the anonymized `SOURCES`.
@@ -1295,7 +1291,11 @@ mod tests {
     #[test]
     fn a_typo_and_a_partial_name_cut_across_events_are_repaired() -> piikey::Result<()> {
         let (engine, sentences) = setup("events-tolerant")?;
-        let ledger = sent_ledger(&engine, &sentences, HOST)?;
+        // Only the email and the person were sent. A bare first name stands for its person only
+        // while no other proxy in the scope has it too, and the second person of `NAMES` draws
+        // the same first name now and then (one time in 200).
+        let sent = [sentences[0].clone(), sentences[8].clone()];
+        let ledger = sent_ledger(&engine, &sent, HOST)?;
         let email = proxies_in(&engine, &sentences[0])?.remove(0);
         let name = proxies_in(&engine, &sentences[8])?.remove(0);
         // A doubled letter in the email, and only the first name of the person.

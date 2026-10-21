@@ -1,10 +1,11 @@
-//! DPAPI-wrapped, encrypted, append-only original↔proxy vault.
+//! DPAPI-wrapped, encrypted original↔proxy vault: append-only, but for [`Vault::forget`].
 //!
 //! The file is the source of truth and the in-memory `State` a cache of it.
-//! [`Vault::resolve`] is the only writer: under the in-process mutex and the
-//! cross-process file lock it merges the records other processes appended,
-//! picks proxies that collide with nothing (and that the caller does not
-//! turn down, see `resolve`), appends them in one write and syncs.
+//! [`Vault::resolve`] appends records and [`Vault::forget`] removes them; those two are the
+//! only writers. Under the in-process mutex and the cross-process file lock each first merges
+//! what other processes did. `resolve` then picks proxies that collide with nothing (and that
+//! the caller does not turn down, see `resolve`), appends them in one write and syncs. `forget`
+//! rewrites the file: see there.
 //!
 //! No lock is ever held across a rayon call. A rayon worker that waits for its
 //! own parallel work runs other queued jobs meanwhile, and one of those may
@@ -18,21 +19,24 @@ mod keys;
 use std::{
     collections::{HashMap, HashSet},
     fmt,
-    fs::{File, OpenOptions},
+    fs::{self, File, OpenOptions},
+    io::{self, BufWriter, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock, RwLockReadGuard},
 };
 
 use rayon::prelude::*;
+use serde::Serialize;
 
 use self::{
-    file::{Entry, FileLock, VAULT_ID_LEN},
+    file::{Entry, FileLock, Id, VAULT_ID_LEN},
     keys::VaultKeys,
 };
 use crate::{
     Error, Result,
     detect::EntityKind,
     proxy::{ProxyKeys, generate, watermark_ok},
+    sys,
 };
 
 /// Candidates tried per original before giving up.
@@ -44,12 +48,16 @@ const KINDS: usize = EntityKind::ALL.len();
 /// # Errors
 /// `VaultPathUnavailable` when `LOCALAPPDATA` is unset; `Io` on mkdir failure.
 pub fn default_path() -> Result<PathBuf> {
-    let base = std::env::var_os("LOCALAPPDATA")
-        .filter(|base| !base.is_empty())
-        .ok_or(Error::VaultPathUnavailable)?;
-    let dir = PathBuf::from(base).join("piikey");
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir.join("vault.pkv"))
+    Ok(sys::data_dir()?.join("vault.pkv"))
+}
+
+/// How [`export`] writes the records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportFormat {
+    /// A JSON array of `{"kind","original","proxy"}` objects.
+    Json,
+    /// RFC 4180 CSV with the header `kind,original,proxy`.
+    Csv,
 }
 
 /// Index of `kind` in `State::by_original`.
@@ -70,6 +78,9 @@ struct State {
     count: u64,
     /// Proxies in file order: the order they were issued in.
     order: Vec<Arc<str>>,
+    /// How often the records were replaced wholesale since the vault was opened, see
+    /// [`VaultView::generation`].
+    generation: u64,
 }
 
 // Hand-written: `Default` is only derived for arrays of up to 32 elements, and there is one map
@@ -82,6 +93,7 @@ impl Default for State {
             originals: HashSet::new(),
             count: 0,
             order: Vec::new(),
+            generation: 0,
         }
     }
 }
@@ -118,7 +130,14 @@ pub struct Vault {
     file: File,
     path: PathBuf,
     keys: VaultKeys,
-    id: [u8; VAULT_ID_LEN],
+    /// The DPAPI-wrapped master key as the header holds it: a forget writes it back as it is.
+    wrapped: Vec<u8>,
+    /// Size of the header in bytes; the records start there. It depends on the wrapped key
+    /// alone, so it outlives a forget.
+    header_len: u64,
+    /// The id the file's records are sealed under. Another process's forget replaces it, and
+    /// `merge_appended` is where this process finds out. Only touched with `known_len` held.
+    id: RwLock<Id>,
     state: RwLock<State>,
     /// File offset just past the last record this process has read or
     /// written. Also the in-process writer lock: it is held for a whole write.
@@ -127,7 +146,7 @@ pub struct Vault {
 
 /// A consistent read snapshot (holds the read lock while alive).
 ///
-/// Drop it before calling [`Vault::resolve`] on the same thread, and never
+/// Drop it before calling [`Vault::resolve`] or [`Vault::forget`] on the same thread, and never
 /// hold one across a rayon `par_iter`/`join`: a worker waiting inside one
 /// runs other jobs, and any of them may need the write lock or a second read
 /// lock, which deadlocks against the one held here.
@@ -155,7 +174,8 @@ impl fmt::Debug for VaultView<'_> {
 impl Vault {
     /// Opens the vault at `path`. A missing or empty file becomes a new vault
     /// with a fresh DPAPI-wrapped key; concurrent first opens are safe. A
-    /// record cut short by a crash at the end of the file is truncated.
+    /// record cut short by a crash at the end of the file is truncated, and a
+    /// [`Vault::forget`] that a crash interrupted is finished.
     ///
     /// # Errors
     /// `Io`, `Dpapi`, `VaultCorrupt`.
@@ -166,35 +186,37 @@ impl Vault {
             .create(true)
             .truncate(false)
             .open(path)?;
-        // One exclusive lock covers creating the header, reading the file and
-        // cutting a torn tail. Whoever gets it first on an empty file creates
-        // the vault; everyone else waits and then loads it.
+        // One exclusive lock covers finishing an interrupted forget, creating the header,
+        // reading the file and cutting a torn tail. Whoever gets it first on an empty file
+        // creates the vault; everyone else waits and then loads it.
         let lock = FileLock::exclusive(&file)?;
+        finish_compaction(&file, path)?;
         let len = file.metadata()?.len();
-        let (vault_id, header_len, keys, body) = if len == 0 {
-            let (vault_id, header_len, keys) = create_header(&file)?;
-            (vault_id, header_len, keys, Vec::new())
+        let (head, body) = if len == 0 {
+            (create_header(&file)?, Vec::new())
         } else {
-            let (vault_id, header_len, keys) = load_header(&file, len)?;
-            let body = file::read_range(&file, header_len, len)?;
-            (vault_id, header_len, keys, body)
+            let head = load_header(&file, len)?;
+            let body = file::read_range(&file, head.len, len)?;
+            (head, body)
         };
-        let framed = file::frame(&keys.records, &vault_id, &body, 0)?;
-        let known_len = header_len + framed.good_len as u64;
+        let framed = file::frame(&head.keys.records, &head.id, &body, 0)?;
+        let known_len = head.len + framed.good_len as u64;
         if framed.good_len < body.len() {
             file.set_len(known_len)?;
         }
         // Decrypting everything is the slow part; it needs only the bytes in
         // memory, so it runs after the lock is released and in parallel.
         drop(lock);
-        let entries = file::decrypt(&keys.records, &vault_id, &body, &framed.frames, 0, true)?;
+        let entries = file::decrypt(&head.keys.records, &head.id, &body, &framed.frames, 0, true)?;
         let mut state = State::default();
         state.insert_all(entries);
         Ok(Self {
             file,
             path: path.to_owned(),
-            keys,
-            id: vault_id,
+            keys: head.keys,
+            wrapped: head.wrapped,
+            header_len: head.len,
+            id: RwLock::new(head.id),
             state: RwLock::new(state),
             known_len: Mutex::new(known_len),
         })
@@ -217,7 +239,7 @@ impl Vault {
     }
 
     /// Issues proxies for every `(kind, original)` not yet mapped, merging
-    /// records appended by other processes first. The only writer.
+    /// records appended by other processes first. The only call that adds records.
     ///
     /// A proxy equals no issued proxy, no known original, no original in `new`
     /// and no proxy issued by this call, and none for which `avoid(kind,
@@ -246,6 +268,81 @@ impl Vault {
             .par_iter_mut()
             .for_each(|p| p.first = watermarked(keys, p.kind, &p.original, 0));
         self.locked_append(|state| choose(keys, state, pending, avoid))
+    }
+
+    /// Removes every record `gone(kind, original, proxy)` says yes to and returns how many there
+    /// were. The file is rewritten without them: they are not in it afterwards, and a proxy that
+    /// was issued for one is ordinary text again. A call that finds nothing to remove writes
+    /// nothing.
+    ///
+    /// Every record is sealed under the vault id and its own index, so the rewrite seals all the
+    /// records that stay again, under a new random id. It is done in place, in the same file,
+    /// because other processes hold it open. They find out from the id: the next time one of them
+    /// writes it reloads the vault, while a process that only reads keeps the records it has until
+    /// it is restarted. The order of the steps makes a crash at any point recoverable:
+    ///
+    /// 1. the new file is written to `<vault>.compact.tmp`, synced and renamed to
+    ///    `<vault>.compact`, which is the point of no return;
+    /// 2. the vault file is cut to the new length and the new contents are written over it;
+    /// 3. `.compact` is deleted.
+    ///
+    /// [`Vault::open`] finishes a forget that stopped after step 1.
+    ///
+    /// `gone` is asked about each record in turn while the vault's locks are held, so it must be
+    /// cheap and must not call back into the vault.
+    ///
+    /// # Errors
+    /// `Io`, `VaultCorrupt`, `Poisoned`. An `Io` after step 1 may leave the file half rewritten:
+    /// the next open repairs it.
+    pub fn forget(&self, gone: &dyn Fn(EntityKind, &str, &str) -> bool) -> Result<usize> {
+        let mut known_len = self.known_len.lock()?;
+        let _lock = FileLock::exclusive(&self.file)?;
+        self.merge_appended(&mut known_len)?;
+        let (kept, removed) = {
+            let state = self.state.read()?;
+            let mut kept = Vec::with_capacity(state.order.len());
+            for proxy in &state.order {
+                if let Some((kind, original)) = state.by_proxy.get(proxy)
+                    && !gone(*kind, original, proxy)
+                {
+                    kept.push(Entry {
+                        kind: *kind,
+                        original: Arc::clone(original),
+                        proxy: Arc::clone(proxy),
+                    });
+                }
+            }
+            let removed = state.order.len() - kept.len();
+            (kept, removed)
+        };
+        if removed == 0 {
+            return Ok(0);
+        }
+        let mut id = [0u8; VAULT_ID_LEN];
+        keys::fill_random(&mut id)?;
+        let mut image = file::encode_header(&self.wrapped, &id)?;
+        image.extend_from_slice(&file::seal(&self.keys.records, &id, 0, &kept)?);
+
+        let compact = suffixed(&self.path, COMPACT_SUFFIX);
+        sys::write_atomic(&compact, &image)?;
+        overwrite(&self.file, &image)?;
+        // Best effort: a copy that stays is recognized for what it is, and removed, by the next
+        // open, see `finish_compaction`.
+        let _ = fs::remove_file(&compact);
+
+        self.replace_state(kept)?;
+        *self.id.write()? = id;
+        *known_len = image.len() as u64;
+        Ok(removed)
+    }
+
+    /// Removes every record, see [`Vault::forget`]. The key stays, so the vault is as usable as
+    /// a new one.
+    ///
+    /// # Errors
+    /// As [`Vault::forget`].
+    pub fn wipe(&self) -> Result<usize> {
+        self.forget(&|_, _, _| true)
     }
 
     /// The requests that have no proxy yet, with their originals shared.
@@ -285,10 +382,18 @@ impl Vault {
         self.append(&mut known_len, entries)
     }
 
-    /// Adds the records other processes appended past `known_len`, cutting a
-    /// torn tail they left behind. The file lock must be held.
+    /// Brings the in-memory state up to date with the file: with the records other processes
+    /// appended past `known_len` (cutting a torn tail they left behind) or, when one of them
+    /// forgot records and so gave the vault a new id, with the whole file. The file lock must
+    /// be held.
     fn merge_appended(&self, known_len: &mut u64) -> Result<()> {
         let len = self.file.metadata()?.len();
+        // After a forget the file can be shorter or longer than this process expects, or the
+        // same length: the id is what tells.
+        let id = *self.id.read()?;
+        if len >= self.header_len && self.file_id()? != id {
+            return self.reload(known_len, len);
+        }
         if len == *known_len {
             return Ok(());
         }
@@ -301,14 +406,56 @@ impl Vault {
         }
         let body = file::read_range(&self.file, *known_len, len)?;
         let cipher = &self.keys.records;
-        let framed = file::frame(cipher, &self.id, &body, first_index)?;
+        let framed = file::frame(cipher, &id, &body, first_index)?;
         let good_end = *known_len + framed.good_len as u64;
         if framed.good_len < body.len() {
             self.file.set_len(good_end)?;
         }
-        let entries = file::decrypt(cipher, &self.id, &body, &framed.frames, first_index, false)?;
+        let entries = file::decrypt(cipher, &id, &body, &framed.frames, first_index, false)?;
         self.state.write()?.insert_all(entries);
         *known_len = good_end;
+        Ok(())
+    }
+
+    /// The vault id the file's header carries now. The file lock must be held.
+    fn file_id(&self) -> Result<Id> {
+        let mut id = [0u8; VAULT_ID_LEN];
+        file::read_exact_at(&self.file, &mut id, self.header_len - VAULT_ID_LEN as u64)?;
+        Ok(id)
+    }
+
+    /// Replaces everything this process knows with the file's contents, which another
+    /// process's [`Vault::forget`] rewrote under a new id. The file lock must be held.
+    fn reload(&self, known_len: &mut u64, len: u64) -> Result<()> {
+        let header = file::read_header(&self.file, len)?;
+        // A forget keeps the key. Another one means another vault, and its records would not
+        // open with ours.
+        if header.wrapped_key != self.wrapped {
+            return Err(file::invalid(
+                "the vault file was replaced by another vault",
+            ));
+        }
+        let body = file::read_range(&self.file, header.len, len)?;
+        let cipher = &self.keys.records;
+        let framed = file::frame(cipher, &header.vault_id, &body, 0)?;
+        let good_end = header.len + framed.good_len as u64;
+        if framed.good_len < body.len() {
+            self.file.set_len(good_end)?;
+        }
+        let entries = file::decrypt(cipher, &header.vault_id, &body, &framed.frames, 0, false)?;
+        self.replace_state(entries)?;
+        *self.id.write()? = header.vault_id;
+        *known_len = good_end;
+        Ok(())
+    }
+
+    /// Swaps the records in memory for `entries`, which are all the file holds now.
+    fn replace_state(&self, entries: Vec<Entry>) -> Result<()> {
+        let mut fresh = State::default();
+        fresh.insert_all(entries);
+        let mut state = self.state.write()?;
+        fresh.generation = state.generation + 1;
+        *state = fresh;
         Ok(())
     }
 
@@ -317,7 +464,8 @@ impl Vault {
     /// must be the file's length.
     fn append(&self, known_len: &mut u64, entries: Vec<Entry>) -> Result<()> {
         let first_index = self.state.read()?.count;
-        let bytes = file::seal(&self.keys.records, &self.id, first_index, &entries)?;
+        let id = *self.id.read()?;
+        let bytes = file::seal(&self.keys.records, &id, first_index, &entries)?;
         let written =
             file::write_all_at(&self.file, &bytes, *known_len).and_then(|()| self.file.sync_data());
         if let Err(e) = written {
@@ -332,29 +480,101 @@ impl Vault {
     }
 }
 
-/// Creates the header of an empty vault file and returns
-/// `(vault_id, header_len, keys)`.
-fn create_header(file: &File) -> Result<([u8; VAULT_ID_LEN], u64, VaultKeys)> {
+/// What the header of a vault file holds.
+struct Head {
+    id: Id,
+    /// The header's size in bytes: the records start there.
+    len: u64,
+    /// The DPAPI-wrapped master key.
+    wrapped: Vec<u8>,
+    keys: VaultKeys,
+}
+
+/// Creates the header of an empty vault file.
+fn create_header(file: &File) -> Result<Head> {
     let master = keys::generate_master()?;
-    let wrapped_key = keys::wrap(&master)?;
-    let mut vault_id = [0u8; VAULT_ID_LEN];
-    keys::fill_random(&mut vault_id)?;
-    let header = file::encode_header(&wrapped_key, &vault_id)?;
+    let wrapped = keys::wrap(&master)?;
+    let mut id = [0u8; VAULT_ID_LEN];
+    keys::fill_random(&mut id)?;
+    let header = file::encode_header(&wrapped, &id)?;
     file::write_all_at(file, &header, 0)
         .and_then(|()| file.sync_data())
         .inspect_err(|_| {
             // Leave an empty file so the next open starts over.
             let _ = file.set_len(0);
         })?;
-    Ok((vault_id, header.len() as u64, VaultKeys::derive(&master)))
+    Ok(Head {
+        id,
+        len: header.len() as u64,
+        wrapped,
+        keys: VaultKeys::derive(&master),
+    })
 }
 
-/// Reads the header of an existing vault file of `len` bytes and returns
-/// `(vault_id, header_len, keys)`.
-fn load_header(file: &File, len: u64) -> Result<([u8; VAULT_ID_LEN], u64, VaultKeys)> {
+/// Reads the header of an existing vault file of `len` bytes.
+fn load_header(file: &File, len: u64) -> Result<Head> {
     let header = file::read_header(file, len)?;
     let master = keys::unwrap(&header.wrapped_key)?;
-    Ok((header.vault_id, header.len, VaultKeys::derive(&master)))
+    Ok(Head {
+        id: header.vault_id,
+        len: header.len,
+        wrapped: header.wrapped_key,
+        keys: VaultKeys::derive(&master),
+    })
+}
+
+/// `<vault>.compact`: what [`Vault::forget`] leaves while it replaces the vault's contents.
+const COMPACT_SUFFIX: &str = ".compact";
+
+/// `path` with `suffix` appended to its file name.
+fn suffixed(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Makes `file` hold exactly `image`. It is cut to the new length first, so that a crash never
+/// leaves the new contents followed by what is left of the old ones.
+fn overwrite(file: &File, image: &[u8]) -> io::Result<()> {
+    file.set_len(image.len() as u64)?;
+    file::write_all_at(file, image, 0)?;
+    file.sync_data()
+}
+
+/// Finishes a [`Vault::forget`] that a crash stopped, and sweeps what it left. The file lock
+/// must be held.
+///
+/// `<vault>.compact` is the complete file the forget was about to put in place, and it only
+/// exists once that was decided. The vault file is then in one of these states:
+///
+/// - the old file, cut short or written over in part: the forget goes through;
+/// - the new file, with or without records appended since: nothing to do. That is also what a
+///   forget that merely failed to delete `.compact` leaves, and the check is what keeps the
+///   leftover from cutting off the records appended afterwards;
+/// - shorter than the new file, which none of the above ever is: the vault was deleted or
+///   swapped for another since, and `.compact` is not for it, so it must not bring back
+///   records.
+fn finish_compaction(file: &File, path: &Path) -> Result<()> {
+    let compact = suffixed(path, COMPACT_SUFFIX);
+    // A forget that died while writing `.compact` left only this.
+    let _ = fs::remove_file(suffixed(&compact, ".tmp"));
+    let image = match File::open(&compact) {
+        Ok(image) => image,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let image_len = image.metadata()?.len();
+    file::read_header(&image, image_len).map_err(|e| match e {
+        Error::Io(e) => sys::io_context(&e, "use", &compact),
+        other => other,
+    })?;
+    let bytes = file::read_range(&image, 0, image_len)?;
+    drop(image);
+    if file.metadata()?.len() >= image_len && file::read_range(file, 0, image_len)? != bytes {
+        overwrite(file, &bytes)?;
+    }
+    let _ = fs::remove_file(&compact);
+    Ok(())
 }
 
 /// A value waiting for a proxy.
@@ -477,12 +697,30 @@ impl VaultView<'_> {
 
     /// Every record as `(kind, original, proxy)`, the newest first.
     pub fn newest_first(&self) -> impl Iterator<Item = (EntityKind, &str, &str)> {
-        self.state.order.iter().rev().filter_map(|proxy| {
-            self.state
-                .by_proxy
-                .get(proxy)
-                .map(|(kind, original)| (*kind, &**original, &**proxy))
-        })
+        records(&self.state).rev()
+    }
+
+    /// The records whose original or proxy contains `query`, as `(kind, original, proxy)`, the
+    /// newest first. Case does not matter, and an empty `query` matches every record. With a
+    /// `kind`, only records of that kind are looked at.
+    pub fn search<'v>(
+        &'v self,
+        query: &str,
+        kind: Option<EntityKind>,
+    ) -> impl Iterator<Item = (EntityKind, &'v str, &'v str)> + use<'v> {
+        let mut needle = String::new();
+        fold_into(query, &mut needle);
+        let mut scratch = String::new();
+        records(&self.state)
+            .rev()
+            .filter(move |&(found_kind, original, proxy)| {
+                kind.is_none_or(|wanted| wanted == found_kind)
+                    && (needle.is_empty()
+                        || [original, proxy].into_iter().any(|text| {
+                            fold_into(text, &mut scratch);
+                            scratch.contains(needle.as_str())
+                        }))
+            })
     }
 
     /// Every proxy issued as the `from`-th record or after, with its kind, in the order they
@@ -504,6 +742,97 @@ impl VaultView<'_> {
     pub fn record_count(&self) -> u64 {
         self.state.count
     }
+
+    /// How often the vault's records were replaced wholesale (by a [`Vault::forget`], here or in
+    /// another process) since it was opened. [`VaultView::record_count`] only says how many
+    /// records there are; this says whether the ones an earlier view saw are still the first
+    /// ones: they are, as long as it is the same.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.state.generation
+    }
+}
+
+/// The records of `state` as `(kind, original, proxy)`, in the order they were issued in.
+fn records(state: &State) -> impl DoubleEndedIterator<Item = (EntityKind, &str, &str)> {
+    state.order.iter().filter_map(|proxy| {
+        state
+            .by_proxy
+            .get(proxy)
+            .map(|(kind, original)| (*kind, &**original, &**proxy))
+    })
+}
+
+/// Lower-cases `text` into `out`, replacing what it held. Per character, so the same text folds
+/// the same wherever it stands: `str::to_lowercase` reads a Greek final sigma by its position.
+fn fold_into(text: &str, out: &mut String) {
+    out.clear();
+    out.extend(text.chars().flat_map(char::to_lowercase));
+}
+
+/// One record as [`export`] writes it in JSON.
+#[derive(Serialize)]
+struct Exported<'a> {
+    kind: &'a str,
+    original: &'a str,
+    proxy: &'a str,
+}
+
+/// Writes every record of `view`, in the order they were issued in, as `format` and returns how
+/// many there were. JSON is an array of `{"kind","original","proxy"}` objects with the kind as
+/// its name (`email`), CSV has the header `kind,original,proxy`.
+///
+/// The originals are in the output in the clear: where it goes is the caller's to protect. To
+/// keep from overwriting a file, open it with `OpenOptions::create_new`.
+///
+/// # Errors
+/// `Io`.
+pub fn export(view: &VaultView<'_>, format: ExportFormat, out: &mut dyn Write) -> Result<usize> {
+    let mut out = BufWriter::new(out);
+    let mut count = 0;
+    match format {
+        ExportFormat::Json => {
+            out.write_all(b"[")?;
+            for (kind, original, proxy) in records(&view.state) {
+                out.write_all(if count == 0 { b"\n" } else { b",\n" })?;
+                let record = Exported {
+                    kind: kind.as_str(),
+                    original,
+                    proxy,
+                };
+                serde_json::to_writer(&mut out, &record).map_err(io::Error::from)?;
+                count += 1;
+            }
+            out.write_all(b"\n]\n")?;
+        }
+        ExportFormat::Csv => {
+            csv_row(&mut out, &["kind", "original", "proxy"])?;
+            for (kind, original, proxy) in records(&view.state) {
+                csv_row(&mut out, &[kind.as_str(), original, proxy])?;
+                count += 1;
+            }
+        }
+    }
+    out.flush()?;
+    Ok(count)
+}
+
+/// One CSV record: the fields, quoted where RFC 4180 asks for it (when they hold a comma, a
+/// quote or a line break; a quote inside is doubled), separated by commas and ended by CRLF.
+pub(crate) fn csv_row(out: &mut dyn Write, fields: &[&str]) -> io::Result<()> {
+    for (i, field) in fields.iter().enumerate() {
+        if i > 0 {
+            out.write_all(b",")?;
+        }
+        if field.contains([',', '"', '\r', '\n']) {
+            out.write_all(b"\"")?;
+            out.write_all(field.replace('"', "\"\"").as_bytes())?;
+            out.write_all(b"\"")?;
+        } else {
+            out.write_all(field.as_bytes())?;
+        }
+    }
+    out.write_all(b"\r\n")
 }
 
 #[cfg(test)]
@@ -1402,6 +1731,601 @@ mod tests {
         );
         assert!(since(3).is_empty());
         assert!(since(u64::MAX).is_empty());
+        Ok(())
+    }
+
+    /// The vault id in the header of a vault file, found with the documented layout rather
+    /// than the code under test.
+    fn id_of(bytes: &[u8]) -> Vec<u8> {
+        let dpapi_len = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let at = 8 + usize::try_from(dpapi_len).unwrap_or(usize::MAX);
+        bytes[at..at + 16].to_vec()
+    }
+
+    fn contains_bytes(bytes: &[u8], needle: &[u8]) -> bool {
+        bytes.windows(needle.len()).any(|window| window == needle)
+    }
+
+    fn compact_of(dir: &TempDir) -> PathBuf {
+        suffixed(&dir.vault_path(), COMPACT_SUFFIX)
+    }
+
+    /// The originals of every record, the newest first.
+    fn originals_newest_first(vault: &Vault) -> Result<Vec<String>> {
+        Ok(vault
+            .read()?
+            .newest_first()
+            .map(|(_, original, _)| original.to_owned())
+            .collect())
+    }
+
+    /// Everything `export` writes for the vault, and how many records it says it wrote.
+    fn exported(vault: &Vault, format: ExportFormat) -> Result<(usize, String)> {
+        let mut out = Vec::new();
+        let count = export(&vault.read()?, format, &mut out)?;
+        let text = String::from_utf8(out)
+            .map_err(|e| Error::Io(io::Error::new(io::ErrorKind::InvalidData, e)))?;
+        Ok((count, text))
+    }
+
+    fn parse_json(text: &str) -> Result<serde_json::Value> {
+        serde_json::from_str(text).map_err(|e| Error::Io(io::Error::from(e)))
+    }
+
+    #[test]
+    fn forget_removes_the_records_and_rewrites_the_file() -> Result<()> {
+        let dir = TempDir::new()?;
+        let vault = Vault::open(&dir.vault_path())?;
+        append(
+            &vault,
+            &[
+                (
+                    EntityKind::Email,
+                    "jan.jansen@example.org",
+                    "piet.bakker@orchardgate.org",
+                ),
+                (EntityKind::Email, "b@example.org", "x2@example.net"),
+                (EntityKind::Phone, "+31612345678", "+31687654321"),
+            ],
+        )?;
+        let before = std::fs::read(dir.vault_path())?;
+        let starts = record_starts(&before);
+        assert_eq!(vault.read()?.generation(), 0);
+
+        let removed = vault.forget(&|_, original, _| original == "jan.jansen@example.org")?;
+        assert_eq!(removed, 1);
+        {
+            let view = vault.read()?;
+            assert_eq!(view.record_count(), 2);
+            assert_eq!(view.generation(), 1);
+            assert_eq!(
+                view.proxy_for(EntityKind::Email, "jan.jansen@example.org"),
+                None
+            );
+            assert_eq!(view.original_for("piet.bakker@orchardgate.org"), None);
+            assert_eq!(view.count_of(EntityKind::Email), 1);
+            assert_eq!(
+                view.proxy_for(EntityKind::Email, "b@example.org"),
+                Some("x2@example.net")
+            );
+            assert_eq!(view.issued_since(0).count(), 2);
+        }
+
+        // On disk: a well-formed file of two records under a new id, in which nothing of the
+        // old file is left: every record that stays was sealed again.
+        let after = std::fs::read(dir.vault_path())?;
+        assert_eq!(record_starts(&after).len(), 2);
+        assert_ne!(id_of(&after), id_of(&before), "the vault got a new id");
+        assert!(after.len() < before.len());
+        for needle in ["jan.jansen", "example.org", "piet.bakker", "orchardgate"] {
+            assert!(!contains_bytes(&after, needle.as_bytes()), "{needle}");
+        }
+        let mut ends = starts[1..].to_vec();
+        ends.push(before.len());
+        for (&start, &end) in starts.iter().zip(&ends) {
+            assert!(!contains_bytes(&after, &before[start..end]));
+        }
+        assert!(!compact_of(&dir).exists());
+        assert!(!suffixed(&compact_of(&dir), ".tmp").exists());
+
+        // The vault goes on under its new id.
+        append(
+            &vault,
+            &[(EntityKind::Email, "c@example.org", "x3@example.net")],
+        )?;
+        drop(vault);
+        let vault = Vault::open(&dir.vault_path())?;
+        assert_eq!(
+            vault.read()?.generation(),
+            0,
+            "a generation counts from open"
+        );
+        assert_eq!(
+            originals_newest_first(&vault)?,
+            ["c@example.org", "+31612345678", "b@example.org"]
+        );
+        let (count, json) = exported(&vault, ExportFormat::Json)?;
+        assert_eq!(count, 3);
+        assert!(!json.contains("jan.jansen"), "{json}");
+        assert!(json.contains("b@example.org"), "{json}");
+        Ok(())
+    }
+
+    #[test]
+    fn forgetting_nothing_writes_nothing() -> Result<()> {
+        let dir = TempDir::new()?;
+        let vault = Vault::open(&dir.vault_path())?;
+        three(&vault)?;
+        let before = std::fs::read(dir.vault_path())?;
+        assert_eq!(vault.forget(&|_, _, _| false)?, 0);
+        assert_eq!(
+            vault.forget(&|_, original, _| original == "nobody@example.org")?,
+            0
+        );
+        assert_eq!(std::fs::read(dir.vault_path())?, before);
+        assert_eq!(vault.read()?.generation(), 0);
+        assert!(!compact_of(&dir).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn forget_offers_the_kind_the_original_and_the_proxy() -> Result<()> {
+        let dir = TempDir::new()?;
+        let vault = Vault::open(&dir.vault_path())?;
+        three(&vault)?;
+        append(
+            &vault,
+            &[(EntityKind::Phone, "+31612345678", "+31687654321")],
+        )?;
+        assert_eq!(vault.forget(&|kind, _, _| kind == EntityKind::Phone)?, 1);
+        assert_eq!(
+            vault.forget(&|_, _, proxy| proxy == "x2@example.net")?,
+            1,
+            "by proxy"
+        );
+        assert_eq!(
+            originals_newest_first(&vault)?,
+            ["c@example.org", "a@example.org"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn forgetting_one_kind_keeps_the_same_text_of_another() -> Result<()> {
+        let dir = TempDir::new()?;
+        let vault = Vault::open(&dir.vault_path())?;
+        append(
+            &vault,
+            &[
+                (EntityKind::NlBsn, "111222333", "100000008"),
+                (EntityKind::UsSsn, "111222333", "100000009"),
+            ],
+        )?;
+        assert_eq!(vault.forget(&|kind, _, _| kind == EntityKind::NlBsn)?, 1);
+        let view = vault.read()?;
+        assert_eq!(view.proxy_for(EntityKind::NlBsn, "111222333"), None);
+        assert_eq!(
+            view.proxy_for(EntityKind::UsSsn, "111222333"),
+            Some("100000009")
+        );
+        assert_eq!(view.original_for("100000008"), None);
+        assert_eq!(view.original_for("100000009"), Some("111222333"));
+        // What the kept record holds still keeps a new proxy from being equal to it.
+        assert!(view.state.originals.contains("111222333"));
+        Ok(())
+    }
+
+    #[test]
+    fn wipe_empties_the_vault_and_keeps_its_key() -> Result<()> {
+        let dir = TempDir::new()?;
+        let vault = Vault::open(&dir.vault_path())?;
+        assert_eq!(vault.wipe()?, 0, "nothing to wipe");
+        three(&vault)?;
+        let before = std::fs::read(dir.vault_path())?;
+        assert_eq!(vault.wipe()?, 3);
+        assert_eq!(vault.read()?.record_count(), 0);
+
+        let after = std::fs::read(dir.vault_path())?;
+        assert!(record_starts(&after).is_empty());
+        let wrapped = after.len() - 16;
+        assert_eq!(
+            after[..wrapped],
+            before[..wrapped],
+            "the wrapped key is kept"
+        );
+        assert_ne!(id_of(&after), id_of(&before));
+
+        // The same key opens it, and it takes records again.
+        vault.resolve(corpus(), FREE)?;
+        let issued = dump(&vault)?;
+        assert_eq!(issued.len(), corpus().len());
+        drop(vault);
+        let vault = Vault::open(&dir.vault_path())?;
+        assert_eq!(dump(&vault)?, issued);
+        Ok(())
+    }
+
+    #[test]
+    fn a_forget_stopped_after_its_point_of_no_return_is_finished_on_open() -> Result<()> {
+        let dir = TempDir::new()?;
+        let (before, after) = forget_b(&dir)?;
+        let halfway = after.len() / 2;
+        // What a crash between the rename of `.compact` and the end of the rewrite can leave.
+        let states = [
+            ("untouched", before.clone()),
+            ("cut to the new length", before[..after.len()].to_vec()),
+            (
+                "partly written",
+                [&after[..halfway], &before[halfway..after.len()]].concat(),
+            ),
+            ("complete", after.clone()),
+        ];
+        for (what, state) in states {
+            std::fs::write(dir.vault_path(), &state)?;
+            std::fs::write(compact_of(&dir), &after)?;
+            let vault = Vault::open(&dir.vault_path())?;
+            assert_eq!(
+                originals_newest_first(&vault)?,
+                ["c@example.org", "a@example.org"],
+                "{what}"
+            );
+            drop(vault);
+            assert!(!compact_of(&dir).exists(), "{what}: .compact was left");
+            assert_eq!(std::fs::read(dir.vault_path())?, after, "{what}");
+        }
+        Ok(())
+    }
+
+    /// Three records, one of them forgotten: the vault file before and after.
+    fn forget_b(dir: &TempDir) -> Result<(Vec<u8>, Vec<u8>)> {
+        let vault = Vault::open(&dir.vault_path())?;
+        three(&vault)?;
+        let before = std::fs::read(dir.vault_path())?;
+        assert_eq!(
+            vault.forget(&|_, original, _| original == "b@example.org")?,
+            1
+        );
+        let after = std::fs::read(dir.vault_path())?;
+        Ok((before, after))
+    }
+
+    #[test]
+    fn a_compact_file_left_behind_does_not_cost_the_records_appended_after_it() -> Result<()> {
+        let dir = TempDir::new()?;
+        let (_, after) = forget_b(&dir)?;
+        let vault = Vault::open(&dir.vault_path())?;
+        append(
+            &vault,
+            &[(EntityKind::Email, "d@example.org", "x4@example.net")],
+        )?;
+        drop(vault);
+        let grown = std::fs::read(dir.vault_path())?;
+        assert!(grown.len() > after.len());
+
+        // The forget could not delete its `.compact`.
+        std::fs::write(compact_of(&dir), &after)?;
+        let vault = Vault::open(&dir.vault_path())?;
+        assert_eq!(
+            originals_newest_first(&vault)?,
+            ["d@example.org", "c@example.org", "a@example.org"]
+        );
+        drop(vault);
+        assert!(!compact_of(&dir).exists());
+        assert_eq!(std::fs::read(dir.vault_path())?, grown);
+        Ok(())
+    }
+
+    #[test]
+    fn a_compact_file_does_not_bring_back_a_vault_that_was_deleted() -> Result<()> {
+        let dir = TempDir::new()?;
+        let (_, after) = forget_b(&dir)?;
+        std::fs::remove_file(dir.vault_path())?;
+        std::fs::write(compact_of(&dir), &after)?;
+        let vault = Vault::open(&dir.vault_path())?;
+        assert!(dump(&vault)?.is_empty());
+        drop(vault);
+        assert!(!compact_of(&dir).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn a_compact_file_that_is_not_a_vault_is_refused_and_overwrites_nothing() -> Result<()> {
+        let dir = TempDir::new()?;
+        three(&Vault::open(&dir.vault_path())?)?;
+        let good = std::fs::read(dir.vault_path())?;
+        std::fs::write(compact_of(&dir), b"this is not a vault file")?;
+        assert!(matches!(Vault::open(&dir.vault_path()), Err(Error::Io(_))));
+        assert_eq!(std::fs::read(dir.vault_path())?, good);
+        Ok(())
+    }
+
+    #[test]
+    fn a_partial_compact_temp_file_is_swept_on_open() -> Result<()> {
+        let dir = TempDir::new()?;
+        three(&Vault::open(&dir.vault_path())?)?;
+        let tmp = suffixed(&compact_of(&dir), ".tmp");
+        std::fs::write(&tmp, b"PKV1 cut short")?;
+        let vault = Vault::open(&dir.vault_path())?;
+        assert_eq!(dump(&vault)?.len(), 3);
+        assert!(!tmp.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn a_second_instance_reloads_after_a_forget_on_its_next_write() -> Result<()> {
+        let dir = TempDir::new()?;
+        let a = Vault::open(&dir.vault_path())?;
+        let b = Vault::open(&dir.vault_path())?;
+        three(&a)?;
+        // `b` merges the three by writing a record of its own.
+        append(
+            &b,
+            &[(EntityKind::Email, "d@example.org", "x4@example.net")],
+        )?;
+        assert_eq!(dump(&b)?.len(), 4);
+
+        assert_eq!(a.forget(&|_, original, _| original == "b@example.org")?, 1);
+        assert_eq!(dump(&a)?.len(), 3, "a merged d before it rewrote the file");
+        assert_eq!(dump(&b)?.len(), 4, "b cannot know yet");
+        let generation = b.read()?.generation();
+
+        b.resolve(vec![(EntityKind::Email, "new@example.org".into())], FREE)?;
+        assert!(b.read()?.generation() > generation);
+        assert_eq!(proxy_of(&b, EntityKind::Email, "b@example.org")?, None);
+        let originals: Vec<String> = dump(&b)?.into_iter().map(|(_, o, _)| o).collect();
+        assert_eq!(
+            originals,
+            [
+                "a@example.org",
+                "c@example.org",
+                "d@example.org",
+                "new@example.org"
+            ]
+        );
+
+        // `a` takes `b`'s record when it next writes: they share the new id now.
+        append(
+            &a,
+            &[(EntityKind::Email, "e@example.org", "x5@example.net")],
+        )?;
+        assert_eq!(dump(&a)?.len(), 5);
+        drop((a, b));
+        let vault = Vault::open(&dir.vault_path())?;
+        assert_eq!(dump(&vault)?.len(), 5);
+        assert_eq!(proxy_of(&vault, EntityKind::Email, "b@example.org")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_forget_that_leaves_the_file_exactly_as_long_is_noticed_by_its_id() -> Result<()> {
+        let dir = TempDir::new()?;
+        let a = Vault::open(&dir.vault_path())?;
+        let b = Vault::open(&dir.vault_path())?;
+        three(&a)?;
+        append(
+            &b,
+            &[(EntityKind::Email, "d@example.org", "x4@example.net")],
+        )?;
+        let len = std::fs::metadata(dir.vault_path())?.len();
+
+        // One record out, one of the same size in: `b`'s idea of the length is still right.
+        assert_eq!(a.forget(&|_, original, _| original == "b@example.org")?, 1);
+        append(
+            &a,
+            &[(EntityKind::Email, "z@example.org", "x9@example.net")],
+        )?;
+        assert_eq!(std::fs::metadata(dir.vault_path())?.len(), len);
+
+        append(
+            &b,
+            &[(EntityKind::Email, "f@example.org", "x6@example.net")],
+        )?;
+        let originals: Vec<String> = dump(&b)?.into_iter().map(|(_, o, _)| o).collect();
+        assert_eq!(
+            originals,
+            [
+                "a@example.org",
+                "c@example.org",
+                "d@example.org",
+                "f@example.org",
+                "z@example.org"
+            ]
+        );
+        drop((a, b));
+        assert_eq!(dump(&Vault::open(&dir.vault_path())?)?.len(), 5);
+        Ok(())
+    }
+
+    #[test]
+    fn instances_forgetting_while_others_append_end_consistent() -> Result<()> {
+        const WRITERS: usize = 3;
+        const ROUNDS: usize = 6;
+        const KEPT_PER_ROUND: usize = 4;
+        let dir = TempDir::new()?;
+        let path = dir.vault_path();
+        let dropped = |_: EntityKind, original: &str, _: &str| original.starts_with("drop.");
+        let finished = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for t in 0..WRITERS {
+                let (path, finished) = (&path, &finished);
+                handles.push(scope.spawn(move || -> Result<()> {
+                    let written = Vault::open(path).and_then(|vault| {
+                        for round in 0..ROUNDS {
+                            let mut batch = emails(&format!("keep.t{t}r{round}"), KEPT_PER_ROUND);
+                            batch.extend(emails(&format!("drop.t{t}r{round}"), 3));
+                            vault.resolve(batch, FREE)?;
+                        }
+                        Ok(())
+                    });
+                    finished.fetch_add(1, Ordering::SeqCst);
+                    written
+                }));
+            }
+            let (path, dropped, finished) = (&path, &dropped, &finished);
+            handles.push(scope.spawn(move || -> Result<()> {
+                let vault = Vault::open(path)?;
+                while finished.load(Ordering::SeqCst) < WRITERS {
+                    vault.forget(dropped)?;
+                    std::thread::yield_now();
+                }
+                Ok(())
+            }));
+            join_all(handles)
+        })?;
+
+        // Nothing that stays was lost, whatever the forgets did meanwhile; one more clears the
+        // records the writers added after the forgetter's last turn.
+        let kept = WRITERS * ROUNDS * KEPT_PER_ROUND;
+        let vault = Vault::open(&path)?;
+        vault.forget(&dropped)?;
+        assert_consistent(&vault, kept)?;
+        assert!(
+            dump(&vault)?
+                .iter()
+                .all(|(_, original, _)| original.starts_with("keep."))
+        );
+        drop(vault);
+        assert_consistent(&Vault::open(&path)?, kept)
+    }
+
+    #[test]
+    fn search_matches_original_or_proxy_ignoring_case_newest_first() -> Result<()> {
+        let dir = TempDir::new()?;
+        let vault = Vault::open(&dir.vault_path())?;
+        append(
+            &vault,
+            &[
+                (
+                    EntityKind::Email,
+                    "Jan.Jansen@Example.org",
+                    "px1@example.net",
+                ),
+                (EntityKind::Person, "\u{C9}mile M\u{FC}ller", "Haley Quinn"),
+                (EntityKind::Phone, "+31612345678", "+31687654321"),
+                (
+                    EntityKind::Email,
+                    "other@example.org",
+                    "jan-proxy@example.net",
+                ),
+            ],
+        )?;
+        let view = vault.read()?;
+        let found = |query: &str, kind: Option<EntityKind>| -> Vec<String> {
+            view.search(query, kind)
+                .map(|(_, original, _)| original.to_owned())
+                .collect()
+        };
+        assert_eq!(
+            found("", None),
+            [
+                "other@example.org",
+                "+31612345678",
+                "\u{C9}mile M\u{FC}ller",
+                "Jan.Jansen@Example.org"
+            ],
+            "an empty query matches everything"
+        );
+        assert_eq!(
+            found("jan", None),
+            ["other@example.org", "Jan.Jansen@Example.org"],
+            "the original of one, the proxy of the other"
+        );
+        assert_eq!(found("JAN.JANSEN", None), ["Jan.Jansen@Example.org"]);
+        assert_eq!(found("EXAMPLE.ORG", None).len(), 2);
+        assert_eq!(
+            found("\u{E9}MILE m\u{DC}LLER", None),
+            ["\u{C9}mile M\u{FC}ller"]
+        );
+        assert_eq!(
+            found("QUINN", Some(EntityKind::Person)),
+            ["\u{C9}mile M\u{FC}ller"],
+            "the proxy matches too"
+        );
+        assert!(found("quinn", Some(EntityKind::Email)).is_empty());
+        assert_eq!(found("+316", Some(EntityKind::Phone)), ["+31612345678"]);
+        assert!(found("nobody", None).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn export_json_is_an_array_of_records_in_file_order() -> Result<()> {
+        let dir = TempDir::new()?;
+        let vault = Vault::open(&dir.vault_path())?;
+        let (count, empty) = exported(&vault, ExportFormat::Json)?;
+        assert_eq!(count, 0);
+        assert_eq!(parse_json(&empty)?, serde_json::json!([]));
+
+        // Quotes, backslashes, line breaks, control characters and characters outside ASCII.
+        let tricky = "Zo\u{EB} \"Z\" O'Neil\\ \u{1F600} \u{1}";
+        append(
+            &vault,
+            &[
+                (
+                    EntityKind::Email,
+                    "jan.jansen@example.org",
+                    "x1@example.net",
+                ),
+                (EntityKind::Person, tricky, "Haley\ttab\r\nbreak"),
+                (EntityKind::Phone, "+31 6 12345678", "+31 6 87654321"),
+            ],
+        )?;
+        let (count, json) = exported(&vault, ExportFormat::Json)?;
+        assert_eq!(count, 3);
+        assert_eq!(
+            parse_json(&json)?,
+            serde_json::json!([
+                {"kind": "email", "original": "jan.jansen@example.org", "proxy": "x1@example.net"},
+                {"kind": "person", "original": tricky, "proxy": "Haley\ttab\r\nbreak"},
+                {"kind": "phone", "original": "+31 6 12345678", "proxy": "+31 6 87654321"},
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn export_csv_quotes_what_rfc_4180_says_to_quote() -> Result<()> {
+        let dir = TempDir::new()?;
+        let vault = Vault::open(&dir.vault_path())?;
+        assert_eq!(
+            exported(&vault, ExportFormat::Csv)?,
+            (0, "kind,original,proxy\r\n".to_owned())
+        );
+        append(
+            &vault,
+            &[
+                (EntityKind::Email, "plain@example.org", "p1@example.net"),
+                (EntityKind::Email, "a,b@example.org", "p2@example.net"),
+                (EntityKind::Person, "say \"hi\"", "p3"),
+                (EntityKind::Person, "line one\nline two", "p4"),
+                (EntityKind::Person, "carriage\rreturn", "p5, \"quoted\""),
+                (EntityKind::Person, "Zo\u{EB}", "p6"),
+            ],
+        )?;
+        let (count, csv) = exported(&vault, ExportFormat::Csv)?;
+        assert_eq!(count, 6);
+        assert_eq!(
+            csv,
+            "kind,original,proxy\r\n\
+             email,plain@example.org,p1@example.net\r\n\
+             email,\"a,b@example.org\",p2@example.net\r\n\
+             person,\"say \"\"hi\"\"\",p3\r\n\
+             person,\"line one\nline two\",p4\r\n\
+             person,\"carriage\rreturn\",\"p5, \"\"quoted\"\"\"\r\n\
+             person,Zo\u{EB},p6\r\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn csv_rows_quote_only_where_needed() -> io::Result<()> {
+        let mut out = Vec::new();
+        csv_row(&mut out, &["a", "", "b c", "d,e", "f\"g", "h\ni"])?;
+        csv_row(&mut out, &[])?;
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "a,,b c,\"d,e\",\"f\"\"g\",\"h\ni\"\r\n\r\n"
+        );
         Ok(())
     }
 }

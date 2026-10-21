@@ -1,7 +1,7 @@
 //! Zip packages (OOXML, ODF): the XML parts are rewritten, every other entry
 //! is copied through.
 //!
-//! The XML parts are read and scanned in parallel, one [`Engine::plan`] call
+//! The XML parts are read and scanned in parallel, one engine call
 //! covers every segment of the package, and the changed parts are rebuilt and
 //! compressed in parallel. The output keeps the original entry order; parts
 //! without changes are copied compressed, byte for byte.
@@ -17,12 +17,11 @@ use zip::{
     write::{PreparedZipFile, ZipFileBuilder},
 };
 
-use super::xmltext::{Attrs, XmlDoc, segments};
-use crate::{
-    Error, Result,
-    detect::Mode,
-    engine::{Engine, Replacement},
+use super::{
+    Pass,
+    xmltext::{Attrs, XmlDoc, segments},
 };
+use crate::{Error, Result, engine::Replacement};
 
 /// A package read from memory.
 pub(super) type Archive<'a> = ZipArchive<Cursor<&'a [u8]>>;
@@ -40,19 +39,15 @@ pub(super) fn open(bytes: &[u8]) -> Result<Archive<'_>> {
 }
 
 /// Anonymizes or deanonymizes every XML part of `archive`, returning the new
-/// package (the original bytes when nothing changes).
-pub(super) fn rewrite(
-    engine: &Engine,
-    mode: Mode,
-    mut archive: Archive<'_>,
-    scope: Scope,
-) -> Result<Vec<u8>> {
+/// package (the original bytes when nothing changes). A scan reads the same
+/// segments and returns nothing.
+pub(super) fn rewrite(pass: &Pass<'_>, mut archive: Archive<'_>, scope: Scope) -> Result<Vec<u8>> {
     let docs = read_docs(&archive, scope)?;
     let texts: Vec<&str> = docs.iter().flat_map(|(_, doc)| doc.texts()).collect();
     let plans = if texts.is_empty() {
         Vec::new()
     } else {
-        engine.plan(mode, &texts)?
+        pass.plan(&texts)?
     };
 
     let mut jobs: Vec<(usize, &XmlDoc, &[Vec<Replacement>])> = Vec::new();
@@ -69,7 +64,7 @@ pub(super) fn rewrite(
 
     let original = archive.clone().into_inner().into_inner();
     if jobs.is_empty() {
-        return Ok(original.to_vec());
+        return Ok(pass.unchanged(original));
     }
     let mut prepared: HashMap<usize, PreparedZipFile> = jobs
         .par_iter()

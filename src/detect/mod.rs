@@ -13,7 +13,7 @@ use std::ops::Range;
 pub use composite::CompositeDetector;
 pub(crate) use composite::overlaps;
 pub(crate) use issued::{IssuedProxies, Words};
-pub use kind::{EntityKind, KindSet, Span};
+pub use kind::{EntityKind, KIND_GROUPS, KindSet, Span};
 pub use ner::NerDetector;
 use rayon::prelude::*;
 use regex_automata::{Anchored, Input, meta, util::syntax};

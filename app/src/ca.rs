@@ -17,12 +17,10 @@ use hudsucker::rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose,
     date_time_ymd,
 };
+use piikey::sys::{data_dir, run_system_tool, write_atomic};
 use windows_dpapi::{Scope, decrypt_data, encrypt_data};
 
-use crate::{
-    Res,
-    policy::{data_dir, run_system_tool, write_atomic},
-};
+use crate::Res;
 
 /// Subject common name; also how `certutil` finds the certificate.
 // The name is kept for existing installs: the installed `ca.crt` and the Windows Root store entry carry it.
@@ -54,7 +52,7 @@ impl fmt::Debug for Ca {
 /// # Errors
 /// I/O, DPAPI or certificate generation failure.
 pub fn ensure() -> Res<Ca> {
-    ensure_in(&data_dir()?)
+    ensure_in(&data_dir().map_err(|e| e.to_string())?)
 }
 
 /// Whether the CA is in the current user's Root store.
@@ -76,7 +74,7 @@ pub fn install() -> Res<()> {
     if is_installed() {
         return Ok(());
     }
-    let cert = data_dir()?.join(CERT_FILE);
+    let cert = data_dir().map_err(|e| e.to_string())?.join(CERT_FILE);
     let out = certutil(&["-addstore", "Root", &cert.to_string_lossy()])?;
     if out.status.success() {
         Ok(())
@@ -115,7 +113,7 @@ pub fn uninstall() -> Res<()> {
 fn certutil(args: &[&str]) -> Res<Output> {
     let mut full = vec!["-user"];
     full.extend_from_slice(args);
-    run_system_tool("certutil.exe", &full)
+    run_system_tool("certutil.exe", &full).map_err(|e| e.to_string())
 }
 
 /// The last two lines certutil printed: its verdict and the reason.
@@ -145,8 +143,8 @@ fn ensure_in(dir: &Path) -> Res<Ca> {
     let ca = generate()?;
     let wrapped = encrypt_data(ca.key_pem.as_bytes(), Scope::User, Some(DPAPI_ENTROPY))
         .map_err(|e| format!("DPAPI cannot protect the CA key: {e:#}"))?;
-    write_atomic(&key_path, &wrapped)?;
-    write_atomic(&cert_path, ca.cert_pem.as_bytes())?;
+    write_atomic(&key_path, &wrapped).map_err(|e| e.to_string())?;
+    write_atomic(&cert_path, ca.cert_pem.as_bytes()).map_err(|e| e.to_string())?;
     Ok(ca)
 }
 
@@ -235,10 +233,7 @@ mod tests {
     use super::*;
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("piikey-ca-{}-{tag}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        let _ = fs::create_dir_all(&dir);
-        dir
+        crate::ui::testing::temp_dir(tag)
     }
 
     #[test]

@@ -15,8 +15,10 @@ use std::{
     time::Duration,
 };
 
+use piikey::sys::CREATE_NO_WINDOW;
+
 use super::instance::Instance;
-use crate::{Res, policy::CREATE_NO_WINDOW, sysproxy};
+use crate::{Res, sysproxy};
 
 /// Runs the exe as the watchdog of the app that started it.
 pub const WATCH_FLAG: &str = "--watchdog";

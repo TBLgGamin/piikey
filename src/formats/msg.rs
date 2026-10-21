@@ -12,11 +12,11 @@ use std::{
 use cfb::CompoundFile;
 
 use super::{
-    Output,
+    Output, Pass,
     eml::{Attachment, Mail, display, render},
     text,
 };
-use crate::{Error, Result, detect::Mode, engine::Engine};
+use crate::{Error, Result};
 
 type Cfb<'a> = CompoundFile<Cursor<&'a [u8]>>;
 
@@ -35,7 +35,7 @@ const PROPERTY_HEADER: usize = 8;
 const PROPERTY_ENTRY: usize = 16;
 const UNNAMED: &str = "attachment";
 
-pub(super) fn process(engine: &Engine, mode: Mode, bytes: &[u8], depth: u8) -> Result<Output> {
+pub(super) fn process(pass: &Pass<'_>, bytes: &[u8], depth: u8) -> Result<Output> {
     let mut file = CompoundFile::open(Cursor::new(bytes))
         .map_err(|e| Error::Mail(format!("compound file: {e}")))?;
     if !file.is_stream(PROPERTIES) {
@@ -78,7 +78,7 @@ pub(super) fn process(engine: &Engine, mode: Mode, bytes: &[u8], depth: u8) -> R
             data: Cow::Owned(data),
         });
     }
-    render(engine, mode, depth, &mail)
+    render(pass, depth, &mail)
 }
 
 /// Paths (`/NAME`) of the root storages whose names start with `prefix`, in name order.

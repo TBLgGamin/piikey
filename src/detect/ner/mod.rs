@@ -43,8 +43,11 @@
 pub mod files;
 
 mod decode;
+mod fetch;
 mod gate;
 mod labels;
+
+pub use fetch::fetch;
 
 use std::{
     cmp::Reverse,

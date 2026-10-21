@@ -58,9 +58,11 @@ Filename: "{app}\piikey.exe"; Description: "Start piikey"; Flags: nowait postins
 
 [UninstallRun]
 ; In this order: stop the app and its watchdog, give Windows its proxy settings back (a no-op when
-; piikey did not change them), then remove the local CA from the user's Root store.
+; piikey did not change them), remove the Explorer "Scan for PII" verb (a no-op when it was never
+; added), then remove the local CA from the user's Root store.
 Filename: "{sys}\taskkill.exe"; Parameters: "/IM piikey.exe /F"; Flags: runhidden; RunOnceId: "StopPiikey"
 Filename: "{app}\piikey.exe"; Parameters: "--restore-proxy"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "RestoreProxy"
+Filename: "{app}\piikey.exe"; Parameters: "--unregister-shell"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "UnregisterShell"
 Filename: "{sys}\certutil.exe"; Parameters: "-user -delstore Root ""piikey Guard CA"""; Flags: runhidden; RunOnceId: "RemoveCA"
 
 [Code]

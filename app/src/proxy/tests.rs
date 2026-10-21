@@ -278,10 +278,7 @@ impl Drop for Rig {
 }
 
 fn temp_vault(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("piikey-proxy-{}-{tag}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::create_dir_all(&dir);
-    dir.join("vault.pkv")
+    crate::ui::testing::temp_dir(tag).join("vault.pkv")
 }
 
 fn own_exe() -> String {
@@ -300,7 +297,16 @@ fn local_sites() -> Policy {
     }
 }
 
+/// How long a stopped proxy lets open connections finish in the tests: short, so that the tests
+/// that stop one with a connection open do not wait for it.
+const TEST_GRACE: Duration = Duration::from_millis(300);
+
 fn rig(tag: &str, policy: Policy) -> Res<Rig> {
+    rig_with_grace(tag, policy, TEST_GRACE)
+}
+
+/// [`rig`] whose proxy gives open connections `grace` to finish after a stop.
+fn rig_with_grace(tag: &str, policy: Policy, grace: Duration) -> Res<Rig> {
     let vault = temp_vault(tag);
     let engine = core(test_names::engine(&vault, &["Jeroen de Vries"]))?;
     let shared = Arc::new(Shared {
@@ -308,18 +314,13 @@ fn rig(tag: &str, policy: Policy) -> Res<Rig> {
         policy: RwLock::new(policy),
         ledger: Ledger::default(),
         typed: Typed::new(),
+        purpose: Arc::default(),
     });
     let (tx, events) = mpsc::channel();
     let listener = io(StdListener::bind("127.0.0.1:0"))?;
     let proxy = io(listener.local_addr())?;
     let ca = ca::generate()?;
-    let handle = start_on(
-        &ca,
-        Arc::clone(&shared),
-        tx,
-        listener,
-        Duration::from_millis(300),
-    )?;
+    let handle = start_on(&ca, Arc::clone(&shared), tx, listener, grace)?;
 
     let runtime = io(tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -449,10 +450,7 @@ fn outgoing_data_is_anonymized_and_the_reply_restored() -> Res<()> {
     // The client got its address back.
     assert_eq!(utf8(&body), JSON);
 
-    let Some(Event::Masked {
-        host, exe, kinds, ..
-    }) = rig.event()
-    else {
+    let Some(Event::Masked { host, exe, .. }) = rig.event() else {
         return Err("expected a Masked event".into());
     };
     assert_eq!(host, "127.0.0.1");
@@ -461,7 +459,6 @@ fn outgoing_data_is_anonymized_and_the_reply_restored() -> Res<()> {
         Some(own_exe().as_str()),
         "the sending program is named"
     );
-    assert_eq!(kinds, [("email", 1)]);
     let Some(Event::Restored { host, count }) = rig.event() else {
         return Err("expected a Restored event".into());
     };
@@ -491,10 +488,9 @@ fn only_what_the_user_typed_is_anonymized_while_capturing() -> Res<()> {
     assert_eq!(rig.proxies_in(sent)?.len(), 1, "{sent}");
     assert_eq!(utf8(&reply), body, "the typed address comes back");
 
-    let Some(Event::Masked { kinds, proxies, .. }) = rig.event() else {
+    let Some(Event::Masked { proxies, .. }) = rig.event() else {
         return Err("expected a Masked event".into());
     };
-    assert_eq!(kinds, [("email", 1)]);
     assert_eq!(proxies.len(), 1);
     Ok(())
 }
@@ -837,7 +833,9 @@ fn a_vault_failure_stops_the_request_instead_of_leaking_it() -> Res<()> {
     Ok(())
 }
 
-/// A WebSocket server that records every message and sends it back.
+/// A WebSocket server that records every text and binary message and sends it back. Control frames
+/// are not recorded: a client that hangs up without closing the socket makes the proxy send the
+/// server a close of its own, and when that arrives is not the test's business.
 async fn websocket_echo(listener: TcpListener, seen: Arc<Mutex<Vec<WsMessage>>>) {
     while let Ok((socket, _)) = listener.accept().await {
         let seen = Arc::clone(&seen);
@@ -846,7 +844,9 @@ async fn websocket_echo(listener: TcpListener, seen: Arc<Mutex<Vec<WsMessage>>>)
                 return;
             };
             while let Some(Ok(message)) = ws.next().await {
-                if let Ok(mut seen) = seen.lock() {
+                if (message.is_text() || message.is_binary())
+                    && let Ok(mut seen) = seen.lock()
+                {
                     seen.push(message.clone());
                 }
                 if ws.send(message).await.is_err() {
@@ -930,13 +930,10 @@ fn websocket_text_frames_are_anonymized_out_and_restored_back() -> Res<()> {
         Some(Some(Ok(WsMessage::Binary(bytes)))) if bytes.as_ref() == b"\x00 jan.jansen@acme.nl"
     ));
 
-    let Some(Event::Masked { host, kinds, .. }) = rig.event() else {
+    let Some(Event::Masked { host, .. }) = rig.event() else {
         return Err("expected a Masked event".into());
     };
-    assert_eq!(
-        (host.as_str(), kinds.as_slice()),
-        ("127.0.0.1", [("email", 1)].as_slice())
-    );
+    assert_eq!(host, "127.0.0.1");
     let Some(Event::Restored { count, .. }) = rig.event() else {
         return Err("expected a Restored event".into());
     };
@@ -944,24 +941,51 @@ fn websocket_text_frames_are_anonymized_out_and_restored_back() -> Res<()> {
     Ok(())
 }
 
+/// The far end of a tunnel that nobody closes: a server that takes one connection, reports once
+/// `expect` bytes have come through it and then holds the connection open until the other end ends
+/// it. Returns its address and the report.
+fn tunnel_end(rig: &Rig, expect: usize) -> Res<(SocketAddr, mpsc::Receiver<()>)> {
+    let listener = io(rig.runtime.block_on(TcpListener::bind("127.0.0.1:0")))?;
+    let addr = io(listener.local_addr())?;
+    let (arrived, report) = mpsc::channel();
+    rig.runtime.spawn(async move {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let mut buffer = vec![0u8; expect];
+        if socket.read_exact(&mut buffer).await.is_ok() {
+            let _ = arrived.send(());
+        }
+        while matches!(socket.read(&mut buffer).await, Ok(n) if n > 0) {}
+    });
+    Ok((addr, report))
+}
+
 #[test]
 fn stopping_ends_every_thread_even_with_a_tunnel_left_open() -> Res<()> {
+    const NOISE: &[u8] = b"XXXX not a protocol";
     let mut rig = rig("stop", local_sites())?;
+    let (server, arrived) = tunnel_end(&rig, NOISE.len())?;
     // A CONNECT tunnel that nobody closes: not TLS, so a plain byte tunnel.
     let held = rig.runtime.block_on(async {
         let mut socket = TcpStream::connect(rig.proxy).await?;
-        let connect = format!(
-            "CONNECT {addr} HTTP/1.1\r\nHost: {addr}\r\n\r\n",
-            addr = rig.server_addr
-        );
+        let connect = format!("CONNECT {server} HTTP/1.1\r\nHost: {server}\r\n\r\n");
         socket.write_all(connect.as_bytes()).await?;
-        let mut answer = [0u8; 9];
-        socket.read_exact(&mut answer).await?;
-        socket.write_all(b"XXXX not a protocol").await?;
+        // The whole answer, so that after it only the tunnel's own bytes or its end can come.
+        let mut answer = Vec::new();
+        while !answer.ends_with(b"\r\n\r\n") {
+            answer.push(socket.read_u8().await?);
+        }
+        socket.write_all(NOISE).await?;
         Ok::<_, std::io::Error>((socket, answer))
     });
     let (mut held, answer) = io(held)?;
-    assert_eq!(&answer, b"HTTP/1.1 ");
+    assert!(answer.starts_with(b"HTTP/1.1 200"), "{}", utf8(&answer));
+    // Stop with the tunnel up and in use: the server has what went through it and keeps its end
+    // open, so only the proxy can end the tunnel.
+    arrived
+        .recv_timeout(Duration::from_secs(10))
+        .map_err(|e| format!("nothing came through the tunnel: {e}"))?;
 
     let started = Instant::now();
     if let Some(handle) = rig.handle.take() {
@@ -989,15 +1013,19 @@ fn stopping_ends_every_thread_even_with_a_tunnel_left_open() -> Res<()> {
     Ok(())
 }
 
+/// With nothing open there is nothing to wait for: a stop must not sit out the grace period. The
+/// grace here is far longer than the delay a starved machine adds to a stop (threads that were
+/// not scheduled for seconds), so waiting for it cannot be mistaken for being slow.
 #[test]
 fn stopping_an_idle_proxy_is_prompt() -> Res<()> {
-    let mut rig = rig("stop-idle", local_sites())?;
+    const LONG_GRACE: Duration = Duration::from_mins(1);
+    let mut rig = rig_with_grace("stop-idle", local_sites(), LONG_GRACE)?;
     let started = Instant::now();
     if let Some(handle) = rig.handle.take() {
         handle.stop();
     }
     assert!(
-        started.elapsed() < Duration::from_secs(3),
+        started.elapsed() < LONG_GRACE / 2,
         "{:?}",
         started.elapsed()
     );
@@ -1027,6 +1055,7 @@ fn unusable_ca_material_is_reported_when_starting() -> Res<()> {
         policy: RwLock::new(Policy::default()),
         ledger: Ledger::default(),
         typed: Typed::new(),
+        purpose: Arc::default(),
     });
     let err = start_on(&broken, shared, tx, listener, GRACE)
         .err()
@@ -1250,15 +1279,11 @@ fn selected_sites_are_decrypted_with_a_certificate_of_the_proxys_ca() -> Res<()>
         "the upstream failure comes back through the tunnel: {:?}",
         String::from_utf8_lossy(&answer)
     );
-    let Some(Event::Masked {
-        host, exe, kinds, ..
-    }) = rig.event()
-    else {
+    let Some(Event::Masked { host, exe, .. }) = rig.event() else {
         return Err("the decrypted request was not anonymized".into());
     };
     assert_eq!(host, "localhost");
     assert_eq!(exe.as_deref(), Some(own_exe().as_str()));
-    assert_eq!(kinds, [("email", 1)]);
     Ok(())
 }
 
@@ -1368,4 +1393,70 @@ fn a_disabled_app_decrypts_nothing_over_tls() -> Res<()> {
     let (_tls, presented) = tls_through_proxy(rig.proxy, port, &[&upstream])?;
     assert_eq!(presented, upstream);
     Ok(())
+}
+
+#[test]
+fn a_new_purpose_masks_and_does_not_highlight() {
+    let purpose = Purpose::default();
+    assert!(purpose.mask());
+    assert_eq!(purpose.highlight(), Highlight::Off);
+    assert!(!purpose.paused());
+    assert_eq!(purpose.presses(), 0);
+}
+
+#[test]
+fn every_highlight_mode_survives_the_trip_through_the_purpose() {
+    let purpose = Purpose::default();
+    for mode in [Highlight::Off, Highlight::Always, Highlight::Hotkey] {
+        purpose.set_highlight(mode);
+        assert_eq!(purpose.highlight(), mode);
+    }
+    purpose.set_mask(false);
+    assert!(!purpose.mask());
+}
+
+#[test]
+fn pausing_runs_the_hook_once_per_change() {
+    let purpose = Purpose::default();
+    let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    purpose.on_pause({
+        let runs = Arc::clone(&runs);
+        move || {
+            runs.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    });
+    for (pause, runs_so_far) in [(true, 1), (true, 1), (false, 2), (false, 2)] {
+        purpose.set_paused(pause);
+        assert_eq!(purpose.paused(), pause);
+        assert_eq!(runs.load(std::sync::atomic::Ordering::Acquire), runs_so_far);
+    }
+}
+
+#[test]
+fn a_press_is_counted_and_wakes_the_worker() {
+    let purpose = Arc::new(Purpose::default());
+    // No worker yet: counting is all that happens.
+    purpose.press();
+    assert_eq!(purpose.presses(), 1);
+    let (ready, registered) = mpsc::channel();
+    let waiter = std::thread::spawn({
+        let purpose = Arc::clone(&purpose);
+        move || {
+            purpose.set_worker(std::thread::current());
+            let _ = ready.send(());
+            let started = Instant::now();
+            while purpose.presses() < 2 {
+                std::thread::park_timeout(Duration::from_mins(1));
+            }
+            started.elapsed()
+        }
+    });
+    assert!(registered.recv().is_ok());
+    std::thread::sleep(Duration::from_millis(50));
+    purpose.press();
+    let lasted = waiter.join().unwrap_or(Duration::MAX);
+    assert!(
+        lasted < Duration::from_secs(30),
+        "the press did not wake it: {lasted:?}"
+    );
 }

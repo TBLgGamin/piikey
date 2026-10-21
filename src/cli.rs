@@ -1,852 +1,461 @@
-//! Command-line entry: `anonymize`, `deanonymize` and `serve`.
+//! `piikey-cli`: a client of the piikey API, one command per operation.
+//!
+//! Every command becomes one [`Request`]. It goes to the app over the named pipe when the app
+//! answers there, and is answered in this process, by [`Local`], when nobody does (or with
+//! `--local` or `--vault`). Either way the result is the same JSON, printed as it is with
+//! `--json` and as lines and tables without.
+//!
+//! Exit codes: 0 done; 1 `scan --fail-on` found personal data; 2 the command line is wrong;
+//! 3 the API answered with an error, or this process could not read or write.
+
+mod parse;
+mod show;
+#[cfg(test)]
+mod tests;
 
 use std::{
-    ffi::OsString,
-    fmt::Display,
-    fs,
     io::{self, Read, Write},
-    path::{Path, PathBuf},
+    path::{self, Path, PathBuf},
     process::ExitCode,
     sync::Arc,
+    time::Duration,
 };
 
-use lexopt::{Arg, Parser, ValueExt};
+use parse::{Call, Cli, Command, Input, ParseError, Serve};
 use piikey::{
-    detect::{EntityKind, Mode, NerDetector, ner},
+    api::{self, ApiError, EngineSource, Handler, Local, Request},
+    detect::{NerDetector, ner},
     engine::Engine,
-    formats::{self, Output},
-    restore::{Restorer, Scope, ScopeEntry},
+    inventory::Inventory,
+    policy::Policy,
     service,
     vault::default_path,
 };
-use rayon::prelude::*;
+use serde_json::Value;
+use show::View;
 
 const USAGE: &str = "\
 usage:
-  piikey-cli anonymize   [--vault PATH] [--out DIR] [PATH...]
-  piikey-cli deanonymize [--vault PATH] [--tolerant] [--out DIR] [PATH...]
-  piikey-cli serve       [--vault PATH] [--pipe NAME]      (default \\\\.\\pipe\\piikey)
-  piikey-cli --version
+  piikey-cli scan [--fail-on KINDS|any] [--no-record] [PATH...]        no PATH: stdin text
+  piikey-cli anonymize [--out DIR] [PATH...]                            no PATH: stdin -> stdout
+  piikey-cli deanonymize [--tolerant] [--out DIR] [PATH...]
+  piikey-cli subject --value V [--value V ...] [PATH...]
+  piikey-cli vault list [--query Q] [--kind KIND] [--limit N] [--offset N]
+  piikey-cli vault forget VALUE...
+  piikey-cli vault export --out FILE [--format json|csv]
+  piikey-cli vault wipe --yes
+  piikey-cli inventory status | list [--under PATH] [--limit N] [--offset N] | tree [--under PATH] | rescan | report --out FILE [--format json|csv]
+  piikey-cli settings get | settings set KEY=VALUE...      keys = guard.cfg keys; list keys repeat (site=a site=b)
+  piikey-cli kinds | model status | model download | token [--rotate] | status | protection on|off
+  piikey-cli serve [--http [--port N]] [--pipe NAME]
+global: --json  --local  --vault PATH  -h/--help  -V/--version
 
-With no PATH, stdin is processed and the result goes to stdout.
-With PATHs, --out DIR is required; directories are walked recursively.
+With no PATH, scan, anonymize and deanonymize read UTF-8 text from stdin, and anonymize and
+deanonymize write the result to stdout. With PATHs, anonymize and deanonymize need --out DIR;
+folders are walked recursively.
 
---tolerant     also restores proxies that came back with a typo, and first or last
-               names that came back alone; only for text, not for zip documents";
+--fail-on      the kinds (see `piikey-cli kinds`) whose presence makes scan exit 1
+--tolerant     also restores stand-ins that came back with a typo, and first or last names
+               that came back alone; only for text, not for zip documents
+--local        work in this process even when the app is running; --vault PATH implies it
+--pipe         serve on \\\\.\\pipe\\NAME instead of \\\\.\\pipe\\piikey-<USERNAME>
 
-/// A parsed command line.
-#[derive(Debug, PartialEq, Eq)]
-enum Command {
-    Help,
-    Version,
-    /// Process stdin to stdout.
-    Stdin {
-        mode: Mode,
-        vault: Option<PathBuf>,
-        tolerant: bool,
-    },
-    /// Process files and directories into `out`.
-    Files {
-        mode: Mode,
-        vault: Option<PathBuf>,
-        tolerant: bool,
-        out: PathBuf,
-        inputs: Vec<PathBuf>,
-    },
-    Serve {
-        vault: Option<PathBuf>,
-        pipe: Option<String>,
-    },
+exit codes: 0 done; 1 personal data found under --fail-on; 2 usage error; 3 any API error";
+
+/// How long to wait for the app to take the call before doing the work in this process.
+const ASK_APP: Duration = Duration::from_millis(300);
+
+/// The prefix of a named pipe's path.
+const PIPE_PREFIX: &str = r"\\.\pipe\";
+
+/// Told how far the model download is, in bytes done and bytes in all.
+type Progress = Arc<dyn Fn(u64, u64) + Send + Sync>;
+
+/// How the command ended, which is the process's exit code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Exit {
+    Ok,
+    /// `scan --fail-on` found personal data.
+    Found,
+    Usage,
+    Failed,
 }
 
-/// Why a command line was rejected (always exit code 2).
-#[derive(Debug, PartialEq, Eq)]
-enum ParseError {
-    /// Print the message followed by the usage text.
-    Usage(String),
-    /// Input paths were given without `--out`.
-    OutRequired,
-}
-
-impl From<lexopt::Error> for ParseError {
-    fn from(e: lexopt::Error) -> Self {
-        Self::Usage(e.to_string())
+impl From<Exit> for ExitCode {
+    fn from(exit: Exit) -> Self {
+        Self::from(match exit {
+            Exit::Ok => 0,
+            Exit::Found => 1,
+            Exit::Usage => 2,
+            Exit::Failed => 3,
+        })
     }
 }
 
-#[derive(Clone, Copy)]
-enum Sub {
-    Run(Mode),
-    Serve,
+/// Why a command stopped: the API said no, or this process could not read or write.
+#[derive(Debug)]
+pub enum Fail {
+    Api(ApiError),
+    Io(io::Error),
 }
 
-fn parse<I>(args: I) -> Result<Command, ParseError>
-where
-    I: IntoIterator,
-    I::Item: Into<OsString>,
-{
-    let mut parser = Parser::from_args(args);
-    let mut sub: Option<Sub> = None;
-    let mut vault: Option<PathBuf> = None;
-    let mut out: Option<PathBuf> = None;
-    let mut pipe: Option<String> = None;
-    let mut inputs: Vec<PathBuf> = Vec::new();
-    let mut tolerant = false;
+impl From<ApiError> for Fail {
+    fn from(error: ApiError) -> Self {
+        Self::Api(error)
+    }
+}
 
-    while let Some(arg) = parser.next()? {
-        match arg {
-            Arg::Short('h') | Arg::Long("help") => return Ok(Command::Help),
-            Arg::Short('V') | Arg::Long("version") => return Ok(Command::Version),
-            Arg::Long("vault") => vault = Some(PathBuf::from(parser.value()?)),
-            Arg::Long("out") => out = Some(PathBuf::from(parser.value()?)),
-            Arg::Long("pipe") => pipe = Some(parser.value()?.string()?),
-            Arg::Long("tolerant") => tolerant = true,
-            Arg::Value(value) => {
-                if sub.is_none() {
-                    sub = Some(match value.to_str() {
-                        Some("anonymize") => Sub::Run(Mode::Anonymize),
-                        Some("deanonymize") => Sub::Run(Mode::Deanonymize),
-                        Some("serve") => Sub::Serve,
-                        _ => {
-                            return Err(ParseError::Usage(format!(
-                                "unknown command '{}'",
-                                value.to_string_lossy()
-                            )));
-                        }
-                    });
-                } else {
-                    inputs.push(PathBuf::from(value));
-                }
-            }
-            other => return Err(other.unexpected().into()),
+impl From<piikey::Error> for Fail {
+    fn from(error: piikey::Error) -> Self {
+        Self::Api(error.into())
+    }
+}
+
+impl From<io::Error> for Fail {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl Fail {
+    fn into_api(self) -> ApiError {
+        match self {
+            Self::Api(error) => error,
+            Self::Io(error) => piikey::Error::Io(error).into(),
         }
     }
+}
 
-    match sub {
-        None => Err(ParseError::Usage("missing command".into())),
-        Some(Sub::Serve) => {
-            if out.is_some() {
-                return Err(ParseError::Usage("--out is not valid for serve".into()));
-            }
-            if tolerant {
-                return Err(ParseError::Usage(
-                    "--tolerant is not valid for serve".into(),
-                ));
-            }
-            if !inputs.is_empty() {
-                return Err(ParseError::Usage("serve takes no input paths".into()));
-            }
-            Ok(Command::Serve { vault, pipe })
-        }
-        Some(Sub::Run(mode)) => {
-            if pipe.is_some() {
-                return Err(ParseError::Usage("--pipe is only valid for serve".into()));
-            }
-            if tolerant && mode != Mode::Deanonymize {
-                return Err(ParseError::Usage(
-                    "--tolerant is only valid for deanonymize".into(),
-                ));
-            }
-            if inputs.is_empty() {
-                if out.is_some() {
-                    return Err(ParseError::Usage(
-                        "--out is only valid with input paths".into(),
-                    ));
-                }
-                Ok(Command::Stdin {
-                    mode,
-                    vault,
-                    tolerant,
-                })
-            } else {
-                let out = out.ok_or(ParseError::OutRequired)?;
-                Ok(Command::Files {
-                    mode,
-                    vault,
-                    tolerant,
-                    out,
-                    inputs,
-                })
+/// Where a request is answered.
+trait Caller {
+    fn call(&mut self, request: Request) -> Result<Value, Fail>;
+}
+
+/// The app if it answers on the pipe, else this process.
+struct Router {
+    /// `--local` or `--vault`: do not ask the app.
+    in_process: bool,
+    vault: Option<PathBuf>,
+}
+
+impl Caller for Router {
+    fn call(&mut self, request: Request) -> Result<Value, Fail> {
+        let download = matches!(request, Request::ModelDownload);
+        // What the download shares with the app is nothing, so it never asks.
+        if !self.in_process && !download {
+            let pipe = service::default_pipe();
+            if let Some(envelope) = service::call(&pipe, &request, ASK_APP)? {
+                return Ok(api::open_envelope(envelope)?);
             }
         }
+        let progress = download.then(|| -> Progress { Arc::new(show_download) });
+        let local = open_local(self.vault.as_deref(), detects(&request), progress)?;
+        let reply = local.handle(request);
+        if download {
+            // The progress line stays on one line; end it.
+            eprintln!();
+        }
+        Ok(reply?)
+    }
+}
+
+/// `\r<done>/<total> MB`, over the same line each time.
+fn show_download(done: u64, total: u64) {
+    const MB: u64 = 1024 * 1024;
+    eprint!("\r{}/{} MB", done / MB, total / MB);
+}
+
+/// Whether the operation finds personal data, which the detection model helps with.
+fn detects(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::ScanText { .. }
+            | Request::Anonymize { .. }
+            | Request::ScanFiles { .. }
+            | Request::AnonymizeFiles { .. }
+            | Request::SubjectSearch { .. }
+            | Request::InventoryRescan
+    )
+}
+
+/// The handler that answers in this process, on the vault at `vault` (the default vault when
+/// `None`), the user's inventory and settings, and the detection model when it is downloaded.
+fn open_local(
+    vault: Option<&Path>,
+    detecting: bool,
+    progress: Option<Progress>,
+) -> piikey::Result<Local> {
+    let vault = match vault {
+        Some(path) => path.to_path_buf(),
+        None => default_path()?,
+    };
+    let model_dir = ner::files::default_dir().ok();
+    let installed = model_dir.as_deref().is_some_and(ner::files::is_installed);
+    let detector = model_dir.map(NerDetector::new);
+    let engine = match &detector {
+        Some(detector) if installed => Engine::open_with_model(&vault, detector.clone())?,
+        _ => {
+            if detecting {
+                eprintln!(
+                    "note: the detection model is not downloaded (piikey-cli model download); \
+                     only emails, phone numbers, IBANs and other patterns are found"
+                );
+            }
+            Engine::open(&vault)?
+        }
+    };
+    // What the user switched off in Settings is off here too, as it is in the app.
+    engine.set_enabled(Policy::load()?.enabled_kinds());
+    let engine = Arc::new(engine);
+    let source: EngineSource = Arc::new(move || Arc::clone(&engine));
+    let inventory = Arc::new(Inventory::open(&Inventory::default_path()?)?);
+    let local = Local::new(source, inventory, detector);
+    Ok(match progress {
+        Some(progress) => local.with_progress(progress),
+        None => local,
+    })
+}
+
+/// What a command reads and writes.
+struct Streams<'a> {
+    stdin: &'a mut dyn Read,
+    out: &'a mut dyn Write,
+    err: &'a mut dyn Write,
+}
+
+/// Runs `call` against `caller`, printing the result (as JSON with `json`) and the failures.
+fn run(json: bool, call: Call, caller: &mut dyn Caller, streams: &mut Streams<'_>) -> Exit {
+    match execute(json, call, caller, streams) {
+        Ok(exit) => exit,
+        Err(fail) => {
+            report(json, &fail.into_api(), streams);
+            Exit::Failed
+        }
+    }
+}
+
+fn execute(
+    json: bool,
+    call: Call,
+    caller: &mut dyn Caller,
+    streams: &mut Streams<'_>,
+) -> Result<Exit, Fail> {
+    let Call { input, fail_on } = call;
+    let mut request = match input {
+        Input::Request(request) => request,
+        Input::Stdin(text) => text.request(read_text(streams.stdin)?),
+    };
+    make_absolute(&mut request)?;
+    let view = View::of(&request);
+    let value = caller.call(request)?;
+    // A reader that leaves early (`| head`) is no failure, and the verdict below still counts.
+    match print_result(json, &view, &value, streams) {
+        Err(Fail::Io(error)) if error.kind() == io::ErrorKind::BrokenPipe => {}
+        printed => printed?,
+    }
+    if let Some(fail_on) = &fail_on
+        && show::found(fail_on, &view, &value)?
+    {
+        return Ok(Exit::Found);
+    }
+    Ok(if show::failed(&view, &value)? > 0 {
+        Exit::Failed
+    } else {
+        Exit::Ok
+    })
+}
+
+/// The result as JSON, or as lines and tables.
+fn print_result(
+    json: bool,
+    view: &View,
+    value: &Value,
+    streams: &mut Streams<'_>,
+) -> Result<(), Fail> {
+    if json {
+        writeln!(streams.out, "{}", show::pretty(value))?;
+    } else {
+        show::print(view, value, streams.out, streams.err)?;
+    }
+    streams.out.flush()?;
+    Ok(())
+}
+
+/// The text on stdin. It travels as JSON, so it has to be UTF-8.
+fn read_text(stdin: &mut dyn Read) -> Result<String, Fail> {
+    let mut bytes = Vec::new();
+    stdin.read_to_end(&mut bytes)?;
+    String::from_utf8(bytes).map_err(|_| {
+        ApiError::bad_request(
+            "stdin is not UTF-8 text; give other encodings and documents as PATH arguments",
+        )
+        .into()
+    })
+}
+
+/// Makes every path in `request` absolute. The app that answers has another working folder than
+/// this process, and the API wants absolute paths whoever answers.
+fn make_absolute(request: &mut Request) -> io::Result<()> {
+    match request {
+        Request::ScanFiles { paths, .. }
+        | Request::SubjectSearch { paths, .. }
+        | Request::ExplorerScan { paths } => absolute_all(paths),
+        Request::AnonymizeFiles { paths, out } | Request::DeanonymizeFiles { paths, out, .. } => {
+            absolute_all(paths)?;
+            absolute(out)
+        }
+        Request::VaultExport { path, .. } | Request::InventoryReport { path, .. } => absolute(path),
+        Request::InventoryList { under, .. } | Request::InventoryTree { under } => {
+            under.as_mut().map_or(Ok(()), absolute)
+        }
+        Request::ScanText { .. }
+        | Request::Anonymize { .. }
+        | Request::Deanonymize { .. }
+        | Request::VaultList { .. }
+        | Request::VaultForget { .. }
+        | Request::VaultWipe { .. }
+        | Request::InventoryStatus
+        | Request::InventoryRescan
+        | Request::SettingsGet
+        | Request::SettingsSet { .. }
+        | Request::Kinds
+        | Request::ModelStatus
+        | Request::ModelDownload
+        | Request::ApiToken { .. }
+        | Request::Status
+        | Request::Protection { .. } => Ok(()),
+    }
+}
+
+fn absolute(target: &mut PathBuf) -> io::Result<()> {
+    *target = path::absolute(&*target)?;
+    Ok(())
+}
+
+fn absolute_all(paths: &mut [PathBuf]) -> io::Result<()> {
+    paths.iter_mut().try_for_each(absolute)
+}
+
+/// Says why a command failed: on stderr, or with `--json` as the error object on stdout.
+fn report(json: bool, error: &ApiError, streams: &mut Streams<'_>) {
+    // The command already failed, and there is nowhere else to say so.
+    let _ = if json {
+        let body = serde_json::json!({ "code": error.code(), "message": error.message() });
+        writeln!(streams.out, "{}", show::pretty(&body)).and_then(|()| streams.out.flush())
+    } else {
+        writeln!(streams.err, "piikey-cli: {}", error.message())
+    };
+}
+
+/// `serve`: answers the API on the pipe (and HTTP) from this process until Ctrl+C.
+fn serve(vault: Option<&Path>, args: &Serve) -> Result<(), Fail> {
+    let handler: Arc<dyn Handler> = Arc::new(open_local(vault, true, None)?);
+    let pipe = args
+        .pipe
+        .as_deref()
+        .map_or_else(service::default_pipe, pipe_name);
+    let pipe_server = service::spawn(Arc::clone(&handler), &pipe)?;
+    let http_server = if args.http {
+        match serve_http(handler, args.port) {
+            Ok(started) => Some(started),
+            Err(fail) => {
+                pipe_server.stop();
+                return Err(fail);
+            }
+        }
+    } else {
+        None
+    };
+    // Said now, so that a server that could not start does not claim to serve.
+    eprintln!("piikey-cli: serving the API on {pipe}; stop with Ctrl+C");
+    if let Some((_, port)) = &http_server {
+        eprintln!(
+            "piikey-cli: serving HTTP on http://127.0.0.1:{port}/v1/<op>; the token is what \
+             piikey-cli token prints"
+        );
+    }
+    // Ctrl+C ends the process, which closes the pipe: nothing here needs a clean stop.
+    let ended = pipe_server.wait();
+    if let Some((http_server, _)) = http_server {
+        http_server.stop();
+    }
+    Ok(ended?)
+}
+
+/// The HTTP server, and the port it listens on.
+fn serve_http(
+    handler: Arc<dyn Handler>,
+    port: Option<u16>,
+) -> Result<(service::Server, u16), Fail> {
+    let port = match port {
+        Some(port) => port,
+        None => Policy::load()?.http_port,
+    };
+    let token = api::read_or_create_token(false)?;
+    Ok((api::http::spawn(handler, port, token)?, port))
+}
+
+/// A pipe name as given: `NAME` or the whole `\\.\pipe\NAME`.
+fn pipe_name(name: &str) -> String {
+    let full = name
+        .get(..PIPE_PREFIX.len())
+        .is_some_and(|start| start.eq_ignore_ascii_case(PIPE_PREFIX));
+    if full {
+        name.to_owned()
+    } else {
+        format!("{PIPE_PREFIX}{name}")
     }
 }
 
 /// Entry point called by `main`.
 pub fn main() -> ExitCode {
-    match parse(std::env::args_os().skip(1)) {
-        Ok(Command::Help) => {
-            println!("{USAGE}");
-            ExitCode::SUCCESS
+    let cli = match parse::parse(std::env::args_os().skip(1)) {
+        Ok(cli) => cli,
+        Err(ParseError::Usage(message)) => {
+            eprintln!("piikey-cli: {message}\n{USAGE}");
+            return Exit::Usage.into();
         }
-        Ok(Command::Version) => {
-            println!("piikey-cli {}", env!("CARGO_PKG_VERSION"));
-            ExitCode::SUCCESS
-        }
-        Ok(command) => execute(command),
-        Err(ParseError::OutRequired) => {
-            eprintln!("piikey-cli: --out is required with input paths");
-            ExitCode::from(2)
-        }
-        Err(ParseError::Usage(msg)) => {
-            eprintln!("piikey-cli: {msg}\n{USAGE}");
-            ExitCode::from(2)
-        }
-    }
-}
-
-/// Opens the engine for `vault` (the default vault when `None`), with the
-/// detection model when the app has downloaded it.
-fn open_engine(vault: Option<PathBuf>) -> piikey::Result<Engine> {
-    let path = match vault {
-        Some(path) => path,
-        None => default_path()?,
-    };
-    match ner::files::default_dir() {
-        Ok(dir) if ner::files::is_installed(&dir) => {
-            Engine::open_with_model(&path, NerDetector::new(dir))
-        }
-        _ => {
-            eprintln!(
-                "note: the detection model is not downloaded yet (start piikey.exe once); \
-                 only emails, phone numbers, IBANs and other patterns are masked"
-            );
-            Engine::open(&path)
-        }
-    }
-}
-
-/// The restorer behind `--tolerant`: scoped to every proxy in the vault. `None` when the flag
-/// is off or the vault holds no proxy.
-fn tolerant_restorer(engine: &Engine, wanted: bool) -> piikey::Result<Option<Restorer>> {
-    if !wanted {
-        return Ok(None);
-    }
-    let scope = vault_scope(engine)?;
-    if scope.entries().is_empty() {
-        return Ok(None);
-    }
-    Restorer::new(scope).map(Some)
-}
-
-/// Every proxy the vault has issued, with its kind and original, in a fixed order.
-fn vault_scope(engine: &Engine) -> piikey::Result<Scope> {
-    let guard = engine.vault().read()?;
-    let view = &guard;
-    let mut entries: Vec<ScopeEntry> = EntityKind::ALL
-        .into_iter()
-        .flat_map(|kind| {
-            view.proxies_of(kind).filter_map(move |proxy| {
-                view.original_for(proxy).map(|original| ScopeEntry {
-                    kind,
-                    proxy: proxy.into(),
-                    original: original.into(),
-                })
-            })
-        })
-        .collect();
-    entries.sort_unstable_by(|a, b| (a.kind, &a.proxy).cmp(&(b.kind, &b.proxy)));
-    Ok(Scope::from_pairs(entries))
-}
-
-/// The result of the exact pass, run through `restorer` when there is one. A zip document
-/// keeps its exact result: its XML is compressed and cannot be edited as a byte string.
-fn tolerate(restorer: Option<&Restorer>, output: Output, label: &dyn Display) -> Output {
-    let Some(restorer) = restorer else {
-        return output;
-    };
-    match output {
-        Output::Text(text) => {
-            let bytes = restorer.restore(text.as_bytes());
-            Output::Text(
-                String::from_utf8(bytes)
-                    .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned()),
-            )
-        }
-        Output::Same(raw) if raw.starts_with(b"PK\x03\x04") => {
-            eprintln!(
-                "piikey-cli: {label}: --tolerant skipped, documents are restored exactly only"
-            );
-            Output::Same(raw)
-        }
-        Output::Same(raw) => Output::Same(restorer.restore(&raw)),
-    }
-}
-
-fn execute(command: Command) -> ExitCode {
-    match command {
-        Command::Help | Command::Version => ExitCode::SUCCESS,
-        Command::Stdin {
-            mode,
-            vault,
-            tolerant,
-        } => {
-            let result = open_engine(vault).and_then(|engine| {
-                let restorer = tolerant_restorer(&engine, tolerant)?;
-                run_stdin(&engine, mode, restorer.as_ref())
-            });
-            finish(result)
-        }
-        Command::Files {
-            mode,
-            vault,
-            tolerant,
-            out,
-            inputs,
-        } => run_files_command(mode, vault, tolerant, &out, &inputs),
-        Command::Serve { vault, pipe } => {
-            let pipe = pipe.unwrap_or_else(|| service::DEFAULT_PIPE.to_owned());
-            let result = open_engine(vault).and_then(|engine| {
-                eprintln!("piikey-cli: serving on {pipe}");
-                service::serve(Arc::new(engine), &pipe)
-            });
-            finish(result)
-        }
-    }
-}
-
-fn finish(result: piikey::Result<()>) -> ExitCode {
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            eprintln!("piikey-cli: {err}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn run_stdin(engine: &Engine, mode: Mode, restorer: Option<&Restorer>) -> piikey::Result<()> {
-    let mut bytes = Vec::new();
-    io::stdin().lock().read_to_end(&mut bytes)?;
-    let output = formats::process(engine, mode, &bytes, 0)?;
-    let output = tolerate(restorer, output, &"stdin");
-    let mut stdout = io::stdout().lock();
-    match &output {
-        Output::Same(raw) => stdout.write_all(raw)?,
-        Output::Text(text) => stdout.write_all(text.as_bytes())?,
-    }
-    stdout.flush()?;
-    Ok(())
-}
-
-fn run_files_command(
-    mode: Mode,
-    vault: Option<PathBuf>,
-    tolerant: bool,
-    out: &Path,
-    inputs: &[PathBuf],
-) -> ExitCode {
-    match out_inside_inputs(out, inputs) {
-        Ok(None) => {}
-        Ok(Some(dir)) => {
-            eprintln!(
-                "piikey-cli: --out {} must not be inside input directory {}",
-                out.display(),
-                dir.display()
-            );
-            return ExitCode::from(2);
-        }
-        Err(err) => {
-            eprintln!("piikey-cli: {}: {err}", out.display());
-            return ExitCode::FAILURE;
-        }
-    }
-    let opened = open_engine(vault).and_then(|engine| {
-        let restorer = tolerant_restorer(&engine, tolerant)?;
-        Ok((engine, restorer))
-    });
-    let (engine, restorer) = match opened {
-        Ok(opened) => opened,
-        Err(err) => {
-            eprintln!("piikey-cli: {err}");
-            return ExitCode::FAILURE;
+        Err(ParseError::Invalid(message)) => {
+            eprintln!("piikey-cli: {message}");
+            return Exit::Usage.into();
         }
     };
-
-    let (jobs, walk_errors) = collect_jobs(inputs);
-    for (path, err) in &walk_errors {
-        eprintln!("piikey-cli: {}: {err}", path.display());
-    }
-    let any_failed = jobs
-        .par_iter()
-        .map(
-            |job| match process_file(&engine, mode, restorer.as_ref(), job, out) {
-                Ok(()) => false,
-                Err(err) => {
-                    eprintln!("piikey-cli: {}: {err}", job.src.display());
-                    true
-                }
-            },
-        )
-        .reduce(|| false, |a, b| a || b);
-
-    if any_failed || !walk_errors.is_empty() {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
-    }
-}
-
-/// One input file and its path relative to the `--out` root.
-#[derive(Debug, PartialEq, Eq)]
-struct Job {
-    src: PathBuf,
-    rel: PathBuf,
-}
-
-fn process_file(
-    engine: &Engine,
-    mode: Mode,
-    restorer: Option<&Restorer>,
-    job: &Job,
-    out: &Path,
-) -> piikey::Result<()> {
-    let bytes = fs::read(&job.src)?;
-    let output = formats::process(engine, mode, &bytes, 0)?;
-    let output = tolerate(restorer, output, &job.src.display());
-    let (dest, data) = match &output {
-        Output::Same(raw) => (output_path(out, &job.rel, false), raw.as_slice()),
-        Output::Text(text) => (output_path(out, &job.rel, true), text.as_bytes()),
-    };
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(dest, data)?;
-    Ok(())
-}
-
-/// Destination of `rel` under `out`; text results get a `.txt` suffix appended
-/// to the full file name.
-fn output_path(out: &Path, rel: &Path, text: bool) -> PathBuf {
-    let mut joined = out.join(rel).into_os_string();
-    if text {
-        joined.push(".txt");
-    }
-    PathBuf::from(joined)
-}
-
-/// Gathers files from `inputs`. A file input maps to its file name, a
-/// directory is walked recursively with paths relative to it. Symlinks and
-/// junctions found while walking are skipped. Unreadable entries are returned
-/// as errors instead of aborting the walk.
-fn collect_jobs(inputs: &[PathBuf]) -> (Vec<Job>, Vec<(PathBuf, io::Error)>) {
-    let mut jobs = Vec::new();
-    let mut errors = Vec::new();
-    for input in inputs {
-        match fs::metadata(input) {
-            Err(err) => errors.push((input.clone(), err)),
-            Ok(meta) if meta.is_file() => {
-                if let Some(name) = input.file_name() {
-                    jobs.push(Job {
-                        src: input.clone(),
-                        rel: PathBuf::from(name),
-                    });
-                } else {
-                    errors.push((
-                        input.clone(),
-                        io::Error::new(io::ErrorKind::InvalidInput, "no file name"),
-                    ));
-                }
+    let in_process = cli.in_process();
+    let Cli {
+        json,
+        vault,
+        command,
+        ..
+    } = cli;
+    let exit = match command {
+        Command::Help => print_line(USAGE),
+        Command::Version => print_line(&format!("piikey-cli {}", env!("CARGO_PKG_VERSION"))),
+        Command::Serve(args) => match serve(vault.as_deref(), &args) {
+            Ok(()) => Exit::Ok,
+            Err(fail) => {
+                eprintln!("piikey-cli: {}", fail.into_api().message());
+                Exit::Failed
             }
-            Ok(meta) if meta.is_dir() => walk_dir(input, &mut jobs, &mut errors),
-            Ok(_) => errors.push((
-                input.clone(),
-                io::Error::new(io::ErrorKind::InvalidInput, "not a file or directory"),
-            )),
-        }
-    }
-    // Windows paths are case-insensitive: two inputs mapping to the same
-    // output would silently overwrite each other, so later ones fail.
-    let mut seen = std::collections::HashMap::new();
-    jobs.retain(|job| {
-        let key = job.rel.to_string_lossy().to_lowercase();
-        match seen.entry(key) {
-            std::collections::hash_map::Entry::Vacant(slot) => {
-                slot.insert(job.src.clone());
-                true
-            }
-            std::collections::hash_map::Entry::Occupied(first) => {
-                errors.push((
-                    job.src.clone(),
-                    io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        format!("output collides with {}", first.get().display()),
-                    ),
-                ));
-                false
-            }
-        }
-    });
-    (jobs, errors)
-}
-
-fn walk_dir(root: &Path, jobs: &mut Vec<Job>, errors: &mut Vec<(PathBuf, io::Error)>) {
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let entries = match fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(err) => {
-                errors.push((dir, err));
-                continue;
-            }
-        };
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(err) => {
-                    errors.push((dir.clone(), err));
-                    continue;
-                }
+        },
+        Command::Call(call) => {
+            let mut router = Router { in_process, vault };
+            let (stdin, stdout, stderr) = (io::stdin(), io::stdout(), io::stderr());
+            let mut streams = Streams {
+                stdin: &mut stdin.lock(),
+                out: &mut stdout.lock(),
+                err: &mut stderr.lock(),
             };
-            let path = entry.path();
-            let file_type = match entry.file_type() {
-                Ok(file_type) => file_type,
-                Err(err) => {
-                    errors.push((path, err));
-                    continue;
-                }
-            };
-            if file_type.is_symlink() {
-                continue;
-            }
-            if file_type.is_dir() {
-                stack.push(path);
-            } else if file_type.is_file()
-                && let Ok(rel) = path.strip_prefix(root)
-            {
-                jobs.push(Job {
-                    rel: rel.to_path_buf(),
-                    src: path,
-                });
-            }
+            run(json, call, &mut router, &mut streams)
         }
-    }
+    };
+    exit.into()
 }
 
-/// Canonicalizes `path` even when its tail does not exist yet: the longest
-/// existing ancestor is canonicalized and the missing components are
-/// re-appended.
-fn canonical_lenient(path: &Path) -> io::Result<PathBuf> {
-    let absolute = std::path::absolute(path)?;
-    let mut missing = Vec::new();
-    let mut current = absolute.as_path();
-    loop {
-        match current.canonicalize() {
-            Ok(mut base) => {
-                base.extend(missing.iter().rev());
-                return Ok(base);
-            }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                match (current.parent(), current.file_name()) {
-                    (Some(parent), Some(name)) => {
-                        missing.push(name.to_owned());
-                        current = parent;
-                    }
-                    _ => return Err(err),
-                }
-            }
-            Err(err) => return Err(err),
-        }
-    }
-}
-
-/// The first input directory that equals or contains `out`, if any. Inputs
-/// that cannot be resolved are ignored here; they fail later with their own
-/// error.
-fn out_inside_inputs<'a>(out: &Path, inputs: &'a [PathBuf]) -> io::Result<Option<&'a Path>> {
-    let out = canonical_lenient(out)?;
-    for input in inputs {
-        if fs::metadata(input).is_ok_and(|m| m.is_dir())
-            && let Ok(dir) = input.canonicalize()
-            && out.starts_with(&dir)
-        {
-            return Ok(Some(input.as_path()));
-        }
-    }
-    Ok(None)
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use super::*;
-
-    fn args(list: &[&str]) -> Result<Command, ParseError> {
-        parse(list.iter().map(OsString::from))
-    }
-
-    fn usage(list: &[&str]) -> bool {
-        matches!(args(list), Err(ParseError::Usage(_)))
-    }
-
-    /// Temp directory removed on drop.
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new() -> io::Result<Self> {
-            static N: AtomicUsize = AtomicUsize::new(0);
-            let dir = std::env::temp_dir().join(format!(
-                "piikey-cli-test-{}-{}",
-                std::process::id(),
-                N.fetch_add(1, Ordering::Relaxed)
-            ));
-            fs::create_dir_all(&dir)?;
-            Ok(Self(dir))
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
-    #[test]
-    fn parses_stdin_mode() {
-        assert_eq!(
-            args(&["anonymize"]),
-            Ok(Command::Stdin {
-                mode: Mode::Anonymize,
-                vault: None,
-                tolerant: false,
-            })
-        );
-        assert_eq!(
-            args(&["deanonymize", "--vault", "v.pkv"]),
-            Ok(Command::Stdin {
-                mode: Mode::Deanonymize,
-                vault: Some(PathBuf::from("v.pkv")),
-                tolerant: false,
-            })
-        );
-    }
-
-    #[test]
-    fn parses_file_mode() {
-        assert_eq!(
-            args(&["anonymize", "--out", "o", "a.txt", "dir", "--vault=v"]),
-            Ok(Command::Files {
-                mode: Mode::Anonymize,
-                vault: Some(PathBuf::from("v")),
-                tolerant: false,
-                out: PathBuf::from("o"),
-                inputs: vec![PathBuf::from("a.txt"), PathBuf::from("dir")],
-            })
-        );
-    }
-
-    #[test]
-    fn parses_tolerant() {
-        assert_eq!(
-            args(&["deanonymize", "--tolerant", "--vault", "v"]),
-            Ok(Command::Stdin {
-                mode: Mode::Deanonymize,
-                vault: Some(PathBuf::from("v")),
-                tolerant: true,
-            })
-        );
-        assert_eq!(
-            args(&["deanonymize", "--tolerant", "--out", "o", "a.txt"]),
-            Ok(Command::Files {
-                mode: Mode::Deanonymize,
-                vault: None,
-                tolerant: true,
-                out: PathBuf::from("o"),
-                inputs: vec![PathBuf::from("a.txt")],
-            })
-        );
-    }
-
-    #[test]
-    fn paths_without_out_is_rejected() {
-        assert_eq!(args(&["anonymize", "a.txt"]), Err(ParseError::OutRequired));
-    }
-
-    #[test]
-    fn parses_serve() {
-        assert_eq!(
-            args(&["serve", "--pipe", r"\\.\pipe\x", "--vault", "v"]),
-            Ok(Command::Serve {
-                vault: Some(PathBuf::from("v")),
-                pipe: Some(r"\\.\pipe\x".to_owned()),
-            })
-        );
-        assert_eq!(
-            args(&["serve"]),
-            Ok(Command::Serve {
-                vault: None,
-                pipe: None
-            })
-        );
-    }
-
-    #[test]
-    fn help_wins() {
-        assert_eq!(args(&["--help"]), Ok(Command::Help));
-        assert_eq!(args(&["anonymize", "-h"]), Ok(Command::Help));
-    }
-
-    #[test]
-    fn version_wins() {
-        assert_eq!(args(&["--version"]), Ok(Command::Version));
-        assert_eq!(args(&["anonymize", "-V"]), Ok(Command::Version));
-    }
-
-    #[test]
-    fn bad_args_are_usage_errors() {
-        assert!(usage(&[]));
-        assert!(usage(&["frobnicate"]));
-        assert!(usage(&["anonymize", "--bogus"]));
-        assert!(usage(&["anonymize", "--vault"]));
-        assert!(usage(&["anonymize", "--pipe", "x"]));
-        assert!(usage(&["anonymize", "--out", "o"]));
-        assert!(usage(&["serve", "a.txt"]));
-        assert!(usage(&["serve", "--out", "o"]));
-        assert!(usage(&["anonymize", "--tolerant"]));
-        assert!(usage(&["anonymize", "--tolerant", "--out", "o", "a.txt"]));
-        assert!(usage(&["serve", "--tolerant"]));
-    }
-
-    #[test]
-    fn output_path_mapping() {
-        let out = Path::new("out");
-        let rel = Path::new("sub").join("x.docx");
-        assert_eq!(
-            output_path(out, &rel, false),
-            out.join("sub").join("x.docx")
-        );
-        assert_eq!(
-            output_path(out, &rel, true),
-            out.join("sub").join("x.docx.txt")
-        );
-    }
-
-    #[test]
-    fn out_inside_input_is_detected() -> io::Result<()> {
-        let tmp = TempDir::new()?;
-        let input = tmp.0.join("in");
-        fs::create_dir_all(input.join("nested"))?;
-        let inputs = vec![input.clone()];
-
-        assert_eq!(out_inside_inputs(&input, &inputs)?, Some(input.as_path()));
-        assert_eq!(
-            out_inside_inputs(&input.join("nested"), &inputs)?,
-            Some(input.as_path())
-        );
-        // Not created yet, but would live inside the input.
-        assert_eq!(
-            out_inside_inputs(&input.join("new").join("deeper"), &inputs)?,
-            Some(input.as_path())
-        );
-        // `..` must not fool the check.
-        assert_eq!(
-            out_inside_inputs(&input.join("nested").join("..").join("x"), &inputs)?,
-            Some(input.as_path())
-        );
-        assert_eq!(out_inside_inputs(&tmp.0.join("out"), &inputs)?, None);
-        // A sibling that merely shares a name prefix is not inside.
-        assert_eq!(out_inside_inputs(&tmp.0.join("in2"), &inputs)?, None);
-        Ok(())
-    }
-
-    #[test]
-    fn file_inputs_never_contain_out() -> io::Result<()> {
-        let tmp = TempDir::new()?;
-        let file = tmp.0.join("a.txt");
-        fs::write(&file, b"x")?;
-        assert_eq!(out_inside_inputs(&tmp.0.join("out"), &[file])?, None);
-        Ok(())
-    }
-
-    #[test]
-    fn collects_files_recursively() -> io::Result<()> {
-        let tmp = TempDir::new()?;
-        let dir = tmp.0.join("in");
-        fs::create_dir_all(dir.join("a").join("b"))?;
-        fs::write(dir.join("top.txt"), b"1")?;
-        fs::write(dir.join("a").join("b").join("deep.txt"), b"2")?;
-        let single = tmp.0.join("single.txt");
-        fs::write(&single, b"3")?;
-
-        let (mut jobs, errors) = collect_jobs(&[dir.clone(), single.clone()]);
-        assert!(errors.is_empty());
-        jobs.sort_by(|x, y| x.rel.cmp(&y.rel));
-        let rels: Vec<PathBuf> = jobs.iter().map(|j| j.rel.clone()).collect();
-        assert_eq!(
-            rels,
-            vec![
-                PathBuf::from("a").join("b").join("deep.txt"),
-                PathBuf::from("single.txt"),
-                PathBuf::from("top.txt"),
-            ]
-        );
-        assert!(jobs.iter().any(|j| j.src == single));
-        Ok(())
-    }
-
-    #[test]
-    fn missing_input_is_reported() -> io::Result<()> {
-        let tmp = TempDir::new()?;
-        let missing = tmp.0.join("nope");
-        let (jobs, errors) = collect_jobs(std::slice::from_ref(&missing));
-        assert!(jobs.is_empty());
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].0, missing);
-        Ok(())
-    }
-
-    #[test]
-    fn the_tolerant_scope_holds_every_proxy_with_its_kind_and_original() -> piikey::Result<()> {
-        let tmp = TempDir::new()?;
-        let engine = Engine::open(&tmp.0.join("v.pkv"))?;
-        engine.run(
-            Mode::Anonymize,
-            &["NL91ABNA0417164300 mailt jan.jansen@acme.nl"],
-        )?;
-        let scope = vault_scope(&engine)?;
-        let mut found: Vec<(EntityKind, &str)> = scope
-            .entries()
-            .iter()
-            .map(|e| (e.kind, &*e.original))
-            .collect();
-        found.sort();
-        assert_eq!(
-            found,
-            [
-                (EntityKind::Email, "jan.jansen@acme.nl"),
-                (EntityKind::Iban, "NL91ABNA0417164300")
-            ]
-        );
-        let view = engine.vault().read()?;
-        for entry in scope.entries() {
-            assert_eq!(view.original_for(&entry.proxy), Some(&*entry.original));
-            assert_eq!(view.kind_of(&entry.proxy), Some(entry.kind));
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn the_tolerant_restorer_needs_the_flag_and_a_proxy() -> piikey::Result<()> {
-        let tmp = TempDir::new()?;
-        let engine = Engine::open(&tmp.0.join("v.pkv"))?;
-        assert!(tolerant_restorer(&engine, true)?.is_none(), "empty vault");
-        engine.run(Mode::Anonymize, &["jan.jansen@acme.nl"])?;
-        assert!(tolerant_restorer(&engine, false)?.is_none(), "flag off");
-        assert!(tolerant_restorer(&engine, true)?.is_some());
-        Ok(())
-    }
-
-    #[test]
-    fn tolerate_leaves_documents_alone_and_does_nothing_without_a_restorer() -> piikey::Result<()> {
-        let tmp = TempDir::new()?;
-        let engine = Engine::open(&tmp.0.join("v.pkv"))?;
-        engine.run(Mode::Anonymize, &["jan.jansen@acme.nl"])?;
-        let restorer = tolerant_restorer(&engine, true)?;
-        let zip = Output::Same(b"PK\x03\x04 pretend this is a zip".to_vec());
-        assert_eq!(tolerate(restorer.as_ref(), zip.clone(), &"x.docx"), zip);
-        let text = Output::Text("plain text".to_owned());
-        assert_eq!(tolerate(None, text.clone(), &"x.txt"), text);
-        Ok(())
+/// A line on stdout, for `--help` and `--version`. A reader that left (`| head`) is no failure;
+/// any other write error is, and no panic.
+fn print_line(line: &str) -> Exit {
+    match writeln!(io::stdout().lock(), "{line}") {
+        Err(error) if error.kind() != io::ErrorKind::BrokenPipe => Exit::Failed,
+        _ => Exit::Ok,
     }
 }

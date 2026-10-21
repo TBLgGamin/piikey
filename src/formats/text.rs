@@ -4,8 +4,8 @@
 
 use std::borrow::Cow;
 
-use super::Output;
-use crate::{Error, Result, detect::Mode, engine::Engine};
+use super::{Output, Pass};
+use crate::{Error, Result, engine::Engine};
 
 const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
 const UTF16LE_BOM: [u8; 2] = [0xFF, 0xFE];
@@ -90,11 +90,11 @@ pub(super) fn encode(text: String, encoding: Encoding) -> Result<Vec<u8>> {
 }
 
 /// Anonymizes or deanonymizes a text file, keeping its encoding and BOM.
-pub(super) fn process(engine: &Engine, mode: Mode, bytes: &[u8]) -> Result<Output> {
+pub(super) fn process(pass: &Pass<'_>, bytes: &[u8]) -> Result<Output> {
     let (text, encoding) = decode(bytes)?;
-    let reps = engine.plan(mode, &[&*text])?.pop().unwrap_or_default();
+    let reps = pass.plan(&[&*text])?.pop().unwrap_or_default();
     if reps.is_empty() {
-        return Ok(Output::Same(bytes.to_vec()));
+        return Ok(Output::Same(pass.unchanged(bytes)));
     }
     let out = Engine::apply(&text, &reps);
     Ok(Output::Same(encode(out, encoding)?))

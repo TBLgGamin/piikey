@@ -3,10 +3,10 @@
 //! Proxies cannot be drawn into pixels believably, so the result is the
 //! anonymized text found in the picture.
 
-use super::{Output, run_text};
-use crate::{Result, detect::Mode, engine::Engine, ocr};
+use super::{Output, Pass, run_text};
+use crate::{Result, ocr};
 
-pub(super) fn process(engine: &Engine, mode: Mode, bytes: &[u8]) -> Result<Output> {
+pub(super) fn process(pass: &Pass<'_>, bytes: &[u8]) -> Result<Output> {
     let text = ocr::image(bytes)?;
-    run_text(engine, mode, &text).map(Output::Text)
+    run_text(pass, &text).map(Output::Text)
 }

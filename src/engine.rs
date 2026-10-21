@@ -5,7 +5,7 @@ use std::{
     collections::HashSet,
     path::Path,
     sync::{
-        Arc, RwLock,
+        Arc, PoisonError, RwLock,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -74,9 +74,11 @@ const MAX_DELTA: u64 = 4096;
 /// A vault that grows by a few records at a time would otherwise have its automaton rebuilt over
 /// everything on every restore. So the automata are two: `base`, over the first `base_records`
 /// records and rebuilt rarely, and a small one over the records since, rebuilt as it grows.
-/// `current` is both.
+/// `current` is both. All of it is only good for the vault's `generation`: when the records are
+/// replaced (see [`VaultView::generation`]) they are not a prefix of the new ones any more.
 #[derive(Debug)]
 struct Matcher {
+    generation: u64,
     records: u64,
     base_records: u64,
     base: Arc<IssuedProxies>,
@@ -229,6 +231,35 @@ impl Engine {
             }
         }
         self.plan_anonymize(texts, spans, !wanted.is_empty(), resent)
+    }
+
+    /// What the detector finds in each of `texts`, as spans sorted by start and never
+    /// overlapping: the values [`Engine::anonymize`] would mask, without masking anything.
+    ///
+    /// Nothing is issued or resolved, so the vault is exactly as it was. A span whose text is a
+    /// stand-in the vault issued is left out: a text piikey masked scans as clean, and a scan
+    /// never counts piikey's own output as personal data. The kinds are the ones
+    /// [`Engine::enabled`] says.
+    ///
+    /// # Errors
+    /// `Poisoned`.
+    pub fn scan(&self, texts: &[&str]) -> Result<Vec<Vec<Span>>> {
+        let wanted = self.enabled();
+        let mut spans = self
+            .detector
+            .detect_batch(texts, Mode::Anonymize, wanted, &[]);
+        // As in `anonymize`: a detector may report kinds nobody wants.
+        if wanted != KindSet::ALL {
+            for found in &mut spans {
+                found.retain(|s| wanted.contains(s.kind));
+            }
+        }
+        // Hash lookups, sequential and short: see `plan_anonymize` on holding the view.
+        let view = self.vault.read()?;
+        for (text, found) in texts.iter().zip(&mut spans) {
+            found.retain(|s| view.kind_of(&text[s.start..s.end]).is_none());
+        }
+        Ok(spans)
     }
 
     /// `masking`: some kind is on. With none on, the text is left exactly as it is.
@@ -424,7 +455,8 @@ impl Engine {
     }
 
     /// The matcher for the vault's proxies of `class`, as of now: it is rebuilt when the vault
-    /// has grown since it was, and only as far as the growth makes necessary, see [`Matcher`].
+    /// has grown since it was, and only as far as the growth makes necessary, see [`Matcher`],
+    /// or from scratch when the vault's records were replaced.
     fn matcher(&self, class: Class) -> Result<Arc<IssuedProxies>> {
         let cache = match class {
             Class::Listed => &self.listed,
@@ -432,10 +464,16 @@ impl Engine {
         };
         let view = self.vault.read()?;
         let records = view.record_count();
+        let generation = view.generation();
         let (base_records, base) = match cache.read()?.as_ref() {
-            Some(cached) if cached.records == records => return Ok(Arc::clone(&cached.current)),
-            Some(cached) => (cached.base_records, Arc::clone(&cached.base)),
-            None => (0, Arc::default()),
+            Some(cached) if cached.generation == generation => {
+                if cached.records == records {
+                    return Ok(Arc::clone(&cached.current));
+                }
+                (cached.base_records, Arc::clone(&cached.base))
+            }
+            // None, or built for records the vault does not hold anymore.
+            _ => (0, Arc::default()),
         };
         let issued_since = |from| -> Vec<(EntityKind, &str)> {
             view.issued_since(from)
@@ -452,8 +490,12 @@ impl Engine {
         };
         // A concurrent call may have stored a newer matcher already; keep that one.
         let mut cached = cache.write()?;
-        if cached.as_ref().is_none_or(|m| m.records < records) {
+        if cached
+            .as_ref()
+            .is_none_or(|m| (m.generation, m.records) < (generation, records))
+        {
             *cached = Some(Matcher {
+                generation,
                 records,
                 base_records,
                 base,
@@ -461,6 +503,44 @@ impl Engine {
             });
         }
         Ok(current)
+    }
+
+    /// Forgets the automata over the vault's issued proxies, so the next call builds them
+    /// again from the vault as it is then. [`Engine::forget`] and [`Engine::wipe`] do this. The
+    /// automata notice by themselves when the vault's records were replaced (see
+    /// [`VaultView::generation`]), so it frees them early rather than making them right.
+    pub fn reset_issued(&self) {
+        // Clearing is valid whatever a panicking thread left behind.
+        for cache in [&self.listed, &self.patterned] {
+            *cache.write().unwrap_or_else(PoisonError::into_inner) = None;
+        }
+    }
+
+    /// Forgets the vault's records of `values`: every record whose original or stand-in is one
+    /// of them. The file is rewritten without them, and a stand-in that was issued for one is
+    /// ordinary text again, which [`Mode::Deanonymize`] leaves as it is. Returns how many
+    /// records there were.
+    ///
+    /// # Errors
+    /// Vault failures.
+    pub fn forget(&self, values: &[&str]) -> Result<usize> {
+        let wanted: HashSet<&str> = values.iter().copied().collect();
+        let forgotten = self
+            .vault
+            .forget(&|_, original, proxy| wanted.contains(original) || wanted.contains(proxy));
+        // Also when it failed: the vault may have taken over another process's forget on its way.
+        self.reset_issued();
+        forgotten
+    }
+
+    /// Forgets every record of the vault, see [`Engine::forget`]. The vault keeps its key.
+    ///
+    /// # Errors
+    /// Vault failures.
+    pub fn wipe(&self) -> Result<usize> {
+        let wiped = self.vault.wipe();
+        self.reset_issued();
+        wiped
     }
 
     /// Applies sorted, non-overlapping replacements in one pass.
@@ -608,10 +688,7 @@ mod tests {
     ];
 
     fn temp_vault(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("piikey-engine-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::create_dir_all(&dir);
-        dir.join("vault.pkv")
+        crate::testing::temp_dir(tag).join("vault.pkv")
     }
 
     /// Stands in for the detection model: reports each value it was given as its kind, in any
@@ -721,6 +798,190 @@ mod tests {
         let engine = Engine::open(&temp_vault("lookalike"))?;
         let text = ["call +31 6 87654321 or mail piet@example.org"];
         assert_eq!(engine.run(Mode::Deanonymize, &text)?, text);
+        Ok(())
+    }
+
+    /// What `scan` found in `texts`, as `(kind, value)` per text.
+    fn scanned<'t>(
+        engine: &Engine,
+        texts: &[&'t str],
+    ) -> crate::Result<Vec<Vec<(EntityKind, &'t str)>>> {
+        Ok(texts
+            .iter()
+            .zip(engine.scan(texts)?)
+            .map(|(text, spans)| {
+                spans
+                    .into_iter()
+                    .map(|s| (s.kind, &text[s.start..s.end]))
+                    .collect()
+            })
+            .collect())
+    }
+
+    #[test]
+    fn scan_reports_what_anonymize_masks_and_leaves_the_vault_alone() -> crate::Result<()> {
+        let engine = engine_at(&temp_vault("scan"), Finds::people(&["Marieke de Vries"]))?;
+        let texts = [
+            CORPUS[2],
+            "Marieke de Vries woont hier, mail marieke@example.org",
+        ];
+        let found = scanned(&engine, &texts)?;
+        let values: HashSet<&str> = found.iter().flatten().map(|&(_, value)| value).collect();
+        let expected = [
+            "123-45-6789",
+            "111222333",
+            "+31 6 12345678",
+            "jan.jansen@acme.nl",
+            "Marieke de Vries",
+            "marieke@example.org",
+        ];
+        for value in expected {
+            assert!(values.contains(value), "{value:?} not found in {values:?}");
+        }
+        assert!(found[1].contains(&(EntityKind::Person, "Marieke de Vries")));
+        assert_eq!(
+            engine.vault().read()?.record_count(),
+            0,
+            "a scan issued something"
+        );
+        // Masking the same texts afterwards still hides every one of them, and now issues.
+        let masked = engine.run(Mode::Anonymize, &texts)?;
+        for value in expected {
+            assert!(
+                masked.iter().all(|out| !out.contains(value)),
+                "{value:?} leaked into {masked:?}"
+            );
+        }
+        assert!(engine.vault().read()?.record_count() > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn scan_honours_the_enabled_kinds() -> crate::Result<()> {
+        let engine = Engine::open(&temp_vault("scan-enabled"))?;
+        let text = ["mail jan.jansen@acme.nl, IBAN NL91ABNA0417164300"];
+        assert_eq!(scanned(&engine, &text)?[0].len(), 2);
+        engine.set_enabled(KindSet::ALL.without(EntityKind::Email));
+        assert_eq!(
+            scanned(&engine, &text)?[0],
+            [(EntityKind::Iban, "NL91ABNA0417164300")]
+        );
+        engine.set_enabled(KindSet::EMPTY);
+        assert!(scanned(&engine, &text)?[0].is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn scan_ignores_the_stand_ins_the_vault_issued() -> crate::Result<()> {
+        let engine = engine_at(
+            &temp_vault("scan-proxies"),
+            Finds::people(&["Marieke de Vries"]),
+        )?;
+        let originals = [
+            CORPUS[2],
+            "Marieke de Vries woont in Utrecht, mail marieke@example.org",
+        ];
+        let masked = engine.run(Mode::Anonymize, &originals)?;
+        let masked: Vec<&str> = masked.iter().map(String::as_str).collect();
+        let records = engine.vault().read()?.record_count();
+        assert!(records > 0);
+        for (text, found) in masked.iter().zip(scanned(&engine, &masked)?) {
+            assert!(
+                found.is_empty(),
+                "{found:?} reported in the masked {text:?}"
+            );
+        }
+        // What was masked is still reported where it stands in the clear.
+        assert!(!scanned(&engine, &originals)?[0].is_empty());
+        assert_eq!(engine.vault().read()?.record_count(), records);
+        Ok(())
+    }
+
+    #[test]
+    fn reset_issued_drops_the_matchers_and_the_next_call_builds_them_again() -> crate::Result<()> {
+        let engine = Engine::open(&temp_vault("reset-issued"))?;
+        let anon = engine.run(Mode::Anonymize, &CORPUS)?;
+        let refs: Vec<&str> = anon.iter().map(String::as_str).collect();
+        assert_eq!(engine.run(Mode::Deanonymize, &refs)?, CORPUS);
+        assert!(engine.listed.read()?.is_some() && engine.patterned.read()?.is_some());
+        engine.reset_issued();
+        assert!(engine.listed.read()?.is_none() && engine.patterned.read()?.is_none());
+        assert_eq!(
+            engine.run(Mode::Deanonymize, &refs)?,
+            CORPUS,
+            "built from the vault"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn forget_and_wipe_remove_records_and_their_stand_ins_stop_being_restored() -> crate::Result<()>
+    {
+        let engine = engine_at(&temp_vault("forget"), Finds::people(&["Marieke de Vries"]))?;
+        let originals = [CORPUS[2], "Marieke de Vries woont hier"];
+        let masked = engine.run(Mode::Anonymize, &originals)?;
+        let masked: Vec<&str> = masked.iter().map(String::as_str).collect();
+        assert_eq!(engine.run(Mode::Deanonymize, &masked)?, originals);
+        assert!(engine.listed.read()?.is_some() && engine.patterned.read()?.is_some());
+        let records = engine.vault().read()?.record_count();
+        let stand_in = |kind, original: &str| -> crate::Result<String> {
+            let found = engine
+                .vault()
+                .read()?
+                .proxy_for(kind, original)
+                .map(str::to_owned);
+            found.ok_or_else(|| crate::Error::BadRequest(format!("no stand-in for {original}")))
+        };
+
+        // By original: the email comes back as its stand-in, the rest of the text is restored.
+        let email = stand_in(EntityKind::Email, "jan.jansen@acme.nl")?;
+        assert_eq!(engine.forget(&["jan.jansen@acme.nl"])?, 1);
+        assert!(engine.listed.read()?.is_none() && engine.patterned.read()?.is_none());
+        assert_eq!(engine.vault().read()?.record_count(), records - 1);
+        let restored = engine.run(Mode::Deanonymize, &masked)?;
+        assert_eq!(restored[0], CORPUS[2].replace("jan.jansen@acme.nl", &email));
+        assert_eq!(restored[1], originals[1]);
+
+        // By stand-in: the name goes the same way.
+        let name = stand_in(EntityKind::Person, "Marieke de Vries")?;
+        assert_eq!(engine.forget(&[name.as_str()])?, 1);
+        assert_eq!(engine.run(Mode::Deanonymize, &masked)?[1], masked[1]);
+
+        assert_eq!(engine.forget(&["nobody@example.org"])?, 0);
+        assert_eq!(engine.forget(&[])?, 0);
+
+        // Everything.
+        assert_eq!(u64::try_from(engine.wipe()?).ok(), Some(records - 2));
+        assert_eq!(engine.vault().read()?.record_count(), 0);
+        assert_eq!(engine.run(Mode::Deanonymize, &masked)?, masked);
+        Ok(())
+    }
+
+    #[test]
+    fn a_forget_in_another_instance_does_not_leave_stale_matchers_behind() -> crate::Result<()> {
+        // Two engines on one vault file, as two processes are. `b` forgets one of three records
+        // `a` issued, and `a` then issues a fourth: it holds three records again, but not the
+        // ones its matchers were built for.
+        let path = temp_vault("forget-elsewhere");
+        let names = [
+            "Marieke de Vries",
+            "Pieter van der Berg",
+            "Sanne de Boer",
+            "Fatima El Amrani",
+        ];
+        let a = engine_at(&path, Finds::people(&names))?;
+        let b = engine_at(&path, Finds::people(&names))?;
+        let first = a.run(Mode::Anonymize, &names[..3])?;
+        let first: Vec<&str> = first.iter().map(String::as_str).collect();
+        assert_eq!(a.run(Mode::Deanonymize, &first)?, names[..3]);
+
+        assert_eq!(b.forget(&[names[0]])?, 1);
+        let fourth = a.run(Mode::Anonymize, &names[3..])?;
+        assert_eq!(a.vault().read()?.record_count(), 3);
+        let fourth: Vec<&str> = fourth.iter().map(String::as_str).collect();
+        assert_eq!(a.run(Mode::Deanonymize, &fourth)?, names[3..]);
+        assert_eq!(a.run(Mode::Deanonymize, &first[1..])?, names[1..3]);
+        assert_eq!(a.run(Mode::Deanonymize, &first[..1])?, first[..1]);
         Ok(())
     }
 

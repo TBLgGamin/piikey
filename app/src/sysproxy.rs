@@ -25,11 +25,9 @@ use std::{
 };
 
 use ::sysproxy::Sysproxy;
+use piikey::sys::{data_dir, run_system_tool, write_atomic};
 
-use crate::{
-    Res,
-    policy::{data_dir, run_system_tool, write_atomic},
-};
+use crate::Res;
 
 const SETTINGS_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
 // The file name is kept for existing installs.
@@ -95,7 +93,7 @@ pub fn enable(port: u16) -> Res<()> {
     let saved = plan_enable(&current, read_saved(&state).as_ref(), &ours);
     // Saved first: a crash between the two writes then leaves a record that
     // `disable` recognizes as stale instead of settings nobody can undo.
-    write_atomic(&state, saved.to_text().as_bytes())?;
+    write_atomic(&state, saved.to_text().as_bytes()).map_err(|e| e.to_string())?;
     arm_sign_in_restore()?;
     apply(true, &ours, BYPASS)
 }
@@ -148,7 +146,8 @@ fn arm_sign_in_restore() -> Res<()> {
             &command,
             "/f",
         ],
-    )?;
+    )
+    .map_err(|e| e.to_string())?;
     if out.status.success() {
         Ok(())
     } else {
@@ -165,7 +164,8 @@ fn arm_sign_in_restore() -> Res<()> {
 /// behind only runs a restore that finds nothing to do.
 fn disarm_sign_in_restore() -> Res<()> {
     for value in [RUN_ONCE_VALUE, OLD_RUN_ONCE_VALUE] {
-        run_system_tool("reg.exe", &["delete", RUN_ONCE_KEY, "/v", value, "/f"])?;
+        run_system_tool("reg.exe", &["delete", RUN_ONCE_KEY, "/v", value, "/f"])
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -247,7 +247,7 @@ fn split_server(server: &str) -> (String, u16) {
 }
 
 fn read_settings() -> Res<Snapshot> {
-    let out = run_system_tool("reg.exe", &["query", SETTINGS_KEY])?;
+    let out = run_system_tool("reg.exe", &["query", SETTINGS_KEY]).map_err(|e| e.to_string())?;
     if !out.status.success() {
         return Err(format!(
             "cannot read the Windows proxy settings (reg.exe: {})",
@@ -284,7 +284,7 @@ fn parse_reg_query(text: &str) -> Snapshot {
 }
 
 fn state_path() -> Res<PathBuf> {
-    Ok(data_dir()?.join(STATE_FILE))
+    Ok(data_dir().map_err(|e| e.to_string())?.join(STATE_FILE))
 }
 
 /// The saved record; a missing or unreadable file means none.

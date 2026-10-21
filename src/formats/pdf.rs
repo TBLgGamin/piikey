@@ -6,22 +6,22 @@
 use lopdf::Document;
 use rayon::prelude::*;
 
-use super::{Output, run_text};
-use crate::{Result, detect::Mode, engine::Engine, ocr};
+use super::{Output, Pass, run_text};
+use crate::{Result, ocr};
 
 /// A page with fewer non-blank characters than this has no usable text layer.
 const MIN_TEXT_CHARS: usize = 16;
 /// Between two pages in the extracted text.
 const PAGE_BREAK: &str = "\n\u{c}\n";
 
-pub(super) fn process(engine: &Engine, mode: Mode, bytes: &[u8]) -> Result<Output> {
+pub(super) fn process(pass: &Pass<'_>, bytes: &[u8]) -> Result<Output> {
     let doc = Document::load_mem(bytes)?;
     let numbers: Vec<u32> = doc.get_pages().into_keys().collect();
     let pages = numbers
         .par_iter()
         .map(|&number| page_text(&doc, bytes, number))
         .collect::<Result<Vec<_>>>()?;
-    run_text(engine, mode, &pages.join(PAGE_BREAK)).map(Output::Text)
+    run_text(pass, &pages.join(PAGE_BREAK)).map(Output::Text)
 }
 
 /// The text of page `number` (1-based): its text layer, or OCR when that has

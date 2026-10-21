@@ -657,11 +657,7 @@ mod tests {
     use super::*;
 
     fn engine(tag: &str) -> Result<Engine> {
-        let dir =
-            std::env::temp_dir().join(format!("piikey-transform-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir)?;
-        Engine::open(&dir.join("vault.pkv"))
+        Engine::open(&crate::ui::testing::temp_dir(tag).join("vault.pkv"))
     }
 
     fn headers(content_type: &str) -> HeaderMap {

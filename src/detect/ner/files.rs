@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::{Error, Result, vault};
+use crate::{Result, sys};
 
 /// Folder name of this model under `%LOCALAPPDATA%\piikey\models`: the model, then its short
 /// pinned revision. A new model or revision gets a new folder, so the old one is never half-used.
@@ -62,9 +62,7 @@ pub const DEVICE_FILE: &str = "device.cfg";
 /// `VaultPathUnavailable` when `LOCALAPPDATA` is unset; `Io` when the piikey folder cannot be
 /// created.
 pub fn default_dir() -> Result<PathBuf> {
-    let vault = vault::default_path()?;
-    let base = vault.parent().ok_or(Error::VaultPathUnavailable)?;
-    Ok(base.join("models").join(MODEL_ID))
+    Ok(sys::data_dir()?.join("models").join(MODEL_ID))
 }
 
 /// True when `dir` holds every file at its exact size and the [`VERIFIED`] marker. A download
@@ -87,6 +85,7 @@ mod tests {
     use std::fs;
 
     use super::*;
+    use crate::vault;
 
     const SMALL: [ModelFile; 2] = [
         ModelFile {

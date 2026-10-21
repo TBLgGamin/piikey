@@ -24,11 +24,16 @@ mod tests;
 
 use std::{
     any::Any,
+    fmt,
     net::{Ipv4Addr, TcpListener},
     panic::{AssertUnwindSafe, catch_unwind},
     pin::pin,
-    sync::{Arc, RwLock, mpsc::Sender},
-    thread::JoinHandle,
+    sync::{
+        Arc, Mutex, PoisonError, RwLock,
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
+        mpsc::Sender,
+    },
+    thread::{JoinHandle, Thread},
     time::Duration,
 };
 
@@ -43,7 +48,10 @@ use hudsucker::{
     rcgen::{Issuer, KeyPair},
     rustls::crypto::aws_lc_rs,
 };
-use piikey::engine::Engine;
+use piikey::{
+    engine::Engine,
+    policy::{Highlight, Policy},
+};
 use tokio::{runtime::Runtime, sync::watch};
 
 pub use self::typed::Typed;
@@ -51,7 +59,7 @@ use self::{
     handler::{Env, Interceptor, WsInterceptor},
     origin::Origin,
 };
-use crate::{Res, ca, ledger::Ledger, policy::Policy};
+use crate::{Res, ca, ledger::Ledger};
 
 /// Default proxy port.
 pub const PORT: u16 = 7979;
@@ -78,21 +86,181 @@ pub struct Shared {
     pub ledger: Ledger,
     /// What the user typed or pasted. While its capture runs, requests are masked by it alone.
     pub typed: Typed,
+    /// What capture reads the focused field for.
+    pub purpose: Arc<Purpose>,
 }
 
-/// Something the UI counts and shows.
+/// What capture (`crate::capture`) reads the focused field for: to keep what is typed in a
+/// protected site or program for the proxy (`mask`), and to outline a field that holds personal
+/// data (`highlight`). The controller sets the first two; the capture worker pauses the outline,
+/// and the highlight overlay counts presses of its shortcut. Capture reads all of it on every look
+/// at the focus, so a change takes effect within a tick.
+///
+/// A new one masks and does not highlight: capture as it was before highlighting existed.
+pub struct Purpose {
+    mask: AtomicBool,
+    highlight: AtomicU8,
+    presses: AtomicU64,
+    paused: AtomicBool,
+    /// The capture worker, woken by a press so it need not wait for its next look.
+    worker: Mutex<Option<Thread>>,
+    /// Called whenever `paused` changes.
+    on_pause: Mutex<Option<Hook>>,
+}
+
+type Hook = Arc<dyn Fn() + Send + Sync>;
+
+impl Default for Purpose {
+    fn default() -> Self {
+        Self {
+            mask: AtomicBool::new(true),
+            highlight: AtomicU8::new(Self::encode(Highlight::Off)),
+            presses: AtomicU64::new(0),
+            paused: AtomicBool::new(false),
+            worker: Mutex::new(None),
+            on_pause: Mutex::new(None),
+        }
+    }
+}
+
+// Hand-written: the hook is no `Debug`.
+impl fmt::Debug for Purpose {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Purpose")
+            .field("mask", &self.mask())
+            .field("highlight", &self.highlight())
+            .field("presses", &self.presses())
+            .field("paused", &self.paused())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Purpose {
+    const fn encode(mode: Highlight) -> u8 {
+        match mode {
+            Highlight::Off => 0,
+            Highlight::Always => 1,
+            Highlight::Hotkey => 2,
+        }
+    }
+
+    const fn decode(code: u8) -> Highlight {
+        match code {
+            0 => Highlight::Off,
+            1 => Highlight::Always,
+            _ => Highlight::Hotkey,
+        }
+    }
+
+    /// Whether what is typed in a protected site or program is kept for the proxy: protection is
+    /// on.
+    #[must_use]
+    pub fn mask(&self) -> bool {
+        self.mask.load(Ordering::Acquire)
+    }
+
+    /// Sets [`Purpose::mask`].
+    #[allow(
+        dead_code,
+        reason = "the controller sets it once highlighting is wired in"
+    )]
+    pub fn set_mask(&self, on: bool) {
+        self.mask.store(on, Ordering::Release);
+    }
+
+    /// When the focused field is outlined if it holds personal data.
+    #[must_use]
+    pub fn highlight(&self) -> Highlight {
+        Self::decode(self.highlight.load(Ordering::Acquire))
+    }
+
+    /// Sets [`Purpose::highlight`].
+    #[allow(
+        dead_code,
+        reason = "the controller sets it once highlighting is wired in"
+    )]
+    pub fn set_highlight(&self, mode: Highlight) {
+        self.highlight.store(Self::encode(mode), Ordering::Release);
+    }
+
+    /// Whether the outline is paused: in [`Highlight::Always`] the shortcut pauses and resumes it.
+    #[must_use]
+    #[allow(
+        dead_code,
+        reason = "the tray tooltip reads it once highlighting is wired in"
+    )]
+    pub fn paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
+    }
+
+    /// Sets [`Purpose::paused`] and runs the [hook](Purpose::on_pause) when it changed.
+    pub(crate) fn set_paused(&self, paused: bool) {
+        if self.paused.swap(paused, Ordering::AcqRel) != paused {
+            let hook = self
+                .on_pause
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+    }
+
+    /// Runs `hook` whenever the outline is paused or resumed, on the capture thread: it must be
+    /// quick. The tray tooltip says so.
+    #[allow(
+        dead_code,
+        reason = "the controller sets it once highlighting is wired in"
+    )]
+    pub fn on_pause(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self.on_pause.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(hook));
+    }
+
+    /// How many times the shortcut was pressed.
+    #[must_use]
+    pub(crate) fn presses(&self) -> u64 {
+        self.presses.load(Ordering::Acquire)
+    }
+
+    /// The shortcut was pressed: counts it and wakes the capture worker.
+    pub(crate) fn press(&self) {
+        self.presses.fetch_add(1, Ordering::AcqRel);
+        let worker = self.worker.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(worker) = worker.as_ref() {
+            worker.unpark();
+        }
+    }
+
+    /// The thread that reads the focus now; a press wakes it.
+    pub(crate) fn set_worker(&self, worker: Thread) {
+        *self.worker.lock().unwrap_or_else(PoisonError::into_inner) = Some(worker);
+    }
+}
+
+/// Something the UI shows.
 #[derive(Debug, Clone)]
 pub enum Event {
-    /// An outgoing request was anonymized. `kinds`: (kind name, count).
+    /// An outgoing request was anonymized.
     Masked {
         host: String,
         exe: Option<String>,
-        kinds: Vec<(&'static str, usize)>,
         /// Every issued proxy the request carried.
         proxies: Vec<String>,
     },
     /// A response had proxies restored.
-    Restored { host: String, count: usize },
+    Restored {
+        host: String,
+        /// How many proxies the response carried.
+        #[cfg_attr(
+            not(test),
+            expect(
+                dead_code,
+                reason = "the tests count the restored values, the app shows none"
+            )
+        )]
+        count: usize,
+    },
     /// The proxy can no longer serve (fatal: the thread or runtime failed).
     /// Problems with one request never use this; they show up in the answer
     /// that request gets.

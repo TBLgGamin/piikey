@@ -190,6 +190,66 @@ impl EntityKind {
         Self::ALL.into_iter().find(|k| k.as_str() == s)
     }
 
+    /// The [`KIND_GROUPS`] name this kind is listed under, e.g. "Contact" for `email`.
+    #[must_use]
+    pub fn group(self) -> &'static str {
+        KIND_GROUPS
+            .iter()
+            .find(|(_, kinds)| kinds.contains(&self))
+            .map_or("Other", |&(name, _)| name)
+    }
+
+    /// What the apps call this kind, e.g. "Card number" for `credit_card`.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Email => "Email",
+            Self::Phone => "Phone",
+            Self::Person => "Name",
+            Self::Iban => "IBAN",
+            Self::CreditCard => "Card number",
+            Self::NlBsn => "BSN",
+            Self::UsSsn => "SSN",
+            Self::Ipv4 => "IPv4 address",
+            Self::Ipv6 => "IPv6 address",
+            Self::Mac => "MAC address",
+            Self::Secret => "Secret",
+            Self::UrlCredential => "URL password",
+            Self::PersonAlias => "Alias or nickname",
+            Self::PersonIdentifier => "Personal ID number",
+            Self::PersonAttribute => "Personal trait",
+            Self::PersonRole => "Role or title",
+            Self::DateOfBirth => "Date of birth",
+            Self::PhoneNumber => "Other phone number",
+            Self::ContactHandle => "Social handle",
+            Self::PostalAddress => "Postal address",
+            Self::Location => "Place",
+            Self::GeoLocation => "Coordinates",
+            Self::DeviceId => "Device ID",
+            Self::IdentifyingLink => "Personal link",
+            Self::AccountId => "Account ID",
+            Self::AuthSecret => "Password",
+            Self::BankAccount => "Other bank account",
+            Self::PaymentCard => "Other card number",
+            Self::CardSecurity => "Card security code",
+            Self::FinancialAmount => "Amount of money",
+            Self::DocumentId => "Document number",
+            Self::DocumentReference => "Document reference",
+            Self::VehicleId => "Licence plate or VIN",
+            Self::OrganizationName => "Organization",
+            Self::OrganizationId => "Company number",
+            Self::ProperName => "Other proper name",
+            Self::HealthData => "Health",
+            Self::BiometricData => "Biometric data",
+            Self::EthnicOrigin => "Ethnic origin",
+            Self::PoliticalOpinion => "Political opinion",
+            Self::ReligionOrBelief => "Religion or belief",
+            Self::SexualOrientation => "Sexual orientation",
+            Self::TradeUnion => "Trade union",
+            Self::CriminalOffence => "Criminal record",
+        }
+    }
+
     /// Inverse of `kind as u8`.
     #[must_use]
     pub const fn from_u8(v: u8) -> Option<Self> {
@@ -262,6 +322,95 @@ impl EntityKind {
     }
 }
 
+/// The entity kinds grouped for display, in display order. This is the single source of the apps'
+/// kind filters and switches; every kind appears in exactly one group.
+pub const KIND_GROUPS: [(&str, &[EntityKind]); 9] = [
+    (
+        "People",
+        &[
+            EntityKind::Person,
+            EntityKind::PersonAlias,
+            EntityKind::PersonIdentifier,
+            EntityKind::PersonAttribute,
+            EntityKind::PersonRole,
+            EntityKind::DateOfBirth,
+        ],
+    ),
+    (
+        "Contact",
+        &[
+            EntityKind::Email,
+            EntityKind::Phone,
+            EntityKind::PhoneNumber,
+            EntityKind::ContactHandle,
+            EntityKind::PostalAddress,
+        ],
+    ),
+    ("Places", &[EntityKind::Location, EntityKind::GeoLocation]),
+    (
+        "Money",
+        &[
+            EntityKind::Iban,
+            EntityKind::BankAccount,
+            EntityKind::CreditCard,
+            EntityKind::PaymentCard,
+            EntityKind::CardSecurity,
+            EntityKind::FinancialAmount,
+        ],
+    ),
+    (
+        "IDs and documents",
+        &[
+            EntityKind::UsSsn,
+            EntityKind::NlBsn,
+            EntityKind::DocumentId,
+            EntityKind::DocumentReference,
+            EntityKind::VehicleId,
+        ],
+    ),
+    (
+        "Online and devices",
+        &[
+            EntityKind::Ipv4,
+            EntityKind::Ipv6,
+            EntityKind::Mac,
+            EntityKind::DeviceId,
+            EntityKind::IdentifyingLink,
+            EntityKind::AccountId,
+        ],
+    ),
+    (
+        "Secrets",
+        &[
+            EntityKind::Secret,
+            EntityKind::UrlCredential,
+            EntityKind::AuthSecret,
+        ],
+    ),
+    (
+        "Organizations",
+        &[
+            EntityKind::OrganizationName,
+            EntityKind::OrganizationId,
+            EntityKind::ProperName,
+        ],
+    ),
+    // The GDPR special categories of personal data.
+    (
+        "Sensitive",
+        &[
+            EntityKind::HealthData,
+            EntityKind::BiometricData,
+            EntityKind::EthnicOrigin,
+            EntityKind::PoliticalOpinion,
+            EntityKind::ReligionOrBelief,
+            EntityKind::SexualOrientation,
+            EntityKind::TradeUnion,
+            EntityKind::CriminalOffence,
+        ],
+    ),
+];
+
 /// A set of kinds; bit `kind as u8` is set for each member.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KindSet(u64);
@@ -327,7 +476,7 @@ pub struct Span {
 
 #[cfg(test)]
 mod tests {
-    use super::{EntityKind, KindSet};
+    use super::{EntityKind, KIND_GROUPS, KindSet};
 
     #[test]
     fn wire_codes_round_trip() {
@@ -358,5 +507,42 @@ mod tests {
         assert!(!KindSet::EMPTY.intersects(KindSet::ALL));
         assert!(KindSet::EMPTY.with(EntityKind::Person).intersects(some));
         assert_eq!(KindSet::from_bits(u64::MAX), KindSet::ALL);
+    }
+
+    #[test]
+    fn the_groups_cover_every_kind_exactly_once() {
+        let listed: Vec<EntityKind> = KIND_GROUPS
+            .iter()
+            .flat_map(|&(_, kinds)| kinds.iter().copied())
+            .collect();
+        assert_eq!(listed.len(), EntityKind::ALL.len());
+        for kind in EntityKind::ALL {
+            assert_eq!(listed.iter().filter(|&&k| k == kind).count(), 1, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn every_kind_names_its_group() {
+        for kind in EntityKind::ALL {
+            let group = kind.group();
+            let (_, members) = KIND_GROUPS
+                .iter()
+                .find(|(name, _)| *name == group)
+                .unwrap_or_else(|| panic!("{kind:?} has no group"));
+            assert!(members.contains(&kind), "{kind:?}");
+        }
+        assert_eq!(EntityKind::Email.group(), "Contact");
+    }
+
+    #[test]
+    fn labels_are_filled_in_and_distinct() {
+        for kind in EntityKind::ALL {
+            assert!(!kind.label().is_empty(), "{kind:?}");
+            let same = EntityKind::ALL
+                .iter()
+                .filter(|other| other.label() == kind.label())
+                .count();
+            assert_eq!(same, 1, "{kind:?} shares its label");
+        }
     }
 }

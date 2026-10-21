@@ -26,6 +26,7 @@ use hudsucker::{
 use piikey::{
     detect::Mode,
     engine::{Engine, Resent},
+    policy::{Policy, normalize_host},
     restore::Restorer,
 };
 
@@ -36,7 +37,6 @@ use super::{
     response::{Pipeline, restoring_body},
     transform::{BodyKind, ContentType, mask},
 };
-use crate::policy::{Policy, normalize_host};
 
 /// The largest request body that is read and anonymized.
 const MAX_BODY: usize = 64 << 20;
@@ -198,7 +198,6 @@ impl Env {
             self.emit(Event::Masked {
                 host: target.host.to_string(),
                 exe: target.exe.as_deref().map(str::to_owned),
-                kinds: masked.counts,
                 proxies: masked.proxies,
             });
         }
@@ -439,7 +438,6 @@ impl WsInterceptor {
             self.env.emit(Event::Masked {
                 host: target.host.to_string(),
                 exe: target.exe.as_deref().map(str::to_owned),
-                kinds: masked.counts,
                 proxies: masked.proxies,
             });
         }
@@ -683,10 +681,7 @@ mod tests {
     }
 
     fn temp_vault(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("piikey-handler-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::create_dir_all(&dir);
-        dir.join("vault.pkv")
+        crate::ui::testing::temp_dir(tag).join("vault.pkv")
     }
 
     fn policy(sites: &[&str], programs: &[&str]) -> Policy {
@@ -711,6 +706,7 @@ mod tests {
             policy: RwLock::new(policy),
             ledger: Ledger::default(),
             typed: Typed::new(),
+            purpose: Arc::default(),
         });
         let (events, receiver) = mpsc::channel();
         let env = Env {
@@ -1065,15 +1061,11 @@ mod tests {
             .unwrap_or_default();
         assert!(!frame.contains(EMAIL), "{frame}");
         assert!(frame.starts_with(r#"{"text":"hi "#) && frame.ends_with(r#""}"#));
-        let Ok(Event::Masked {
-            host, exe, kinds, ..
-        }) = events.try_recv()
-        else {
+        let Ok(Event::Masked { host, exe, .. }) = events.try_recv() else {
             panic!("expected a Masked event");
         };
         assert_eq!(host, "chat.example.com");
         assert_eq!(exe.as_deref(), Some("chrome.exe"));
-        assert_eq!(kinds, [("email", 1)]);
         let engine = shared
             .engine
             .read()

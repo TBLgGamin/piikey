@@ -1,6 +1,6 @@
 [package]
 name = "piikey-app"
-description = "Windows app and local proxy that masks your personal data before it reaches AI chatbots and restores it in their replies"
+description = "Windows app that finds and flags personal data as you type, maps it across your files and masks it before it leaves your PC"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -35,7 +35,11 @@ sysinfo = { version = "0.39.6", default-features = false, features = ["system"] 
 windows-dpapi = "0.2.0"
 # Native WinUI 3 UI. Pinned to windows-rs master: the tray / multi-window
 # Application API is not in a crates.io release yet (0.100.0 lacks it).
-windows-reactor = { git = "https://github.com/microsoft/windows-rs", rev = "20f6de7473ebb2761a19a73dcc2c25ac9499db6e" }
+# The `test` feature is for `subscribe_live_interval`, the only way to a timer on the application
+# thread while no window is open (`ui/mod.rs`, `Ticker`): `Application` has no cross-thread
+# handle and no timer, and the reactor's own dispatcher is private. The feature only adds test
+# hooks next to it (a recording adapter, more event payloads); the real adapter is unchanged.
+windows-reactor = { git = "https://github.com/microsoft/windows-rs", rev = "20f6de7473ebb2761a19a73dcc2c25ac9499db6e", features = ["test"] }
 serde_json = { version = "1.0.154", features = ["float_roundtrip", "preserve_order"] }
 # Reads the Windows light/dark app setting (HKCU Personalize) with a safe registry API.
 winreg = "0.56.0"
@@ -48,6 +52,16 @@ uiautomation = "0.25.1"
 clipboard-win = "5.4.1"
 # Finds the captured values in outgoing requests; already built for the root crate.
 aho-corasick = "1.1.5"
+# The live highlight (`highlight.rs`): an outline of four topmost, click-through windows around the
+# field in focus. windows-reactor has no such window and the raw Win32 calls are `unsafe`, which is
+# forbidden here, so winit makes the windows, softbuffer fills them and global-hotkey registers
+# Ctrl+Alt+P. Windows only: no X11 or Wayland features.
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
+softbuffer = { version = "0.4.8", default-features = false }
+global-hotkey = "0.7.0"
+# Scans of files run on a pool of half the cores (`ui/controller.rs`), so the PC stays responsive;
+# the root crate already depends on it.
+rayon = "1.12.0"
 
 [build-dependencies]
 # Embeds assets/piikey.ico as the exe icon resource (icon only: the manifest comes from windows-reactor-setup).

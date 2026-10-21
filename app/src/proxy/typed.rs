@@ -211,6 +211,18 @@ impl Typed {
         !self.lock().values.is_empty()
     }
 
+    /// Forgets every value kept and every text still waiting for detection, as when a value is
+    /// deleted from the vault. Capture goes on: what is typed from now on is kept again. Waits
+    /// for a flush under way, so what that one found does not come back.
+    #[allow(
+        dead_code,
+        reason = "the API handler calls it when values leave the vault"
+    )]
+    pub fn clear(&self) {
+        let _only_one = self.flushing.lock().unwrap_or_else(PoisonError::into_inner);
+        *self.lock() = Inner::default();
+    }
+
     /// Finds the kept values in a text; `None` when there are none, or when the search could not
     /// be built (the caller then checks the whole request, as without capture).
     #[must_use]
@@ -543,10 +555,7 @@ mod tests {
     type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
     fn vault_path(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("piikey-typed-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::create_dir_all(&dir);
-        dir.join("vault.pkv")
+        crate::ui::testing::temp_dir(tag).join("vault.pkv")
     }
 
     /// An engine that finds what the regexes find, and `names`.
@@ -694,6 +703,28 @@ mod tests {
         typed.push("Ik ben Jeroen de Vries".to_owned());
         typed.flush(&engine)?;
         assert!(typed.matcher().is_none() && typed.lock().pending.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn clearing_forgets_what_was_typed_but_keeps_capturing() -> TestResult {
+        let engine = engine("clear", &["Jeroen de Vries"])?;
+        let typed = Typed::new();
+        typed.set_active(true);
+        typed.push("Ik ben Jeroen de Vries".to_owned());
+        typed.flush(&engine)?;
+        typed.push("jan.jansen@acme.nl".to_owned());
+        assert!(typed.has_values() && typed.matcher().is_some());
+
+        typed.clear();
+        assert!(typed.is_active(), "capture goes on");
+        assert!(typed.matcher().is_none() && !typed.has_values());
+        assert!(typed.lock().pending.is_empty());
+
+        // What is typed afterwards is kept again.
+        typed.push("Ik ben Jeroen de Vries".to_owned());
+        typed.flush(&engine)?;
+        assert!(typed.has_values());
         Ok(())
     }
 

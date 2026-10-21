@@ -1,10 +1,7 @@
 //! End-to-end tests: every format against a real engine and a temporary vault.
 //! Fixtures are built in code.
 
-use std::{
-    io::{Cursor, Read, Write},
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use std::io::{Cursor, Read, Write};
 
 use cfb::CompoundFile;
 use lopdf::{
@@ -13,8 +10,12 @@ use lopdf::{
 };
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
-use super::{Format, Output, package, process, same_text, sniff};
-use crate::{Error, detect::Mode, engine::Engine};
+use super::{Format, Output, Scanned, package, process, same_text, scan, sniff};
+use crate::{
+    Error,
+    detect::{EntityKind, Mode},
+    engine::Engine,
+};
 
 type Res<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -25,14 +26,9 @@ const IBAN: &str = "NL91ABNA0417164300";
 const PHONE: &str = "06-1234 5678";
 
 fn engine() -> Res<Engine> {
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "piikey-test-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&dir)?;
-    Ok(Engine::open(&dir.join("vault.pkv"))?)
+    Ok(Engine::open(
+        &crate::testing::temp_dir("formats").join("vault.pkv"),
+    )?)
 }
 
 /// `process` expecting a rewritten file.
@@ -899,5 +895,146 @@ fn nested_mail_attachments_stop_at_the_depth_limit() -> Res {
     }
     let out = text(&engine, Mode::Anonymize, &inner)?;
     assert!(out.contains("nesting too deep"), "{out:?}");
+    Ok(())
+}
+
+// -- scanning ---------------------------------------------------------------------
+
+/// What a scan found, as sorted `(kind, value)` pairs.
+fn found(scanned: &Scanned) -> Vec<(EntityKind, &str)> {
+    let mut found: Vec<_> = scanned
+        .found
+        .iter()
+        .map(|(kind, value)| (*kind, &**value))
+        .collect();
+    found.sort_unstable();
+    found
+}
+
+fn records(engine: &Engine) -> Res<u64> {
+    Ok(engine.vault().read()?.record_count())
+}
+
+#[test]
+fn scanning_a_docx_reports_its_values_and_issues_nothing() -> Res {
+    let engine = engine()?;
+    let scanned = scan(&engine, &docx()?, false)?;
+    let values = found(&scanned);
+    // The address stands in the body, in the hyperlink target and in the core properties.
+    let emails = values.iter().filter(|&&v| v == (EntityKind::Email, EMAIL));
+    assert_eq!(emails.count(), 3, "{values:?}");
+    assert!(values.contains(&(EntityKind::Phone, PHONE)), "{values:?}");
+    assert!(scanned.texts.is_empty(), "texts are kept only when asked");
+    assert_eq!(records(&engine)?, 0);
+    Ok(())
+}
+
+#[test]
+fn a_masked_file_scans_as_clean() -> Res {
+    let engine = engine()?;
+    let masked = same(&engine, Mode::Anonymize, &docx()?)?;
+    let issued = records(&engine)?;
+    assert!(issued > 0);
+    let scanned = scan(&engine, &masked, false)?;
+    assert!(found(&scanned).is_empty(), "{:?}", found(&scanned));
+    assert_eq!(records(&engine)?, issued);
+    Ok(())
+}
+
+#[test]
+fn scanning_keeps_the_texts_it_read_when_asked() -> Res {
+    let engine = engine()?;
+    let scanned = scan(&engine, &xlsx()?, true)?;
+    let values = found(&scanned);
+    for expected in [
+        (EntityKind::Email, EMAIL),
+        (EntityKind::Iban, IBAN),
+        (EntityKind::Phone, MOBILE),
+    ] {
+        assert!(values.contains(&expected), "{expected:?} in {values:?}");
+    }
+    // A value split over two runs is read as one text, so a search can find it.
+    assert!(
+        scanned.texts.iter().any(|t| t == EMAIL),
+        "{:?}",
+        scanned.texts
+    );
+    assert!(scanned.texts.iter().any(|t| t == "gewoon tekst"));
+    assert_eq!(records(&engine)?, 0);
+    Ok(())
+}
+
+#[test]
+fn scanning_an_eml_reads_the_headers_the_bodies_and_the_attachments() -> Res {
+    let engine = engine()?;
+    let scanned = scan(&engine, &eml(), true)?;
+    let values = found(&scanned);
+    for expected in [
+        (EntityKind::Email, EMAIL),
+        (EntityKind::Email, "piet@example.com"),
+        (EntityKind::Phone, MOBILE),
+        (EntityKind::Iban, IBAN),
+    ] {
+        assert!(values.contains(&expected), "{expected:?} in {values:?}");
+    }
+    let texts = scanned.texts.join("\n");
+    assert!(texts.contains("Subject: Offerte"), "{texts:?}");
+    assert!(texts.contains(&format!("Rekening {IBAN}")), "{texts:?}");
+    assert_eq!(records(&engine)?, 0);
+    Ok(())
+}
+
+#[test]
+fn scanning_a_msg_reads_it_like_an_eml() -> Res {
+    let engine = engine()?;
+    let scanned = scan(&engine, &msg()?, false)?;
+    let values = found(&scanned);
+    for expected in [
+        (EntityKind::Email, EMAIL),
+        (EntityKind::Email, "piet@example.com"),
+        (EntityKind::Email, "kees@example.net"),
+        (EntityKind::Phone, MOBILE),
+        (EntityKind::Iban, IBAN),
+    ] {
+        assert!(values.contains(&expected), "{expected:?} in {values:?}");
+    }
+    assert_eq!(records(&engine)?, 0);
+    Ok(())
+}
+
+#[test]
+fn scanning_reads_a_pdf_text_layer_and_text_in_its_encoding() -> Res {
+    let engine = engine()?;
+    let from_pdf = scan(&engine, &pdf(&format!("mail {EMAIL}"))?, true)?;
+    assert_eq!(found(&from_pdf), [(EntityKind::Email, EMAIL)]);
+    assert!(from_pdf.texts.iter().any(|t| t.contains(EMAIL)));
+
+    let mut utf16 = vec![0xFF, 0xFE];
+    utf16.extend(utf16le(&format!("Bel {MOBILE} of mail {EMAIL}\r\n")));
+    let scanned = scan(&engine, &utf16, false)?;
+    let values = found(&scanned);
+    assert_eq!(
+        values,
+        [(EntityKind::Email, EMAIL), (EntityKind::Phone, MOBILE)]
+    );
+    assert_eq!(records(&engine)?, 0);
+    Ok(())
+}
+
+#[test]
+fn scanning_a_clean_file_finds_nothing_and_what_cannot_be_read_is_an_error() -> Res {
+    let engine = engine()?;
+    let clean = scan(&engine, b"nothing to see here", true)?;
+    assert!(clean.found.is_empty());
+    assert_eq!(clean.texts, ["nothing to see here"]);
+    let zip = build_zip(&[("a.txt", b"hello", DEFLATED)])?;
+    assert!(matches!(
+        scan(&engine, &zip, false),
+        Err(Error::UnsupportedFormat("zip archive"))
+    ));
+    assert!(matches!(
+        scan(&engine, b"%PDF-1.7 this is not a pdf", false),
+        Err(Error::Pdf(_))
+    ));
     Ok(())
 }

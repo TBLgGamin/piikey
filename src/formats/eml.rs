@@ -10,8 +10,8 @@ use std::{borrow::Cow, fmt::Write as _};
 
 use mail_parser::{Address, DateTime, MessageParser, MimeHeaders};
 
-use super::{Output, process as process_any, same_text};
-use crate::{Error, Result, detect::Mode, engine::Engine};
+use super::{Output, Pass, process_pass as process_any, same_text};
+use crate::{Error, Result};
 
 /// Shown for an attachment without a file name.
 const UNNAMED: &str = "attachment";
@@ -37,7 +37,7 @@ pub(super) struct Attachment<'a> {
 }
 
 /// Renders an `.eml` message.
-pub(super) fn process(engine: &Engine, mode: Mode, bytes: &[u8], depth: u8) -> Result<Output> {
+pub(super) fn process(pass: &Pass<'_>, bytes: &[u8], depth: u8) -> Result<Output> {
     let message = MessageParser::default()
         .parse(bytes)
         .ok_or_else(|| Error::Mail("unparseable message".into()))?;
@@ -61,7 +61,7 @@ pub(super) fn process(engine: &Engine, mode: Mode, bytes: &[u8], depth: u8) -> R
             })
             .collect(),
     };
-    render(engine, mode, depth, &mail)
+    render(pass, depth, &mail)
 }
 
 /// `Name <address>`, or whichever of the two exists.
@@ -89,7 +89,7 @@ fn addresses(list: Option<&Address<'_>>) -> Vec<String> {
 /// (a file name can hold PII too). Each attachment is processed by its own
 /// recursive [`process_any`] call, and its already-transformed text is
 /// appended unchanged.
-pub(super) fn render(engine: &Engine, mode: Mode, depth: u8, mail: &Mail<'_>) -> Result<Output> {
+pub(super) fn render(pass: &Pass<'_>, depth: u8, mail: &Mail<'_>) -> Result<Output> {
     let mut head = String::new();
     for (label, list) in [
         ("From", &mail.from),
@@ -118,10 +118,10 @@ pub(super) fn render(engine: &Engine, mode: Mode, depth: u8, mail: &Mail<'_>) ->
 
     let mut texts = vec![head.as_str()];
     texts.extend(mail.attachments.iter().map(|a| a.name.as_str()));
-    let mut done = engine.run(mode, &texts)?.into_iter();
+    let mut done = pass.run(&texts)?.into_iter();
     let mut out = done.next().unwrap_or_default();
     for (attachment, name) in mail.attachments.iter().zip(done) {
-        let body = attachment_text(engine, mode, depth, &attachment.data)?;
+        let body = attachment_text(pass, depth, &attachment.data)?;
         let _ = write!(out, "\n--- attachment: {name} ---\n{body}");
     }
     Ok(Output::Text(out))
@@ -130,8 +130,8 @@ pub(super) fn render(engine: &Engine, mode: Mode, depth: u8, mail: &Mail<'_>) ->
 /// The transformed text of one attachment. Attachments that cannot be read
 /// render as `[unsupported: …]`; failures of the engine itself still fail the
 /// whole message.
-fn attachment_text(engine: &Engine, mode: Mode, depth: u8, data: &[u8]) -> Result<String> {
-    let text = match process_any(engine, mode, data, depth.saturating_add(1)) {
+fn attachment_text(pass: &Pass<'_>, depth: u8, data: &[u8]) -> Result<String> {
+    let text = match process_any(pass, data, depth.saturating_add(1)) {
         Ok(Output::Text(text)) => Ok(text),
         Ok(Output::Same(bytes)) => same_text(&bytes),
         Err(e) => Err(e),

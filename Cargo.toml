@@ -12,13 +12,13 @@ license = "MIT"
 authors = ["TBLgGamin"]
 repository = "https://github.com/TBLgGamin/piikey"
 homepage = "https://github.com/TBLgGamin/piikey"
-keywords = ["pii", "privacy", "anonymization", "gdpr", "windows"]
+keywords = ["pii", "privacy", "dlp", "gdpr", "anonymization"]
 categories = ["text-processing", "command-line-utilities"]
 publish = false
 
 [package]
 name = "piikey"
-description = "Local, reversible PII masking for Windows: validated regexes plus an on-device model, format-preserving stand-ins, DPAPI-protected vault"
+description = "Local PII manager for Windows: finds, flags and masks personal data in what you type, send and store; validated regexes plus an on-device model, encrypted vault, JSON API and CLI"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -65,8 +65,20 @@ windows = { version = "0.62.2", features = [
     "Foundation_Collections",
     "Globalization",
 ] }
-# Named-pipe server.
-tokio = { version = "1.53.3", default-features = false, features = ["rt", "net", "io-util"] }
+# Named-pipe server and client, the HTTP API's event loop and its shutdown signal (`sync`, `time`).
+tokio = { version = "1.53.3", default-features = false, features = [
+    "rt",
+    "net",
+    "io-util",
+    "sync",
+    "time",
+    "macros",
+] }
+# The local HTTP API (`api/http.rs`): HTTP/1 on loopback. Already in the build graph through the
+# proxy stack (hudsucker), so they add no new crate.
+hyper = { version = "1.12.0", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
+http-body-util = "0.1.5"
 # Document formats.
 zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 quick-xml = "0.42.0"
@@ -91,16 +103,16 @@ ort = { version = "=2.0.0-rc.15", default-features = false, features = [
 ] }
 # Loads the model's tokenizer.json (byte-fallback BPE). `fancy-regex` is pure Rust: no C/C++ build.
 tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
+# JSON for the API, the vault export and the settings patch. Already in the build graph through
+# `tokenizers` and the proxy stack, so they add no new crate. `preserve_order` (as in the app, so
+# the library and the app agree) keeps the fields of an API reply in the order the docs list them.
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
 
 [build-dependencies]
 # Embeds app/assets/piikey.ico as the exe icon resource (rc.exe or llvm-rc from the Windows SDK):
 # it finds the SDK tools itself and adds no manifest of its own.
 embed-resource = "3.0.12"
-
-[dev-dependencies]
-# Reads the benchmark corpora (JSONL) and writes its results (`examples/pii_eval`). Already in the
-# build graph through `tokenizers`, so it adds no crate.
-serde_json = "1.0.154"
 
 [lints]
 workspace = true

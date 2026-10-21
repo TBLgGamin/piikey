@@ -10,9 +10,11 @@
 //! Integers are little-endian. This is an on-disk format: never reorder or
 //! renumber anything here.
 //!
-//! A crash can only damage the end of the file, so a record that is cut
-//! short, zero-filled, or fails authentication is forgiven only when nothing
-//! valid follows it. Damage anywhere else is `VaultCorrupt`.
+//! A crash while appending can only damage the end of the file, so a record that is cut
+//! short, zero-filled, or fails authentication is forgiven only when nothing valid follows
+//! it. Damage anywhere else is `VaultCorrupt`, except after a forget, which rewrites the
+//! whole file under a new `vault_id`: it keeps the new file in `<vault>.compact` until it is
+//! in place, and `Vault::open` repairs the vault from that copy.
 
 use std::{fs::File, io, ops::Range, os::windows::fs::FileExt, sync::Arc};
 
@@ -39,9 +41,9 @@ const MIN_PLAIN: usize = 1 + 2 + 2;
 const MIN_CT: usize = MIN_PLAIN + TAG_LEN;
 const MAX_CT: usize = MIN_PLAIN + 2 * MAX_VALUE_LEN + TAG_LEN;
 
-type Id = [u8; VAULT_ID_LEN];
+pub(super) type Id = [u8; VAULT_ID_LEN];
 
-fn invalid(msg: &'static str) -> Error {
+pub(super) fn invalid(msg: &'static str) -> Error {
     Error::Io(io::Error::new(io::ErrorKind::InvalidData, msg))
 }
 

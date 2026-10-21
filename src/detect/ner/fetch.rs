@@ -1,15 +1,14 @@
-//! First-run download of the detection model.
+//! Download of the detection model, for the app's first run and for `piikey-cli model download`.
 //!
 //! `curl.exe` and `certutil.exe` ship with Windows, so no HTTP or hashing crate is needed.
 //! curl ignores the `WinINET` proxy setting, so the download never loops through piikey itself.
 
 use std::{fs, io::Read, path::Path, process::Stdio, thread, time::Duration};
 
-use piikey::detect::ner::files::{FILES, ModelFile, VERIFIED};
-
+use super::files::{FILES, ModelFile, VERIFIED};
 use crate::{
-    Res,
-    policy::{system_command, write_atomic},
+    Error, Result,
+    sys::{io_context, system_command, write_atomic},
 };
 
 /// How often the running download reports progress.
@@ -20,9 +19,11 @@ const POLL: Duration = Duration::from_millis(200);
 /// complete are not downloaded again, and partial ones resume.
 ///
 /// # Errors
-/// The download failed, or a file came out damaged (it is deleted so a retry starts over).
-pub(crate) fn fetch(dir: &Path, progress: &mut dyn FnMut(u64, u64)) -> Res<()> {
-    fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+/// `Model` when the download failed or a file came out damaged (it is deleted so a retry starts
+/// over); `Tool` when `curl.exe` or `certutil.exe` cannot be run; `Io` when a file cannot be
+/// written.
+pub fn fetch(dir: &Path, progress: &dyn Fn(u64, u64)) -> Result<()> {
+    fs::create_dir_all(dir).map_err(|e| io_context(&e, "create", dir))?;
     let total: u64 = FILES.iter().map(|file| file.size).sum();
     let mut done = 0;
     for file in &FILES {
@@ -42,8 +43,8 @@ fn download(
     file: &ModelFile,
     done: u64,
     total: u64,
-    progress: &mut dyn FnMut(u64, u64),
-) -> Res<()> {
+    progress: &dyn Fn(u64, u64),
+) -> Result<()> {
     let target = dir.join(file.name);
     if size_of(&target) == Some(file.size) {
         return Ok(());
@@ -67,7 +68,7 @@ fn download(
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| format!("cannot run curl.exe: {e}"))?;
+            .map_err(|e| Error::Tool(format!("cannot run curl.exe: {e}")))?;
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
@@ -75,7 +76,7 @@ fn download(
                     progress(done + size_of(&part).unwrap_or(0).min(file.size), total);
                     thread::sleep(POLL);
                 }
-                Err(e) => return Err(format!("cannot watch curl.exe: {e}")),
+                Err(e) => return Err(Error::Tool(format!("cannot watch curl.exe: {e}"))),
             }
         };
         if !status.success() {
@@ -83,35 +84,39 @@ fn download(
             if let Some(mut pipe) = child.stderr.take() {
                 let _ = pipe.read_to_string(&mut stderr);
             }
-            return Err(format!(
-                "Could not download the detection model: {}",
+            return Err(Error::Model(format!(
+                "could not download the files: {}",
                 stderr.trim()
-            ));
+            )));
         }
     }
     if size_of(&part) != Some(file.size) {
         // A server that sent more or less than expected: start that file over next time.
         let _ = fs::remove_file(&part);
-        return Err("The downloaded model was damaged. Try again.".to_owned());
+        return Err(damaged());
     }
-    fs::rename(&part, &target).map_err(|e| format!("cannot write {}: {e}", target.display()))
+    fs::rename(&part, &target).map_err(|e| io_context(&e, "write", &target))
 }
 
 /// Compares the SHA-256 of `dir/file.name` with the pinned one; deletes the file on a mismatch.
-fn verify(dir: &Path, file: &ModelFile) -> Res<()> {
+fn verify(dir: &Path, file: &ModelFile) -> Result<()> {
     let path = dir.join(file.name);
     let out = system_command("certutil.exe")?
         .arg("-hashfile")
         .arg(&path)
         .arg("SHA256")
         .output()
-        .map_err(|e| format!("cannot run certutil.exe: {e}"))?;
+        .map_err(|e| Error::Tool(format!("cannot run certutil.exe: {e}")))?;
     let text = String::from_utf8_lossy(&out.stdout);
     if out.status.success() && certutil_hash(&text).as_deref() == Some(file.sha256) {
         return Ok(());
     }
     let _ = fs::remove_file(&path);
-    Err("The downloaded model was damaged. Try again.".to_owned())
+    Err(damaged())
+}
+
+fn damaged() -> Error {
+    Error::Model("the downloaded files were damaged; try again".to_owned())
 }
 
 /// The hash in `certutil -hashfile` output: the second line, spaces removed, lowercased.
@@ -132,6 +137,7 @@ fn size_of(path: &Path) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn the_hash_is_read_from_both_certutil_layouts() {
         // Older Windows prints the hash with a space between byte pairs.
@@ -147,14 +153,15 @@ mod tests {
     }
 
     #[test]
-    fn a_damaged_file_is_deleted_and_reported() -> Res<()> {
+    fn a_damaged_file_is_deleted_and_reported() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("piikey-model-{}", std::process::id()));
-        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        fs::create_dir_all(&dir)?;
         let file = &FILES[1];
-        fs::write(dir.join(file.name), b"not the tokenizer").map_err(|e| e.to_string())?;
+        fs::write(dir.join(file.name), b"not the tokenizer")?;
         let result = verify(&dir, file);
-        assert!(result.is_err());
+        assert!(matches!(result, Err(Error::Model(_))), "{result:?}");
         assert!(!dir.join(file.name).exists());
-        fs::remove_dir_all(&dir).map_err(|e| e.to_string())
+        fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 }

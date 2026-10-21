@@ -18,11 +18,10 @@ use std::{
 };
 
 use piikey::{
+    policy::normalize_host,
     restore::{Scope, ScopeEntry},
     vault::Vault,
 };
-
-use crate::policy::normalize_host;
 
 /// Proxies remembered per host; the oldest go first.
 const PER_HOST_CAP: usize = 5_000;
@@ -343,9 +342,7 @@ mod tests {
 
     #[test]
     fn scope_resolves_originals_and_kinds_through_the_vault() -> piikey::Result<()> {
-        let dir = std::env::temp_dir().join(format!("piikey-ledger-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir)?;
+        let dir = crate::ui::testing::temp_dir("ledger");
         let engine = Engine::open(&dir.join("vault.pkv"))?;
         let vault = engine.vault();
         vault.resolve(

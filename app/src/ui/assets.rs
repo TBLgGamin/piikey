@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use windows_reactor::EncodedImage;
+use windows_reactor::{EncodedImage, WindowTheme};
 use winreg::{RegKey, enums::HKEY_CURRENT_USER};
 
 use crate::Res;
@@ -55,13 +55,44 @@ pub fn stacked(dark: bool) -> EncodedImage {
 }
 
 /// Whether Windows apps use the dark theme now (`AppsUseLightTheme` is 0). Cheap, so it can be
-/// polled; light when the setting is missing.
+/// polled; light when the setting is missing. A debug build obeys `PIIKEY_THEME` first.
 #[must_use]
 pub fn system_dark() -> bool {
+    #[cfg(debug_assertions)]
+    if let Some(dark) = forced_dark() {
+        return dark;
+    }
     RegKey::predef(HKEY_CURRENT_USER)
         .open_subkey(PERSONALIZE)
         .and_then(|key| key.get_value::<u32, _>("AppsUseLightTheme"))
         .is_ok_and(|light| light == 0)
+}
+
+/// The theme the window asks `WinUI` for: the Windows setting. A debug build obeys
+/// `PIIKEY_THEME` first.
+#[must_use]
+pub fn window_theme() -> WindowTheme {
+    #[cfg(debug_assertions)]
+    if let Some(dark) = forced_dark() {
+        return if dark {
+            WindowTheme::Dark
+        } else {
+            WindowTheme::Light
+        };
+    }
+    WindowTheme::System
+}
+
+/// Debug builds only, so the README screenshots need no change to the Windows theme:
+/// `PIIKEY_THEME=light` or `dark` replaces the Windows setting for this process.
+#[cfg(debug_assertions)]
+fn forced_dark() -> Option<bool> {
+    let value = std::env::var("PIIKEY_THEME").ok()?;
+    match value.to_ascii_lowercase().as_str() {
+        "light" => Some(false),
+        "dark" => Some(true),
+        _ => None,
+    }
 }
 
 /// Writes the icon into the folder of `vault` and returns its path: the tray and the window load

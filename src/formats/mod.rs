@@ -12,6 +12,10 @@
 //! | images | `image` | [`Output::Text`] |
 //! | `.eml` | `eml` | [`Output::Text`] |
 //! | Outlook `.msg` | `msg` | [`Output::Text`] |
+//!
+//! [`scan`] reads the same inputs the same way but rewrites nothing: it reports what the
+//! detector finds. Both go through one `Pass`, so a scan sees exactly the texts a rewrite
+//! would change.
 
 mod eml;
 mod image;
@@ -25,7 +29,13 @@ mod tests;
 mod text;
 mod xmltext;
 
-use crate::{Error, Result, detect::Mode, engine::Engine};
+use std::{fmt, sync::Mutex};
+
+use crate::{
+    Error, Result,
+    detect::{EntityKind, Mode, Span},
+    engine::{Engine, Replacement},
+};
 
 /// Result of processing one input.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,19 +72,153 @@ const CFB_MAGIC: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 /// # Errors
 /// `UnsupportedFormat` and per-format parse errors.
 pub fn process(engine: &Engine, mode: Mode, bytes: &[u8], depth: u8) -> Result<Output> {
+    process_pass(
+        &Pass {
+            engine,
+            how: How::Rewrite(mode),
+        },
+        bytes,
+        depth,
+    )
+}
+
+/// What [`scan`] found in one file. Its values are personal data: keep them out of logs (the
+/// `Debug` output only counts them).
+#[derive(Default)]
+pub struct Scanned {
+    /// Every value the detector found, with its kind, in reading order.
+    pub found: Vec<(EntityKind, Box<str>)>,
+    /// The texts the detector read: for a package each part's segments, for an email its
+    /// headers, bodies and attachments. Empty unless [`scan`] was asked to keep them.
+    pub texts: Vec<String>,
+}
+
+impl fmt::Debug for Scanned {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Scanned")
+            .field("found", &self.found.len())
+            .field("texts", &self.texts.len())
+            .finish()
+    }
+}
+
+/// Sniffs `bytes` like [`process`] and reports what the detector finds in it, without writing
+/// anything: the vault is left as it was and no output is built. Values that are stand-ins
+/// the vault issued are not reported (see [`Engine::scan`]), so a file piikey masked scans as
+/// clean. `keep_texts` also returns the texts that were read, for callers that look for
+/// something of their own in them.
+///
+/// # Errors
+/// `UnsupportedFormat` and per-format parse errors, as for [`process`].
+pub fn scan(engine: &Engine, bytes: &[u8], keep_texts: bool) -> Result<Scanned> {
+    let collect = Collect {
+        found: Mutex::new(Vec::new()),
+        texts: keep_texts.then(|| Mutex::new(Vec::new())),
+    };
+    process_pass(
+        &Pass {
+            engine,
+            how: How::Scan(&collect),
+        },
+        bytes,
+        0,
+    )?;
+    Ok(Scanned {
+        found: collect.found.into_inner()?,
+        texts: collect
+            .texts
+            .map_or_else(|| Ok(Vec::new()), Mutex::into_inner)?,
+    })
+}
+
+/// What a run over a file does with the texts it hands the engine: rewrite them, or only look
+/// at them. Every format goes through one, which is why a scan reads exactly what a rewrite
+/// would change, attachments and all.
+struct Pass<'a> {
+    engine: &'a Engine,
+    how: How<'a>,
+}
+
+enum How<'a> {
+    Rewrite(Mode),
+    Scan(&'a Collect),
+}
+
+/// What a scan has seen so far. Behind locks because a pass is shared by reference down the
+/// formats; the scans of different files each have their own.
+struct Collect {
+    found: Mutex<Vec<(EntityKind, Box<str>)>>,
+    texts: Option<Mutex<Vec<String>>>,
+}
+
+impl Collect {
+    /// Takes note of what was found in `texts`, and of `texts` when they are kept.
+    fn record(&self, texts: &[&str], found: &[Vec<Span>]) -> Result<()> {
+        let mut values = self.found.lock()?;
+        for (text, spans) in texts.iter().zip(found) {
+            values.extend(
+                spans
+                    .iter()
+                    .map(|s| (s.kind, Box::from(&text[s.start..s.end]))),
+            );
+        }
+        if let Some(kept) = &self.texts {
+            kept.lock()?
+                .extend(texts.iter().map(|&text| text.to_owned()));
+        }
+        Ok(())
+    }
+}
+
+impl Pass<'_> {
+    /// [`Engine::plan`] for a rewrite. A scan records what the engine finds and plans nothing.
+    fn plan(&self, texts: &[&str]) -> Result<Vec<Vec<Replacement>>> {
+        match &self.how {
+            How::Rewrite(mode) => self.engine.plan(*mode, texts),
+            How::Scan(collect) => {
+                collect.record(texts, &self.engine.scan(texts)?)?;
+                Ok(vec![Vec::new(); texts.len()])
+            }
+        }
+    }
+
+    /// [`Engine::run`] for a rewrite. A scan has no output: it looks at the texts and answers
+    /// with empty ones.
+    fn run(&self, texts: &[&str]) -> Result<Vec<String>> {
+        match &self.how {
+            How::Rewrite(mode) => self.engine.run(*mode, texts),
+            How::Scan(_) => {
+                self.plan(texts)?;
+                Ok(vec![String::new(); texts.len()])
+            }
+        }
+    }
+
+    /// `bytes` as the output of a file nothing was rewritten in: a copy of it, except for a
+    /// scan, which has no output to copy into.
+    fn unchanged(&self, bytes: &[u8]) -> Vec<u8> {
+        match self.how {
+            How::Rewrite(_) => bytes.to_vec(),
+            How::Scan(_) => Vec::new(),
+        }
+    }
+}
+
+/// [`process`] and [`scan`] for one input: picks the format and hands the input to it.
+fn process_pass(pass: &Pass<'_>, bytes: &[u8], depth: u8) -> Result<Output> {
     if depth > MAX_DEPTH {
         return Err(Error::UnsupportedFormat("nesting too deep"));
     }
     match sniff(bytes) {
         Format::Zip => {
             let (archive, scope) = open_package(bytes)?;
-            package::rewrite(engine, mode, archive, scope).map(Output::Same)
+            package::rewrite(pass, archive, scope).map(Output::Same)
         }
-        Format::Pdf => pdf::process(engine, mode, bytes),
-        Format::Image => image::process(engine, mode, bytes),
-        Format::Cfb => msg::process(engine, mode, bytes, depth),
-        Format::Mail => eml::process(engine, mode, bytes, depth),
-        Format::Text => text::process(engine, mode, bytes),
+        Format::Pdf => pdf::process(pass, bytes),
+        Format::Image => image::process(pass, bytes),
+        Format::Cfb => msg::process(pass, bytes, depth),
+        Format::Mail => eml::process(pass, bytes, depth),
+        Format::Text => text::process(pass, bytes),
     }
 }
 
@@ -184,11 +328,7 @@ fn same_text(bytes: &[u8]) -> Result<String> {
     }
 }
 
-/// Runs the engine over one text.
-fn run_text(engine: &Engine, mode: Mode, text: &str) -> Result<String> {
-    Ok(engine
-        .run(mode, &[text])?
-        .into_iter()
-        .next()
-        .unwrap_or_default())
+/// Runs the pass over one text; empty for a scan, which has no output.
+fn run_text(pass: &Pass<'_>, text: &str) -> Result<String> {
+    Ok(pass.run(&[text])?.into_iter().next().unwrap_or_default())
 }
