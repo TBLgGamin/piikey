@@ -28,8 +28,8 @@
   Every failure says what was expected and what was found, and prints what Windows logged.
 
 .PARAMETER Version
-  The version that was packaged, as in Cargo.toml (for example 0.2.1). The package says
-  (major + 1).minor.patch.0, here 1.2.1.0: see package-msix.ps1.
+  The version that was packaged, as in Cargo.toml (for example 1.0.0). The package says x.y.z.0:
+  see package-msix.ps1.
 #>
 param([Parameter(Mandatory)][string]$Version)
 
@@ -44,9 +44,8 @@ if ($env:GITHUB_ACTIONS -ne 'true' -or -not $env:RUNNER_TEMP) {
 if ($Version -notmatch '^\d+\.\d+\.\d+$') {
     throw "the version must be x.y.z, not '$Version'"
 }
-# The Store takes no package whose first number is 0: package-msix.ps1 packs x.y.z as (x + 1).y.z.0 (0.2.1 is 1.2.1.0).
-$parts = $Version.Split('.') | ForEach-Object { [int]$_ }
-$packageVersion = '{0}.{1}.{2}.0' -f ($parts[0] + 1), $parts[1], $parts[2]
+# package-msix.ps1 packs x.y.z as x.y.z.0; the fourth number is the Store's.
+$packageVersion = "$Version.0"
 
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $msix = Join-Path $root "dist\piikey-$Version-x64.msix"

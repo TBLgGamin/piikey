@@ -14,9 +14,9 @@ Partner Center as they are. The rest is for the person who submits.
    (`AppxManifest.xml`, `DisplayName`): it must be the name you reserved.
 2. Run `release-assets` (a release does, or run it by hand) and download the workflow artifact
    `piikey-<version>-msix`. Its `piikey-<version>-x64.msix` is unsigned on purpose and is the file
-   to upload: the Store signs it. The package version is the release version with its first number
-   raised by one (0.2.1 becomes 1.2.1.0): the Store takes no package whose first number is 0, and
-   keeps the fourth for itself. Later packages must be higher: the mapping keeps the order. The run
+   to upload: the Store signs it. The package version is the release version with a fourth number
+   0 (1.0.0 is 1.0.0.0); the Store keeps the fourth number for itself and takes no package whose
+   first number is 0. Later packages must be higher, as releases are. The run
    installed a signed copy on a Windows runner, started it and removed it again before the
    artifact was uploaded.
 3. Partner Center asks for a privacy policy URL for a desktop app (Store policy 10.5.1). Point it

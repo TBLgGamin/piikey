@@ -97,9 +97,9 @@ With the repository variables `STORE_IDENTITY_NAME`, `STORE_PUBLISHER` and
 `STORE_PUBLISHER_DISPLAY_NAME` set (Partner Center: Product management, Product
 identity) the package has the identity of the Store listing and is the file to
 upload to Partner Center; without them it has a test identity (`piikey.dev`). The
-package version is the release version with its first number raised by one (0.2.1
-becomes 1.2.1.0), because the Store takes no package whose first number is 0;
-everything else, `piikey-cli --version` included, keeps the release version.
+package version is the release version with a fourth number 0 (1.0.0 is 1.0.0.0);
+the Store takes no package whose first number is 0, so a Store package needs a
+release of 1.0.0 or later.
 [`packaging/windows/msix/CERTIFICATION.md`](packaging/windows/msix/CERTIFICATION.md)
 holds what to paste into the submission. To build it by hand you need the Windows
 SDK: `pwsh packaging/windows/package-msix.ps1 -Version X.Y.Z` after

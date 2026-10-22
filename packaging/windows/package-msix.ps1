@@ -17,9 +17,9 @@
                                             AppxManifest.xml and Assets\)
 
 .PARAMETER Version
-  The version of the build, as in Cargo.toml (for example 0.2.1). The package version is
-  (major + 1).minor.patch.0, here 1.2.1.0: the Store does not take a package whose first number is
-  0, and piikey is 0.x; it keeps the fourth number for itself. The order of the versions is kept.
+  The version of the build, as in Cargo.toml (for example 1.0.0). The package version is the same
+  with a fourth number 0 (1.0.0.0), which the Store keeps for itself. The Store takes no package
+  whose first number is 0, so a Store identity refuses a 0.x version; the test identity takes it.
 
 .PARAMETER IdentityName
   Package/Identity/Name. Test builds: piikey.dev.
@@ -63,14 +63,15 @@ $msix = Join-Path $dist "piikey-$Version-x64.msix"
 if ($Version -notmatch '^\d+\.\d+\.\d+$') {
     throw "the version must be x.y.z (a package version is x.y.z.0), not '$Version'"
 }
-# The Store takes no package whose first number is 0, and piikey is 0.x: (major + 1).minor.patch.0
-# keeps the order of the versions (1.0.0 becomes 2.0.0.0, after 1.9.9.0), and the fourth number
-# is the Store's.
+# The fourth number is the Store's. The Store takes no package whose first number is 0.
 $parts = $Version.Split('.') | ForEach-Object { [int]$_ }
-if ($parts[0] + 1 -gt 65535 -or $parts[1] -gt 65535 -or $parts[2] -gt 65535) {
+if ($parts | Where-Object { $_ -gt 65535 }) {
     throw "'$Version' does not fit a package version: each number is at most 65535"
 }
-$packageVersion = '{0}.{1}.{2}.0' -f ($parts[0] + 1), $parts[1], $parts[2]
+if ($parts[0] -eq 0 -and $IdentityName -ne 'piikey.dev') {
+    throw "the Store takes no package version that starts with 0, and '$Version' does: release 1.0.0 or later"
+}
+$packageVersion = '{0}.{1}.{2}.0' -f $parts[0], $parts[1], $parts[2]
 if ($IdentityName -notmatch '^[-A-Za-z0-9.]{3,50}$') {
     throw "'$IdentityName' is not a package name: 3 to 50 letters, digits, dots and dashes"
 }
