@@ -1,16 +1,16 @@
-//! Protection: what piikey keeps from leaving, and where: the master switch, the certificate, the
-//! protected sites and apps, and the highlighting of personal data as you type.
+//! Protection: what piikey keeps from leaving, and where: the highlighting of personal data as you
+//! type, and the protected sites and apps. The certificate that masking needs is Overview's to ask
+//! for, with the one button that installs it.
 
 use piikey::policy::{Highlight, PRESETS};
 use windows_reactor::{ComboBox, StackPanel, View};
 
 use super::{
-    kit::{Context, Row, attention, caption, card, column, form_error, page_header, section},
+    kit::{Context, Row, caption, card, column, form_error, page_header, section},
     lists::{ROW, add_row, check_row, list_height, plain_list, remove_row},
 };
 use crate::ui::{
-    controller::Cert,
-    status::{Cause, Status},
+    status::Status,
     window::{MainWindow, Msg, Page},
 };
 
@@ -27,7 +27,7 @@ const HIGHLIGHTS: [(Highlight, &str); 3] = [
 pub(super) fn protection(window: &MainWindow, status: &Status, context: Context<'_>) -> View {
     let mut children: Vec<View> = vec![page_header(Page::Protection.title(), DEFINITION, [])];
     children.extend(form_error(window, context));
-    children.push(certificate(window, context));
+    children.push(highlighting(window, status, context));
     children.push(section(
         "Protected sites",
         vec![
@@ -42,24 +42,7 @@ pub(super) fn protection(window: &MainWindow, status: &Status, context: Context<
             apps_card(window, context),
         ],
     ));
-    children.push(highlighting(window, status, context));
     column(children)
-}
-
-/// Whether Windows trusts the certificate masking needs, with the fix when it does not.
-fn certificate(window: &MainWindow, context: Context<'_>) -> View {
-    let row = match window.snap.cert {
-        Cert::Installed => Row::new("Certificate installed")
-            .icon("\u{E8D7}")
-            .description("Windows trusts the piikey certificate, so piikey can read the HTTPS traffic of your protected sites and apps.")
-            .build(),
-        Cert::Missing => attention(window, &Cause::CertificateMissing, context),
-        Cert::Unknown => Row::new("Certificate")
-            .icon("\u{E8D7}")
-            .description("Checking whether Windows trusts the piikey certificate\u{2026}")
-            .build(),
-    };
-    section("Certificate", vec![row])
 }
 
 /// The preset sites with check boxes, then the sites the user added with a remove button each.

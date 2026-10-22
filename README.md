@@ -163,10 +163,11 @@ keeps are described in [docs/how-it-works.md](docs/how-it-works.md).
   button. When something needs you, such as a certificate that is not installed, one message shows
   with its fix button. Below it, six rows say what piikey is doing (Masking, Highlighting,
   Inventory, Watch, Vault, Detection; each opens its page), then the five latest swaps.
-- **Protection** holds the certificate, the protected sites, the protected apps and the
-  highlighting mode.
-- **Inventory** is where you scan. The Scan button looks through your locations (Documents,
-  Desktop and Downloads until you choose others), the box beside it scans one more folder or file,
+- **Protection** holds the highlighting mode, the protected sites and the protected apps. The
+  certificate is installed from Overview.
+- **Inventory** is where you scan. It lists your locations (Documents, Desktop and Downloads until
+  you choose others) with what each holds and a Remove button; the Scan button looks through them,
+  the box below scans one more folder or file,
   and you can drop files and folders from Explorer onto the page. The dashboard shows a tree of
   folders and files with bars by type, the types found, a treemap of the files, and the details of
   what you select. A scan that you start from the page, the box, a drop or Explorer ends in a result
@@ -195,7 +196,7 @@ piikey starts in the tray at sign-in without a window.
     <td width="50%">
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/protection-dark.png">
-        <img alt="Protection page: the certificate, the protected sites and apps, and highlighting" src="docs/assets/screenshots/protection-light.png">
+        <img alt="Protection page: highlighting, then the protected sites and apps" src="docs/assets/screenshots/protection-light.png">
       </picture>
     </td>
     <td width="50%">
@@ -206,7 +207,7 @@ piikey starts in the tray at sign-in without a window.
     </td>
   </tr>
   <tr>
-    <td><b>Protection</b>: what piikey masks and highlights. The certificate, the sites and apps you protect, and the highlighting mode.</td>
+    <td><b>Protection</b>: what piikey masks and highlights. The highlighting mode and the sites and apps you protect.</td>
     <td><b>Inventory</b>: where personal data is stored on this PC, as a tree, a legend of types and a treemap with a tile for every file, from what you scanned.</td>
   </tr>
   <tr>
@@ -249,8 +250,8 @@ Download from the [latest release](https://github.com/TBLgGamin/piikey/releases/
 - **Portable** (`piikey-<version>-windows-x64.zip`): unzip it anywhere and run `piikey\piikey.exe`.
 
 On first start, piikey downloads its detection model (about 343 MB, checked with SHA-256) to
-`%LOCALAPPDATA%\piikey\models`. On the Protection page install the certificate (Windows asks once),
-tick your sites, then turn protection on at Overview.
+`%LOCALAPPDATA%\piikey\models`. On Overview install the certificate (Windows asks once), tick your
+sites on the Protection page, then turn protection on at Overview.
 
 The builds are not code-signed yet, so Windows SmartScreen asks once: choose **More info**, then
 **Run anyway**.

@@ -4,18 +4,15 @@
 //! is shown by the same dashboard as the inventory.
 
 use piikey::policy::default_inventory_roots;
-use windows_reactor::{
-    Button, ButtonStyle, Grid, GridLength, ScrollViewer, StackPanel, TextBlock, TextTrimming,
-    Thickness, VerticalAlignment, View,
-};
+use windows_reactor::{Button, StackPanel, View};
 
 use super::{
     dashboard::{self, dashboard, room},
     kit::{
-        Context, caption, card, counted, feature_switch, form_error, page_header, thousands,
-        toned_glyph, when, wide_column,
+        Context, caption, card, counted, feature_switch, form_error, page_header, thousands, when,
+        wide_column,
     },
-    lists::add_row,
+    lists::{add_row, place_row, places_card},
 };
 use crate::ui::{
     controller::{FolderStatus, Store, WatchedFolder},
@@ -26,10 +23,6 @@ use crate::ui::{
 /// What the page is, in a sentence.
 const DEFINITION: &str = "Keeps an eye on folders and checks a file again when it changes.";
 
-/// The height of the row of a folder.
-const ROW: f64 = 48.0;
-/// The most folders the list shows without scrolling.
-const MOST_ROWS: usize = 4;
 /// What the dashboard has to leave room for on this page besides the folders: the header, the box
 /// that adds a folder, the line under it, and the gaps between them.
 const CHROME: f64 = 150.0;
@@ -65,41 +58,8 @@ const fn tone(status: &FolderStatus) -> Tone {
     }
 }
 
-/// One watched folder: its path, what it is doing, and the button that stops watching it.
-fn folder_row(
-    folder: &WatchedFolder,
-    scanning: Option<(u64, u64)>,
-    dark: bool,
-    context: Context<'_>,
-) -> View {
-    Grid::new()
-        .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
-        .column_spacing(12.0)
-        .height(ROW)
-        .children((
-            toned_glyph("\u{E8B7}", 18.0, tone(&folder.status), dark)
-                .vertical_alignment(VerticalAlignment::Center),
-            StackPanel::new()
-                .grid_column(1)
-                .vertical_alignment(VerticalAlignment::Center)
-                .children((
-                    TextBlock::new()
-                        .text(folder.path.display().to_string())
-                        .text_trimming(TextTrimming::CharacterEllipsis),
-                    caption(folder_status(folder, scanning)),
-                )),
-            Button::new()
-                .content("Remove")
-                .style(ButtonStyle::Subtle)
-                .automation_name(format!("Stop watching {}", folder.path.display()))
-                .grid_column(2)
-                .vertical_alignment(VerticalAlignment::Center)
-                .on_click(context.message(Msg::RemoveWatch(folder.path.clone()))),
-        ))
-        .into()
-}
-
-/// The folders, in a card that scrolls past [`MOST_ROWS`], or what to do when there are none.
+/// The folders, in a card that scrolls past a few rows, or what to do when there are none; with the
+/// room the card takes.
 fn folders(window: &MainWindow, context: Context<'_>) -> (View, f64) {
     let watch = &window.snap.watch;
     if watch.folders.is_empty() {
@@ -115,24 +75,21 @@ fn folders(window: &MainWindow, context: Context<'_>) -> (View, f64) {
             90.0,
         );
     }
-    let rows: Vec<View> = watch
-        .folders
-        .iter()
-        .map(|folder| folder_row(folder, watch.scanning, window.dark, context))
-        .collect();
-    let shown = rows.len().min(MOST_ROWS);
-    // Row counts are tiny: the conversion is exact.
-    let height = ROW * f64::from(u32::try_from(shown).unwrap_or(u32::MAX));
-    (
-        card(
-            ScrollViewer::new().height(height).content(
-                StackPanel::new()
-                    .margin(Thickness::new(0.0, 0.0, 12.0, 0.0))
-                    .children(rows),
-            ),
-        )
-        .into(),
-        height + 34.0,
+    places_card(
+        watch
+            .folders
+            .iter()
+            .map(|folder| {
+                place_row(
+                    &folder.path,
+                    &folder_status(folder, watch.scanning),
+                    tone(&folder.status),
+                    window.dark,
+                    Msg::RemoveWatch(folder.path.clone()),
+                    context,
+                )
+            })
+            .collect(),
     )
 }
 

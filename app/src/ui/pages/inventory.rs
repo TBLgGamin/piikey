@@ -3,20 +3,22 @@
 //! Explorer's "Scan for personal data" adds to it too. What was found is shown by the dashboard of
 //! [`super::dashboard`]; nothing here runs by itself.
 
-use piikey::policy::Policy;
+use std::path::Path;
+
+use piikey::{inventory::Node, sys::same_path};
 use windows_reactor::{
     Border, Button, ButtonStyle, Color, DragDropAction, DragDropOperation, DragDropPolicy,
-    DroppedData, Flyout, FlyoutExt, FlyoutPlacement, Orientation, ProgressBar, ProgressRing,
-    StackPanel, VerticalAlignment, View,
+    DroppedData, Orientation, ProgressBar, ProgressRing, StackPanel, VerticalAlignment, View,
 };
 
 use super::{
     dashboard::{self, dashboard, has_data, room},
     kit::{Context, caption, card, counted, form_error, page_header, thousands, wide_column},
-    lists::{add_row, list_height, plain_list, remove_row},
+    lists::{add_row, place_row, places_card},
 };
 use crate::ui::{
     controller::Store,
+    status::Tone,
     window::{Dash, MainWindow, Msg, Page},
 };
 
@@ -103,31 +105,49 @@ fn status_line(window: &MainWindow) -> View {
     caption(text).into()
 }
 
-/// The locations the Scan button looks through, in a flyout of the button that names how many
-/// there are: each with a button that takes it off the list.
-fn locations(policy: &Policy, context: Context<'_>) -> View {
-    let places = policy.inventory_roots_or_default();
-    let list = plain_list(
-        list_height(places.len()),
-        places.iter().map(|path| {
-            remove_row(
-                format!("location:{}", path.display()),
-                &path.display().to_string(),
-                Msg::RemoveLocation(path.clone()),
-                context,
-            )
-        }),
-    );
-    let panel = StackPanel::new().spacing(8.0).width(440.0).children((
-        caption("The Scan button looks through these folders and everything in them."),
-        list,
-    ));
-    Button::new()
-        .content(format!(
-            "Locations ({})",
-            thousands(u64::try_from(places.len()).unwrap_or(u64::MAX))
-        ))
-        .flyout_with(Flyout::rich(card(panel)).placement(FlyoutPlacement::BottomEdgeAlignedRight))
+/// What the inventory found in `location`, for the row of the location: how much, or that nothing
+/// was found there yet.
+fn location_state(top: &[Node], location: &Path) -> (String, Tone) {
+    match top.iter().find(|node| same_path(&node.path, location)) {
+        Some(node) => (
+            format!(
+                "{} found in {}",
+                thousands(node.hits),
+                counted(u64::from(node.files), "file", "files")
+            ),
+            Tone::Good,
+        ),
+        None => ("Nothing found yet".to_owned(), Tone::Neutral),
+    }
+}
+
+/// The locations the Scan button looks through, one row each like the folders of Watch: with what
+/// was found in it and the button that takes it off. Also the room the card takes.
+fn locations(window: &MainWindow, context: Context<'_>) -> (View, f64) {
+    let top: &[Node] = window
+        .inventory
+        .loaded
+        .as_ref()
+        .map_or(&[], |loaded| &loaded.top);
+    places_card(
+        window
+            .snap
+            .policy
+            .inventory_roots_or_default()
+            .iter()
+            .map(|location| {
+                let (state, tone) = location_state(top, location);
+                place_row(
+                    location,
+                    &state,
+                    tone,
+                    window.dark,
+                    Msg::RemoveLocation(location.clone()),
+                    context,
+                )
+            })
+            .collect(),
+    )
 }
 
 /// What the dashboard says when nothing was found: at the top, how to find something; in a folder,
@@ -166,10 +186,11 @@ pub(super) fn inventory(window: &MainWindow, context: Context<'_>) -> View {
             .is_enabled(exportable)
             .on_click(context.message(Msg::Dash(Store::Inventory, Dash::Report)))
             .into(),
-        locations(&snap.policy, context),
     ];
+    let (places, listed) = locations(window, context);
     let mut children: Vec<View> = vec![page_header(Page::Inventory.title(), DEFINITION, controls)];
     children.extend(form_error(window, context));
+    children.push(places);
     children.push(add_row(
         "A folder or file to scan, e.g. C:\\Users\\you\\Documents",
         &window.root_draft,
@@ -182,7 +203,7 @@ pub(super) fn inventory(window: &MainWindow, context: Context<'_>) -> View {
     children.push(dashboard(
         window,
         Store::Inventory,
-        room(window, CHROME),
+        room(window, CHROME + listed),
         |top| nothing(top, context),
         context,
     ));
@@ -204,7 +225,31 @@ pub(super) fn inventory(window: &MainWindow, context: Context<'_>) -> View {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
+
+    #[test]
+    fn a_location_says_what_was_found_in_it_or_that_nothing_was() {
+        let node = Node {
+            path: PathBuf::from(r"C:\Users\me\Documents"),
+            name: "Documents".to_owned(),
+            is_dir: true,
+            hits: 711,
+            files: 51,
+            counts: Vec::new(),
+        };
+        let top = [node];
+        assert_eq!(
+            location_state(&top, Path::new(r"c:\users\ME\documents")),
+            ("711 found in 51 files".to_owned(), Tone::Good)
+        );
+        assert_eq!(
+            location_state(&top, Path::new(r"C:\Users\me\Desktop")),
+            ("Nothing found yet".to_owned(), Tone::Neutral)
+        );
+        assert_eq!(location_state(&[], Path::new(r"C:\Docs")).1, Tone::Neutral);
+    }
 
     #[test]
     fn the_status_line_counts_values_files_and_locations() {

@@ -22,8 +22,9 @@ use std::path::{Path, PathBuf};
 use piikey::detect::EntityKind;
 use windows_reactor::{
     Border, Button, ButtonStyle, Color, DataItem, FontIcon, FontWeight, Grid, GridLength,
-    HyperlinkButton, ListView, ListViewSelectionMode, Orientation, StackPanel, TextBlock,
-    TextTrimming, TextWrapping, ThemeBrush, Thickness, TooltipExt, VerticalAlignment, View,
+    HyperlinkButton, KeyedView, ListView, ListViewSelectionMode, Orientation, StackPanel,
+    TextBlock, TextTrimming, TextWrapping, ThemeBrush, Thickness, TooltipExt, VerticalAlignment,
+    View,
 };
 
 pub(in crate::ui) use self::report::dialog;
@@ -334,25 +335,35 @@ fn tree_card(dash: &Dashboard, loaded: &Loaded, store: Store, context: Context<'
         .selected
         .as_deref()
         .and_then(|path| position(&all, path));
-    let items: Vec<DataItem> = all
+    // A row's key says how deep it is as well: a folder that is a location and also lies in another
+    // location is two rows, and two rows must not share a key.
+    let keys: Vec<String> = all
         .iter()
         .enumerate()
         .map(|(i, line)| match line {
-            Line::Row(row) => {
-                DataItem::new(format!("row:{}", row.node.path.display()), &row.node.name)
-                    .content(row_view(row, dash.kind, store, context))
-            }
-            other => DataItem::new(format!("more:{i}"), "more").content(
-                caption(leftover(other).unwrap_or_default())
-                    .margin(Thickness::new(INDENT, 8.0, 8.0, 8.0)),
-            ),
+            Line::Row(row) => format!("row:{}:{}", row.depth, row.node.path.display()),
+            Line::More { .. } | Line::Cut => format!("more:{i}"),
         })
         .collect();
+    // Rows that change places make a new list: moving the rows of a list with a selection makes
+    // WinUI fail fast, as picking a second tile of the map did when it listed another folder first.
+    let epoch = dash.tree_list(keys.clone());
+    let items: Vec<DataItem> =
+        all.iter()
+            .zip(keys)
+            .map(|(line, key)| match line {
+                Line::Row(row) => DataItem::new(key, &row.node.name)
+                    .content(row_view(row, dash.kind, store, context)),
+                other => DataItem::new(key, "more").content(
+                    caption(leftover(other).unwrap_or_default())
+                        .margin(Thickness::new(INDENT, 8.0, 8.0, 8.0)),
+                ),
+            })
+            .collect();
     let list = ListView::new()
         .selection_mode(ListViewSelectionMode::Single)
         .selected_index(selected)
         .items(items)
-        .grid_row(1)
         .on_selection_changed(context.callback(move |index: Option<usize>| {
             // The list reports nothing chosen while it is made again: that is not a choice.
             index
@@ -361,6 +372,9 @@ fn tree_card(dash: &Dashboard, loaded: &Loaded, store: Store, context: Context<'
                     Msg::Dash(store, Dash::Select(path, Origin::Tree))
                 })
         }));
+    let list = Grid::new()
+        .grid_row(1)
+        .keyed_children([KeyedView::new(format!("tree-{epoch}"), list)]);
     Border::new()
         .background(ThemeBrush::CardBackground)
         .border_brush(ThemeBrush::CardStroke)

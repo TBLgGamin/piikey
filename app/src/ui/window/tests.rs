@@ -386,15 +386,13 @@ fn pages() -> [(Page, &'static [&'static str]); 5] {
             Page::Protection,
             &[
                 "Protection",
-                "Certificate",
-                "Certificate installed",
+                "Highlighting",
+                "Highlight personal data as you type",
+                "Try highlighting before you turn masking on.",
                 "Protected sites",
                 "Add site",
                 "Protected apps",
                 "Add app",
-                "Highlighting",
-                "Highlight personal data as you type",
-                "Try highlighting before you turn masking on.",
             ],
         ),
         (
@@ -591,7 +589,7 @@ fn the_window_says_everything_in_the_words_of_the_glossary() -> Test {
 }
 
 #[test]
-fn without_the_certificate_overview_and_protection_name_the_one_fix() -> Test {
+fn without_the_certificate_overview_names_the_one_fix_and_protection_leaves_it_there() -> Test {
     let mut ui = Headless::open(|dir| stub_controller_with(dir, false))?;
     let overview = ui.everything();
     // Nobody asked for protection: it is off, and what stands in its way has one button.
@@ -608,13 +606,23 @@ fn without_the_certificate_overview_and_protection_name_the_one_fix() -> Test {
     )?;
     expect_not_drawn("Overview", &overview, &["Needs attention"])?;
 
+    // Protection does not repeat it: the fix lives on Overview, in one place.
     let protection = ui.send(Msg::Nav(Page::Protection))?;
     expect_drawn(
         "Protection",
         &protection,
-        &["Certificate not installed", "Install certificate"],
+        &["Highlighting", "Protected sites"],
     )?;
-    expect_not_drawn("Protection", &protection, &["Certificate installed"])?;
+    expect_not_drawn(
+        "Protection",
+        &protection,
+        &[
+            "Certificate",
+            "Certificate installed",
+            "Certificate not installed",
+            "Install certificate",
+        ],
+    )?;
     Ok(())
 }
 
@@ -1289,5 +1297,108 @@ fn keeping_piikey_in_the_tray_when_the_window_closes_is_a_setting() -> Test {
     assert!(ui.controller.wait_idle(WAIT));
     assert!(!ui.controller.snapshot().policy.background);
     assert!(!ui.controller.runs_in_background());
+    Ok(())
+}
+
+#[test]
+fn protection_starts_with_highlighting_then_the_sites_and_the_apps() -> Test {
+    let mut ui = Headless::open(stub_controller)?;
+    let drawn = ui.send(Msg::Nav(Page::Protection))?;
+    let at = |text: &str| drawn.iter().position(|drawn| drawn == text);
+    let order: Vec<Option<usize>> = ["Highlighting", "Protected sites", "Protected apps"]
+        .iter()
+        .map(|text| at(text))
+        .collect();
+    assert!(
+        order.iter().all(Option::is_some) && order.windows(2).all(|pair| pair[0] < pair[1]),
+        "{order:?} in {drawn:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn inventory_lists_its_locations_like_watch_lists_its_folders() -> Test {
+    let (mut ui, folder) = scanned_window(&[
+        ("a.txt", "mail jan.jansen@acme.nl and piet@acme.nl"),
+        ("b.txt", "call jan.jansen@acme.nl"),
+    ])?;
+    let before = ui.send(Msg::Nav(Page::Inventory))?;
+    // A row for each location, with what the inventory holds of it before the load says more.
+    expect_drawn("locations", &before, &["Remove", "Nothing found yet"])?;
+    expect_not_drawn("no flyout", &before, &["Locations (3)"])?;
+    let drawn = ui.loaded(Store::Inventory, Path::new(""))?;
+    let path = folder.display().to_string();
+    expect_drawn(
+        "the scanned location",
+        &drawn,
+        &[path.as_str(), "3 found in 2 files"],
+    )?;
+    // Taking a location off the list asks the controller, which saves it.
+    ui.send(Msg::RemoveLocation(folder))?;
+    assert!(ui.controller.wait_idle(WAIT));
+    assert!(
+        !ui.controller
+            .snapshot()
+            .policy
+            .inventory_roots
+            .iter()
+            .any(|root| root.display().to_string() == path)
+    );
+    Ok(())
+}
+
+#[test]
+fn picking_a_tile_of_another_folder_makes_a_new_tree_and_never_moves_the_rows_of_one() -> Test {
+    // WinUI fails fast (0xC000027B) when the rows of a list that has a selection change places,
+    // which is what listing the way to the second tile's folder first did.
+    let mut ui = Headless::open(stub_controller)?;
+    let docs = ui.dir.0.join("docs");
+    let mail = ui.dir.0.join("mail");
+    for (folder, text) in [
+        (&docs, "mail jan.jansen@acme.nl"),
+        (&mail, "mail a@acme.nl b@acme.nl c@acme.nl"),
+    ] {
+        fs::create_dir_all(folder).describe()?;
+        fs::write(folder.join("a.txt"), text).describe()?;
+        ui.controller.submit(Command::Edit(Edit::InventoryRoot {
+            path: folder.clone(),
+            on: true,
+        }));
+    }
+    ui.controller.submit(Command::ScanFiles {
+        paths: vec![docs.clone(), mail.clone()],
+        reveal: false,
+    });
+    if !ui.controller.wait_idle(WAIT) || !ui.controller.wait_scans(WAIT) {
+        return Err("the scan did not finish".to_owned());
+    }
+    ui.send(Msg::Nav(Page::Inventory))?;
+    ui.loaded(Store::Inventory, Path::new(""))?;
+    // The folder that holds more is listed first; a tile of the other one is picked, so its way
+    // comes first: the rows would have to change places.
+    let first = mail.join("a.txt");
+    let second = docs.join("a.txt");
+    ui.send(Msg::Dash(
+        Store::Inventory,
+        Dash::Select(first, Origin::Map),
+    ))?;
+    ui.loaded_with(
+        Store::Inventory,
+        Path::new(""),
+        std::slice::from_ref(&mail),
+        None,
+    )?;
+    let before = ui.host.adapter().batches().len();
+    ui.send(Msg::Dash(
+        Store::Inventory,
+        Dash::Select(second, Origin::Map),
+    ))?;
+    let made = created(&ui.host.adapter().batches()[before..], ObjectType::ListView);
+    assert_eq!(made, 1, "the rows changed places in a list that stayed");
+    // The same rows again keep their list.
+    let before = ui.host.adapter().batches().len();
+    ui.loaded_with(Store::Inventory, Path::new(""), &[mail, docs], None)?;
+    let made = created(&ui.host.adapter().batches()[before..], ObjectType::ListView);
+    assert_eq!(made, 0, "rows that only came made a new list");
     Ok(())
 }

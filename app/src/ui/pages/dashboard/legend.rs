@@ -4,9 +4,9 @@
 
 use piikey::{detect::EntityKind, inventory::TypeTotal};
 use windows_reactor::{
-    Border, Button, ButtonStyle, DataItem, Grid, GridLength, ListView, ListViewSelectionMode,
-    Orientation, ScrollBarVisibility, ScrollViewer, StackPanel, TextBlock, TextTrimming,
-    ThemeBrush, Thickness, VerticalAlignment, View,
+    Border, Button, ButtonStyle, DataItem, Grid, GridLength, KeyedView, ListView,
+    ListViewSelectionMode, Orientation, ScrollBarVisibility, ScrollViewer, StackPanel, TextBlock,
+    TextTrimming, ThemeBrush, Thickness, VerticalAlignment, View,
 };
 
 use super::palette::swatch;
@@ -173,6 +173,9 @@ pub(super) fn list(
     context: Context<'_>,
 ) -> Border {
     let kinds: Vec<EntityKind> = totals.iter().map(|total| total.kind).collect();
+    // Types that change places make a new list: moving the rows of a list with a selection makes
+    // WinUI fail fast.
+    let names: Vec<&str> = totals.iter().map(|total| total.kind.as_str()).collect();
     let selected = shown
         .and_then(|kind| kinds.iter().position(|&of| of == kind))
         .map_or(0, |i| i + 1);
@@ -197,20 +200,23 @@ pub(super) fn list(
         .corner_radius(8.0)
         .height(height)
         .content(
-            ListView::new()
-                .selection_mode(ListViewSelectionMode::Single)
-                .selected_index(Some(selected))
-                .items(items)
-                .on_selection_changed(context.callback(move |index: Option<usize>| {
-                    // A list that is made again reports nothing chosen for a moment: that is not
-                    // a choice.
-                    index.map_or(Msg::Noop, |i| {
-                        Msg::Dash(
-                            store,
-                            Dash::Type(i.checked_sub(1).and_then(|k| kinds.get(k).copied())),
-                        )
-                    })
-                })),
+            Grid::new().keyed_children([KeyedView::new(
+                format!("types-{}", names.join(",")),
+                ListView::new()
+                    .selection_mode(ListViewSelectionMode::Single)
+                    .selected_index(Some(selected))
+                    .items(items)
+                    .on_selection_changed(context.callback(move |index: Option<usize>| {
+                        // A list that is made again reports nothing chosen for a moment: that is
+                        // not a choice.
+                        index.map_or(Msg::Noop, |i| {
+                            Msg::Dash(
+                                store,
+                                Dash::Type(i.checked_sub(1).and_then(|k| kinds.get(k).copied())),
+                            )
+                        })
+                    })),
+            )]),
         )
 }
 

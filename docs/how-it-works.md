@@ -147,13 +147,14 @@ under it that is a button to Overview.
   attention block with its single fix button, six clickable rows (Masking, Highlighting, Inventory,
   Watch, Vault, Detection, each with its own state and no switches) and the five most recent swaps
   with a link to the Vault.
-- **Protection**: the certificate, the protected sites, the protected apps and the highlighting
-  mode. It has no switch of its own: turning masking on is the Overview button (and the tray menu),
-  and the page says why it cannot be turned on while the certificate is missing.
-- **Inventory**: the Scan button, Export report, a Locations flyout (the folders the button looks
-  through, each with a Remove button), the box that adds a folder or file and scans it, a status
-  line (progress or what the inventory holds) and the dashboard described under Inventory and
-  Explorer above. Files and folders dropped on the page are scanned.
+- **Protection**: the highlighting mode, the protected sites and the protected apps. It has no
+  switch of its own and no certificate section: turning masking on is the Overview button (and the
+  tray menu), and installing the certificate is the fix button of Overview's attention block.
+- **Inventory**: the Scan button, Export report, the locations (the folders the button looks
+  through, as rows like Watch's folders: what each holds and a Remove button), the box that adds a
+  folder or file and scans it, a status line (progress or what the inventory holds) and the
+  dashboard described under Inventory and Explorer above. Files and folders dropped on the page are
+  scanned.
 - **Watch**: its switch, the folder list with each folder's state and a Remove button, the box that
   adds a folder (or "Watch Documents, Desktop and Downloads" when the list is empty), a status line
   and the same dashboard over the watch's store.

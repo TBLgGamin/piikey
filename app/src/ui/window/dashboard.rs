@@ -8,6 +8,7 @@
 //! (folder, selection, open folders, type) lives in [`Dashboard`] and survives a load.
 
 use std::{
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
@@ -75,6 +76,9 @@ pub struct Loaded {
     pub at: PathBuf,
     /// The nodes of each folder the tree lists: the one of the folder on show is the top level.
     pub levels: HashMap<PathBuf, Vec<Node>>,
+    /// The top level of the store, whatever folder is on show: one node for each of its locations
+    /// that holds something.
+    pub top: Vec<Node>,
     /// The folders the store looks through, which the top level is grouped by.
     pub roots: Vec<PathBuf>,
     /// The map's files.
@@ -104,6 +108,10 @@ pub struct Dashboard {
     /// The number of the load that `loaded` came from: one that is older than that, or was made
     /// for another folder, is not shown.
     shown: u64,
+    /// The keys of the tree's rows as they were last drawn, and the number of the list they were
+    /// drawn in: see [`Dashboard::tree_list`].
+    tree_keys: RefCell<Vec<String>>,
+    tree_epoch: Cell<u64>,
 }
 
 impl Dashboard {
@@ -118,7 +126,23 @@ impl Dashboard {
             loaded: None,
             seq: 0,
             shown: 0,
+            tree_keys: RefCell::new(Vec::new()),
+            tree_epoch: Cell::new(0),
         }
+    }
+
+    /// Tells the dashboard the tree is about to be drawn with rows keyed `keys`, and returns the
+    /// number of the list to draw it in. Rows that come or go keep the list; rows that change places
+    /// make it a new one, because moving the rows of a list that has a selection makes `WinUI` fail
+    /// fast (`0xC000027B`): the old list is dropped and the new one made, which also starts it at the
+    /// top, where the way to the selection is listed first.
+    pub(in crate::ui) fn tree_list(&self, keys: Vec<String>) -> u64 {
+        let mut last = self.tree_keys.borrow_mut();
+        if !keeps_order(&last, &keys) {
+            self.tree_epoch.set(self.tree_epoch.get() + 1);
+        }
+        *last = keys;
+        self.tree_epoch.get()
     }
 
     /// The folders the store looks through, as the last load knew them.
@@ -208,6 +232,15 @@ impl Dashboard {
     }
 }
 
+/// Whether the rows that are in both lists come in the same order in both: nothing has to move.
+fn keeps_order(old: &[String], new: &[String]) -> bool {
+    let in_new: HashSet<&str> = new.iter().map(String::as_str).collect();
+    let in_old: HashSet<&str> = old.iter().map(String::as_str).collect();
+    old.iter()
+        .filter(|key| in_new.contains(key.as_str()))
+        .eq(new.iter().filter(|key| in_old.contains(key.as_str())))
+}
+
 /// The folders that have to be open for the row of `path` to show, from the outermost in: the ones
 /// between `at` and `path`. At the top level the rows start at the `roots`, the folders the store
 /// looks through, so the folders above those are not rows.
@@ -237,6 +270,11 @@ impl Loaded {
         file: Option<&Path>,
     ) -> Self {
         let top = controller.inventory_view(store, at, file);
+        let places = if at.as_os_str().is_empty() {
+            top.nodes.clone()
+        } else {
+            controller.inventory_view(store, Path::new(""), None).nodes
+        };
         let mut levels = HashMap::new();
         for folder in open
             .iter()
@@ -249,6 +287,7 @@ impl Loaded {
         Self {
             at: at.to_path_buf(),
             levels,
+            top: places,
             roots: top.roots,
             tiles: controller.tiles(store, at, TILES),
             totals: controller.type_totals(store, at),
@@ -394,6 +433,7 @@ mod tests {
         Loaded {
             at: PathBuf::new(),
             levels,
+            top: Vec::new(),
             roots: roots.iter().map(PathBuf::from).collect(),
             tiles: Tiles {
                 tiles: Vec::new(),
@@ -411,6 +451,30 @@ mod tests {
             &[node(r"C:\Docs", true), node(r"C:\Docs\a.pdf", false)],
         ));
         dash
+    }
+
+    #[test]
+    fn rows_that_come_or_go_keep_the_list_and_rows_that_move_make_a_new_one() {
+        let keys = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>()
+        };
+        let dash = Dashboard::new();
+        let first = dash.tree_list(keys(&["a", "b", "c"]));
+        // A folder opened: rows come in between.
+        assert_eq!(dash.tree_list(keys(&["a", "a1", "a2", "b", "c"])), first);
+        // A folder closed, and the same drawn again.
+        assert_eq!(dash.tree_list(keys(&["a", "b", "c"])), first);
+        assert_eq!(dash.tree_list(keys(&["a", "b", "c"])), first);
+        // The way to a tile's file listed first: rows move.
+        let moved = dash.tree_list(keys(&["c", "a", "b"]));
+        assert_ne!(moved, first);
+        assert_eq!(dash.tree_list(keys(&["c", "a", "b", "d"])), moved);
+        // Rows that are all new need no move either, but a new order of the old ones does.
+        assert_eq!(dash.tree_list(keys(&["x", "y"])), moved);
+        assert_ne!(dash.tree_list(keys(&["y", "x"])), moved);
     }
 
     #[test]

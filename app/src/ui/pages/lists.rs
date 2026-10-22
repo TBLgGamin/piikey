@@ -2,15 +2,22 @@
 //! button, a box to add an entry. Protection (sites and apps), Inventory (its locations), Watch
 //! (its folders) and Settings (the types of personal data) are built from them.
 
-use std::rc::Rc;
+use std::{path::Path, rc::Rc};
 
 use windows_reactor::{
     Button, ButtonStyle, CheckBox, DataItem, Grid, GridLength, ListView, ListViewSelectionMode,
-    TextBlock, TextBox, TextTrimming, Thickness, View,
+    ScrollViewer, StackPanel, TextBlock, TextBox, TextTrimming, Thickness, VerticalAlignment, View,
 };
 
-use super::kit::Context;
-use crate::ui::window::Msg;
+use super::kit::{Context, caption, card, toned_glyph};
+use crate::ui::{status::Tone, window::Msg};
+
+/// The height of the row of a place.
+const PLACE_ROW: f64 = 44.0;
+/// The most rows a list of places shows without scrolling.
+const PLACE_ROWS: usize = 3;
+/// What a list of places takes besides its rows: the card's padding and the gap under it.
+const PLACE_CARD: f64 = 34.0;
 
 /// Height of one list row in DIPs.
 pub(super) const ROW: f64 = 40.0;
@@ -93,4 +100,59 @@ pub(super) fn add_row(
                 .on_click(context.message(on_add)),
         ))
         .into()
+}
+
+/// One place a page looks through (a location of the inventory, a folder of Watch): its folder
+/// icon in the colour of `tone`, its path, what it is doing, and the button that takes it off.
+pub(super) fn place_row(
+    path: &Path,
+    state: &str,
+    tone: Tone,
+    dark: bool,
+    remove: Msg,
+    context: Context<'_>,
+) -> View {
+    Grid::new()
+        .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
+        .column_spacing(12.0)
+        .height(PLACE_ROW)
+        .children((
+            toned_glyph("\u{E8B7}", 18.0, tone, dark).vertical_alignment(VerticalAlignment::Center),
+            StackPanel::new()
+                .grid_column(1)
+                .vertical_alignment(VerticalAlignment::Center)
+                .children((
+                    TextBlock::new()
+                        .text(path.display().to_string())
+                        .text_trimming(TextTrimming::CharacterEllipsis),
+                    caption(state),
+                )),
+            Button::new()
+                .content("Remove")
+                .style(ButtonStyle::Subtle)
+                .automation_name(format!("Remove {}", path.display()))
+                .grid_column(2)
+                .vertical_alignment(VerticalAlignment::Center)
+                .on_click(context.message(remove)),
+        ))
+        .into()
+}
+
+/// The rows of places in a card that scrolls past [`PLACE_ROWS`]; also how much height the card
+/// and the gap under it take, for the page to leave room for.
+pub(super) fn places_card(rows: Vec<View>) -> (View, f64) {
+    let shown = rows.len().min(PLACE_ROWS);
+    // Row counts are tiny: the conversion is exact.
+    let height = PLACE_ROW * f64::from(u32::try_from(shown).unwrap_or(u32::MAX));
+    (
+        card(
+            ScrollViewer::new().height(height).content(
+                StackPanel::new()
+                    .margin(Thickness::new(0.0, 0.0, 12.0, 0.0))
+                    .children(rows),
+            ),
+        )
+        .into(),
+        height + PLACE_CARD,
+    )
 }

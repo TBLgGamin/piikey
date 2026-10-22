@@ -489,6 +489,7 @@ mod tests {
         Loaded {
             at: PathBuf::new(),
             levels,
+            top: Vec::new(),
             roots: vec![PathBuf::from(r"C:\Docs")],
             tiles: Tiles {
                 tiles: vec![Tile {
