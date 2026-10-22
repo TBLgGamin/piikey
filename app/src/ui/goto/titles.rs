@@ -8,6 +8,8 @@ use std::{collections::HashMap, path::Path};
 /// The fewest characters the name of a file without its extension needs to count as a name in a
 /// title: a shorter one is in too many titles.
 const MIN_STEM: usize = 3;
+/// The most windows that are looked in for a file that may be open already.
+pub(super) const MAX_OPEN: usize = 3;
 
 /// A top-level window, as far as the search tells windows apart.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,6 +17,9 @@ pub(super) struct Window {
     /// What identifies the window on the desktop for as long as it lives.
     pub(super) id: Vec<i32>,
     pub(super) title: String,
+    /// It is on the screen: not minimized, not on another desktop. A window that is not has to be
+    /// brought back by opening the file again, so it is not one to look in at once.
+    pub(super) shown: bool,
 }
 
 /// The windows that were open before the file was opened, with their titles.
@@ -87,6 +92,31 @@ pub(super) fn pick(
         })
 }
 
+/// The windows that may have the file open already, as indexes into `windows`, the likeliest
+/// first: the ones on the screen whose title has the name of the file, then those that have its
+/// name without the extension, each from the top of the stack; at most [`MAX_OPEN`]. The title is
+/// only a hint (another window can be named alike), so the value is looked for in each.
+pub(super) fn open_in(windows: &[Window], names: &Names) -> Vec<usize> {
+    let holding = |wanted: &str| -> Vec<usize> {
+        windows
+            .iter()
+            .enumerate()
+            .filter(|(_, window)| window.shown && window.title.to_lowercase().contains(wanted))
+            .map(|(at, _)| at)
+            .collect()
+    };
+    let mut found = holding(&names.name);
+    if let Some(stem) = &names.stem {
+        for at in holding(stem) {
+            if !found.contains(&at) {
+                found.push(at);
+            }
+        }
+    }
+    found.truncate(MAX_OPEN);
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,11 +125,83 @@ mod tests {
         Window {
             id: vec![42, id],
             title: title.to_owned(),
+            shown: true,
+        }
+    }
+
+    /// A window on the desktop that is minimized, or on another virtual desktop.
+    fn hidden(id: i32, title: &str) -> Window {
+        Window {
+            shown: false,
+            ..window(id, title)
         }
     }
 
     fn named(file: &str) -> Result<Names, String> {
         Names::of(Path::new(file)).ok_or_else(|| format!("{file:?} has no name"))
+    }
+
+    #[test]
+    fn a_file_that_is_open_already_is_found_by_its_name_in_a_title() -> Result<(), String> {
+        let now = [
+            window(1, "Inbox - Mail"),
+            window(2, "report.docx - Word"),
+            window(3, "Notes - Notepad"),
+        ];
+        assert_eq!(open_in(&now, &named(r"C:\Docs\Report.docx")?), [1]);
+        // Nothing is open with that name.
+        assert_eq!(
+            open_in(&now, &named(r"C:\Docs\other.docx")?),
+            Vec::<usize>::new()
+        );
+        assert_eq!(
+            open_in(&[], &named(r"C:\Docs\Report.docx")?),
+            Vec::<usize>::new()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_full_name_comes_before_the_name_without_the_extension() -> Result<(), String> {
+        // Word hides the extension of known file types; a window of another app has it in full.
+        let now = [
+            window(1, "Report - Word"),
+            window(2, "report.docx - Notepad"),
+            window(3, "Report.docx and 2 more pages - Edge"),
+        ];
+        // Each from the top of the stack, the ones with the whole name first.
+        assert_eq!(open_in(&now, &named(r"C:\Docs\Report.docx")?), [1, 2, 0]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_window_that_is_not_on_the_screen_is_not_one_to_look_in_at_once() -> Result<(), String> {
+        let now = [
+            hidden(1, "report.docx - Word"),
+            window(2, "report.docx - Notepad"),
+        ];
+        assert_eq!(open_in(&now, &named(r"C:\Docs\report.docx")?), [1]);
+        Ok(())
+    }
+
+    #[test]
+    fn only_a_few_windows_are_looked_in() -> Result<(), String> {
+        let now: Vec<Window> = (0..8).map(|id| window(id, "a.txt - Notepad")).collect();
+        assert_eq!(
+            open_in(&now, &named(r"C:\a.txt")?),
+            (0..MAX_OPEN).collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_short_name_without_the_extension_is_not_enough_for_an_open_window() -> Result<(), String> {
+        let now = [window(1, "ab - Calculator")];
+        assert_eq!(
+            open_in(&now, &named(r"C:\data\ab.txt")?),
+            Vec::<usize>::new()
+        );
+        Ok(())
     }
 
     #[test]

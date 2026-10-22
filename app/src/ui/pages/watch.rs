@@ -11,12 +11,12 @@ use super::{
         Context, caption, card, counted, feature_switch, form_error, page_header, thousands, when,
         wide_column,
     },
-    lists::{add_row, place_row, places_card},
+    lists::{add_row_with, place_row, places_card},
 };
 use crate::ui::{
     controller::{FolderStatus, Store, WatchedFolder},
     status::Tone,
-    window::{MainWindow, Msg, Page},
+    window::{Browse, MainWindow, Msg, Page},
 };
 
 /// What the page is, in a sentence.
@@ -138,12 +138,13 @@ pub(super) fn watch(window: &MainWindow, context: Context<'_>) -> View {
     )];
     children.extend(form_error(window, context));
     children.push(list);
-    children.push(add_row(
+    children.push(add_row_with(
         "A folder to watch, e.g. C:\\Users\\you\\Downloads",
         &window.watch_draft,
         "Add folder",
         Msg::WatchDraft,
         Msg::AddWatch,
+        &[("Browse\u{2026}", Browse::Watch)],
         context,
     ));
     children.push(status_line(window));

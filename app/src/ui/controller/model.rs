@@ -32,6 +32,14 @@ pub enum Model {
     Skipped,
 }
 
+/// When a detection model that nothing needs may go (see [`Controller::sync_model_after_use`]),
+/// and whether a thread is on its way to look at that time.
+#[derive(Debug, Default)]
+pub(super) struct Hold {
+    until: Option<Instant>,
+    timer: bool,
+}
+
 impl Controller {
     /// Downloads the model again after a failure.
     pub(super) fn refetch(self: &Arc<Self>) {
@@ -99,31 +107,95 @@ impl Controller {
         self.sync_model_with(false);
     }
 
-    /// As [`Controller::sync_model`]; `starting` counts protection as on.
+    /// As [`Controller::sync_model`]; `starting` counts protection as on. A model that nothing
+    /// needs is freed now, whatever a scan that ended before asked it to wait for.
     pub(super) fn sync_model_with(&self, starting: bool) {
-        let _one = self
+        let mut hold = self
             .model_sync
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        // Read only now: a call that waited for the lock must not act on what it saw before the
-        // call ahead of it changed it.
-        let policy = self.policy();
-        let (want, ready) = {
-            let state = self.lock();
-            (
-                starting
-                    || state.enabled
-                    || policy.highlight != Highlight::Off
-                    || (policy.watch && !policy.watch_folders.is_empty())
-                    || state.scan.is_some()
-                    || state.watch.scan.is_some()
-                    || state.findings > 0,
-                state.model == Model::Ready,
-            )
-        };
+        hold.until = None;
+        let (want, ready) = self.model_wanted(starting);
         if !want {
             self.backend.release_model();
-        } else if ready && let Err(error) = self.backend.load_model() {
+        } else if ready {
+            self.load_model_or_say_so();
+        }
+    }
+
+    /// [`Controller::sync_model`] for the end of a scan or of a read of findings: a model that
+    /// nothing needs any more stays in memory for [`Backend::model_idle`], with what it learned of
+    /// the texts it read. What follows a scan is mostly a look at what it found, which reads the
+    /// same texts again: with the model still there it costs no run of the model at all, and no
+    /// seconds to load it.
+    pub(super) fn sync_model_after_use(&self) {
+        let mut hold = self
+            .model_sync
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let (want, ready) = self.model_wanted(false);
+        if want {
+            hold.until = None;
+            if ready {
+                self.load_model_or_say_so();
+            }
+            return;
+        }
+        let now = Instant::now();
+        let until = *hold.until.get_or_insert(now + self.backend.model_idle());
+        if now >= until {
+            hold.until = None;
+            self.backend.release_model();
+        } else if !hold.timer {
+            hold.timer = true;
+            let me = self.me.clone();
+            let pause = until - now;
+            let spawned = thread::Builder::new()
+                .name("piikey-model-idle".into())
+                .spawn(move || {
+                    thread::sleep(pause);
+                    if let Some(controller) = me.upgrade() {
+                        controller.model_idle_elapsed();
+                    }
+                });
+            if spawned.is_err() {
+                hold.timer = false;
+                hold.until = None;
+                self.backend.release_model();
+            }
+        }
+    }
+
+    /// The time a model that nothing needed was kept is up, or may be: look again.
+    fn model_idle_elapsed(&self) {
+        self.model_sync
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .timer = false;
+        self.sync_model_after_use();
+    }
+
+    /// Whether something wants the model now, and whether it can be loaded (it is downloaded).
+    /// Read only when the caller holds `model_sync`: a call that waited for the lock must not act
+    /// on what it saw before the call ahead of it changed it.
+    fn model_wanted(&self, starting: bool) -> (bool, bool) {
+        let policy = self.policy();
+        let state = self.lock();
+        (
+            starting
+                || state.enabled
+                || policy.highlight != Highlight::Off
+                || (policy.watch && !policy.watch_folders.is_empty())
+                || state.scan.is_some()
+                || state.watch.scan.is_some()
+                || state.findings > 0,
+            state.model == Model::Ready,
+        )
+    }
+
+    /// Loads the model; says so when that fails.
+    fn load_model_or_say_so(&self) {
+        if let Err(error) = self.backend.load_model() {
             self.notify(Notice::warning(format!(
                 "The detection model could not load ({error}); only emails, phone numbers, IBANs and other patterns are masked."
             )));

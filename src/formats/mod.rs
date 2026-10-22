@@ -17,13 +17,19 @@
 //! detector finds. All three go through one `Pass`, so a scan sees exactly the texts a rewrite
 //! would change.
 //!
-//! [`findings`] is a scan that keeps each value it finds with the text around it, in reading
-//! order, and says where in the file the format puts it ([`Location`]): the line and column in
-//! a text (and in an e-mail, whose rendering is looked up again in its file), the page of a PDF,
-//! the cell of a workbook or of a sheet. Only the file itself has places: a value in an
-//! attachment, in an embedded package or in a picture has none. A format says where its texts
-//! stand by handing a `Layout` (`places.rs`) to the pass beside them, and a pass that was not
-//! asked for findings never looks at it.
+//! [`findings`] is a scan that reports each value it finds with the text around it, and says
+//! where in the file the format puts it ([`Location`]): the line and column in a text (and in an
+//! e-mail, whose rendering is looked up again in its file), the page of a PDF, the cell of a
+//! workbook or of a sheet, the slide and shape of a presentation, the paragraph and page of a
+//! document. Only the file itself has places: a value in an attachment, in an embedded package
+//! or in a picture has none. A format says where its texts stand by handing a `Layout`
+//! (`places.rs`) to the pass beside them, and a pass that was not asked for findings never looks
+//! at it.
+//!
+//! A read of findings reports as it goes ([`Report`]), because the model that reads the names
+//! costs minutes where the patterns cost a second: the values the patterns find come first, in
+//! reading order, then what the model finds in the text a group at a time, and meanwhile a line
+//! of progress ([`Busy`]) says what the read is doing. The caller can end it at any report.
 
 mod eml;
 mod image;
@@ -31,22 +37,31 @@ mod msg;
 mod odf;
 mod ooxml;
 mod package;
+mod paragraphs;
 mod pdf;
 mod places;
 mod sheets;
+mod slides;
 #[cfg(test)]
 mod tests;
 mod text;
 mod thumbnail;
 mod xmltext;
 
-use std::{fmt, sync::Mutex};
+use std::{
+    fmt,
+    ops::ControlFlow,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use rayon::prelude::*;
 
 use crate::{
     Error, Result,
-    detect::{EntityKind, Mode, Span},
+    detect::{EntityKind, Mode, Span, Step},
     engine::{Engine, Replacement},
     restore::Restorer,
 };
@@ -159,9 +174,9 @@ impl fmt::Debug for Scanned {
 /// `UnsupportedFormat` and per-format parse errors, as for [`process`].
 pub fn scan(engine: &Engine, bytes: &[u8], keep_texts: bool) -> Result<Scanned> {
     let collect = Collect {
-        found: Mutex::new(Vec::new()),
+        found: Some(Mutex::new(Vec::new())),
         texts: keep_texts.then(|| Mutex::new(Vec::new())),
-        findings: None,
+        sink: None,
     };
     process_pass(
         &Pass {
@@ -172,7 +187,9 @@ pub fn scan(engine: &Engine, bytes: &[u8], keep_texts: bool) -> Result<Scanned> 
         0,
     )?;
     Ok(Scanned {
-        found: collect.found.into_inner()?,
+        found: collect
+            .found
+            .map_or_else(|| Ok(Vec::new()), Mutex::into_inner)?,
         texts: collect
             .texts
             .map_or_else(|| Ok(Vec::new()), Mutex::into_inner)?,
@@ -205,6 +222,22 @@ pub enum Location {
     /// and then of the cells; in an `OpenDocument` sheet (`.ods`) a cell that stands for several
     /// is at the first of them.
     Cell { sheet: Box<str>, cell: Box<str> },
+    /// A slide of a presentation, counted from 1 in the order the presentation shows its slides
+    /// (not the number in the name of the slide's part), and the shape of the slide that holds the
+    /// text: counted from 1 among the shapes that lie directly on the slide (a group is one
+    /// shape, a table is one), in the order of the file, which is the order they are stacked in,
+    /// back to front. `None` for text that is in no shape.
+    Slide { slide: u32, shape: Option<u32> },
+    /// The speaker notes of a slide, counted from 1 like [`Location::Slide`]. The notes are not
+    /// on the slide: a presentation shows them in a pane of their own.
+    Notes(u32),
+    /// A paragraph of a word-processing document, counted from 1 among the paragraphs of its
+    /// body (the ones in a table's cells count, and text in a text box counts as the paragraph
+    /// it is anchored in), and the page the paragraph starts on when the file says: the program
+    /// that wrote it marks where each page began when it laid the text out last (`.docx`), or
+    /// the text breaks the page itself. Headers, footers, notes at the foot of a page and
+    /// comments have no place.
+    Paragraph { paragraph: u32, page: Option<u32> },
 }
 
 /// A value the detector found in a file, with the text around it, for showing to the person who
@@ -232,21 +265,54 @@ impl fmt::Debug for Finding {
     }
 }
 
-/// Sniffs `bytes` like [`scan`] and lists what the detector finds in it, each value with the
-/// text around it, in reading order: the order in which the format hands its texts to the
-/// detector (the parts of a package in the order of its entries, the headers of a message before
-/// its bodies and these before its attachments), and within a text by position. Each finding
-/// says where it stands in the file when the format has a place to name ([`Location`]). It
-/// reads what a scan reads, and nothing is kept: the vault is left as it was and the values only
-/// go to the caller.
+/// What a read of the findings of a file reports while it goes, see [`findings`].
+#[derive(Debug)]
+pub enum Report {
+    /// What the read is busy with, for a line of progress.
+    Busy(Busy),
+    /// More values, each with the text around it and its place: those the patterns find come
+    /// first, in reading order, and what the model finds follows, a group of texts at a time.
+    Found(Vec<Finding>),
+}
+
+/// What a read of findings is busy with when that takes a while.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Busy {
+    /// Reading the text of a picture with the OCR of Windows.
+    Picture,
+    /// Reading the pages of a PDF that are pictures with OCR: `done` of the `total` that are.
+    Pages { done: usize, total: usize },
+    /// The model reads the text for what no pattern describes (names, addresses): `done` of the
+    /// `total` bytes it reads, `total` being 0 while that is not known yet.
+    Model { done: usize, total: usize },
+}
+
+/// Sniffs `bytes` like [`scan`] and reports what the detector finds in it to `report`, each value
+/// with the text around it, as it is found: the values that patterns find come first, in the
+/// order in which the format hands its texts to the detector (the parts of a package in the
+/// order of its entries, the headers of a message before its bodies and these before its
+/// attachments) and within a text by position, then what the model finds a group of texts at a
+/// time, and from time to time what the read is busy with ([`Busy`]). Each finding says where
+/// it stands in the file when the format has a place to name ([`Location`]). It reads what a
+/// scan reads, and so finds what a scan counts, and nothing is kept: the vault is left as it was
+/// and the values only go to `report`, which may be called from several threads (the pages of a
+/// PDF are read at once). `report` answers whether to go on: when it says no, the read ends
+/// early (after the group of texts the model is in) and this returns `Ok`.
 ///
 /// # Errors
 /// `UnsupportedFormat` and per-format parse errors, as for [`process`].
-pub fn findings(engine: &Engine, bytes: &[u8]) -> Result<Vec<Finding>> {
+pub fn findings(
+    engine: &Engine,
+    bytes: &[u8],
+    report: &(dyn Fn(Report) -> bool + Sync),
+) -> Result<()> {
     let collect = Collect {
-        found: Mutex::new(Vec::new()),
+        found: None,
         texts: None,
-        findings: Some(Mutex::new(Vec::new())),
+        sink: Some(Sink {
+            report,
+            stopped: AtomicBool::new(false),
+        }),
     };
     process_pass(
         &Pass {
@@ -256,10 +322,7 @@ pub fn findings(engine: &Engine, bytes: &[u8]) -> Result<Vec<Finding>> {
         bytes,
         0,
     )?;
-    let list = collect
-        .findings
-        .map_or_else(|| Ok(Vec::new()), Mutex::into_inner)?;
-    Ok(list)
+    Ok(())
 }
 
 /// What a run over a file does with the texts it hands the engine: rewrite them, or only look
@@ -275,43 +338,107 @@ enum How<'a> {
     /// A deanonymize that restores through a restorer, which finds every proxy of the vault as
     /// well as the ones it scopes.
     Restore(&'a Restorer),
-    Scan(&'a Collect),
+    Scan(&'a Collect<'a>),
 }
+
+/// How many findings go in one report: the first of a file with a hundred thousand reach the
+/// reader while the rest are still being made ready.
+const REPORT_BATCH: usize = 1_000;
+
+/// The values a scan found, each with its kind.
+type Values = Vec<(EntityKind, Box<str>)>;
 
 /// What a scan has seen so far. Behind locks because a pass is shared by reference down the
 /// formats; the scans of different files each have their own.
-struct Collect {
-    found: Mutex<Vec<(EntityKind, Box<str>)>>,
+struct Collect<'a> {
+    /// The values, for a scan that counts them.
+    found: Option<Mutex<Values>>,
     texts: Option<Mutex<Vec<String>>>,
-    /// The values with their surroundings, for a scan that was asked to show them.
-    findings: Option<Mutex<Vec<Finding>>>,
+    /// Where the findings go, for a scan that was asked to show them.
+    sink: Option<Sink<'a>>,
 }
 
-impl Collect {
-    /// Takes note of what was found in `texts`, and of `texts` when they are kept. A scan that
-    /// was asked for findings also keeps each value with the place that `layout` says it is at.
-    fn record(&self, layout: &Layout<'_>, texts: &[&str], spans: &[Vec<Span>]) -> Result<()> {
-        let mut values = self.found.lock()?;
-        for (text, spans) in texts.iter().zip(spans) {
-            values.extend(
-                spans
-                    .iter()
-                    .map(|s| (s.kind, Box::from(&text[s.start..s.end]))),
-            );
+/// The reader of a read of findings, and whether it asked to stop.
+struct Sink<'a> {
+    report: &'a (dyn Fn(Report) -> bool + Sync),
+    stopped: AtomicBool,
+}
+
+impl Collect<'_> {
+    /// Takes note of what was found in `texts`, and of `texts` when they are kept.
+    fn record(&self, texts: &[&str], spans: &[Vec<Span>]) -> Result<()> {
+        if let Some(values) = &self.found {
+            let mut values = values.lock()?;
+            for (text, spans) in texts.iter().zip(spans) {
+                values.extend(
+                    spans
+                        .iter()
+                        .map(|s| (s.kind, Box::from(&text[s.start..s.end]))),
+                );
+            }
         }
         if let Some(kept) = &self.texts {
             kept.lock()?
                 .extend(texts.iter().map(|&text| text.to_owned()));
         }
-        if let Some(shown) = &self.findings {
-            let mut shown = shown.lock()?;
-            let from = shown.len();
-            for (text, spans) in texts.iter().zip(spans) {
-                shown.extend(spans.iter().map(|span| finding(text, span)));
-            }
-            layout.locate(texts, spans, &mut shown[from..]);
-        }
         Ok(())
+    }
+
+    /// Whether a read of findings asked to stop.
+    fn stopped(&self) -> bool {
+        self.sink
+            .as_ref()
+            .is_some_and(|sink| sink.stopped.load(Ordering::Relaxed))
+    }
+
+    /// Gives `report` to the reader of the findings; `false` once it has asked to stop, by this
+    /// answer or an earlier one. Nothing is given after that.
+    fn tell(&self, report: Report) -> bool {
+        let Some(sink) = &self.sink else {
+            return true;
+        };
+        if sink.stopped.load(Ordering::Relaxed) {
+            return false;
+        }
+        let go = (sink.report)(report);
+        if !go {
+            sink.stopped.store(true, Ordering::Relaxed);
+        }
+        go
+    }
+
+    /// Reports the values that `spans` are in `texts`, each with the place `layout` says it is
+    /// at, in reports of at most [`REPORT_BATCH`]. `false` once the reader asked to stop.
+    fn found(&self, layout: &Layout<'_>, texts: &[&str], spans: &[Vec<Span>]) -> bool {
+        let mut made: Vec<Finding> = texts
+            .iter()
+            .zip(spans)
+            .flat_map(|(text, spans)| spans.iter().map(move |span| finding(text, span)))
+            .collect();
+        layout.locate(texts, spans, &mut made);
+        let mut rest = made.into_iter();
+        loop {
+            let batch: Vec<Finding> = rest.by_ref().take(REPORT_BATCH).collect();
+            if batch.is_empty() {
+                return true;
+            }
+            if !self.tell(Report::Found(batch)) {
+                return false;
+            }
+        }
+    }
+
+    /// One step of what the engine finds: its values, then how far the model is.
+    fn step(&self, layout: &Layout<'_>, texts: &[&str], step: &Step) -> ControlFlow<()> {
+        let mut go = self.found(layout, texts, &step.spans);
+        if go && let Some((done, total)) = step.more {
+            go = self.tell(Report::Busy(Busy::Model { done, total }));
+        }
+        if go {
+            ControlFlow::Continue(())
+        } else {
+            ControlFlow::Break(())
+        }
     }
 }
 
@@ -390,8 +517,8 @@ fn head(text: &str, n: usize) -> (&str, bool) {
 
 impl Pass<'_> {
     /// [`Engine::plan`] for a rewrite; for a restore, what [`Restorer::plan_with`] makes of each
-    /// text. A scan records what the engine finds, and where `layout` says that is, and plans
-    /// nothing.
+    /// text. A scan notes what the engine finds, or for findings reports it as it is found, with
+    /// the place `layout` says it is at, and plans nothing.
     fn plan(&self, layout: &Layout<'_>, texts: &[&str]) -> Result<Vec<Vec<Replacement>>> {
         match &self.how {
             How::Rewrite(mode) => self.engine.plan(*mode, texts),
@@ -400,10 +527,51 @@ impl Pass<'_> {
                 .map(|text| restorer.plan_with(text.as_bytes(), self.engine))
                 .collect()),
             How::Scan(collect) => {
-                collect.record(layout, texts, &self.engine.scan(texts)?)?;
+                if collect.sink.is_some() {
+                    self.scan_in_steps(collect, layout, texts)?;
+                } else {
+                    collect.record(texts, &self.engine.scan(texts)?)?;
+                }
                 Ok(vec![Vec::new(); texts.len()])
             }
         }
+    }
+
+    /// Reports what the engine finds in `texts` as it finds it (see [`Engine::scan_steps`]). Where
+    /// a value stands is worked out per step, except when the place of a value depends on the
+    /// others of the call ([`Layout::Raw`]): those wait until the call is done, and the progress
+    /// of the model goes on being reported meanwhile.
+    fn scan_in_steps(
+        &self,
+        collect: &Collect<'_>,
+        layout: &Layout<'_>,
+        texts: &[&str],
+    ) -> Result<()> {
+        if collect.stopped() {
+            return Ok(());
+        }
+        if !layout.needs_the_whole_call() {
+            return self
+                .engine
+                .scan_steps(texts, |step| collect.step(layout, texts, &step));
+        }
+        let mut all: Vec<Vec<Span>> = vec![Vec::new(); texts.len()];
+        self.engine.scan_steps(texts, |step| {
+            for (mine, spans) in all.iter_mut().zip(step.spans) {
+                mine.extend(spans);
+            }
+            match step.more {
+                Some((done, total)) if !collect.tell(Report::Busy(Busy::Model { done, total })) => {
+                    ControlFlow::Break(())
+                }
+                _ => ControlFlow::Continue(()),
+            }
+        })?;
+        for spans in &mut all {
+            spans.sort_by_key(|span| span.start);
+        }
+        collect.found(layout, texts, &all);
+        Ok(())
     }
 
     /// [`Engine::run`] for a rewrite and a restore. A scan has no output: it looks at the texts
@@ -424,9 +592,21 @@ impl Pass<'_> {
     }
 
     /// Whether the places of the texts of a file at nesting `depth` are wanted: only the file
-    /// itself has places, and only a scan that was asked for findings works them out.
+    /// itself has places, and only a read of findings works them out.
     fn wants_places(&self, depth: u8) -> bool {
-        depth == 0 && matches!(&self.how, How::Scan(collect) if collect.findings.is_some())
+        depth == 0 && matches!(&self.how, How::Scan(collect) if collect.sink.is_some())
+    }
+
+    /// Tells a read of findings what the pass is busy with; any other pass has no one to tell.
+    fn busy(&self, busy: Busy) {
+        if let How::Scan(collect) = &self.how {
+            collect.tell(Report::Busy(busy));
+        }
+    }
+
+    /// Whether the reader of the findings has asked to stop: what is left to read can be left.
+    fn stopped(&self) -> bool {
+        matches!(&self.how, How::Scan(collect) if collect.stopped())
     }
 
     /// `bytes` as the output of a file nothing was rewritten in: a copy of it, except for a

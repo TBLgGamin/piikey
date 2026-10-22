@@ -10,7 +10,10 @@ use windows_reactor::{
 };
 
 use super::kit::{Context, caption, card, toned_glyph};
-use crate::ui::{status::Tone, window::Msg};
+use crate::ui::{
+    status::Tone,
+    window::{Browse, Msg},
+};
 
 /// The height of the row of a place.
 const PLACE_ROW: f64 = 44.0;
@@ -84,21 +87,49 @@ pub(super) fn add_row(
     on_add: Msg,
     context: Context<'_>,
 ) -> View {
-    Grid::new()
-        .columns([GridLength::STAR, GridLength::Auto])
-        .column_spacing(8.0)
-        .children((
-            TextBox::new()
-                .text(draft)
-                .placeholder_text(placeholder)
-                .automation_name(placeholder)
-                .on_text_changed(context.callback(move |text: Rc<str>| on_text(text.to_string()))),
+    add_row_with(placeholder, draft, button, on_text, on_add, &[], context)
+}
+
+/// [`add_row`] with Browse buttons after its button: each opens the Windows picker named by its
+/// label, and what is picked goes where the box's text would.
+pub(super) fn add_row_with(
+    placeholder: &str,
+    draft: &str,
+    button: &str,
+    on_text: impl Fn(String) -> Msg + 'static,
+    on_add: Msg,
+    browse: &[(&str, Browse)],
+    context: Context<'_>,
+) -> View {
+    let mut columns = vec![GridLength::STAR, GridLength::Auto];
+    let mut children: Vec<View> = vec![
+        TextBox::new()
+            .text(draft)
+            .placeholder_text(placeholder)
+            .automation_name(placeholder)
+            .on_text_changed(context.callback(move |text: Rc<str>| on_text(text.to_string())))
+            .into(),
+        Button::new()
+            .content(button)
+            .grid_column(1)
+            .is_enabled(!draft.trim().is_empty())
+            .on_click(context.message(on_add))
+            .into(),
+    ];
+    for (column, &(label, kind)) in (2..).zip(browse) {
+        columns.push(GridLength::Auto);
+        children.push(
             Button::new()
-                .content(button)
-                .grid_column(1)
-                .is_enabled(!draft.trim().is_empty())
-                .on_click(context.message(on_add)),
-        ))
+                .content(label)
+                .grid_column(column)
+                .on_click(context.message(Msg::Browse(kind)))
+                .into(),
+        );
+    }
+    Grid::new()
+        .columns(columns)
+        .column_spacing(8.0)
+        .children(children)
         .into()
 }
 

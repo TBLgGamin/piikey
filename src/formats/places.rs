@@ -39,6 +39,13 @@ pub(super) enum Layout<'a> {
 }
 
 impl Layout<'_> {
+    /// Whether a value is placed by looking at every value of its call together, and so cannot be
+    /// placed before the call is done: a message's values are looked up in its file, the `k`th
+    /// finding of a value at its `k`th occurrence.
+    pub(super) fn needs_the_whole_call(&self) -> bool {
+        matches!(self, Self::Raw(_))
+    }
+
     /// Gives the findings in `made` their places. They are the findings of `spans`, text after
     /// text: the findings of `texts[0]` first, one for each of `spans[0]`, then those of
     /// `texts[1]`, and so on.

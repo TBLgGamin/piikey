@@ -50,7 +50,7 @@ use std::{
 use rayon::prelude::*;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
-pub use crate::formats::{Finding, Location};
+pub use crate::formats::{Busy, Finding, Location, Report};
 use crate::{
     Error, Result,
     detect::EntityKind,
@@ -1137,19 +1137,26 @@ fn detect(engine: &Engine, bytes: &[u8], modified: &mut u64) -> (Status, Vec<(En
     }
 }
 
-/// What the detector finds in the file at `path`, read now, each with the text around it. It is
-/// for showing to the person who asked: nothing is stored, and the values go nowhere else. The
-/// findings come in reading order, and each says where it stands in the file when the format has
-/// a place to name (a line and column, a page, a cell: see [`Location`]).
+/// Reads the file at `path` now and reports what the detector finds in it to `report`, each value
+/// with the text around it, as it is found (see [`formats::findings`]: what patterns find
+/// first, in reading order, then what the model finds, with what the read is busy with in
+/// between). It is for showing to the person who asked: nothing is stored, and the values go
+/// nowhere else. Each finding says where it stands in the file when the format has a place to
+/// name (a line and column, a page, a cell, a slide, a paragraph: see [`Location`]). `report`
+/// answers whether to go on, and may be called from several threads.
 ///
 /// # Errors
 /// `Io` when the file cannot be read; `UnsupportedFormat` when it is a format piikey does not
-/// read, or bigger than [`MAX_FILE`].
-pub fn findings(engine: &Engine, path: &Path) -> Result<Vec<Finding>> {
+/// read, or bigger than [`MAX_FILE`]; the errors of reading the format.
+pub fn findings(
+    engine: &Engine,
+    path: &Path,
+    report: &(dyn Fn(Report) -> bool + Sync),
+) -> Result<()> {
     let bytes = read_capped(path)
         .map_err(|err| io_context(&err, "read", path))?
         .ok_or(Error::UnsupportedFormat("the file is too large to be read"))?;
-    formats::findings(engine, &bytes)
+    formats::findings(engine, &bytes, report)
 }
 
 /// The contents of the file at `path`, or `None` when it is bigger than [`MAX_FILE`]. The size
@@ -3082,6 +3089,23 @@ mod tests {
         assert_eq!(empty.dominant(), None);
     }
 
+    /// Everything `findings` reports for the file at `path`.
+    fn all_findings(engine: &Engine, path: &Path) -> Result<Vec<Finding>> {
+        let found = std::sync::Mutex::new(Vec::new());
+        findings(engine, path, &|report| {
+            if let Report::Found(list) = report {
+                found
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend(list);
+            }
+            true
+        })?;
+        Ok(found
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
+    }
+
     #[test]
     fn findings_show_each_value_with_its_surroundings_and_keep_nothing() -> Res {
         let tmp = TempDir::new()?;
@@ -3103,7 +3127,7 @@ mod tests {
         };
         let before = listing()?;
 
-        let found = findings(&engine, &file)?;
+        let found = all_findings(&engine, &file)?;
         let kinds: Vec<EntityKind> = found.iter().map(|finding| finding.kind).collect();
         assert_eq!(kinds, [Email, Iban], "{found:?}");
         let email = &found[0];
@@ -3133,19 +3157,19 @@ mod tests {
     fn findings_of_a_file_that_cannot_be_read_say_why() -> Res {
         let tmp = TempDir::new()?;
         let engine = tmp.engine()?;
-        let missing = findings(&engine, &tmp.0.join("nope.txt"));
+        let missing = findings(&engine, &tmp.0.join("nope.txt"), &|_| true);
         assert!(matches!(missing, Err(Error::Io(_))), "{missing:?}");
         let big = tmp.0.join("big.dat");
         let file = File::create(&big)?;
         file.set_len(MAX_FILE + 1)?;
         drop(file);
         assert!(matches!(
-            findings(&engine, &big),
+            findings(&engine, &big, &|_| true),
             Err(Error::UnsupportedFormat(_))
         ));
         let broken = tmp.0.join("broken.zip");
         put_bytes(&broken, b"PK\x03\x04 not really a zip")?;
-        assert!(findings(&engine, &broken).is_err());
+        assert!(findings(&engine, &broken, &|_| true).is_err());
         Ok(())
     }
 }

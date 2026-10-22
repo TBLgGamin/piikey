@@ -5,6 +5,7 @@ use std::{
     cell::RefCell,
     path::PathBuf,
     sync::{Arc, OnceLock, mpsc::Sender},
+    time::Duration,
 };
 
 use piikey::{
@@ -36,6 +37,11 @@ use crate::{
 
 /// The activity feed, next to the settings; see [`super::activity`].
 const ACTIVITY_FILE: &str = "activity.cfg";
+
+/// How long the detection model stays in memory after a scan or a read of findings, when nothing
+/// else needs it: long enough to look at what a scan found, which reads the same texts again
+/// (the model remembers its answers for them), and to read the findings of another file.
+const MODEL_IDLE: Duration = Duration::from_mins(2);
 
 /// Talks to the machine.
 pub struct System {
@@ -122,6 +128,10 @@ impl Backend for System {
 
     fn release_model(&self) {
         self.ner.release();
+    }
+
+    fn model_idle(&self) -> Duration {
+        MODEL_IDLE
     }
 
     fn token(&self, rotate: bool) -> Res<String> {

@@ -7,8 +7,9 @@
 //! that are packages themselves, like the workbook behind a chart, are read as packages of
 //! their own; pictures and other binary objects are not read.
 //!
-//! A scan that is asked for findings also says which cell of a workbook each text is in
-//! ([`places`]).
+//! A scan that is asked for findings also says where each text is: which cell of a workbook
+//! ([`places`]), which slide and shape of a presentation (`slides.rs`), which paragraph and page
+//! of a document (`paragraphs.rs`).
 
 use std::{collections::HashMap, ops::ControlFlow};
 
@@ -17,7 +18,9 @@ use quick_xml::events::Event;
 use super::{
     Location,
     package::Archive,
+    paragraphs,
     sheets::{Cell, Docs, attribute, holding, location, reference},
+    slides,
     xmltext::{Attrs, XmlDoc},
 };
 
@@ -46,24 +49,39 @@ pub(super) fn in_embeddings(name: &str) -> bool {
     folders.any(|folder| folder.eq_ignore_ascii_case("embeddings"))
 }
 
-/// The workbook part, and the relationships that name the parts of its sheets.
+/// The main part of each kind of package: the workbook, the presentation and the document.
 const WORKBOOK: &str = "xl/workbook.xml";
+const PRESENTATION: &str = "ppt/presentation.xml";
+const DOCUMENT: &str = "word/document.xml";
+/// The relationships of the workbook, which name the parts of its sheets.
 const WORKBOOK_RELATIONSHIPS: &str = "xl/_rels/workbook.xml.rels";
-/// The folder those relationships' targets are relative to.
-const WORKBOOK_FOLDER: &str = "xl/";
 /// The part of the shared strings, when the relationships name no other.
 const SHARED_STRINGS: &str = "xl/sharedStrings.xml";
 /// How the type of the relationship of the shared strings ends.
 const SHARED_STRINGS_TYPE: &str = "/sharedStrings";
 
-/// The cell of each of the texts `wanted` (their numbers among the texts of the package, see
-/// [`Docs`]), for the findings of a workbook. A text of a worksheet is in the cell it is read
-/// from, whether an inline string or the plain value of the cell. A shared string is in the first
-/// cell that shows it, going through the sheets in the order of the workbook and through the
-/// cells in the order of the sheet. Every other text (headers and footers, comments, a shared
-/// string no cell shows) has no cell, nor has anything in a package whose workbook cannot be
-/// read.
+/// Where each of the texts `wanted` (their numbers among the texts of the package, see [`Docs`])
+/// is, for the findings of a package: the cell of a workbook ([`cells`]), the slide of a
+/// presentation, the paragraph of a document. A package that is none of them has no places.
 pub(super) fn places(docs: &Docs<'_>, wanted: &[usize]) -> Vec<Option<Location>> {
+    if docs.find(WORKBOOK).is_some() {
+        cells(docs, wanted)
+    } else if docs.find(PRESENTATION).is_some() {
+        slides::places(docs, wanted)
+    } else if docs.find(DOCUMENT).is_some() {
+        paragraphs::places(docs, wanted)
+    } else {
+        vec![None; wanted.len()]
+    }
+}
+
+/// The cell of each of the texts `wanted`, for the findings of a workbook. A text of a worksheet
+/// is in the cell it is read from, whether an inline string or the plain value of the cell. A
+/// shared string is in the first cell that shows it, going through the sheets in the order of the
+/// workbook and through the cells in the order of the sheet. Every other text (headers and
+/// footers, comments, a shared string no cell shows) has no cell, nor has anything in a package
+/// whose workbook cannot be read.
+fn cells(docs: &Docs<'_>, wanted: &[usize]) -> Vec<Option<Location>> {
     let mut answers = vec![None; wanted.len()];
     let Some(book) = Workbook::read(docs) else {
         return answers;
@@ -136,7 +154,7 @@ impl Workbook {
     /// has neither.
     fn read(docs: &Docs<'_>) -> Option<Self> {
         let workbook = docs.doc(docs.find(WORKBOOK)?)?;
-        let relationships = docs.doc(docs.find(WORKBOOK_RELATIONSHIPS)?)?;
+        docs.find(WORKBOOK_RELATIONSHIPS)?;
 
         // Each sheet: its name, and the id of the relationship that names its part.
         let mut listed: Vec<(Box<str>, Box<str>)> = Vec::new();
@@ -153,19 +171,15 @@ impl Workbook {
         // Each relationship that names a part of the package: the part, by id.
         let mut targets: HashMap<Box<str>, usize> = HashMap::new();
         let mut shared = None;
-        relationships.walk(|event, _| {
-            if let Event::Start(tag) | Event::Empty(tag) = event
-                && tag.local_name().into_inner() == "Relationship"
-                && let (Some(id), Some(target)) = (attribute(tag, "Id"), attribute(tag, "Target"))
-                && let Some(part) = docs.find(&resolve(&target))
-            {
-                if attribute(tag, "Type").is_some_and(|kind| kind.ends_with(SHARED_STRINGS_TYPE)) {
-                    shared = Some(part);
-                }
-                targets.insert(Box::from(&*id), part);
+        for relation in relationships(docs, WORKBOOK_RELATIONSHIPS, folder_of(WORKBOOK)) {
+            let Some(part) = docs.find(&relation.target) else {
+                continue;
+            };
+            if relation.kind.ends_with(SHARED_STRINGS_TYPE) {
+                shared = Some(part);
             }
-            ControlFlow::Continue(())
-        });
+            targets.insert(relation.id, part);
+        }
 
         let sheets = listed
             .into_iter()
@@ -178,12 +192,62 @@ impl Workbook {
     }
 }
 
-/// The name of the entry that a relationship of the workbook points to with `target`: relative
-/// to the folder of the workbook, or from the root of the package when it starts with `/`.
-fn resolve(target: &str) -> String {
+/// One relationship of a part: what it points to, and what for.
+#[derive(Debug)]
+pub(super) struct Relationship {
+    pub(super) id: Box<str>,
+    /// Its type, a URI that ends in what the relationship is for (`/notesSlide`).
+    pub(super) kind: Box<str>,
+    /// The name of the entry it points to, see [`resolve`].
+    pub(super) target: String,
+}
+
+/// The relationships that the part called `rels` lists, the ones to something outside the package
+/// left out. Their targets are relative to `folder`, the folder of the part they belong to (see
+/// [`folder_of`]). Nothing when the package has no such part.
+pub(super) fn relationships(docs: &Docs<'_>, rels: &str, folder: &str) -> Vec<Relationship> {
+    let Some(doc) = docs.find(rels).and_then(|index| docs.doc(index)) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    doc.walk(|event, _| {
+        if let Event::Start(tag) | Event::Empty(tag) = event
+            && tag.local_name().into_inner() == "Relationship"
+            && let (Some(id), Some(target)) = (attribute(tag, "Id"), attribute(tag, "Target"))
+            && attribute(tag, "TargetMode")
+                .is_none_or(|mode| !mode.eq_ignore_ascii_case("External"))
+        {
+            found.push(Relationship {
+                id: Box::from(&*id),
+                kind: attribute(tag, "Type").map_or_else(Box::default, |kind| Box::from(&*kind)),
+                target: resolve(folder, &target),
+            });
+        }
+        ControlFlow::Continue(())
+    });
+    found
+}
+
+/// The folder the entry `name` is in, with its closing `/`: what the targets of the relationships
+/// of a part are relative to. Empty for an entry at the root.
+pub(super) fn folder_of(name: &str) -> &str {
+    name.rfind('/').map_or("", |at| &name[..=at])
+}
+
+/// The name of the entry that holds the relationships of the part called `name`: those of
+/// `ppt/slides/slide1.xml` are in `ppt/slides/_rels/slide1.xml.rels`.
+pub(super) fn rels_of(name: &str) -> String {
+    let folder = folder_of(name);
+    format!("{folder}_rels/{}.rels", &name[folder.len()..])
+}
+
+/// The name of the entry that a relationship points to with `target`: relative to `folder`, the
+/// folder of the part the relationship belongs to, or from the root of the package when it
+/// starts with `/`.
+pub(super) fn resolve(folder: &str, target: &str) -> String {
     let full = target
         .strip_prefix('/')
-        .map_or_else(|| format!("{WORKBOOK_FOLDER}{target}"), str::to_owned);
+        .map_or_else(|| format!("{folder}{target}"), str::to_owned);
     let mut kept: Vec<&str> = Vec::new();
     for part in full.split('/') {
         match part {
@@ -344,14 +408,32 @@ mod tests {
 
     #[test]
     fn a_relationship_target_is_a_name_in_the_package() {
-        assert_eq!(resolve("worksheets/sheet1.xml"), "xl/worksheets/sheet1.xml");
+        let at = |target| resolve("xl/", target);
+        assert_eq!(at("worksheets/sheet1.xml"), "xl/worksheets/sheet1.xml");
+        assert_eq!(at("/xl/worksheets/sheet2.xml"), "xl/worksheets/sheet2.xml");
+        assert_eq!(at("../customXml/item1.xml"), "customXml/item1.xml");
+        assert_eq!(at("./sharedStrings.xml"), "xl/sharedStrings.xml");
+        assert_eq!(at("a//b.xml"), "xl/a/b.xml");
+        // From the folder of a slide, a note is a step up and into another folder.
         assert_eq!(
-            resolve("/xl/worksheets/sheet2.xml"),
-            "xl/worksheets/sheet2.xml"
+            resolve("ppt/slides/", "../notesSlides/notesSlide1.xml"),
+            "ppt/notesSlides/notesSlide1.xml"
         );
-        assert_eq!(resolve("../customXml/item1.xml"), "customXml/item1.xml");
-        assert_eq!(resolve("./sharedStrings.xml"), "xl/sharedStrings.xml");
-        assert_eq!(resolve("a//b.xml"), "xl/a/b.xml");
+    }
+
+    #[test]
+    fn the_relationships_of_a_part_are_in_the_rels_folder_next_to_it() {
+        assert_eq!(folder_of("ppt/slides/slide1.xml"), "ppt/slides/");
+        assert_eq!(folder_of("[Content_Types].xml"), "");
+        assert_eq!(
+            rels_of("ppt/slides/slide1.xml"),
+            "ppt/slides/_rels/slide1.xml.rels"
+        );
+        assert_eq!(
+            rels_of("ppt/presentation.xml"),
+            "ppt/_rels/presentation.xml.rels"
+        );
+        assert_eq!(rels_of("root.xml"), "_rels/root.xml.rels");
     }
 
     #[test]

@@ -135,15 +135,23 @@ impl Loaded {
     }
 
     pub(super) fn open(dir: &Path) -> Result<Self> {
-        let mut tokenizer =
-            Tokenizer::from_file(dir.join(files::TOKENIZER_FILE)).map_err(model_err)?;
-        // Windows are cut here, not by the tokenizer.
-        tokenizer.with_truncation(None).map_err(model_err)?;
-        tokenizer.with_padding(None);
-        let sentence = tokenizer
-            .encode(CALIBRATION_TEXT, false)
-            .map_err(model_err)?;
-        let (cpu, gpu) = lanes(dir, sentence.get_ids())?;
+        let graph = dir.join(files::GRAPH_FILE);
+        let choice_file = dir.join(files::DEVICE_FILE);
+        let saved = saved_choice(&choice_file);
+        // Reading the tokenizer takes about as long as building a session (more, in a build
+        // without optimizations), so the two go side by side: the tokenizer in a thread of its
+        // own, the sessions here and in `build_sessions`.
+        let (tokenizer, built) = std::thread::scope(|scope| {
+            let tokenizer = scope.spawn(|| read_tokenizer(dir));
+            let built = build_sessions(&graph, saved);
+            let tokenizer = match tokenizer.join() {
+                Ok(tokenizer) => tokenizer,
+                Err(payload) => std::panic::resume_unwind(payload),
+            };
+            (tokenizer, built)
+        });
+        let (tokenizer, sentence) = tokenizer?;
+        let (cpu, gpu) = settle(built, &sentence, &choice_file, saved)?;
         Ok(Self {
             tokenizer,
             cpu,
@@ -153,27 +161,78 @@ impl Loaded {
     }
 }
 
-/// The session of the CPU, and the one of the GPU when it helps: what an earlier load chose,
-/// else what a measurement of both says.
-fn lanes(dir: &Path, ids: &[u32]) -> Result<(Lane, Option<Lane>)> {
-    let graph = dir.join(files::GRAPH_FILE);
-    let choice_file = dir.join(files::DEVICE_FILE);
-    let saved = saved_choice(&choice_file);
+/// The tokenizer of the model, and the token ids of the calibration text.
+fn read_tokenizer(dir: &Path) -> Result<(Tokenizer, Vec<u32>)> {
+    let mut tokenizer = Tokenizer::from_file(dir.join(files::TOKENIZER_FILE)).map_err(model_err)?;
+    // Windows are cut here, not by the tokenizer.
+    tokenizer.with_truncation(None).map_err(model_err)?;
+    tokenizer.with_padding(None);
+    let sentence = tokenizer
+        .encode(CALIBRATION_TEXT, false)
+        .map_err(model_err)?
+        .get_ids()
+        .to_vec();
+    Ok((tokenizer, sentence))
+}
+
+/// The sessions of a load, built and not yet run.
+struct Built {
+    cpu: Result<Lane>,
+    /// The GPU's, unless `device.cfg` says the CPU alone.
+    gpu: Option<Result<Lane>>,
+}
+
+/// Builds the session of the CPU, and the GPU's at the same time (in a thread of its own: it takes
+/// the longest) unless an earlier load chose the CPU alone.
+fn build_sessions(graph: &Path, saved: Option<Device>) -> Built {
     if saved == Some(Device::Cpu) {
-        return Ok((build_cpu(&graph)?, None));
+        return Built {
+            cpu: build_cpu(graph),
+            gpu: None,
+        };
     }
-    let warm_up = Input::filled(ids, WARM_UP_SHAPE.0, WARM_UP_SHAPE.1).ok_or_else(no_tokens)?;
-    let (cpu, gpu) = build_both(&graph, &warm_up);
-    let cpu = cpu?;
+    std::thread::scope(|scope| {
+        let gpu = scope.spawn(|| build_gpu(graph));
+        let cpu = build_cpu(graph);
+        let gpu = match gpu.join() {
+            Ok(gpu) => gpu,
+            Err(payload) => std::panic::resume_unwind(payload),
+        };
+        Built {
+            cpu,
+            gpu: Some(gpu),
+        }
+    })
+}
+
+/// The session of the CPU, and the one of the GPU when it helps: what an earlier load chose,
+/// else what a measurement of both says. A GPU builds its kernels on the first run, so that run
+/// is a tiny one made here, and a GPU that does not build or run is no GPU.
+fn settle(
+    built: Built,
+    sentence: &[u32],
+    choice_file: &Path,
+    saved: Option<Device>,
+) -> Result<(Lane, Option<Lane>)> {
+    let cpu = built.cpu?;
+    let Some(gpu) = built.gpu else {
+        return Ok((cpu, None));
+    };
+    let gpu = gpu.and_then(|lane| {
+        let warm_up =
+            Input::filled(sentence, WARM_UP_SHAPE.0, WARM_UP_SHAPE.1).ok_or_else(no_tokens)?;
+        lane.execute(warm_up, &mut |_| ())?;
+        Ok(lane)
+    });
     if saved.is_some() {
         if gpu.is_err() {
             // The GPU or its driver changed: measure again next time, run on the CPU now.
-            let _ = fs::remove_file(&choice_file);
+            let _ = fs::remove_file(choice_file);
         }
         return Ok((cpu, gpu.ok()));
     }
     let gpu = match gpu {
-        Ok(gpu) if gpu_helps(&cpu, &gpu, ids)? => Some(gpu),
+        Ok(gpu) if gpu_helps(&cpu, &gpu, sentence)? => Some(gpu),
         _ => None,
     };
     let device = if gpu.is_some() {
@@ -182,7 +241,7 @@ fn lanes(dir: &Path, ids: &[u32]) -> Result<(Lane, Option<Lane>)> {
         Device::Cpu
     };
     // Best effort: without the file the next load measures again.
-    let _ = fs::write(&choice_file, device.name());
+    let _ = fs::write(choice_file, device.name());
     Ok((cpu, gpu))
 }
 
@@ -210,25 +269,6 @@ fn utf16(bytes: &[u8], unit: fn([u8; 2]) -> u16) -> String {
     char::decode_utf16(pairs.iter().copied().map(unit))
         .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
         .collect()
-}
-
-/// Builds the CPU's session and the GPU's at the same time, the GPU's in a thread of its own:
-/// it takes the longest, and its warm-up run (a GPU builds its kernels on the first run) goes in
-/// the same thread. A GPU that does not build or run is no GPU.
-fn build_both(graph: &Path, warm_up: &Input) -> (Result<Lane>, Result<Lane>) {
-    std::thread::scope(|scope| {
-        let gpu = scope.spawn(|| -> Result<Lane> {
-            let lane = build_gpu(graph)?;
-            lane.execute(warm_up.clone(), &mut |_| ())?;
-            Ok(lane)
-        });
-        let cpu = build_cpu(graph);
-        let gpu = match gpu.join() {
-            Ok(gpu) => gpu,
-            Err(payload) => std::panic::resume_unwind(payload),
-        };
-        (cpu, gpu)
-    })
 }
 
 /// Whether the GPU is worth keeping next to the CPU: on a large batch, where it does best, it

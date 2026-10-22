@@ -9,7 +9,7 @@ pub mod ner;
 mod patterns;
 pub(crate) mod validate;
 
-use std::ops::Range;
+use std::ops::{ControlFlow, Range};
 
 pub use composite::CompositeDetector;
 pub(crate) use composite::{overlaps, overlaps_bytes};
@@ -30,6 +30,19 @@ pub enum Mode {
     Deanonymize,
 }
 
+/// What a detector found in one step of [`Detector::detect_batch_steps`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Step {
+    /// Per text, the spans found in this step: sorted by start, and overlapping neither each
+    /// other, nor what an earlier step reported, nor what an earlier detector of a
+    /// [`CompositeDetector`] kept.
+    pub spans: Vec<Vec<Span>>,
+    /// `Some((done, total))` while more steps follow: how many of the `total` bytes of text the
+    /// rest of the work reads have been read (`total` is 0 while that is not known yet). `None`
+    /// in the last step.
+    pub more: Option<(usize, usize)>,
+}
+
 /// Finds PII spans in text.
 pub trait Detector: Send + Sync + std::fmt::Debug {
     /// Spans sorted by start, never overlapping.
@@ -47,6 +60,24 @@ pub trait Detector: Send + Sync + std::fmt::Debug {
     ) -> Vec<Vec<Span>> {
         let _ = (wanted, taken);
         texts.par_iter().map(|t| self.detect(t, mode)).collect()
+    }
+
+    /// [`Detector::detect_batch`] that hands over what it finds as it finds it, in steps, so that
+    /// a caller can show the first of it while the rest is still being looked for (a model reads
+    /// minutes of text where a pattern reads it in a second). Everything the steps hold
+    /// together is what `detect_batch` returns. `step` may end the work by breaking: the
+    /// detector then does no more than the step it is in. A detector that has no steps reports
+    /// everything in one, as this does.
+    fn detect_batch_steps(
+        &self,
+        texts: &[&str],
+        mode: Mode,
+        wanted: KindSet,
+        taken: &[Vec<Span>],
+        step: &mut dyn FnMut(Step) -> ControlFlow<()>,
+    ) {
+        let spans = self.detect_batch(texts, mode, wanted, taken);
+        let _ = step(Step { spans, more: None });
     }
 }
 

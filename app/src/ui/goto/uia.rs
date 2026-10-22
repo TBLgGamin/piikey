@@ -3,13 +3,22 @@
 //! the value there, and tells the highlight overlay where it is.
 //!
 //! All of it runs on a thread of its own ([`Search`]): an app that does not answer holds up that
-//! thread and nobody else. It only reads and selects. It sends no keystroke and no click, never
-//! gives anything the focus, and touches nothing but the text control that holds the value. A
-//! password field is left alone entirely: not its text, not its value, not its place; a field that
-//! cannot say whether it is one counts as one. Nothing is logged, and no value leaves this module
-//! but as the text that is looked for in the control.
+//! thread and nobody else. It first looks for a window that has the file open already (a title with
+//! the name of the file, see `titles`) and goes straight to the value in it, so that the file is not
+//! opened a second time; only when no window has it is the caller told to open the file
+//! ([`Search::first`]), and the search waits for the window that is new and looks in it, a few
+//! times a second, until the app has read the file.
+//!
+//! It only reads and selects. It sends no keystroke and no click, and touches nothing but the
+//! text control that holds the value; the window that had the file open already is brought forward
+//! by asking it for the focus, after the outline is up. A password field is left alone entirely:
+//! not its text, not its value, not its place; a field that cannot say whether it is one counts as
+//! one. Nothing is logged, and no value leaves this module but as the text that is looked for in
+//! the control. Where the apps differ, `office` (`PowerPoint` and Excel show no one text control) and
+//! `crate::uia_text` (the text controls of the others) know how.
 
 use std::{
+    cell::{Cell, RefCell},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -19,48 +28,58 @@ use std::{
     time::{Duration, Instant},
 };
 
+use piikey::formats::Location;
 use uiautomation::{
     UIAutomation, UIElement,
     core::{UICacheRequest, UICondition},
-    patterns::{UITextPattern, UITextRange},
-    types::{Point, TextPatternRangeEndpoint, TreeScope, UIProperty},
+    types::{TreeScope, UIProperty},
     variants::{Value, Variant},
 };
 
 use super::{
     Outcome, Target,
-    measure::{self, Probe},
     needles::{self, Needle},
+    office,
     titles::{self, Before, Names, Window},
 };
 use crate::{
     highlight::{Mark, Overlay, Rect},
     proxy::Purpose,
+    uia_text::{Control, Found},
 };
 
 /// How often the windows are looked at while the file's window is awaited.
-const POLL: Duration = Duration::from_millis(250);
+const POLL: Duration = Duration::from_millis(50);
 /// How long the file's window is awaited.
 const WINDOW_WAIT: Duration = Duration::from_secs(8);
 /// How long a window that already had the file's name is left alone, in case a new window for the
 /// file is still on its way.
 const GRACE: Duration = Duration::from_millis(2_500);
-/// How many times the value is looked for in the window (the app may still be reading the file),
-/// and how long between.
-const ATTEMPTS: usize = 3;
-const RETRY: Duration = Duration::from_millis(500);
-/// How long a text control is given to stop scrolling before its points are asked about.
-const SETTLE: Duration = Duration::from_millis(120);
+/// How long the value is looked for in the window of a file that was just opened (the app may
+/// still be reading the file), and how often.
+const LOOK_FOR: Duration = Duration::from_secs(6);
+const RETRY: Duration = Duration::from_millis(60);
+/// How long a window that shows no text control at all is looked in: one that has none after this
+/// is not going to (Chromium needs a moment to show its page, hence this long).
+const NO_TEXT: Duration = Duration::from_millis(1_200);
 /// How long the outline of the value stays.
 const FLASH: Duration = Duration::from_secs(2);
+/// How long finding the rectangles of a text may take.
+const MEASURE: Duration = Duration::from_millis(700);
+/// How long a text that was scrolled to is waited for to be laid out (Word lays out a page when it
+/// is shown), and how often it is looked at meanwhile.
+const LAYOUT: Duration = Duration::from_millis(1_500);
+const LAYOUT_POLL: Duration = Duration::from_millis(40);
 /// The most text controls of a window that are looked in.
-const MAX_CONTROLS: usize = 32;
+const MAX_CONTROLS: usize = 40;
 
 /// What a search is for.
 pub(super) struct Job {
-    names: Names,
-    needles: Vec<Needle>,
-    purpose: Arc<Purpose>,
+    pub(super) names: Names,
+    pub(super) needles: Vec<Needle>,
+    /// Where the format says the value is.
+    pub(super) place: Option<Location>,
+    pub(super) purpose: Arc<Purpose>,
 }
 
 impl Job {
@@ -74,6 +93,7 @@ impl Job {
         Some(Self {
             names: Names::of(&target.file)?,
             needles,
+            place: target.place.clone(),
             purpose: Arc::clone(purpose),
         })
     }
@@ -81,11 +101,27 @@ impl Job {
 
 /// What the search thread tells the caller.
 enum Event {
-    /// It knows which windows are open. The file is opened after that, so that its window is told
-    /// from them.
+    /// No window that had the file open held the value: the file is to be opened now.
     Looked,
     /// It is done.
     Done(Outcome),
+}
+
+/// Tells the caller what became of the search, once.
+pub(super) struct Reporter {
+    events: mpsc::Sender<Event>,
+    sent: Cell<bool>,
+}
+
+impl Reporter {
+    /// The caller may stop waiting: this is how it ended. What is done after this is the app's
+    /// business (bringing its window forward, selecting a cell) and takes as long as the app takes.
+    pub(super) fn done(&self, outcome: Outcome) {
+        if !self.sent.replace(true) {
+            // The caller may have stopped waiting.
+            let _ = self.events.send(Event::Done(outcome));
+        }
+    }
 }
 
 /// A search that runs on a thread of its own, and ends with it: dropping the search tells the
@@ -105,7 +141,7 @@ impl Search {
         let stop = Arc::clone(&cancel);
         thread::Builder::new()
             .name("piikey-goto".to_owned())
-            .spawn(move || run(&job, &sender, &stop))
+            .spawn(move || run(&job, sender, &stop))
             .ok()?;
         Some(Self {
             events,
@@ -114,10 +150,21 @@ impl Search {
         })
     }
 
-    /// Waits until the thread knows which windows are open, for at most `wait`.
-    pub(super) fn wait_until_looked(&mut self, wait: Duration) {
-        if let Ok(Event::Done(outcome)) = self.events.recv_timeout(wait) {
-            self.done = Some(outcome);
+    /// Waits until the thread has looked in the windows that may have the file open already, for
+    /// at most `wait`: [`Outcome::Marked`] when one had the value, which was then pointed at, and
+    /// the file is not to be opened again; [`Outcome::Opened`] when none had it, or it took too
+    /// long to tell, and the file is to be opened now.
+    pub(super) fn first(&mut self, wait: Duration) -> Outcome {
+        match self.events.recv_timeout(wait) {
+            Ok(Event::Done(Outcome::Marked)) => {
+                self.done = Some(Outcome::Marked);
+                Outcome::Marked
+            }
+            Ok(Event::Done(outcome)) => {
+                self.done = Some(outcome);
+                Outcome::Opened
+            }
+            Ok(Event::Looked) | Err(_) => Outcome::Opened,
         }
     }
 
@@ -145,120 +192,239 @@ impl Drop for Search {
 }
 
 /// The search thread.
-fn run(job: &Job, events: &mpsc::Sender<Event>, cancel: &AtomicBool) {
-    let outcome = search(job, events, cancel);
-    // The caller may have stopped waiting.
-    let _ = events.send(Event::Done(outcome));
+fn run(job: &Job, events: mpsc::Sender<Event>, cancel: &AtomicBool) {
+    // The overlay takes a moment to start (a thread, an event loop, windows); it does while the
+    // windows are looked at.
+    let purpose = Arc::clone(&job.purpose);
+    let _ = thread::Builder::new()
+        .name("piikey-goto-overlay".to_owned())
+        .spawn(move || {
+            let _ = Overlay::get_or_start(&purpose);
+        });
+    let report = Reporter {
+        events,
+        sent: Cell::new(false),
+    };
+    let outcome = search(job, &report, cancel);
+    report.done(outcome);
 }
 
-/// Looks at the windows that are open, tells the caller, then waits for the window of the file and
-/// looks in it.
-fn search(job: &Job, events: &mpsc::Sender<Event>, cancel: &AtomicBool) -> Outcome {
+/// Looks at the windows that are open, tells the caller whether one had the file and the value,
+/// then waits for the window of the file and looks in it.
+fn search(job: &Job, report: &Reporter, cancel: &AtomicBool) -> Outcome {
     let Some(desk) = Desk::new() else {
-        let _ = events.send(Event::Looked);
+        let _ = report.events.send(Event::Looked);
         return Outcome::Opened;
     };
-    let before = desk
-        .windows()
-        .map(|(_, windows)| Before::of(&windows))
+    let listing = desk.windows();
+    let before = listing
+        .as_ref()
+        .map(|listing| Before::of(&listing.windows))
         .unwrap_or_default();
-    let _ = events.send(Event::Looked);
+    // The file may be open already: then the value is looked for there, and the file not opened.
+    if let Some(listing) = &listing {
+        for at in titles::open_in(&listing.windows, &job.names) {
+            let Some(frame) = listing.frames.get(at) else {
+                continue;
+            };
+            if look(&desk, frame, job, report, cancel, None) == Outcome::Marked {
+                bring_forward(frame);
+                return Outcome::Marked;
+            }
+        }
+    }
+    let _ = report.events.send(Event::Looked);
     let started = Instant::now();
     while started.elapsed() < WINDOW_WAIT && !cancel.load(Ordering::Relaxed) {
-        if let Some((elements, windows)) = desk.windows()
-            && let Some(at) =
-                titles::pick(&windows, &before, &job.names, started.elapsed() >= GRACE)
-            && let Some(window) = elements.get(at)
+        if let Some(listing) = desk.windows()
+            && let Some(at) = titles::pick(
+                &listing.windows,
+                &before,
+                &job.names,
+                started.elapsed() >= GRACE,
+            )
+            && let Some(frame) = listing.frames.get(at)
         {
-            return look_in(&desk.automation, window, job, cancel);
+            return look(
+                &desk,
+                frame,
+                job,
+                report,
+                cancel,
+                Some(Instant::now() + LOOK_FOR),
+            );
         }
         thread::sleep(POLL);
     }
     Outcome::Opened
 }
 
-/// Looks for the value in `window`, a few times: an app that has just opened the file may not
-/// have read it yet.
-fn look_in(
-    automation: &UIAutomation,
-    window: &UIElement,
+/// Looks for the value in `frame`, a window: once, or, with `until`, as often as it takes until
+/// then, as an app that has just opened the file may not have read it yet.
+fn look(
+    desk: &Desk,
+    frame: &Frame,
     job: &Job,
+    report: &Reporter,
     cancel: &AtomicBool,
+    until: Option<Instant>,
 ) -> Outcome {
-    for attempt in 0..ATTEMPTS {
-        if attempt > 0 {
-            thread::sleep(RETRY);
-        }
+    let started = Instant::now();
+    // The window has a text control: PowerPoint and Excel have their own ways to wait.
+    let mut text_seen = matches!(frame.class.as_str(), office::POWERPOINT | office::EXCEL);
+    loop {
         if cancel.load(Ordering::Relaxed) {
-            break;
+            return Outcome::Opened;
         }
-        if mark(automation, window, job) == Outcome::Marked {
-            return Outcome::Marked;
+        let outcome = match frame.class.as_str() {
+            office::POWERPOINT => office::powerpoint(desk, frame, job, report),
+            office::EXCEL => office::excel(desk, frame, job, report),
+            _ => {
+                let controls = text_controls(desk, &frame.element);
+                text_seen |= !controls.is_empty();
+                mark_in(&controls, job, report)
+            }
+        };
+        if outcome == Outcome::Marked {
+            return outcome;
+        }
+        // An app that has not read the file yet is waited for; one whose window shows no text
+        // control at all after a while (a Notepad that has none) is not worth it.
+        let waiting = text_seen || started.elapsed() < NO_TEXT;
+        match until {
+            Some(end) if waiting && Instant::now() < end => thread::sleep(RETRY),
+            _ => return Outcome::Opened,
         }
     }
-    Outcome::Opened
+}
+
+/// Asks a window that had the file open already for the focus, which brings it to the front. The
+/// app may take its time, and may refuse: the outline is up by now.
+fn bring_forward(frame: &Frame) {
+    let _ = frame.element.set_focus();
 }
 
 /// UI Automation, and what the search asks of the windows on the desktop.
-struct Desk {
-    automation: UIAutomation,
-    /// What is read of every window in one go: its title, process and identity.
+pub(super) struct Desk {
+    pub(super) automation: UIAutomation,
+    /// What is read of every window in one go: its title, process, class, identity and whether it
+    /// is on the screen.
     request: UICacheRequest,
     /// Matches every element.
-    all: UICondition,
+    pub(super) all: UICondition,
+    /// Matches the elements that have a text pattern.
+    has_text: UICondition,
+    /// What is read of a text control before it is looked at: whether it is a password field.
+    text_request: UICacheRequest,
+    /// The `PowerPoint` window whose slides were asked to show themselves (see `office`).
+    pub(super) awake: RefCell<Vec<Vec<i32>>>,
+}
+
+/// A top-level window of another program: the element and its class.
+pub(super) struct Frame {
+    pub(super) element: UIElement,
+    pub(super) class: String,
+}
+
+/// The top-level windows of the other programs, from the top of the stack: the elements, and what
+/// the search needs to know of each, in the same order.
+struct Listing {
+    frames: Vec<Frame>,
+    windows: Vec<Window>,
 }
 
 impl Desk {
     fn new() -> Option<Self> {
         let automation = UIAutomation::new().ok()?;
-        let request = automation.create_cache_request().ok()?;
-        for property in [
-            UIProperty::Name,
-            UIProperty::ProcessId,
-            UIProperty::RuntimeId,
-        ] {
-            request.add_property(property).ok()?;
-        }
+        let request = |properties: &[UIProperty]| -> Option<UICacheRequest> {
+            let request = automation.create_cache_request().ok()?;
+            for &property in properties {
+                request.add_property(property).ok()?;
+            }
+            Some(request)
+        };
         let all = automation.create_true_condition().ok()?;
+        let has_text = automation
+            .create_property_condition(
+                UIProperty::IsTextPatternAvailable,
+                Variant::from(true),
+                None,
+            )
+            .ok()?;
         Some(Self {
+            request: request(&[
+                UIProperty::Name,
+                UIProperty::ProcessId,
+                UIProperty::RuntimeId,
+                UIProperty::ClassName,
+                UIProperty::IsOffscreen,
+            ])?,
+            text_request: request(&[UIProperty::IsPassword])?,
             automation,
-            request,
             all,
+            has_text,
+            awake: RefCell::new(Vec::new()),
         })
     }
 
-    /// The top-level windows of the other programs, from the top of the stack: the elements, and
-    /// what the search needs to know of each, in the same order.
-    fn windows(&self) -> Option<(Vec<UIElement>, Vec<Window>)> {
+    fn windows(&self) -> Option<Listing> {
         let root = self.automation.get_root_element().ok()?;
         let children = root
             .find_all_build_cache(TreeScope::Children, &self.all, &self.request)
             .ok()?;
         let own = std::process::id();
-        Some(
-            children
-                .into_iter()
-                .filter_map(|element| {
-                    let process = element
-                        .get_cached_process_id()
-                        .ok()
-                        .and_then(|process| u32::try_from(process).ok());
-                    if process == Some(own) {
-                        return None;
-                    }
-                    let window = Window {
-                        id: runtime_id(&element)?,
-                        title: element.get_cached_name().ok()?,
-                    };
-                    Some((element, window))
-                })
-                .unzip(),
-        )
+        let (frames, windows) = children
+            .into_iter()
+            .filter_map(|element| {
+                let process = element
+                    .get_cached_process_id()
+                    .ok()
+                    .and_then(|process| u32::try_from(process).ok());
+                if process == Some(own) {
+                    return None;
+                }
+                let window = Window {
+                    id: runtime_id(&element)?,
+                    title: element.get_cached_name().ok()?,
+                    // A window that cannot say counts as one that is not on the screen: the
+                    // file is opened, and brings it back.
+                    shown: cached_flag(&element, UIProperty::IsOffscreen) == Some(false),
+                };
+                let class = element.get_cached_classname().unwrap_or_default();
+                Some((Frame { element, class }, window))
+            })
+            .unzip();
+        Some(Listing { frames, windows })
+    }
+
+    /// The first element below `parent` that has the automation id.
+    pub(super) fn with_id(&self, parent: &UIElement, id: &str) -> Option<UIElement> {
+        let condition = self
+            .automation
+            .create_property_condition(UIProperty::AutomationId, Variant::from(id), None)
+            .ok()?;
+        parent.find_first(TreeScope::Descendants, &condition).ok()
+    }
+
+    /// The first element below `parent` of the class.
+    pub(super) fn with_class(&self, parent: &UIElement, class: &str) -> Option<UIElement> {
+        let condition = self
+            .automation
+            .create_property_condition(UIProperty::ClassName, Variant::from(class), None)
+            .ok()?;
+        parent.find_first(TreeScope::Descendants, &condition).ok()
+    }
+}
+
+impl Drop for Desk {
+    fn drop(&mut self) {
+        // Event handlers that were put up to wake an app live as long as the automation.
+        let _ = self.automation.remove_all_event_handlers();
     }
 }
 
 /// What identifies `element` on the desktop: the id that came with it, or else the live one.
-fn runtime_id(element: &UIElement) -> Option<Vec<i32>> {
+pub(super) fn runtime_id(element: &UIElement) -> Option<Vec<i32>> {
     let cached = element
         .get_cached_property_value(UIProperty::RuntimeId)
         .ok()
@@ -269,56 +435,38 @@ fn runtime_id(element: &UIElement) -> Option<Vec<i32>> {
     }
 }
 
-/// A text control that may be read: not a password field, and it has a text pattern.
-struct Control {
-    element: UIElement,
-    pattern: UITextPattern,
-    /// All of its text.
-    document: UITextRange,
+/// A flag that came with `element`.
+fn cached_flag(element: &UIElement, property: UIProperty) -> Option<bool> {
+    let value = element.get_cached_property_value(property).ok()?;
+    let flag: Result<bool, _> = (&value).try_into();
+    flag.ok()
 }
 
-/// The text controls of `window` that may be read, in the order of the window.
-fn text_controls(automation: &UIAutomation, window: &UIElement) -> Vec<Control> {
-    let Ok(has_text) = automation.create_property_condition(
-        UIProperty::IsTextPatternAvailable,
-        Variant::from(true),
-        None,
-    ) else {
-        return Vec::new();
-    };
-    let Ok(elements) = window.find_all(TreeScope::Descendants, &has_text) else {
+/// The text controls of `element` that may be read, in the order of the tree: not a password
+/// field, and with a text pattern.
+pub(super) fn text_controls(desk: &Desk, element: &UIElement) -> Vec<Control> {
+    let Ok(elements) =
+        element.find_all_build_cache(TreeScope::Descendants, &desk.has_text, &desk.text_request)
+    else {
         return Vec::new();
     };
     elements
         .into_iter()
         // A password field is left alone entirely, before anything else is asked of it. A field
         // that cannot say what it is counts as one.
-        .filter(|element| matches!(element.is_password(), Ok(false)))
-        .filter_map(|element| {
-            let pattern = element.get_pattern::<UITextPattern>().ok()?;
-            let document = pattern.get_document_range().ok()?;
-            Some(Control {
-                element,
-                pattern,
-                document,
-            })
-        })
+        .filter(|element| cached_flag(element, UIProperty::IsPassword) == Some(false))
+        .filter_map(Control::of)
         .take(MAX_CONTROLS)
         .collect()
 }
 
-/// Looks for the value in the text controls of `window`, the most exact way first in all of them
-/// before the next way, and points at the first place it is found. [`Outcome::Marked`] when it
-/// was found.
-fn mark(automation: &UIAutomation, window: &UIElement, job: &Job) -> Outcome {
-    let controls = text_controls(automation, window);
+/// Looks for the value in `controls`, the most exact way first in all of them before the next way,
+/// and points at the first place it is found. [`Outcome::Marked`] when it was found.
+pub(super) fn mark_in(controls: &[Control], job: &Job, report: &Reporter) -> Outcome {
     for needle in &job.needles {
-        for control in &controls {
-            if let Ok(found) = control
-                .document
-                .find_text(&needle.text, false, needle.ignore_case)
-            {
-                return point_at(control, &found, &job.purpose);
+        for control in controls {
+            if let Some(found) = control.find(&needle.text, needle.ignore_case, 0) {
+                return point_at(control, &found, &job.purpose, report);
             }
         }
     }
@@ -326,76 +474,60 @@ fn mark(automation: &UIAutomation, window: &UIElement, job: &Job) -> Outcome {
 }
 
 /// Selects `found` in `control`, brings it into view, and outlines it on the screen.
-fn point_at(control: &Control, found: &UITextRange, purpose: &Arc<Purpose>) -> Outcome {
-    let selected = found.select().is_ok();
-    // Wherever it is, it is in view after this, if the control lets it be.
-    if found.scroll_into_view(false).is_ok() {
-        thread::sleep(SETTLE);
-    }
-    // Both are tried: a control that will not select can still be outlined.
-    let outlined = outline(control, found, purpose);
-    if selected || outlined {
+fn point_at(
+    control: &Control,
+    found: &Found,
+    purpose: &Arc<Purpose>,
+    report: &Reporter,
+) -> Outcome {
+    // Selected before it is boxed: a shape of `PowerPoint` says where its text is once some of it
+    // is selected.
+    let selected = found.select();
+    found.scroll_into_view();
+    let outlined = outline(&measure(control, found), purpose);
+    let outcome = if selected || outlined {
         Outcome::Marked
     } else {
         Outcome::Opened
-    }
+    };
+    report.done(outcome);
+    outcome
 }
 
-/// Outlines `found` on the screen for a moment. `false` when its place cannot be told or there is
-/// no overlay to draw it.
-fn outline(control: &Control, found: &UITextRange, purpose: &Arc<Purpose>) -> bool {
-    let Some(area) = bounds(&control.element) else {
+/// Outlines `rects` on the screen for a moment. `false` when there are none or no overlay to draw
+/// them.
+pub(super) fn outline(rects: &[Rect], purpose: &Arc<Purpose>) -> bool {
+    if rects.is_empty() {
         return false;
-    };
-    let mut hits = Hits {
-        pattern: &control.pattern,
-        found,
-    };
-    let Some(field) = measure::locate(&mut hits, area) else {
-        return false;
-    };
+    }
     let Ok(overlay) = Overlay::get_or_start(purpose) else {
         return false;
     };
-    overlay.flash(field, Mark::Pii, FLASH);
+    overlay.flash(rects, Mark::Pii, FLASH);
     true
 }
 
-/// Where `element` is on the screen.
-fn bounds(element: &UIElement) -> Option<Rect> {
-    let rect = element.get_bounding_rectangle().ok()?;
-    Rect::field(
-        rect.get_left(),
-        rect.get_top(),
-        rect.get_right(),
-        rect.get_bottom(),
-    )
-}
-
-/// The found text in its control, as the hit tests of [`measure`] ask about it.
-struct Hits<'a> {
-    pattern: &'a UITextPattern,
-    found: &'a UITextRange,
-}
-
-impl Hits<'_> {
-    /// Where the text position at the point is against `end` of the found text: below zero before
-    /// it, zero at it, above zero after it. `None` when the control does not say.
-    fn order(&self, x: i32, y: i32, end: TextPatternRangeEndpoint) -> Option<i32> {
-        let at = self.pattern.get_range_from_point(Point::new(x, y)).ok()?;
-        at.compare_endpoints(TextPatternRangeEndpoint::Start, self.found, end)
-            .ok()
-    }
-}
-
-impl Probe for Hits<'_> {
-    fn at_or_after_start(&mut self, x: i32, y: i32) -> Option<bool> {
-        let order = self.order(x, y, TextPatternRangeEndpoint::Start)?;
-        Some(order >= 0)
-    }
-
-    fn before_end(&mut self, x: i32, y: i32) -> Option<bool> {
-        let order = self.order(x, y, TextPatternRangeEndpoint::End)?;
-        Some(order < 0)
+/// A rectangle around each line of `found` that is in view, once it is: it was scrolled to, and a
+/// control that lays a page out when it is shown (Word) is asked again for a moment. None when the
+/// control cannot say.
+fn measure(control: &Control, found: &Found) -> Vec<Rect> {
+    let end = Instant::now() + LAYOUT;
+    let mut scrolled = false;
+    loop {
+        match found.rects(control, MEASURE) {
+            Some(rects) if !rects.is_empty() => return rects,
+            // Not in view: a control whose range does not scroll (Chromium) is asked through the
+            // element around the text.
+            Some(_) if !scrolled => {
+                scrolled = true;
+                found.scroll_enclosing();
+            }
+            Some(_) => {}
+            None => return Vec::new(),
+        }
+        if Instant::now() >= end {
+            return Vec::new();
+        }
+        thread::sleep(LAYOUT_POLL);
     }
 }

@@ -42,6 +42,16 @@ impl Field {
     }
 }
 
+/// A piece of personal data in the text of a field, as the text control is asked to find it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Value {
+    /// What it says.
+    pub text: String,
+    /// Which of the places in the field's text where that text stands it is, counted from 0: the
+    /// same words can be in the field twice.
+    pub nth: usize,
+}
+
 /// What the clipboard holds.
 pub(super) enum Clip {
     /// Text.
@@ -71,6 +81,14 @@ pub(super) trait Desktop {
     fn field(&mut self) -> Option<Field>;
     /// Where that element is on the screen now; `None` when that cannot be told.
     fn bounds(&mut self) -> Option<Rect>;
+    /// Where `values` are on the screen, in the text of the element [`focus`](Self::focus)
+    /// returned: a rectangle around each line of each one that is in view, in reading order, as
+    /// close to the text as its text control lets them be. Empty when that element has no text
+    /// control that can say, or none of the values is in view.
+    fn places(&mut self, values: &[Value]) -> Vec<Rect>;
+    /// Whether the first value that the last call to [`places`](Self::places) found is still at
+    /// `rect`: the text may have scrolled or moved since. `false` when that cannot be told.
+    fn still_at(&mut self, rect: Rect) -> bool;
     /// Changes whenever the clipboard does; `None` when Windows will not tell.
     fn clipboard_seq(&mut self) -> Option<NonZeroU32>;
     /// The text on the clipboard.

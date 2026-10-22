@@ -3,6 +3,7 @@
 use std::{
     num::NonZeroU32,
     sync::{Arc, PoisonError},
+    time::{Duration, Instant},
 };
 
 use piikey::policy::Policy;
@@ -10,12 +11,17 @@ use uiautomation::{
     UIAutomation, UIElement, UITreeWalker,
     core::{UICacheRequest, UICondition},
     patterns::UITextPattern,
-    types::{ControlType, TreeScope, UIProperty},
+    types::{ControlType, TextAttribute, TreeScope, UIProperty},
     variants::{Value, Variant},
 };
 
-use super::desktop::{Clip, Desktop, Field, Focus};
-use crate::{highlight::Rect, process, proxy::Shared};
+use super::desktop::{Clip, Desktop, Field, Focus, Value as Personal};
+use crate::{
+    highlight::Rect,
+    process,
+    proxy::Shared,
+    uia_text::{Control, Found},
+};
 
 /// Ancestors looked at to find the page an element is in.
 const PAGE_STEPS: usize = 40;
@@ -24,6 +30,9 @@ const PAGE_STEPS: usize = 40;
 const MAX_CHARS: i32 = 1 << 18;
 /// Characters of a field's value from which Chromium may have cut the rest off: it keeps 10,000.
 const VALUE_CUT: usize = 10_000;
+/// How long finding where the values of a field are may take in all: a read that takes longer than
+/// a second counts as a stall of capture (see `supervisor`).
+const PLACE_WITHIN: Duration = Duration::from_millis(600);
 
 /// The real desktop: UI Automation and the clipboard.
 pub(super) struct Uia {
@@ -42,8 +51,19 @@ pub(super) struct Uia {
     edits: UICondition,
     /// The element that has the focus.
     current: Option<Current>,
+    /// Where the values were last looked for.
+    placed: Option<Placed>,
     /// The address bar of the last browser window that needed one.
     address_bar: Option<AddressBar>,
+}
+
+/// The text control that the values of a field were looked for in, and the first of them that was
+/// found in view: [`Desktop::still_at`] asks whether that is still where it was.
+struct Placed {
+    /// Identifies the element the control is.
+    id: Vec<i32>,
+    control: Control,
+    first: Option<Found>,
 }
 
 /// The focused element and what was asked of it.
@@ -113,8 +133,16 @@ impl Uia {
             ancestors,
             edits,
             current: None,
+            placed: None,
             address_bar: None,
         })
+    }
+
+    /// The element that has the focus, with `request` cached.
+    fn focused(&self, request: &UICacheRequest) -> Option<UIElement> {
+        self.automation
+            .get_focused_element_build_cache(request)
+            .ok()
     }
 
     /// The host of the page `element` is in: the address its page element carries. `None` outside
@@ -168,10 +196,7 @@ impl Desktop for Uia {
         } else {
             &self.focus
         };
-        let element = self
-            .automation
-            .get_focused_element_build_cache(request)
-            .ok()?;
+        let element = self.focused(request)?;
         let id = runtime_id(&element)?;
         // Unreadable counts as a password: nothing is lost by leaving a field alone. It comes with
         // the element at every look, so a field that turns into a password field is noticed.
@@ -263,6 +288,55 @@ impl Desktop for Uia {
         bounds_of(&current.element, current.value_cached)
     }
 
+    fn places(&mut self, values: &[Personal]) -> Vec<Rect> {
+        self.placed = None;
+        let Some(current) = self.current.as_ref().filter(|current| !current.password) else {
+            return Vec::new();
+        };
+        let (Some(id), Some(control)) = (
+            runtime_id(&current.element),
+            Control::of(current.element.clone()),
+        ) else {
+            return Vec::new();
+        };
+        let until = Instant::now() + PLACE_WITHIN;
+        let mut rects = Vec::new();
+        let mut first = None;
+        for value in values {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            let Some(found) = control.find(&value.text, false, value.nth) else {
+                continue;
+            };
+            let Some(boxes) = found
+                .rects(&control, left)
+                .filter(|boxes| !boxes.is_empty())
+            else {
+                continue;
+            };
+            rects.extend(boxes);
+            first.get_or_insert(found);
+        }
+        self.placed = Some(Placed { id, control, first });
+        rects
+    }
+
+    fn still_at(&mut self, rect: Rect) -> bool {
+        let id = self
+            .current
+            .as_ref()
+            .and_then(|current| runtime_id(&current.element));
+        match &self.placed {
+            Some(placed) if id.as_ref() == Some(&placed.id) => placed
+                .first
+                .as_ref()
+                .is_some_and(|found| found.is_at(&placed.control, rect)),
+            _ => false,
+        }
+    }
+
     fn clipboard_seq(&mut self) -> Option<NonZeroU32> {
         clipboard_win::seq_num()
     }
@@ -306,10 +380,13 @@ fn read_text(current: &Current) -> Option<String> {
         );
     }
     // An editable block (`contenteditable`) has only a text pattern. A page element has one too,
-    // and holds the whole page.
-    if element.get_cached_control_type().ok() == Some(ControlType::Document)
-        || cached_bool(element, UIProperty::IsTextPatternAvailable) != Some(true)
-    {
+    // but also a value (its address), so it was answered above. The document of an editor (Word,
+    // WordPad) has a text pattern and no value: it is what the user types in when its text says
+    // it can be changed, and a viewer's is not.
+    if cached_bool(element, UIProperty::IsTextPatternAvailable) != Some(true) {
+        return None;
+    }
+    if element.get_cached_control_type().ok() == Some(ControlType::Document) && !editable(element) {
         return None;
     }
     range_text(element)
@@ -353,6 +430,20 @@ fn range_text(element: &UIElement) -> Option<String> {
         .ok()?
         .get_text(MAX_CHARS)
         .ok()
+}
+
+/// Whether the text of `element` says it can be changed. A viewer's text says it cannot, and one
+/// that does not say counts as one that cannot.
+fn editable(element: &UIElement) -> bool {
+    let read_only = element
+        .get_pattern::<UITextPattern>()
+        .ok()
+        .and_then(|pattern| pattern.get_document_range().ok())
+        .and_then(|range| range.get_attribute_value(TextAttribute::IsReadOnly).ok());
+    read_only.is_some_and(|value| {
+        let flag: Result<bool, _> = (&value).try_into();
+        flag == Ok(false)
+    })
 }
 
 fn cached_bool(element: &UIElement, property: UIProperty) -> Option<bool> {

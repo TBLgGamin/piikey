@@ -43,7 +43,7 @@ mod report;
 
 pub use self::{
     dashboard::{Dash, Dashboard, Loaded, Origin},
-    findings::{FindingsView, Reading, Row},
+    findings::{FindingsView, Reading, Row, Working},
 };
 
 /// How long one background poll waits for a change before it checks for cancellation.
@@ -176,6 +176,28 @@ pub struct WindowInput {
     pub reveal: Option<u64>,
 }
 
+/// What a Browse button picks, and for which box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Browse {
+    /// A folder for the inventory: it becomes a location and is scanned.
+    Location,
+    /// A file for the inventory: it is scanned.
+    File,
+    /// A folder for the watch.
+    Watch,
+}
+
+impl Browse {
+    /// The picker's title.
+    const fn title(self) -> &'static str {
+        match self {
+            Self::Location => "Choose a folder to scan",
+            Self::File => "Choose a file to scan",
+            Self::Watch => "Choose a folder to watch",
+        }
+    }
+}
+
 /// Messages of the window; all `Send` so background work can return them.
 #[derive(Clone)]
 pub enum Msg {
@@ -231,6 +253,10 @@ pub enum Msg {
     AddWatch,
     /// A folder taken off the Watch list.
     RemoveWatch(PathBuf),
+    /// A Browse button: open the Windows picker for it.
+    Browse(Browse),
+    /// The picker of a Browse button gave this path: it goes where the box's text would.
+    Browsed(Browse, PathBuf),
     /// Something was dropped on the window: the paths of the files and folders.
     Dropped(Vec<String>),
     /// Something a dashboard's controls ask for; the store says which dashboard.
@@ -240,6 +266,10 @@ pub enum Msg {
     /// What a batch of those files held, or why one could not be read; the number says which
     /// reading it belongs to.
     FindingsRead(u64, Vec<(PathBuf, Result<Vec<Finding>, String>)>),
+    /// More values of a file that is still being read, in the order they were found.
+    FindingsMore(u64, PathBuf, Vec<Finding>),
+    /// What the reading with this number is doing now, for the line of progress.
+    FindingsBusy(u64, Working),
     /// The reading that has this number is over.
     FindingsDone(u64),
     /// The findings view's search box.
@@ -616,6 +646,15 @@ impl MainWindow {
                 self.form_error = None;
             }
             Msg::AddRoot => self.add_root(context),
+            Msg::Browse(browse) => Self::browse(browse, context),
+            Msg::Browsed(Browse::Location | Browse::File, path) => {
+                self.root_draft = path.display().to_string();
+                self.add_root(context);
+            }
+            Msg::Browsed(Browse::Watch, path) => {
+                self.watch_draft = path.display().to_string();
+                self.add_watch();
+            }
             Msg::RootAdded => {
                 self.root_draft.clear();
                 self.form_error = None;
@@ -628,21 +667,37 @@ impl MainWindow {
                 self.watch_draft = text;
                 self.form_error = None;
             }
-            Msg::AddWatch => {
-                let path = PathBuf::from(self.watch_draft.trim());
-                match self.edit(Edit::WatchFolder { path, on: true }) {
-                    Ok(()) => {
-                        self.watch_draft.clear();
-                        self.form_error = None;
-                    }
-                    Err(error) => self.form_error = Some(error),
-                }
-            }
+            Msg::AddWatch => self.add_watch(),
             Msg::RemoveWatch(path) => {
                 let _ = self.edit(Edit::WatchFolder { path, on: false });
             }
             _ => {}
         }
+    }
+
+    /// The Watch box: its folder is watched, or the box says why not.
+    fn add_watch(&mut self) {
+        let path = PathBuf::from(self.watch_draft.trim());
+        match self.edit(Edit::WatchFolder { path, on: true }) {
+            Ok(()) => {
+                self.watch_draft.clear();
+                self.form_error = None;
+            }
+            Err(error) => self.form_error = Some(error),
+        }
+    }
+
+    /// Opens the Windows picker of `browse` off the UI thread: it waits for the user. Nothing
+    /// happens when the picker is closed without a choice.
+    fn browse(browse: Browse, context: &ComponentContext<Self>) {
+        context.spawn_background(move |_| {
+            let dialog = rfd::FileDialog::new().set_title(browse.title());
+            let picked = match browse {
+                Browse::File => dialog.pick_file(),
+                Browse::Location | Browse::Watch => dialog.pick_folder(),
+            };
+            picked.map_or(Msg::Noop, |path| Msg::Browsed(browse, path))
+        });
     }
 
     /// The Inventory box: a folder is added to the locations and scanned, a file is scanned, both
@@ -912,7 +967,9 @@ impl Component for MainWindow {
             | Msg::RemoveLocation(_)
             | Msg::WatchDraft(_)
             | Msg::AddWatch
-            | Msg::RemoveWatch(_) => self.update_lists(message, context),
+            | Msg::RemoveWatch(_)
+            | Msg::Browse(_)
+            | Msg::Browsed(..) => self.update_lists(message, context),
             Msg::Highlight(_)
             | Msg::Kind(..)
             | Msg::ExplorerMenu(_)
@@ -942,6 +999,8 @@ impl Component for MainWindow {
             }
             Msg::FindingsListed(..)
             | Msg::FindingsRead(..)
+            | Msg::FindingsMore(..)
+            | Msg::FindingsBusy(..)
             | Msg::FindingsDone(_)
             | Msg::FindingsSearch(_)
             | Msg::FindingsType(_)

@@ -141,6 +141,11 @@ impl<'d> Docs<'d> {
             .position(|entry| entry.eq_ignore_ascii_case(name))
     }
 
+    /// The name of the entry the part with number `index` is read from.
+    pub(super) fn name(&self, index: usize) -> Option<&str> {
+        self.names.get(index).map(|name| &**name)
+    }
+
     /// The part with number `index`.
     pub(super) fn doc(&self, index: usize) -> Option<&'d XmlDoc> {
         self.parts.get(index).map(|(_, doc)| doc)

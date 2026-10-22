@@ -1150,8 +1150,13 @@ fn the_inventory_dashboard_lists_what_was_scanned_in_the_tree_the_legend_the_map
     expect_drawn(
         "a folder",
         &folder_row,
-        &["Show only this folder", "Show in Explorer", "Scan this"],
+        &[
+            "Show only this folder",
+            "Show in Explorer",
+            "Show what was found",
+        ],
     )?;
+    expect_not_drawn("nothing to scan again", &folder_row, &["Scan this"])?;
     // A tile of the map selected: the details offer what applies to a file.
     let file = folder.join("a.txt");
     let picked = ui.send(Msg::Dash(
@@ -1161,13 +1166,9 @@ fn the_inventory_dashboard_lists_what_was_scanned_in_the_tree_the_legend_the_map
     expect_drawn(
         "a file",
         &picked,
-        &[
-            "Open",
-            "Show what was found",
-            "Make masked copy",
-            "Scan this",
-        ],
+        &["Open", "Show what was found", "Make masked copy"],
     )?;
+    expect_not_drawn("nothing to scan again", &picked, &["Scan this"])?;
     // The load that follows brings the entry of the file: when it was scanned, and how big.
     let entry = ui.loaded_with(Store::Inventory, Path::new(""), &[folder], Some(&file))?;
     assert!(
@@ -1201,6 +1202,33 @@ fn a_wide_window_lists_the_types_in_a_column_next_to_the_map() -> Test {
             "The most personal data first",
         ],
     )
+}
+
+#[test]
+fn the_browse_buttons_open_pickers_and_what_is_picked_goes_where_the_box_would() -> Test {
+    let mut ui = Headless::open(stub_controller)?;
+    let inventory = ui.go(Page::Inventory)?;
+    expect_drawn(
+        "inventory pickers",
+        &inventory,
+        &["Browse folder\u{2026}", "Browse file\u{2026}"],
+    )?;
+    let watch = ui.go(Page::Watch)?;
+    expect_drawn("watch picker", &watch, &["Browse\u{2026}"])?;
+    // A folder picked for the watch is watched, as if it had been typed in the box.
+    let folder = ui.dir.0.join("picked");
+    fs::create_dir_all(&folder).describe()?;
+    ui.send(Msg::Browsed(Browse::Watch, folder.clone()))?;
+    assert!(ui.controller.wait_idle(WAIT));
+    assert!(
+        ui.controller
+            .snapshot()
+            .policy
+            .watch_folders
+            .iter()
+            .any(|path| path == &folder)
+    );
+    Ok(())
 }
 
 #[test]

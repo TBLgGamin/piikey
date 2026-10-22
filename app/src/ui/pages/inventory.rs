@@ -14,12 +14,12 @@ use windows_reactor::{
 use super::{
     dashboard::{self, dashboard, has_data, room},
     kit::{Context, caption, card, counted, form_error, page_header, thousands, wide_column},
-    lists::{add_row, place_row, places_card},
+    lists::{add_row_with, place_row, places_card},
 };
 use crate::ui::{
     controller::Store,
     status::Tone,
-    window::{Dash, MainWindow, Msg, Page},
+    window::{Browse, Dash, MainWindow, Msg, Page},
 };
 
 /// What the page is, in a sentence.
@@ -199,12 +199,16 @@ pub(super) fn inventory(window: &MainWindow, context: Context<'_>) -> View {
     let mut children: Vec<View> = vec![page_header(Page::Inventory.title(), DEFINITION, controls)];
     children.extend(form_error(window, context));
     children.push(places);
-    children.push(add_row(
+    children.push(add_row_with(
         "A folder or file to scan, e.g. C:\\Users\\you\\Documents",
         &window.root_draft,
         "Add and scan",
         Msg::RootDraft,
         Msg::AddRoot,
+        &[
+            ("Browse folder\u{2026}", Browse::Location),
+            ("Browse file\u{2026}", Browse::File),
+        ],
         context,
     ));
     children.push(status_line(window));

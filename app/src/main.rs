@@ -13,6 +13,7 @@ mod shell;
 mod startup;
 mod sysproxy;
 mod ui;
+mod uia_text;
 
 use std::{
     thread,

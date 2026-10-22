@@ -11,18 +11,17 @@ use std::{
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::{
-        Arc, PoisonError, Weak,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, PoisonError, Weak,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::Duration,
 };
 
 use piikey::{
-    inventory::{self, Entry, Finding, Inventory, Node, Progress, Tiles, TypeTotal},
+    inventory::{self, Busy, Entry, Finding, Inventory, Node, Progress, Report, Tiles, TypeTotal},
     sys,
 };
-use rayon::prelude::*;
 
 use super::{Controller, Edit, Notice, PROGRESS_EVERY, ScanSummary, State};
 use crate::{
@@ -40,7 +39,20 @@ const SCAN_STOP_WAIT: Duration = Duration::from_secs(2);
 pub const MOST_FILES: usize = 500;
 
 /// How many files the findings of a view are read for at once.
-const FINDINGS_BATCH: usize = 4;
+const FINDINGS_PARALLEL: usize = 4;
+
+/// What a read of findings reports as it goes, see [`Controller::read_findings`].
+#[derive(Debug)]
+pub enum FindingsEvent {
+    /// The detection model is being loaded: nothing is read before it is there.
+    Loading,
+    /// What a file is busy with when that takes a while.
+    Busy(PathBuf, Busy),
+    /// More values of a file, in the order they are found.
+    Found(PathBuf, Vec<Finding>),
+    /// The file is read, or could not be: the message says why, for the user.
+    Done(PathBuf, Res<()>),
+}
 
 /// Which of the two inventories a view reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,7 +145,7 @@ impl Drop for FindingsRead<'_> {
     fn drop(&mut self) {
         self.0
             .update(|state| state.findings = state.findings.saturating_sub(1));
-        self.0.sync_model();
+        self.0.sync_model_after_use();
     }
 }
 
@@ -275,33 +287,71 @@ impl Controller {
         pick_files(named, held, MOST_FILES)
     }
 
-    /// Reads what the detector finds in each of `files`, a few at a time in the scan pool, and hands
-    /// every batch to `batch` as it is done, in the order of `files`; `batch` says whether to go
-    /// on. It is for showing: nothing is stored, not by the inventory and not anywhere else. The
-    /// detection model stays loaded from the first file to the last, as for a scan. A file that
+    /// Reads what the detector finds in each of `files`, four at a time in the scan pool, and
+    /// reports it to `report` as it is found: what the file is busy with, more of its values
+    /// (the ones patterns find come first, then what the model finds, see
+    /// [`inventory::findings`]) and, last for each file, that it is done or why it could not be
+    /// read. `report` says whether to go on, and the read stops there (after the group of texts
+    /// the model is in); it also stops once `limit` values were reported. It is for showing:
+    /// nothing is stored, not by the inventory and not anywhere else. The detection model stays
+    /// loaded from the first file to the last, as for a scan, and a while after it. A file that
     /// cannot be read, is bigger than piikey reads or is not a format it understands comes with a
     /// message for the user instead of its findings.
     pub fn read_findings(
         &self,
         files: &[PathBuf],
-        mut batch: impl FnMut(Vec<(PathBuf, Res<Vec<Finding>>)>) -> bool,
+        limit: usize,
+        report: impl FnMut(FindingsEvent) -> bool + Send,
     ) {
         if files.is_empty() {
             return;
         }
+        let report = Mutex::new(report);
+        let go = AtomicBool::new(true);
+        let found = AtomicUsize::new(0);
+        let tell = |event: FindingsEvent| -> bool {
+            if !go.load(Ordering::Relaxed) {
+                return false;
+            }
+            let more = (report.lock().unwrap_or_else(PoisonError::into_inner))(event);
+            if !more {
+                go.store(false, Ordering::Relaxed);
+            }
+            more
+        };
+        tell(FindingsEvent::Loading);
         let _reading = FindingsRead::start(self);
         let engine = self.engine();
-        for chunk in files.chunks(FINDINGS_BATCH) {
-            let done: Vec<(PathBuf, Res<Vec<Finding>>)> = self.in_scan_pool(|| {
-                chunk
-                    .par_iter()
-                    .map(|path| (path.clone(), inventory::findings(&engine, path).describe()))
-                    .collect()
+        let next = AtomicUsize::new(0);
+        self.in_scan_pool(|| {
+            rayon::scope(|scope| {
+                for _ in 0..FINDINGS_PARALLEL.min(files.len()) {
+                    scope.spawn(|_| {
+                        while go.load(Ordering::Relaxed) {
+                            let Some(path) = files.get(next.fetch_add(1, Ordering::Relaxed)) else {
+                                break;
+                            };
+                            let result =
+                                inventory::findings(&engine, path, &|report| match report {
+                                    Report::Busy(busy) => {
+                                        tell(FindingsEvent::Busy(path.clone(), busy))
+                                    }
+                                    Report::Found(list) => {
+                                        let total = found.fetch_add(list.len(), Ordering::Relaxed)
+                                            + list.len();
+                                        let more = tell(FindingsEvent::Found(path.clone(), list));
+                                        if total >= limit {
+                                            go.store(false, Ordering::Relaxed);
+                                        }
+                                        more && go.load(Ordering::Relaxed)
+                                    }
+                                });
+                            tell(FindingsEvent::Done(path.clone(), result.describe()));
+                        }
+                    });
+                }
             });
-            if !batch(done) {
-                break;
-            }
-        }
+        });
     }
 
     /// Writes what the inventory found under `under` (everything for an empty path) as CSV to a
@@ -548,7 +598,7 @@ impl Controller {
                 "Could not save the inventory: {error}"
             )));
         }
-        self.sync_model();
+        self.sync_model_after_use();
     }
 
     /// Scans what the watch saw change into the watch's inventory: everything, or the paths that
@@ -591,7 +641,7 @@ impl Controller {
                 "Could not save what the watch found: {error}"
             )));
         }
-        self.sync_model();
+        self.sync_model_after_use();
     }
 
     /// Runs `work` in the scan pool while the progress it makes reaches the window a few times a

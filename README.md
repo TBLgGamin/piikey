@@ -74,7 +74,7 @@ back into your values by `piikey-cli deanonymize --tolerant`: the full names, th
   </tr>
   <tr>
     <td><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/icons/dark/inventory.svg"><img src="docs/assets/icons/light/inventory.svg" width="28" height="28" alt=""></picture></td>
-    <td><b>Inventory</b><br>Scan your folders and see where personal data is stored: a folder tree with bars by type, a legend of the types found, a treemap with a tile for every file, and details with actions per file: open, show in Explorer, show what was found, make a masked copy, scan it again, export a report. It scans only when you ask, and skips files that did not change.</td>
+    <td><b>Inventory</b><br>Scan your folders and see where personal data is stored: a folder tree with bars by type, a legend of the types found, a treemap with a tile for every file, and details with actions per file: open, show in Explorer, show what was found, make a masked copy, export a report. Pick folders and files with Browse or drop them on the page. It scans only when you ask, and skips files that did not change.</td>
   </tr>
   <tr>
     <td><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/icons/dark/explorer.svg"><img src="docs/assets/icons/light/explorer.svg" width="28" height="28" alt=""></picture></td>

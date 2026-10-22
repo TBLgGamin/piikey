@@ -4,16 +4,21 @@
 //! 1. **Placed.** The app Windows opens the file with is an editor that takes a line and column on
 //!    its command line: VS Code (and Insiders), Notepad++ and Sublime Text. The exe is read from
 //!    the registry (`default_app`), and started with the place (`editors`).
-//! 2. **Marked.** Any other app is handed the file by Explorer, as a double click would. Then
-//!    `uia` waits for its window, finds the text control that holds the value, selects the value
-//!    there and has the highlight overlay outline it for two seconds. `measure` finds the
-//!    rectangle of the value through hit tests, and `needles` says what to look for when the value
-//!    as shown is not what the text holds; `titles` tells which window is the one.
+//! 2. **Marked.** Any other app. When a window already has the file open (its title names it), the
+//!    value is looked for there and the file is not opened again. Otherwise Explorer hands the
+//!    file to the app, as a double click would, and `uia` waits for its window. Either way it finds
+//!    the text control that holds the value, selects the value there and has the highlight overlay
+//!    outline it for two seconds, around the text and nothing else: `crate::uia_text` finds the
+//!    rectangle of each line of the value through hit tests (the safe `uiautomation` wrapper has
+//!    no `GetBoundingRectangles`, which is `unsafe`). `office` knows `PowerPoint` (the slide, then its
+//!    shapes) and Excel (the sheet, then the cell), `needles` says what to look for when the value
+//!    as shown is not what the text holds, and `titles` tells which window is the one.
 //! 3. **Opened.** The file is open; piikey could not point at the value in the app that has it.
 //!
 //! Everything that merely fails to place the value is an `Opened`: it is a best effort, and quiet:
 //! nothing is logged or printed, and no value is kept. It reads the app's text and selects the
-//! value in it, and does nothing else to it. The only error is a file that cannot be opened at all.
+//! value in it, and does nothing else to it but ask a window that had the file open already for
+//! the focus, so that it comes to the front. The only error is a file that cannot be opened at all.
 //!
 //! [`open_at`] blocks for as long as it takes the app to show the file, up to about twelve
 //! seconds, so it belongs on a thread of its own, never the UI's. UI Automation calls into a hung
@@ -26,8 +31,8 @@
 
 mod default_app;
 mod editors;
-mod measure;
 mod needles;
+mod office;
 mod titles;
 mod uia;
 
@@ -41,7 +46,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use piikey::sys::CREATE_NO_WINDOW;
+use piikey::{formats::Location, sys::CREATE_NO_WINDOW};
 
 use self::{
     default_app::default_exe,
@@ -68,8 +73,9 @@ pub struct Target {
     /// The value to find in the file, as the findings list shows it: runs of white space are one
     /// space, and a value that was cut ends in `…`.
     pub value: String,
-    /// Line and column, both from 1, when the file is text.
-    pub line: Option<(u32, u32)>,
+    /// Where the format says the value is, when it says: a line and column of a text, a page, a
+    /// sheet and cell, a slide.
+    pub place: Option<Location>,
 }
 
 /// What "Open at this place" did.
@@ -85,9 +91,9 @@ pub enum Outcome {
     Opened,
 }
 
-/// Opens `target.file`, at `target.line` when the app takes one, else with the value selected and
-/// outlined in the app's window when that can be done. `purpose` is the one of the app: the
-/// highlight overlay that draws the outline counts the presses of its shortcut on it.
+/// Opens `target.file`, at its line and column when the app takes them, else with the value
+/// selected and outlined in the app's window when that can be done. `purpose` is the one of the
+/// app: the highlight overlay that draws the outline counts the presses of its shortcut on it.
 ///
 /// Blocks for up to about twelve seconds: call it from a background thread.
 ///
@@ -103,7 +109,9 @@ pub fn open_at(target: &Target, purpose: &Arc<Purpose>) -> Res<Outcome> {
 /// Starts the app that opens the file by default at the line of the target, when it is an editor
 /// that takes a place: `Some(Placed)` then, `None` for any other app or when it will not start.
 fn place(target: &Target) -> Option<Outcome> {
-    let (line, column) = target.line?;
+    let Some(Location::Line { line, column }) = target.place else {
+        return None;
+    };
     let exe = default_exe(&target.file)?;
     let arguments = Editor::of(&exe)?.arguments(&target.file, line, column);
     start(&exe, &arguments).then_some(Outcome::Placed)
@@ -122,7 +130,9 @@ fn start(exe: &Path, arguments: &[OsString]) -> bool {
         .is_ok()
 }
 
-/// Opens the file with its default app, and looks for the value in the window that shows it.
+/// Looks for the value in a window that has the file open already, and goes straight to it there;
+/// otherwise opens the file with its default app, and looks for the value in the window that shows
+/// it.
 fn open_and_mark(target: &Target, purpose: &Arc<Purpose>) -> Res<Outcome> {
     if let Err(error) = std::fs::metadata(&target.file)
         && error.kind() == ErrorKind::NotFound
@@ -134,9 +144,11 @@ fn open_and_mark(target: &Target, purpose: &Arc<Purpose>) -> Res<Outcome> {
     }
     let deadline = Instant::now() + BUDGET;
     let mut search = Job::of(target, purpose).and_then(Search::start);
-    if let Some(search) = &mut search {
-        // The window of the file is told from the windows that are open before it is.
-        search.wait_until_looked(LOOK_WAIT);
+    if let Some(search) = &mut search
+        && search.first(LOOK_WAIT) == Outcome::Marked
+    {
+        // The file is open and the value is pointed at: opening it again would only open it twice.
+        return Ok(Outcome::Marked);
     }
     // Dropping the search, when this fails, tells its thread to stop.
     open_file(&target.file)?;
@@ -185,7 +197,7 @@ mod tests {
         let target = Target {
             file: std::env::temp_dir().join("piikey-goto-test-there-is-no-such-file.txt"),
             value: "Jan Jansen".to_owned(),
-            line: None,
+            place: None,
         };
         let opened = open_at(&target, &Arc::new(Purpose::default()));
         assert_eq!(

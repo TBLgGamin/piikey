@@ -58,7 +58,7 @@ use crate::{
 
 pub use self::{
     edit::{Edit, apply_edit},
-    inventory::{FindingFiles, Reveal, RevealState, Store},
+    inventory::{FindingFiles, FindingsEvent, Reveal, RevealState, Store},
     keyed::{Keyed, KeyedPage, KeyedQuery, Period, Sent},
     model::Model,
     watch::{Change, FolderStatus, Started, Watch, WatchedFolder},
@@ -113,6 +113,13 @@ pub trait Backend: Send + Sync + 'static {
     fn load_model(&self) -> Res<()>;
     /// Frees the detection model's memory.
     fn release_model(&self);
+    /// How long the detection model stays in memory after a scan or a read of findings ends and
+    /// nothing else needs it: what follows a scan is mostly a look at what it found, which reads
+    /// the same texts again, so the model that is still there (with what it learned of them)
+    /// answers at once. Nothing to wait for unless the backend says so.
+    fn model_idle(&self) -> Duration {
+        Duration::ZERO
+    }
     /// The token the local HTTP API asks for, made on first use; with `rotate`, a new one that
     /// replaces it.
     fn token(&self, rotate: bool) -> Res<String>;
@@ -340,8 +347,10 @@ pub struct Controller {
     events: Sender<Event>,
     /// What the scan thread works through.
     scanner: Arc<Scanner>,
-    /// One load or release of the detection model at a time.
-    model_sync: Mutex<()>,
+    /// One load or release of the detection model at a time, and when it may go after a scan.
+    model_sync: Mutex<model::Hold>,
+    /// This controller, for a thread that comes back to it later.
+    me: Weak<Controller>,
     /// The pool the scans run in, made when first needed, see [`Controller::in_scan_pool`]; `None`
     /// when the system would not start its threads.
     pool: LazyLock<Option<rayon::ThreadPool>>,
@@ -466,7 +475,8 @@ impl Controller {
             totals: watch_store.totals(),
             ..watch::WatchState::default()
         };
-        let controller = Arc::new(Self {
+        let controller = Arc::new_cyclic(|me| Self {
+            me: me.clone(),
             shared,
             backend,
             vault_path,
@@ -502,7 +512,7 @@ impl Controller {
             commands: Mutex::new(Some(command_tx)),
             events: event_tx,
             scanner: Arc::new(Scanner::default()),
-            model_sync: Mutex::new(()),
+            model_sync: Mutex::new(model::Hold::default()),
             pool: LazyLock::new(inventory::scan_pool),
         });
         // A pause of the highlight is on the tray's tooltip: the window follows it like any change.

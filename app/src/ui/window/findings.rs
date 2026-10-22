@@ -16,13 +16,13 @@ use std::{
 
 use piikey::{
     detect::EntityKind,
-    inventory::{Finding, Location},
+    inventory::{Busy, Finding},
 };
 use windows_reactor::{ComponentContext, ComponentTask};
 
 use super::{MainWindow, Msg};
 use crate::ui::{
-    controller::{FindingFiles, Notice, Store},
+    controller::{FindingFiles, FindingsEvent, Notice, Store},
     goto,
 };
 
@@ -49,6 +49,15 @@ pub struct Row {
     pub finding: Finding,
 }
 
+/// What a reading is doing now, for the line of progress.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Working {
+    /// Loading the detection model, which nothing is read without.
+    Model,
+    /// A file that is being read, and what that takes a while for.
+    File(PathBuf, Busy),
+}
+
 /// How far the reading is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reading {
@@ -69,6 +78,8 @@ pub struct FindingsView {
     /// The task that reads, cancelled when the view closes.
     task: Option<ComponentTask>,
     pub reading: Reading,
+    /// What the reading is doing now, when it takes a while: loading the model, reading a picture.
+    pub working: Option<Working>,
     /// The files to read, in the order they are listed.
     pub files: Vec<Rc<FileRef>>,
     /// How many files there are beyond the ones that are read.
@@ -107,6 +118,7 @@ impl FindingsView {
             seq,
             task: None,
             reading: Reading::Listing,
+            working: None,
             files: Vec::new(),
             left_out_files: 0,
             read: 0,
@@ -208,6 +220,25 @@ impl FindingsView {
     /// Everything was read, whatever the batches said.
     pub fn finish(&mut self) {
         self.reading = Reading::Done;
+        self.working = None;
+    }
+
+    /// More values of the file at `path`, which is still being read: they follow the ones
+    /// before them. What the list is cut at is counted and said once it is full.
+    pub fn more(&mut self, path: &Path, list: Vec<Finding>) {
+        let Some(file) = self
+            .files
+            .iter()
+            .find(|file| file.path == path)
+            .map(Rc::clone)
+        else {
+            return;
+        };
+        self.add(&file, list);
+        if self.rows.len() >= MOST_VALUES {
+            self.left_out_values = self.left_out_values.max(1);
+        }
+        self.refilter();
     }
 
     /// Makes `shown`, the counts and the revision of what the search, the type and the file leave.
@@ -269,20 +300,13 @@ impl Row {
             || contains_fold(&self.finding.snippet, needle)
     }
 
-    /// The line and column of the value, when it is in text.
-    pub fn line(&self) -> Option<(u32, u32)> {
-        match self.finding.location {
-            Some(Location::Line { line, column }) => Some((line, column)),
-            _ => None,
-        }
-    }
-
-    /// What "Open at this place" opens for the row: its file, and the value to bring into view.
+    /// What "Open at this place" opens for the row: its file, the value to bring into view, and
+    /// where the format says it is.
     pub fn target(&self) -> goto::Target {
         goto::Target {
             file: self.file.path.clone(),
             value: self.finding.value.to_string(),
-            line: self.line(),
+            place: self.finding.location.clone(),
         }
     }
 }
@@ -332,8 +356,21 @@ impl MainWindow {
             if token.is_cancelled() || !sender.clone().complete(Msg::FindingsListed(seq, listed)) {
                 return Msg::Noop;
             }
-            controller.read_findings(&files, |batch| {
-                !token.is_cancelled() && sender.clone().complete(Msg::FindingsRead(seq, batch))
+            controller.read_findings(&files, MOST_VALUES, |event| {
+                if token.is_cancelled() {
+                    return false;
+                }
+                let message = match event {
+                    FindingsEvent::Loading => Msg::FindingsBusy(seq, Working::Model),
+                    FindingsEvent::Busy(path, busy) => {
+                        Msg::FindingsBusy(seq, Working::File(path, busy))
+                    }
+                    FindingsEvent::Found(path, list) => Msg::FindingsMore(seq, path, list),
+                    FindingsEvent::Done(path, result) => {
+                        Msg::FindingsRead(seq, vec![(path, result.map(|()| Vec::new()))])
+                    }
+                };
+                sender.clone().complete(message)
             });
             Msg::FindingsDone(seq)
         }));
@@ -366,6 +403,16 @@ impl MainWindow {
             Msg::FindingsRead(seq, batch) => {
                 if let Some(view) = self.findings_of(seq) {
                     view.take(batch);
+                }
+            }
+            Msg::FindingsMore(seq, path, list) => {
+                if let Some(view) = self.findings_of(seq) {
+                    view.more(&path, list);
+                }
+            }
+            Msg::FindingsBusy(seq, working) => {
+                if let Some(view) = self.findings_of(seq) {
+                    view.working = Some(working);
                 }
             }
             Msg::FindingsDone(seq) => {
@@ -441,6 +488,7 @@ impl MainWindow {
 mod tests {
     use super::*;
     use crate::ui::controller::FindingFile;
+    use piikey::inventory::Location;
 
     fn finding(kind: EntityKind, value: &str, snippet: &str, line: u32) -> Finding {
         Finding {
@@ -685,33 +733,6 @@ mod tests {
     }
 
     #[test]
-    fn a_row_knows_its_line_only_when_the_file_is_text() {
-        let view = view();
-        assert_eq!(view.rows[0].line(), Some((3, 1)));
-        let mut other = Finding {
-            kind: EntityKind::Email,
-            value: "x".into(),
-            snippet: "x".into(),
-            location: Some(Location::Page(2)),
-        };
-        let row = Row {
-            id: 0,
-            file: Rc::clone(&view.files[0]),
-            finding: other.clone(),
-        };
-        assert_eq!(row.line(), None);
-        other.location = None;
-        assert_eq!(
-            Row {
-                finding: other,
-                ..row
-            }
-            .line(),
-            None
-        );
-    }
-
-    #[test]
     fn a_row_opens_its_file_with_the_value_to_find_and_the_line_when_there_is_one() {
         let view = view();
         assert_eq!(
@@ -719,7 +740,7 @@ mod tests {
             goto::Target {
                 file: PathBuf::from(r"C:\Docs\a.txt"),
                 value: "jan@acme.nl".to_owned(),
-                line: Some((3, 1)),
+                place: Some(Location::Line { line: 3, column: 1 }),
             }
         );
         let sheet = view.rows[3].target();

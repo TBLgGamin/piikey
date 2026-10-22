@@ -91,10 +91,11 @@ files has a bar by type on each row; a legend lists the types found (a chip row 
 a list in a wide one) and picking one shows only that type; a treemap has a tile for every file,
 coloured by type (up to 400 tiles, the rest one "+N files" tile); and a details pane describes
 what is selected. Selecting a tile opens the tree along the way to its file. For a file the details
-can open it, show it in Explorer, show what was found, make a masked copy (beside the file; it
-never replaces an existing file) or scan it again; for a folder
-they can show only that folder, show it in Explorer, show what was found or scan it. The
-inventory has no exclusions and no switch: what is in it is what was scanned.
+can open it, show it in Explorer, show what was found or make a masked copy (beside the file; it
+never replaces an existing file); for a folder they can show only that folder, show it in Explorer
+or show what was found. What is listed was scanned already, so the details offer no scan. The
+inventory has no exclusions and no switch: what is in it is what was scanned. The boxes that add a
+location or a watched folder have Browse buttons that open the Windows folder (or file) picker.
 
 A scan started from the page, the box, a drop or Explorer opens a result dialog in the window
 (scanning, then how much was found, with "Show what was found" and "Show in Inventory" when

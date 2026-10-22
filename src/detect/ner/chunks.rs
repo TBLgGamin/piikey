@@ -13,8 +13,10 @@ const CHUNK_BYTES: usize = 256 << 10;
 const BLOB_BYTES: usize = 1024;
 
 /// Text the model reads at a time, in a call with more: it keeps the tokens of one group in
-/// memory, not of all texts of the call.
-pub(super) const GROUP_BYTES: usize = 1 << 20;
+/// memory, not of all texts of the call, and a caller that is shown what the model found (see
+/// [`Detector::detect_batch_steps`](crate::detect::Detector::detect_batch_steps)) gets it a group
+/// at a time: one chunk of a long text, which the model takes seconds to read, not minutes.
+pub(super) const GROUP_BYTES: usize = CHUNK_BYTES;
 
 /// One text to run: a text of the batch, or a piece of a long one.
 pub(super) struct Job<'a> {

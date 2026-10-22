@@ -3,6 +3,7 @@ use std::sync::mpsc;
 use piikey::inventory::Inventory;
 
 use super::*;
+use crate::ui::controller::FindingsEvent;
 use crate::ui::scanner::{Job, Kind, Request};
 
 /// A folder `docs` in `dir` with one file that holds an email address.
@@ -345,22 +346,37 @@ fn adding_a_location_adds_the_folder_and_scans_it_with_the_dialog() -> Test {
     Ok(())
 }
 
-/// The findings of some files, as `read_findings` hands them over: each file with its values or the
-/// message that says why there are none.
-type Batch = Vec<(PathBuf, Result<Vec<piikey::inventory::Finding>, String>)>;
-
-/// What `read_findings` hands over for `files`, one list per batch, until `go_on` says stop.
-fn read_batches(
+/// What `read_findings` reports for `files` with at most `limit` values, until `go_on` (told how
+/// many reports there are) says stop.
+fn read_events(
     controller: &Controller,
     files: &[PathBuf],
-    mut go_on: impl FnMut(usize) -> bool,
-) -> Vec<Batch> {
-    let mut batches = Vec::new();
-    controller.read_findings(files, |batch| {
-        batches.push(batch);
-        go_on(batches.len())
+    limit: usize,
+    mut go_on: impl FnMut(usize) -> bool + Send,
+) -> Vec<FindingsEvent> {
+    let mut events = Vec::new();
+    controller.read_findings(files, limit, |event| {
+        events.push(event);
+        go_on(events.len())
     });
-    batches
+    events
+}
+
+/// The values the events report for `path`, and how the file ended: `None` while it did not.
+fn of_file(
+    events: &[FindingsEvent],
+    path: &Path,
+) -> (Vec<piikey::inventory::Finding>, Option<Result<(), String>>) {
+    let mut values = Vec::new();
+    let mut ended = None;
+    for event in events {
+        match event {
+            FindingsEvent::Found(file, list) if file == path => values.extend(list.iter().cloned()),
+            FindingsEvent::Done(file, result) if file == path => ended = Some(result.clone()),
+            _ => {}
+        }
+    }
+    (values, ended)
 }
 
 #[test]
@@ -370,13 +386,19 @@ fn the_findings_of_files_are_read_on_request_with_the_model_and_kept_nowhere() -
     let file = folder.join("a.txt");
     let missing = dir.0.join("missing.txt");
     let rig = rig(true, quiet())?;
-    let batches = read_batches(&rig.controller, &[file.clone(), missing.clone()], |_| true);
-    // Both files are one batch, in the order they were asked for.
-    assert_eq!(batches.len(), 1);
-    let read = &batches[0];
-    assert_eq!(read.len(), 2);
-    assert_eq!(read[0].0, file);
-    let found = read[0].1.as_ref().map_err(Clone::clone)?;
+    let events = read_events(
+        &rig.controller,
+        &[file.clone(), missing.clone()],
+        1_000,
+        |_| true,
+    );
+    // The model is loaded first: that is the first thing said.
+    assert!(
+        matches!(events.first(), Some(FindingsEvent::Loading)),
+        "{events:?}"
+    );
+    let (found, ended) = of_file(&events, &file);
+    assert_eq!(ended, Some(Ok(())));
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].kind, EntityKind::Email);
     assert_eq!(&*found[0].value, "jan.jansen@acme.nl");
@@ -386,13 +408,9 @@ fn the_findings_of_files_are_read_on_request_with_the_model_and_kept_nowhere() -
         Some(piikey::inventory::Location::Line { line: 1, column: 6 })
     );
     // A file that is not there says so, and the others are read all the same.
-    assert_eq!(read[1].0, missing);
-    assert!(
-        read[1]
-            .1
-            .as_ref()
-            .is_err_and(|error| error.contains("cannot read"))
-    );
+    let (none, ended) = of_file(&events, &missing);
+    assert!(none.is_empty());
+    assert!(ended.is_some_and(|result| result.is_err_and(|error| error.contains("cannot read"))));
     // The model is there for the detection, and given back when nothing else needs it.
     assert!(has_call(&rig, "load_model"));
     eventually("the model to be released", || {
@@ -408,13 +426,13 @@ fn the_findings_of_files_are_read_on_request_with_the_model_and_kept_nowhere() -
     assert_eq!(rig.controller.snapshot().inventory_totals, (0, 0));
     // Nothing to read: the model is not loaded for it.
     let calls = rig.calls().len();
-    assert!(read_batches(&rig.controller, &[], |_| true).is_empty());
+    assert!(read_events(&rig.controller, &[], 1_000, |_| true).is_empty());
     assert_eq!(rig.calls().len(), calls);
     Ok(())
 }
 
 #[test]
-fn files_are_read_a_few_at_a_time_in_order_and_the_reader_can_stop_the_rest() -> Test {
+fn files_are_read_a_few_at_a_time_and_the_reader_or_the_limit_can_stop_the_rest() -> Test {
     let dir = TempDir::new()?;
     let folder = docs(&dir)?;
     let files: Vec<PathBuf> = (0..9)
@@ -425,14 +443,60 @@ fn files_are_read_a_few_at_a_time_in_order_and_the_reader_can_stop_the_rest() ->
         })
         .collect::<Result<_, String>>()?;
     let rig = rig(true, quiet())?;
-    let all = read_batches(&rig.controller, &files, |_| true);
-    assert_eq!(all.iter().map(Vec::len).collect::<Vec<_>>(), [4, 4, 1]);
-    let order: Vec<PathBuf> = all.into_iter().flatten().map(|(path, _)| path).collect();
-    assert_eq!(order, files);
-    // Whoever reads says when to stop: nothing is read past the batch that was refused.
-    let first = read_batches(&rig.controller, &files, |_| false);
-    assert_eq!(first.len(), 1);
-    assert_eq!(first[0].len(), 4);
+    let all = read_events(&rig.controller, &files, 1_000, |_| true);
+    for file in &files {
+        let (found, ended) = of_file(&all, file);
+        assert_eq!((found.len(), ended), (1, Some(Ok(()))), "{file:?}");
+    }
+    // Whoever reads says when to stop: nothing is reported past the report that was refused.
+    let some = read_events(&rig.controller, &files, 1_000, |reports| reports < 3);
+    assert_eq!(some.len(), 3, "{some:?}");
+    // So does the limit: the files that were not started are left alone.
+    let few = read_events(&rig.controller, &files, 2, |_| true);
+    let values: usize = few
+        .iter()
+        .map(|event| match event {
+            FindingsEvent::Found(_, list) => list.len(),
+            _ => 0,
+        })
+        .sum();
+    assert!((2..9).contains(&values), "{values}");
+    Ok(())
+}
+
+#[test]
+fn the_model_stays_for_a_while_after_a_read_of_findings_and_what_comes_next_keeps_it() -> Test {
+    let dir = TempDir::new()?;
+    let folder = docs(&dir)?;
+    let file = folder.join("a.txt");
+    let rig = rig(true, quiet())?;
+    *rig.fake.idle.lock().map_err(|error| error.to_string())? = Duration::from_millis(400);
+    let releases = |rig: &Rig| {
+        rig.calls()
+            .iter()
+            .filter(|call| *call == "release_model")
+            .count()
+    };
+    read_events(&rig.controller, std::slice::from_ref(&file), 1_000, |_| {
+        true
+    });
+    // Nothing needs the model any more, and it is still there.
+    assert!(has_call(&rig, "load_model"));
+    assert_eq!(releases(&rig), 0, "{:?}", rig.calls());
+    // Another read in the meantime has it at once, and the time starts again after it.
+    std::thread::sleep(Duration::from_millis(250));
+    read_events(&rig.controller, std::slice::from_ref(&file), 1_000, |_| {
+        true
+    });
+    std::thread::sleep(Duration::from_millis(250));
+    assert_eq!(
+        releases(&rig),
+        0,
+        "kept by the second read: {:?}",
+        rig.calls()
+    );
+    // And when it is up, the model goes.
+    eventually("the model to be released", || releases(&rig) == 1)?;
     Ok(())
 }
 

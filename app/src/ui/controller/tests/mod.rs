@@ -37,6 +37,8 @@ fn quiet() -> Policy {
 struct Fake {
     calls: Calls,
     installed: AtomicBool,
+    /// How long the model stays after a scan: nothing, unless a test says so.
+    idle: Mutex<Duration>,
     fail_start: AtomicBool,
     fail_enable: AtomicBool,
     fail_capture: AtomicBool,
@@ -303,6 +305,10 @@ impl Backend for Arc<Fake> {
 
     fn release_model(&self) {
         log(&self.calls, "release_model");
+    }
+
+    fn model_idle(&self) -> Duration {
+        *self.idle.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn load_activity(&self) -> Activity {

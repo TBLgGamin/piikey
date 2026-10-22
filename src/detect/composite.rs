@@ -1,8 +1,10 @@
 //! Runs several detectors over the same texts; the earlier detector wins overlaps.
 
+use std::ops::ControlFlow;
+
 use rayon::prelude::*;
 
-use super::{Detector, KindSet, Mode, Span};
+use super::{Detector, KindSet, Mode, Span, Step};
 
 /// Detectors run in order, each over every text. A span that shares a byte with a span of an
 /// earlier detector is dropped, so the order is the priority. The result is sorted by start and
@@ -40,6 +42,55 @@ impl Detector for CompositeDetector {
                 .for_each(|(mine, found)| claim(mine, found));
         }
         kept
+    }
+
+    /// One member after the other, as [`CompositeDetector::detect_batch`] runs them, each
+    /// member's steps passed on with the spans an earlier member kept left out. A member that
+    /// is not the last says that more follows, so a caller that shows the first step knows the
+    /// model that comes after the patterns is still at work.
+    fn detect_batch_steps(
+        &self,
+        texts: &[&str],
+        mode: Mode,
+        wanted: KindSet,
+        _taken: &[Vec<Span>],
+        step: &mut dyn FnMut(Step) -> ControlFlow<()>,
+    ) {
+        // What the members before the one at work have kept.
+        let mut kept: Vec<Vec<Span>> = Vec::new();
+        let last = self.0.len().saturating_sub(1);
+        for (at, member) in self.0.iter().enumerate() {
+            let mut added: Vec<Vec<Span>> = vec![Vec::new(); texts.len()];
+            let mut stopped = false;
+            member.detect_batch_steps(texts, mode, wanted, &kept, &mut |mut found| {
+                if !kept.is_empty() {
+                    for (own, claimed) in found.spans.iter_mut().zip(&kept) {
+                        own.retain(|span| !overlaps(claimed, span));
+                    }
+                }
+                for (all, new) in added.iter_mut().zip(&found.spans) {
+                    all.extend_from_slice(new);
+                }
+                // Only the last member's last step is the last.
+                if at < last && found.more.is_none() {
+                    found.more = Some((0, 0));
+                }
+                let flow = step(found);
+                stopped = flow.is_break();
+                flow
+            });
+            if stopped {
+                return;
+            }
+            if kept.is_empty() {
+                kept = added;
+            } else {
+                for (all, new) in kept.iter_mut().zip(added) {
+                    all.extend(new);
+                    all.sort_by_key(|span| span.start);
+                }
+            }
+        }
     }
 }
 
@@ -444,5 +495,67 @@ mod tests {
             ]
         );
         Ok(())
+    }
+
+    /// Every step the composite reports for `texts`, until `stop_after` of them have come.
+    fn steps_of(detector: &CompositeDetector, texts: &[&str], stop_after: usize) -> Vec<Step> {
+        let mut steps = Vec::new();
+        detector.detect_batch_steps(texts, Mode::Anonymize, KindSet::ALL, &[], &mut |step| {
+            steps.push(step);
+            if steps.len() >= stop_after {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        });
+        steps
+    }
+
+    #[test]
+    fn the_steps_are_what_each_member_keeps_and_together_they_are_the_batch() {
+        use EntityKind::{Email, Person, Phone};
+        let names = [span(0, 10, Person), span(30, 35, Person)];
+        let regex = [span(5, 15, Phone), span(20, 25, Email), span(33, 40, Phone)];
+        let detector = composite(&[&names, &regex]);
+        let texts = ["one", "two"];
+
+        let steps = steps_of(&detector, &texts, usize::MAX);
+        assert_eq!(steps.len(), 2);
+        // The first member's step says more follows, though not how much; the last says nothing
+        // does. What the second member found over the first's spans is left out of its step.
+        assert_eq!(steps[0].more, Some((0, 0)));
+        assert_eq!(steps[1].more, None);
+        assert_eq!(steps[0].spans, vec![names.to_vec(); 2]);
+        assert_eq!(steps[1].spans, vec![vec![span(20, 25, Email)]; 2]);
+
+        let mut together = vec![Vec::new(); texts.len()];
+        for step in &steps {
+            for (all, spans) in together.iter_mut().zip(&step.spans) {
+                all.extend(spans.iter().copied());
+            }
+        }
+        for spans in &mut together {
+            spans.sort_by_key(|span| span.start);
+        }
+        assert_eq!(
+            together,
+            detector.detect_batch(&texts, Mode::Anonymize, KindSet::ALL, &[])
+        );
+    }
+
+    #[test]
+    fn a_later_member_is_told_what_the_earlier_ones_kept_and_a_stop_ends_the_work() {
+        use EntityKind::{Person, Phone};
+        let (second, calls) = spy(&[span(5, 15, Phone)]);
+        let detector = CompositeDetector(vec![Box::new(Fixed(vec![span(0, 10, Person)])), second]);
+        let steps = steps_of(&detector, &["a", "b"], usize::MAX);
+        assert_eq!(steps.len(), 2);
+        assert_eq!(seen(&calls), [vec![vec![span(0, 10, Person)]; 2]]);
+
+        // Told to stop after the first step, the second member is never asked.
+        let before = seen(&calls).len();
+        let steps = steps_of(&detector, &["a", "b"], 1);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(seen(&calls).len(), before);
     }
 }

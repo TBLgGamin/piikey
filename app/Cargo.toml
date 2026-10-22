@@ -50,7 +50,9 @@ windows = { version = "0.62.2", features = ["ApplicationModel", "ApplicationMode
 # Automation, behind a safe wrapper: raw `windows` UIA calls are `unsafe` and `unsafe` is forbidden.
 # Uses windows 0.62.2, the version the root crate already builds.
 # Default features: the crate does not build with fewer (its feature gates are incomplete).
-uiautomation = "0.25.1"
+# `event` (no extra crate) compiles the safe event-handler registration: PowerPoint shows its slide
+# area to a UI Automation client only once that client has registered a handler.
+uiautomation = { version = "0.25.1", features = ["event"] }
 # What the user pastes: clipboard sequence number and text, safe API, no other dependencies.
 clipboard-win = "5.4.1"
 # Finds the captured values in outgoing requests; already built for the root crate.
@@ -71,6 +73,9 @@ rayon.workspace = true
 # `default-features = false` leaves out the macOS backend; on Windows it adds `notify-types` and a
 # newer `windows-sys`, and uses `walkdir` and `log` as the rest of the build does.
 notify = { version = "8.2.0", default-features = false }
+# The Browse buttons of Inventory and Watch: the Windows folder and file pickers. The reactor has no
+# picker, and the shell's `IFileOpenDialog` is COM, `unsafe` to call, so a crate wraps it.
+rfd = { version = "0.17.2", default-features = false }
 
 [build-dependencies]
 # Embeds assets/piikey.ico as the exe icon resource (icon only: the manifest comes from windows-reactor-setup).

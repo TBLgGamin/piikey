@@ -7,7 +7,7 @@
 //! than a screenful. The values are on screen and nowhere else: see
 //! [`FindingsView`](crate::ui::window::FindingsView).
 
-use piikey::inventory::Location;
+use piikey::inventory::{Busy, Location};
 use windows_reactor::{
     Border, Button, ButtonStyle, Callback, ComboBox, FontIcon, FontWeight, Grid, GridLength,
     HorizontalAlignment, ItemsRepeater, KeyedView, Orientation, ProgressRing, ScrollViewer,
@@ -22,7 +22,7 @@ use super::{
 };
 use crate::ui::{
     pages::kit::{Context, caption, counted, glyph, kind_glyph, measured, subtitle, thousands},
-    window::{FindingsView, Msg, Reading, Row},
+    window::{FindingsView, Msg, Reading, Row, Working},
 };
 
 /// How high a row is.
@@ -37,12 +37,20 @@ const OPEN_HINT: &str = "Open at this place";
 const OPENED_ONLY: &str =
     "Opened the file. piikey cannot jump to the value in this app: search for it there.";
 
-/// Where a value is in its file, in words: `line 12`, `page 3`, `Sheet1, cell B7`.
+/// Where a value is in its file, in words: `line 12`, `page 3`, `Sheet1, cell B7`, `slide 4`,
+/// `slide 4, notes`. A paragraph is named by its page when the file knows it (the page is what a
+/// reader finds in a document), by its number when not.
 pub(super) fn place_text(location: &Location) -> String {
     match location {
         Location::Line { line, .. } => format!("line {line}"),
-        Location::Page(page) => format!("page {page}"),
+        Location::Page(page)
+        | Location::Paragraph {
+            page: Some(page), ..
+        } => format!("page {page}"),
         Location::Cell { sheet, cell } => format!("{sheet}, cell {cell}"),
+        Location::Slide { slide, .. } => format!("slide {slide}"),
+        Location::Notes(slide) => format!("slide {slide}, notes"),
+        Location::Paragraph { paragraph, .. } => format!("paragraph {paragraph}"),
     }
 }
 
@@ -52,6 +60,55 @@ pub(super) fn place_detail(location: &Location) -> String {
         Location::Line { line, column } => format!("Line {line}, column {column}"),
         Location::Page(page) => format!("Page {page}"),
         Location::Cell { sheet, cell } => format!("Sheet {sheet}, cell {cell}"),
+        Location::Slide {
+            slide,
+            shape: Some(shape),
+        } => format!("Slide {slide}, shape {shape}"),
+        Location::Slide { slide, shape: None } => format!("Slide {slide}"),
+        Location::Notes(slide) => format!("Notes of slide {slide}"),
+        Location::Paragraph {
+            paragraph,
+            page: Some(page),
+        } => format!("Page {page}, paragraph {paragraph}"),
+        Location::Paragraph {
+            paragraph,
+            page: None,
+        } => format!("Paragraph {paragraph}"),
+    }
+}
+
+/// What the line over the list says about the reading of file number `done + 1` of `total`: which
+/// file it is, and what the reading is doing when that takes a while. A view of one file leaves
+/// the first out when the second is there.
+fn reading_parts(view: &FindingsView, done: usize, total: usize, parts: &mut Vec<String>) {
+    let working = view.working.as_ref().map(working_text);
+    if working.is_none() || !view.single() {
+        parts.push(format!(
+            "Reading file {} of {total}\u{2026}",
+            (done + 1).min(total)
+        ));
+    }
+    parts.extend(working);
+}
+
+/// What a reading says it is doing, in words.
+fn working_text(working: &Working) -> String {
+    match working {
+        Working::Model => "Loading the detection model\u{2026}".to_owned(),
+        Working::File(_, Busy::Picture) => "Reading a picture\u{2026}".to_owned(),
+        Working::File(_, Busy::Pages { done, total }) => {
+            format!(
+                "Reading scanned page {} of {total}\u{2026}",
+                (done + 1).min(*total)
+            )
+        }
+        Working::File(_, Busy::Model { done, total }) if *total > 0 => format!(
+            "Looking for names and addresses\u{2026} {} %",
+            (done * 100 / total).min(100)
+        ),
+        Working::File(_, Busy::Model { .. }) => {
+            "Looking for names and addresses\u{2026}".to_owned()
+        }
     }
 }
 
@@ -66,10 +123,7 @@ pub(super) fn tally(view: &FindingsView) -> String {
     let mut parts: Vec<String> = Vec::new();
     if view.rows.is_empty() {
         if let Reading::Files { done, total } = view.reading {
-            parts.push(format!(
-                "Reading file {} of {total}\u{2026}",
-                (done + 1).min(total)
-            ));
+            reading_parts(view, done, total, &mut parts);
         } else {
             parts.push(nothing(view));
         }
@@ -86,10 +140,7 @@ pub(super) fn tally(view: &FindingsView) -> String {
             )
         });
         if let Reading::Files { done, total } = view.reading {
-            parts.push(format!(
-                "Reading file {} of {total}\u{2026}",
-                (done + 1).min(total)
-            ));
+            reading_parts(view, done, total, &mut parts);
         }
     }
     if view.left_out_files > 0 {
@@ -512,7 +563,7 @@ mod tests {
     }
 
     #[test]
-    fn a_place_is_a_line_a_page_or_a_cell_in_words() {
+    fn a_place_is_a_line_a_page_a_cell_a_slide_or_a_paragraph_in_words() {
         let line = Location::Line {
             line: 12,
             column: 5,
@@ -527,6 +578,33 @@ mod tests {
         };
         assert_eq!(place_text(&cell), "Klanten, cell B7");
         assert_eq!(place_detail(&cell), "Sheet Klanten, cell B7");
+        let shape = Location::Slide {
+            slide: 4,
+            shape: Some(2),
+        };
+        assert_eq!(place_text(&shape), "slide 4");
+        assert_eq!(place_detail(&shape), "Slide 4, shape 2");
+        let loose = Location::Slide {
+            slide: 4,
+            shape: None,
+        };
+        assert_eq!(place_text(&loose), "slide 4");
+        assert_eq!(place_detail(&loose), "Slide 4");
+        assert_eq!(place_text(&Location::Notes(4)), "slide 4, notes");
+        assert_eq!(place_detail(&Location::Notes(4)), "Notes of slide 4");
+        // A paragraph is named by its page when the file says which, else by its number.
+        let paged = Location::Paragraph {
+            paragraph: 12,
+            page: Some(3),
+        };
+        assert_eq!(place_text(&paged), "page 3");
+        assert_eq!(place_detail(&paged), "Page 3, paragraph 12");
+        let bare = Location::Paragraph {
+            paragraph: 12,
+            page: None,
+        };
+        assert_eq!(place_text(&bare), "paragraph 12");
+        assert_eq!(place_detail(&bare), "Paragraph 12");
     }
 
     #[test]

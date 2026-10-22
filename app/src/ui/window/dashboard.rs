@@ -23,7 +23,7 @@ use windows_reactor::ComponentContext;
 
 use super::{MainWindow, Msg, Page};
 use crate::ui::{
-    controller::{Command, Controller, Store},
+    controller::{Controller, Store},
     explorer,
 };
 
@@ -61,8 +61,6 @@ pub enum Dash {
     Show(PathBuf),
     /// Write a masked copy of the file beside it and show it.
     Mask(PathBuf),
-    /// Scan the file or folder again, into the main inventory, and show the result.
-    Scan(PathBuf),
     /// Run the detection over the file, or over the files of the folder that hold personal data,
     /// and show every value it finds in the findings view.
     Found(PathBuf),
@@ -365,10 +363,6 @@ impl MainWindow {
             Dash::Mask(path) => self.background(context, move |controller| {
                 explorer::show(&controller.masked_copy(&path)?)?;
                 Ok(Msg::Noop)
-            }),
-            Dash::Scan(path) => self.input.controller.submit(Command::ScanFiles {
-                paths: vec![path],
-                reveal: true,
             }),
             Dash::Found(path) => self.open_findings(vec![path], store, context),
             Dash::Report => {

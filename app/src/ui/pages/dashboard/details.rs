@@ -56,7 +56,6 @@ pub(super) enum Action {
     Show,
     Found,
     Mask,
-    Scan,
     /// Show only this folder.
     Enter,
 }
@@ -69,7 +68,6 @@ impl Action {
             Self::Show => "Show in Explorer",
             Self::Found => "Show what was found",
             Self::Mask => "Make masked copy",
-            Self::Scan => "Scan this",
             Self::Enter => "Show only this folder",
         }
     }
@@ -84,16 +82,15 @@ impl Action {
                 Self::Show => Dash::Show(path),
                 Self::Found => Dash::Found(path),
                 Self::Mask => Dash::Mask(path),
-                Self::Scan => Dash::Scan(path),
                 Self::Enter => Dash::Enter(path),
             },
         )
     }
 }
 
-/// What can be done with a `target` of `store`. The watch looks at its files by itself, so it has
-/// nothing to scan; a folder already on show cannot be shown again (`on_show`).
-pub(super) fn actions(target: Target, store: Store, on_show: bool) -> Vec<Action> {
+/// What can be done with a `target`. What is listed was scanned already, so there is nothing to
+/// scan here; a folder already on show cannot be shown again (`on_show`).
+pub(super) fn actions(target: Target, on_show: bool) -> Vec<Action> {
     let mut list = match target {
         Target::File => vec![Action::Open, Action::Show, Action::Found, Action::Mask],
         Target::Folder => vec![Action::Show, Action::Found],
@@ -101,9 +98,6 @@ pub(super) fn actions(target: Target, store: Store, on_show: bool) -> Vec<Action
     };
     if target == Target::Folder && !on_show {
         list.insert(0, Action::Enter);
-    }
-    if store == Store::Inventory && matches!(target, Target::File | Target::Folder) {
-        list.push(Action::Scan);
     }
     list
 }
@@ -367,7 +361,7 @@ pub(super) fn details(dash: &Dashboard, store: Store, height: f64, context: Cont
         Target::Top | Target::Other | Target::Folder => "\u{E8B7}",
     };
     let on_show = subject.path == dash.at;
-    let todo = actions(subject.target, store, on_show);
+    let todo = actions(subject.target, on_show);
     let rows = type_rows(height, subject.target, todo.len());
     let mut parts: Vec<View> = vec![
         Grid::new()
@@ -614,39 +608,14 @@ mod tests {
         assert_eq!(subject.title, "Other scans");
         assert!(subject.path.as_os_str().is_empty());
         assert_eq!(subject.summary, "1 found in 2 files");
-        assert!(actions(Target::Other, Store::Inventory, false).is_empty());
+        assert!(actions(Target::Other, false).is_empty());
     }
 
     #[test]
-    fn each_target_offers_what_applies_to_it() {
+    fn each_target_offers_what_applies_to_it_and_nothing_to_scan_again() {
         let labels = |list: Vec<Action>| list.into_iter().map(Action::label).collect::<Vec<_>>();
         assert_eq!(
-            labels(actions(Target::File, Store::Inventory, false)),
-            [
-                "Open",
-                "Show in Explorer",
-                "Show what was found",
-                "Make masked copy",
-                "Scan this"
-            ]
-        );
-        assert_eq!(
-            labels(actions(Target::Folder, Store::Inventory, false)),
-            [
-                "Show only this folder",
-                "Show in Explorer",
-                "Show what was found",
-                "Scan this"
-            ]
-        );
-        // The folder on show cannot be shown again.
-        assert_eq!(
-            labels(actions(Target::Folder, Store::Inventory, true)),
-            ["Show in Explorer", "Show what was found", "Scan this"]
-        );
-        // The watch keeps its files scanned by itself.
-        assert_eq!(
-            labels(actions(Target::File, Store::Watch, false)),
+            labels(actions(Target::File, false)),
             [
                 "Open",
                 "Show in Explorer",
@@ -654,7 +623,20 @@ mod tests {
                 "Make masked copy"
             ]
         );
-        assert!(actions(Target::Top, Store::Inventory, true).is_empty());
+        assert_eq!(
+            labels(actions(Target::Folder, false)),
+            [
+                "Show only this folder",
+                "Show in Explorer",
+                "Show what was found"
+            ]
+        );
+        // The folder on show cannot be shown again.
+        assert_eq!(
+            labels(actions(Target::Folder, true)),
+            ["Show in Explorer", "Show what was found"]
+        );
+        assert!(actions(Target::Top, true).is_empty());
     }
 
     #[test]
