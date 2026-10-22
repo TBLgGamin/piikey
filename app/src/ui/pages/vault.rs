@@ -12,7 +12,9 @@ use windows_reactor::{
     TooltipExt, VerticalAlignment, View,
 };
 
-use super::kit::{Context, caption, card, counted, glyph, measured, page_header, thousands};
+use super::kit::{
+    Context, caption, card, counted, glyph, kind_glyph, measured, page_header, thousands,
+};
 use crate::ui::{
     controller::{Keyed, Period},
     window::{MainWindow, Msg, Page, VAULT_LIMIT},
@@ -29,54 +31,6 @@ const EXPORT_NOTE: &str = "Writes every value with its stand-in to a CSV file in
 
 /// What Forget does, as the question before it says.
 const FORGET_NOTE: &str = "Their stand-ins will no longer be turned back.";
-
-/// A Segoe Fluent Icons glyph for `kind`. Types of one group share a glyph.
-const fn kind_glyph(kind: EntityKind) -> &'static str {
-    match kind {
-        EntityKind::Email
-        | EntityKind::PhoneNumber
-        | EntityKind::ContactHandle
-        | EntityKind::PostalAddress => "\u{E715}",
-        EntityKind::Phone => "\u{E717}",
-        EntityKind::Person
-        | EntityKind::PersonAlias
-        | EntityKind::PersonIdentifier
-        | EntityKind::PersonAttribute
-        | EntityKind::PersonRole
-        | EntityKind::DateOfBirth => "\u{E77B}",
-        EntityKind::Iban
-        | EntityKind::CreditCard
-        | EntityKind::BankAccount
-        | EntityKind::PaymentCard
-        | EntityKind::CardSecurity
-        | EntityKind::FinancialAmount => "\u{E8C7}",
-        EntityKind::NlBsn
-        | EntityKind::UsSsn
-        | EntityKind::DocumentId
-        | EntityKind::DocumentReference
-        | EntityKind::VehicleId => "\u{E779}",
-        EntityKind::Ipv4
-        | EntityKind::Ipv6
-        | EntityKind::Mac
-        | EntityKind::DeviceId
-        | EntityKind::IdentifyingLink
-        | EntityKind::AccountId => "\u{E968}",
-        EntityKind::Secret | EntityKind::AuthSecret => "\u{E72E}",
-        EntityKind::UrlCredential => "\u{E71B}",
-        EntityKind::Location | EntityKind::GeoLocation => "\u{E707}",
-        EntityKind::OrganizationName | EntityKind::OrganizationId | EntityKind::ProperName => {
-            "\u{E821}"
-        }
-        EntityKind::HealthData
-        | EntityKind::BiometricData
-        | EntityKind::EthnicOrigin
-        | EntityKind::PoliticalOpinion
-        | EntityKind::ReligionOrBelief
-        | EntityKind::SexualOrientation
-        | EntityKind::TradeUnion
-        | EntityKind::CriminalOffence => "\u{E8D7}",
-    }
-}
 
 /// `site · app · time`, or the type of a value that was never sent.
 fn detail(item: &Keyed) -> String {

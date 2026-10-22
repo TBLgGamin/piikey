@@ -24,26 +24,37 @@ mod watch;
 
 use windows_reactor::{Grid, GridLength, KeyedView, StackPanel, Thickness, View};
 
-use self::kit::{Context, measured, notice};
 pub(super) use self::{dashboard::dialog, kit::status_chip};
+use self::{
+    dashboard::findings_panel,
+    kit::{Context, measured, notice},
+};
 use super::{
     status::{Cause, Status},
     window::{MainWindow, Page},
 };
 
-/// The page the navigation selected, under the notice the controller may have raised. Each page is
-/// built anew when it comes back, from the top of its scroller.
+/// The page the navigation selected, under the notice the controller may have raised; while the
+/// findings view is open it takes the page's place, and the page comes back when it closes. Each
+/// page is built anew when it comes back, from the top of its scroller.
 pub fn page(window: &MainWindow, status: &Status, context: Context<'_>) -> View {
-    let body = match window.page {
-        Page::Overview => overview::overview(window, status, context),
-        Page::Protection => protection::protection(window, status, context),
-        Page::Inventory => inventory::inventory(window, context),
-        Page::Watch => watch::watch(window, context),
-        Page::Vault => vault::vault(window, context),
-        Page::Settings => settings::settings(window, context),
+    let (key, body) = match &window.findings {
+        Some(view) => ("findings", findings_panel(view, context)),
+        None => (
+            window.page.tag(),
+            match window.page {
+                Page::Overview => overview::overview(window, status, context),
+                Page::Protection => protection::protection(window, status, context),
+                Page::Inventory => inventory::inventory(window, context),
+                Page::Watch => watch::watch(window, context),
+                Page::Vault => vault::vault(window, context),
+                Page::Settings => settings::settings(window, context),
+            },
+        ),
     };
     // Overview already shows an error as the cause it needs the user for: not twice.
     let shown_by_the_page = window.page == Page::Overview
+        && window.findings.is_none()
         && matches!(
             status,
             Status::NeedsAttention {
@@ -67,7 +78,7 @@ pub fn page(window: &MainWindow, status: &Status, context: Context<'_>) -> View 
             StackPanel::new().grid_row(0).children(notices),
             Grid::new()
                 .grid_row(1)
-                .keyed_children([KeyedView::new(window.page.tag(), body)]),
+                .keyed_children([KeyedView::new(key, body)]),
         ))
         .into()
 }

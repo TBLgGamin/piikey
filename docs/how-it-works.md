@@ -56,6 +56,12 @@ personal data gets a short green flash. In `Always`, Ctrl+Alt+P pauses and resum
 check runs on your PC with the same detector as masking, even when protection is off, and nothing is
 stored. Password fields are never read.
 
+"Open at this place" in the findings view (see Inventory and Explorer) uses the same outline: when
+the app that opens a file has a UI Automation text pattern, piikey selects the value in its window
+and four bars outline it for about two seconds. It never sends a key or a click, never takes the
+focus and never reads a password field, and it runs on a thread of its own, so a hung app cannot
+hold the window.
+
 ## Inventory and Explorer
 
 The inventory records which files hold personal data. It scans only when somebody asks: the Scan
@@ -87,14 +93,25 @@ coloured by type (up to 400 tiles, the rest one "+N files" tile); and a details 
 what is selected. Selecting a tile opens the tree along the way to its file. For a file the details
 can open it, show it in Explorer, show what was found, make a masked copy (beside the file; it
 never replaces an existing file) or scan it again; for a folder
-they can show only that folder, show it in Explorer or scan it. "Show what was found" runs
-detection on that one file when asked and lists its values (at most 200) in a dialog: they are read
-from the file at that moment and never stored. The inventory has no exclusions and no switch: what
-is in it is what was scanned.
+they can show only that folder, show it in Explorer, show what was found or scan it. The
+inventory has no exclusions and no switch: what is in it is what was scanned.
 
 A scan started from the page, the box, a drop or Explorer opens a result dialog in the window
-(scanning, then how much was found, with "Show in Inventory" when anything was). A newer scan
-replaces an older dialog, and a window the user opens does not replay old results.
+(scanning, then how much was found, with "Show what was found" and "Show in Inventory" when
+anything was). A newer scan replaces an older dialog, and a window the user opens does not replay
+old results.
+
+"Show what was found" (also a button in the details of a file or a folder) opens the findings view
+in place of the page, with a way back. It runs the detection again on the files of the result (the
+file itself, or the files of a folder that the inventory found personal data in, the most first, at
+most 500) and lists every value whole, with its type, the text around it, its file and where in it:
+a line and column in text files, the page of a PDF, the sheet and cell of a spreadsheet, the line of
+the file for an `.eml`; nothing for the other formats. The files are read a few at a time in the
+scan pool and the list fills as they come; closing the view stops the reading. A search box matches
+value, type, file and the text around it, chips filter by type with their counts, and a folder
+result has a list of its files. The list is made as it scrolls, so a hundred thousand values (the
+most it keeps) cost no more than a screenful. The values live in the window only while the view is
+open and are never stored.
 
 "Scan for personal data" in Explorer's right-click menu (under "Show more options" on Windows 11;
 the General setting "Scan for personal data in Explorer" adds or removes it) starts
@@ -161,6 +178,7 @@ under it that is a button to Overview.
   folder or file and scans it, a status line (progress or what the inventory holds) and the
   dashboard described under Inventory and Explorer above. Files and folders dropped on the page are
   scanned.
+  The scan result dialog and the details of a file or folder lead to the findings view.
 - **Watch**: its switch, the folder list with each folder's state and a Remove button, the box that
   adds a folder (nothing is watched until you add one), a status line and the same dashboard over
   the watch's store.

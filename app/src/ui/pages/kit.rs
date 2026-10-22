@@ -6,6 +6,7 @@
 //! follow the accent the user chose in Windows, and nothing here competes with it: the brand purple
 //! is for the logo only: the dashboards colour by type of personal data. Status is a glyph and words first, and a colour second.
 
+use piikey::detect::EntityKind;
 use windows_reactor::{
     Border, Brush, Button, ButtonStyle, Callback, Color, DateTime, FontIcon, FontWeight, Grid,
     GridLength, HorizontalAlignment, HyperlinkButton, InfoBar, InfoBarSeverity, Orientation,
@@ -123,6 +124,54 @@ pub(super) fn glyph(code: &str, size: f64) -> FontIcon {
         .glyph(code)
         .font_size(size)
         .foreground(ThemeBrush::PrimaryText)
+}
+
+/// A Segoe Fluent Icons glyph for `kind`. Types of one group share a glyph.
+pub(super) const fn kind_glyph(kind: EntityKind) -> &'static str {
+    match kind {
+        EntityKind::Email
+        | EntityKind::PhoneNumber
+        | EntityKind::ContactHandle
+        | EntityKind::PostalAddress => "\u{E715}",
+        EntityKind::Phone => "\u{E717}",
+        EntityKind::Person
+        | EntityKind::PersonAlias
+        | EntityKind::PersonIdentifier
+        | EntityKind::PersonAttribute
+        | EntityKind::PersonRole
+        | EntityKind::DateOfBirth => "\u{E77B}",
+        EntityKind::Iban
+        | EntityKind::CreditCard
+        | EntityKind::BankAccount
+        | EntityKind::PaymentCard
+        | EntityKind::CardSecurity
+        | EntityKind::FinancialAmount => "\u{E8C7}",
+        EntityKind::NlBsn
+        | EntityKind::UsSsn
+        | EntityKind::DocumentId
+        | EntityKind::DocumentReference
+        | EntityKind::VehicleId => "\u{E779}",
+        EntityKind::Ipv4
+        | EntityKind::Ipv6
+        | EntityKind::Mac
+        | EntityKind::DeviceId
+        | EntityKind::IdentifyingLink
+        | EntityKind::AccountId => "\u{E968}",
+        EntityKind::Secret | EntityKind::AuthSecret => "\u{E72E}",
+        EntityKind::UrlCredential => "\u{E71B}",
+        EntityKind::Location | EntityKind::GeoLocation => "\u{E707}",
+        EntityKind::OrganizationName | EntityKind::OrganizationId | EntityKind::ProperName => {
+            "\u{E821}"
+        }
+        EntityKind::HealthData
+        | EntityKind::BiometricData
+        | EntityKind::EthnicOrigin
+        | EntityKind::PoliticalOpinion
+        | EntityKind::ReligionOrBelief
+        | EntityKind::SexualOrientation
+        | EntityKind::TradeUnion
+        | EntityKind::CriminalOffence => "\u{E8D7}",
+    }
 }
 
 /// A status glyph: coloured by its tone, and dimmed when the tone is none at all.

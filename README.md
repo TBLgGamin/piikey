@@ -171,8 +171,9 @@ keeps are described in [docs/how-it-works.md](docs/how-it-works.md).
   and you can drop files and folders from Explorer onto the page. The dashboard shows a tree of
   folders and files with bars by type, the types found, a treemap of the files, and the details of
   what you select. A scan that you start from the page, the box, a drop or Explorer ends in a result
-  dialog. The inventory keeps counts, never the values; "Show what was found" reads the file again
-  and lists its values on screen, without storing them.
+  dialog. The inventory keeps counts, never the values; "Show what was found" reads the files again
+  and lists every value with search, type and file filters, where it is (line, page or cell) and a
+  button that opens the file at that place, without storing anything.
 - **Watch** has its own switch, the folders it keeps an eye on (with what each is doing), a box to
   add one, and the same dashboard for what it found. Nothing is watched until you add a folder.
 - **Vault** lists every value next to its stand-in, newest first, with search and filters by type,

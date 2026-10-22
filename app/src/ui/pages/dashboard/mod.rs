@@ -10,6 +10,7 @@
 
 mod crumbs;
 mod details;
+mod findings;
 mod legend;
 mod map;
 mod palette;
@@ -27,11 +28,11 @@ use windows_reactor::{
     View,
 };
 
-pub(in crate::ui) use self::report::dialog;
 use self::{
     crumbs::{crumbs, top_label},
     tree::{Line, Row, lines, position, segments},
 };
+pub(in crate::ui) use self::{findings::panel as findings_panel, report::dialog};
 use super::kit::{Context, caption, card, counted, glyph, thousands};
 use crate::ui::{
     controller::Store,

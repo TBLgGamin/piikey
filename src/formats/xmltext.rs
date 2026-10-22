@@ -23,7 +23,10 @@
 //! entities and character references resolve; any other reference is opaque
 //! and reads as `\n`.
 
-use std::{collections::BTreeMap, ops::Range};
+use std::{
+    collections::BTreeMap,
+    ops::{ControlFlow, Range},
+};
 
 use quick_xml::{
     escape::{escape, partial_escape, resolve_xml_entity},
@@ -124,6 +127,34 @@ impl XmlDoc {
     /// The segment texts, in document order.
     pub(super) fn texts(&self) -> impl Iterator<Item = &str> {
         self.segs.iter().map(|s| &self.buf[s.text.clone()])
+    }
+
+    /// Where segment `index` starts in the source of the document, in the byte offsets that
+    /// [`XmlDoc::walk`] reports: at the first piece of its text that has source bytes of its
+    /// own (a break has none).
+    pub(super) fn offset(&self, index: usize) -> Option<usize> {
+        let seg = self.segs.get(index)?;
+        self.parts
+            .get(seg.parts.clone())?
+            .iter()
+            .find(|part| part.kind != Kind::Break)
+            .map(|part| part.src.start)
+    }
+
+    /// Calls `each` with every event of the source and the range of the source it covers, until
+    /// it breaks off or the source ends. The source was read whole once already, so it is
+    /// well-formed; a read error would only end the walk early.
+    pub(super) fn walk(&self, mut each: impl FnMut(&Event<'_>, Range<usize>) -> ControlFlow<()>) {
+        let mut reader = Reader::from_reader(&self.src[..]);
+        loop {
+            let from = position(&reader);
+            let Ok(event) = reader.read_event() else {
+                return;
+            };
+            if matches!(event, Event::Eof) || each(&event, from..position(&reader)).is_break() {
+                return;
+            }
+        }
     }
 
     /// The document with `reps` (one list per segment, offsets into that
@@ -957,6 +988,43 @@ mod tests {
                 "trailing\n"
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_segment_starts_where_its_first_text_is_in_the_source() -> TestResult {
+        let xml = "<r><v>12</v><p>Bel<br/> 06</p><p><br/>0612345678</p></r>";
+        let doc = segments(xml.as_bytes().to_vec(), Attrs::None)?;
+        assert_eq!(texts(&doc), ["12", "Bel\n 06", "\n0612345678"]);
+        assert_eq!(doc.offset(0), xml.find("12"));
+        assert_eq!(doc.offset(1), xml.find("Bel"));
+        // A break has no bytes in the source: the segment starts at its text.
+        assert_eq!(doc.offset(2), xml.find("0612345678"));
+        assert_eq!(doc.offset(3), None);
+        Ok(())
+    }
+
+    #[test]
+    fn walk_reports_every_event_with_its_bytes_and_stops_when_told() -> TestResult {
+        let xml = r#"<a><b x="1">t</b><c/></a>"#;
+        let doc = segments(xml.as_bytes().to_vec(), Attrs::None)?;
+        let mut seen = Vec::new();
+        doc.walk(|_, range| {
+            seen.push(&xml[range]);
+            ControlFlow::Continue(())
+        });
+        assert_eq!(seen, ["<a>", r#"<b x="1">"#, "t", "</b>", "<c/>", "</a>"]);
+
+        let mut until_text = Vec::new();
+        doc.walk(|event, range| {
+            until_text.push(&xml[range]);
+            if matches!(event, Event::Text(_)) {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        });
+        assert_eq!(until_text, ["<a>", r#"<b x="1">"#, "t"]);
         Ok(())
     }
 }

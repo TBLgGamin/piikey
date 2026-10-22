@@ -345,17 +345,54 @@ fn adding_a_location_adds_the_folder_and_scans_it_with_the_dialog() -> Test {
     Ok(())
 }
 
+/// The findings of some files, as `read_findings` hands them over: each file with its values or the
+/// message that says why there are none.
+type Batch = Vec<(PathBuf, Result<Vec<piikey::inventory::Finding>, String>)>;
+
+/// What `read_findings` hands over for `files`, one list per batch, until `go_on` says stop.
+fn read_batches(
+    controller: &Controller,
+    files: &[PathBuf],
+    mut go_on: impl FnMut(usize) -> bool,
+) -> Vec<Batch> {
+    let mut batches = Vec::new();
+    controller.read_findings(files, |batch| {
+        batches.push(batch);
+        go_on(batches.len())
+    });
+    batches
+}
+
 #[test]
-fn the_findings_of_a_file_are_listed_on_request_with_the_model_and_kept_nowhere() -> Test {
+fn the_findings_of_files_are_read_on_request_with_the_model_and_kept_nowhere() -> Test {
     let dir = TempDir::new()?;
     let folder = docs(&dir)?;
     let file = folder.join("a.txt");
+    let missing = dir.0.join("missing.txt");
     let rig = rig(true, quiet())?;
-    let found = rig.controller.findings(&file)?;
+    let batches = read_batches(&rig.controller, &[file.clone(), missing.clone()], |_| true);
+    // Both files are one batch, in the order they were asked for.
+    assert_eq!(batches.len(), 1);
+    let read = &batches[0];
+    assert_eq!(read.len(), 2);
+    assert_eq!(read[0].0, file);
+    let found = read[0].1.as_ref().map_err(Clone::clone)?;
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].kind, EntityKind::Email);
     assert_eq!(&*found[0].value, "jan.jansen@acme.nl");
     assert_eq!(&*found[0].snippet, "mail jan.jansen@acme.nl");
+    assert_eq!(
+        found[0].location,
+        Some(piikey::inventory::Location::Line { line: 1, column: 6 })
+    );
+    // A file that is not there says so, and the others are read all the same.
+    assert_eq!(read[1].0, missing);
+    assert!(
+        read[1]
+            .1
+            .as_ref()
+            .is_err_and(|error| error.contains("cannot read"))
+    );
     // The model is there for the detection, and given back when nothing else needs it.
     assert!(has_call(&rig, "load_model"));
     eventually("the model to be released", || {
@@ -369,10 +406,84 @@ fn the_findings_of_a_file_are_listed_on_request_with_the_model_and_kept_nowhere(
     assert!(!dir.0.join("inventory.jsonl").exists());
     assert!(!dir.0.join("watch.jsonl").exists());
     assert_eq!(rig.controller.snapshot().inventory_totals, (0, 0));
+    // Nothing to read: the model is not loaded for it.
+    let calls = rig.calls().len();
+    assert!(read_batches(&rig.controller, &[], |_| true).is_empty());
+    assert_eq!(rig.calls().len(), calls);
+    Ok(())
+}
 
-    // A file that is not there says so.
-    let missing = rig.controller.findings(&dir.0.join("missing.txt"));
-    assert!(missing.is_err_and(|error| error.contains("cannot read")));
+#[test]
+fn files_are_read_a_few_at_a_time_in_order_and_the_reader_can_stop_the_rest() -> Test {
+    let dir = TempDir::new()?;
+    let folder = docs(&dir)?;
+    let files: Vec<PathBuf> = (0..9)
+        .map(|i| {
+            let file = folder.join(format!("f{i}.txt"));
+            fs::write(&file, format!("mail jan{i}.jansen@acme.nl")).describe()?;
+            Ok(file)
+        })
+        .collect::<Result<_, String>>()?;
+    let rig = rig(true, quiet())?;
+    let all = read_batches(&rig.controller, &files, |_| true);
+    assert_eq!(all.iter().map(Vec::len).collect::<Vec<_>>(), [4, 4, 1]);
+    let order: Vec<PathBuf> = all.into_iter().flatten().map(|(path, _)| path).collect();
+    assert_eq!(order, files);
+    // Whoever reads says when to stop: nothing is read past the batch that was refused.
+    let first = read_batches(&rig.controller, &files, |_| false);
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].len(), 4);
+    Ok(())
+}
+
+#[test]
+fn a_folder_result_lists_the_files_with_personal_data_the_most_first_and_a_named_file_always()
+-> Test {
+    let dir = TempDir::new()?;
+    let folder = docs(&dir)?;
+    fs::write(folder.join("b.txt"), "nothing to see here").describe()?;
+    let sub = folder.join("sub");
+    fs::create_dir(&sub).describe()?;
+    fs::write(
+        sub.join("c.txt"),
+        "jan.jansen@acme.nl and piet.pietersen@acme.nl",
+    )
+    .describe()?;
+    let rig = rig(true, quiet())?;
+    rig.run(Command::ScanFiles {
+        paths: vec![folder.clone()],
+        reveal: false,
+    })?;
+    assert!(rig.controller.wait_scans(Duration::from_secs(20)));
+
+    let listed = rig
+        .controller
+        .finding_files(Store::Inventory, std::slice::from_ref(&folder));
+    let labels: Vec<&str> = listed
+        .files
+        .iter()
+        .map(|file| file.label.as_str())
+        .collect();
+    assert_eq!(labels, [r"sub\c.txt", "a.txt"]);
+    assert_eq!(listed.files[0].path, sub.join("c.txt"));
+    assert_eq!(listed.left_out, 0);
+
+    // A file that was named is listed whether or not the inventory found anything in it, and a
+    // path that is no folder is a file: reading it says what is wrong with it.
+    let clean = folder.join("b.txt");
+    let gone = dir.0.join("gone.txt");
+    let named = rig
+        .controller
+        .finding_files(Store::Inventory, &[clean.clone(), gone.clone()]);
+    let paths: Vec<&PathBuf> = named.files.iter().map(|file| &file.path).collect();
+    assert_eq!(paths, [&clean, &gone]);
+    assert_eq!(named.files[0].label, "b.txt");
+
+    // The watch's inventory knows nothing of what was scanned into the main one.
+    let watched = rig
+        .controller
+        .finding_files(Store::Watch, std::slice::from_ref(&folder));
+    assert!(watched.files.is_empty());
     Ok(())
 }
 

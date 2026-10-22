@@ -1,17 +1,20 @@
 use piikey::{
     detect::{KIND_GROUPS, Mode},
-    inventory::Finding,
+    inventory::{Finding, Location},
 };
 use windows_reactor::{
     ComponentHost, ComponentSender, ComponentServices, ComponentTimerRegistration, Key, Mutation,
-    ObjectId, ObjectType, PropertyId, PropertyValue, RecordingAdapter, component,
+    ObjectId, ObjectType, PropertyId, PropertyValue, RealizationRequest, RealizedContainer,
+    RecordingAdapter, component,
 };
 
 use super::{
     super::testing::{TempDir, stub_controller, stub_controller_with},
     *,
 };
-use crate::ui::controller::{FolderStatus, Reveal, RevealState, ScanSummary, Watch, WatchedFolder};
+use crate::ui::controller::{
+    FindingFile, FolderStatus, Reveal, RevealState, ScanSummary, Watch, WatchedFolder,
+};
 use crate::{Describe, proxy::PORT};
 
 type Test = Result<(), String>;
@@ -261,10 +264,56 @@ impl Headless {
         }
         Ok(folder)
     }
+
+    /// Makes the first `count` rows of the list the last render made, as `WinUI` asks for the rows
+    /// that come into view: a list that is made as it is scrolled draws nothing until then.
+    /// Returns what that drew.
+    fn realize(&mut self, count: usize) -> Result<Vec<String>, String> {
+        let (collection, revision) = {
+            let batches = self.host.adapter().batches();
+            let collection = batches
+                .iter()
+                .flatten()
+                .rev()
+                .find_map(|mutation| match mutation {
+                    Mutation::Create {
+                        object,
+                        kind: ObjectType::ItemsRepeater,
+                    } => Some(*object),
+                    _ => None,
+                })
+                .ok_or("no list was made")?;
+            let revision = batches
+                .iter()
+                .flatten()
+                .rev()
+                .find_map(|mutation| match mutation {
+                    Mutation::SetVirtualSource {
+                        object,
+                        source_revision,
+                        ..
+                    } if *object == collection => Some(*source_revision),
+                    _ => None,
+                })
+                .ok_or("the list has no source")?;
+            (collection, revision)
+        };
+        let before = self.host.adapter().batches().len();
+        for index in 0..count {
+            self.host.queue_realization(RealizationRequest::Realize {
+                collection,
+                container: RealizedContainer(u64::try_from(index + 1).describe()?),
+                index,
+                source_revision: revision,
+            });
+        }
+        self.host.drain(64).map_err(|error| format!("{error:?}"))?;
+        Ok(texts(&self.host.adapter().batches()[before..]))
+    }
 }
 
-/// The text that `batches` set on labels, buttons, titles and messages: what was drawn.
-fn texts(batches: &[Vec<Mutation>]) -> Vec<String> {
+/// The strings that `batches` set as one of `ids`.
+fn strings(batches: &[Vec<Mutation>], ids: &[PropertyId]) -> Vec<String> {
     batches
         .iter()
         .flatten()
@@ -273,21 +322,44 @@ fn texts(batches: &[Vec<Mutation>]) -> Vec<String> {
             _ => None,
         })
         .flatten()
-        .filter(|property| {
-            matches!(
-                property.id,
-                PropertyId::Text
-                    | PropertyId::Title
-                    | PropertyId::Message
-                    | PropertyId::PrimaryButtonText
-                    | PropertyId::CloseButtonText
-            )
-        })
+        .filter(|property| ids.contains(&property.id))
         .filter_map(|property| match &property.value {
             PropertyValue::String(text) => Some(text.to_string()),
             _ => None,
         })
         .collect()
+}
+
+/// The text that `batches` set on labels, buttons, titles and messages: what was drawn.
+fn texts(batches: &[Vec<Mutation>]) -> Vec<String> {
+    strings(
+        batches,
+        &[
+            PropertyId::Text,
+            PropertyId::Title,
+            PropertyId::Message,
+            PropertyId::PrimaryButtonText,
+            PropertyId::SecondaryButtonText,
+            PropertyId::CloseButtonText,
+        ],
+    )
+}
+
+/// The names that `batches` gave controls for a screen reader.
+fn names(batches: &[Vec<Mutation>]) -> Vec<String> {
+    strings(batches, &[PropertyId::AutomationName])
+}
+
+/// How many rows the list of the findings view was last told it has.
+fn list_rows(batches: &[Vec<Mutation>]) -> Option<usize> {
+    batches
+        .iter()
+        .flatten()
+        .rev()
+        .find_map(|mutation| match mutation {
+            Mutation::SetVirtualSource { item_count, .. } => Some(*item_count),
+            _ => None,
+        })
 }
 
 /// How many controls of `kind` the batches made.
@@ -1200,6 +1272,7 @@ fn a_scan_that_was_asked_for_shows_its_progress_and_its_result_in_a_dialog() -> 
             "7 found in 2 files",
             "3 files scanned",
             "Email",
+            "Show what was found",
             "Show in Inventory",
         ],
     )?;
@@ -1223,7 +1296,11 @@ fn a_scan_that_was_asked_for_shows_its_progress_and_its_result_in_a_dialog() -> 
         });
     })?;
     expect_drawn("nothing", &none, &["No personal data found", "Close"])?;
-    expect_not_drawn("nothing", &none, &["Show in Inventory"])
+    expect_not_drawn(
+        "nothing",
+        &none,
+        &["Show in Inventory", "Show what was found"],
+    )
 }
 
 #[test]
@@ -1247,45 +1324,327 @@ fn a_window_that_opens_for_a_scan_shows_its_result_and_one_that_opens_for_the_us
     expect_drawn(
         "opened for the scan",
         &ui.everything(),
-        &["Scan result", "1 found in 1 file", "Show in Inventory"],
+        &[
+            "Scan result",
+            "1 found in 1 file",
+            "Show what was found",
+            "Show in Inventory",
+        ],
     )?;
     let ui = Headless::open_for(scan, None)?;
     expect_not_drawn("opened by the user", &ui.everything(), &["Scan result"])
 }
 
-#[test]
-fn what_was_found_in_a_file_is_listed_on_request_and_dropped_when_the_list_closes() -> Test {
-    let mut ui = Headless::open(stub_controller)?;
-    let file = PathBuf::from(r"C:\Docs\a.pdf");
-    let asked = ui.send(Msg::Dash(Store::Inventory, Dash::Found(file.clone())))?;
-    expect_drawn(
-        "asked",
-        &asked,
-        &["a.pdf", "Reading the file\u{2026}", "Close"],
-    )?;
-    let finding = Finding {
-        kind: piikey::detect::EntityKind::Email,
-        value: "jan.jansen@acme.nl".into(),
-        snippet: "write to jan.jansen@acme.nl today".into(),
+/// A finding of `kind` at `place` in a text.
+fn found(kind: piikey::detect::EntityKind, value: &str, snippet: &str, place: Location) -> Finding {
+    Finding {
+        kind,
+        value: value.into(),
+        snippet: snippet.into(),
+        location: Some(place),
+    }
+}
+
+/// What a findings view of `folder` reads: a text with two values and a spreadsheet with one.
+type Read = Vec<(PathBuf, Result<Vec<Finding>, String>)>;
+
+fn two_files(folder: &Path) -> (FindingFiles, Read) {
+    use piikey::detect::EntityKind::{Email, Iban, Person};
+    let (text, sheet) = (folder.join("a.txt"), folder.join("sub").join("b.csv"));
+    let listed = FindingFiles {
+        files: vec![
+            FindingFile {
+                path: text.clone(),
+                label: "a.txt".to_owned(),
+            },
+            FindingFile {
+                path: sheet.clone(),
+                label: r"sub\b.csv".to_owned(),
+            },
+        ],
+        left_out: 0,
     };
-    let listed = ui.send(Msg::FindingsLoaded(file, Ok(vec![finding])))?;
+    let read = vec![
+        (
+            text,
+            Ok(vec![
+                found(
+                    Email,
+                    "jan.jansen@acme.nl",
+                    "write to jan.jansen@acme.nl today",
+                    Location::Line {
+                        line: 3,
+                        column: 10,
+                    },
+                ),
+                found(
+                    Person,
+                    "Jan Jansen",
+                    "Dear Jan Jansen,",
+                    Location::Line { line: 1, column: 6 },
+                ),
+            ]),
+        ),
+        (
+            sheet,
+            Ok(vec![found(
+                Iban,
+                "NL91ABNA0417164300",
+                "pay NL91ABNA0417164300",
+                Location::Line { line: 2, column: 5 },
+            )]),
+        ),
+    ];
+    (listed, read)
+}
+
+/// Opens the findings view for the result of a scan of a folder, and gives it what reading the
+/// two files of [`two_files`] would bring. Returns the folder.
+fn findings_view(ui: &mut Headless) -> Result<PathBuf, String> {
+    let folder = ui.dir.0.join("docs");
+    let summary = ScanSummary {
+        files: 2,
+        files_with_data: 2,
+        hits: 3,
+        counts: vec![
+            (piikey::detect::EntityKind::Email, 1),
+            (piikey::detect::EntityKind::Person, 1),
+            (piikey::detect::EntityKind::Iban, 1),
+        ],
+        unread: 0,
+    };
+    ui.poll_with(|snap| {
+        snap.reveal = Some(Reveal {
+            seq: 1,
+            paths: vec![folder.clone()],
+            at: folder.clone(),
+            select: None,
+            state: RevealState::Done(summary),
+        });
+    })?;
+    ui.send(Msg::ReportFound)?;
+    let (listed, read) = two_files(&folder);
+    ui.send(Msg::FindingsListed(1, listed))?;
+    ui.send(Msg::FindingsRead(1, read))?;
+    Ok(folder)
+}
+
+#[test]
+fn show_what_was_found_opens_the_view_over_the_page_with_every_value_and_back_closes_it() -> Test {
+    let mut ui = Headless::open(stub_controller)?;
+    let folder = ui.dir.0.join("docs");
+    let summary = ScanSummary {
+        files: 2,
+        files_with_data: 2,
+        hits: 3,
+        counts: vec![(piikey::detect::EntityKind::Email, 3)],
+        unread: 0,
+    };
+    ui.poll_with(|snap| {
+        snap.reveal = Some(Reveal {
+            seq: 1,
+            paths: vec![folder.clone()],
+            at: folder.clone(),
+            select: None,
+            state: RevealState::Done(summary),
+        });
+    })?;
+    // The dialog's button puts the result away and opens the view; the files come after.
+    let opened = ui.send(Msg::ReportFound)?;
     expect_drawn(
-        "listed",
-        &listed,
+        "opened",
+        &opened,
         &[
-            "jan.jansen@acme.nl",
-            "write to jan.jansen@acme.nl today",
-            "Email",
+            "What was found",
+            &folder.display().to_string(),
+            "Looking for the files\u{2026}",
         ],
     )?;
-    // Closed, the values are gone from the window: asking again reads them again.
-    ui.send(Msg::FindingsClosed)?;
-    let again = ui.send(Msg::Dash(
-        Store::Inventory,
-        Dash::Found(PathBuf::from(r"C:\Docs\a.pdf")),
+    let (listed, read) = two_files(&folder);
+    let before = ui.host.adapter().batches().len();
+    let files = ui.send(Msg::FindingsListed(1, listed))?;
+    expect_drawn("files", &files, &["Reading file 1 of 2\u{2026}"])?;
+    // More than one file: a list of them to pick one from.
+    let named = names(&ui.host.adapter().batches()[before..]);
+    assert!(named.iter().any(|name| name == "File"), "{named:?}");
+    let values = ui.send(Msg::FindingsRead(1, read))?;
+    expect_drawn(
+        "values",
+        &values,
+        &["3 values in 2 files", "All types", "Email", "Name", "IBAN"],
+    )?;
+    // The list is made as it scrolls into view: three rows come, each with its type, value, the
+    // text around it, its file and its place, and a button.
+    let before = ui.host.adapter().batches().len();
+    let rows = ui.realize(3)?;
+    expect_drawn(
+        "rows",
+        &rows,
+        &[
+            "jan.jansen@acme.nl",
+            "Email \u{b7} write to jan.jansen@acme.nl today",
+            "a.txt",
+            "line 3",
+            "Jan Jansen",
+            "Name \u{b7} Dear Jan Jansen,",
+            "line 1",
+            "NL91ABNA0417164300",
+            "IBAN \u{b7} pay NL91ABNA0417164300",
+            "b.csv",
+            "line 2",
+            OPEN_AT_THIS_PLACE,
+        ],
+    )?;
+    let named = names(&ui.host.adapter().batches()[before..]);
+    for button in ["Open a.txt at this place", "Open b.csv at this place"] {
+        assert!(
+            named.iter().any(|name| name == button),
+            "{button}: {named:?}"
+        );
+    }
+    assert_eq!(times(&named, "Open a.txt at this place"), 2);
+    Ok(())
+}
+
+#[test]
+fn the_search_a_type_and_a_file_narrow_the_list_and_back_closes_the_view() -> Test {
+    let mut ui = Headless::open(stub_controller)?;
+    let folder = findings_view(&mut ui)?;
+    ui.realize(3)?;
+    // The search matches a value, a type, a file and the text around a value; the list is told
+    // how many rows are left.
+    let mut said = "3 values in 2 files";
+    for (search, left, rows) in [
+        ("NL91", "1 of 3 values", 1),
+        ("iban", "1 of 3 values", 1),
+        ("b.csv", "1 of 3 values", 1),
+        ("dear", "1 of 3 values", 1),
+        ("JANSEN", "2 of 3 values", 2),
+    ] {
+        let drawn = ui.send(Msg::FindingsSearch(search.to_owned()))?;
+        // A line that says the same again is not drawn again.
+        if left != said {
+            expect_drawn(search, &drawn, &[left])?;
+            said = left;
+        }
+        assert_eq!(
+            list_rows(ui.host.adapter().batches()),
+            Some(rows),
+            "{search}"
+        );
+    }
+    let none = ui.send(Msg::FindingsSearch("no such thing".to_owned()))?;
+    expect_drawn(
+        "nothing",
+        &none,
+        &[
+            "0 of 3 values",
+            "No value matches. Change the search, the type or the file.",
+        ],
+    )?;
+    ui.send(Msg::FindingsSearch(String::new()))?;
+    assert_eq!(list_rows(ui.host.adapter().batches()), Some(3));
+
+    // A type, and a file: each narrows the list, and picking it again lets go.
+    let email = ui.send(Msg::FindingsType(Some(piikey::detect::EntityKind::Email)))?;
+    expect_drawn("type", &email, &["1 of 3 values"])?;
+    assert_eq!(list_rows(ui.host.adapter().batches()), Some(1));
+    let all = ui.send(Msg::FindingsType(None))?;
+    expect_drawn("all types", &all, &["3 values in 2 files"])?;
+    assert_eq!(list_rows(ui.host.adapter().batches()), Some(3));
+    let sheet = ui.send(Msg::FindingsFile(Some(1)))?;
+    expect_drawn("file", &sheet, &["1 of 3 values"])?;
+    assert_eq!(list_rows(ui.host.adapter().batches()), Some(1));
+    ui.send(Msg::FindingsFile(None))?;
+    assert_eq!(list_rows(ui.host.adapter().batches()), Some(3));
+
+    // Whatever the view drew says personal data, type and stand-in the way the rest does.
+    for text in ui.everything() {
+        for banned in [
+            "PII", "Keyed", "keyed", "program", "Program", "kind", "Kind",
+        ] {
+            assert!(!text.contains(banned), "{text:?} says {banned:?}");
+        }
+    }
+
+    // Back: the page that was on show is there again, and the values are gone from the window.
+    let back = ui.send(Msg::FindingsClose)?;
+    expect_drawn("back", &back, &["What piikey is doing"])?;
+    let again = ui.send(Msg::Dash(Store::Inventory, Dash::Found(folder.clone())))?;
+    expect_drawn("again", &again, &["Looking for the files\u{2026}"])?;
+    expect_not_drawn("again", &again, &["jan.jansen@acme.nl", "Jan Jansen"])?;
+    // What an older reading brings is not taken in: the view that read it is gone.
+    let (_, stale) = two_files(&folder);
+    let late = ui.send(Msg::FindingsRead(1, stale))?;
+    expect_not_drawn(
+        "late",
+        &late,
+        &["jan.jansen@acme.nl", "3 values in 2 files"],
+    )
+}
+
+#[test]
+fn a_row_opens_its_file_and_says_when_the_app_could_not_take_it_to_the_value() -> Test {
+    let mut ui = Headless::open(stub_controller)?;
+    findings_view(&mut ui)?;
+    ui.realize(3)?;
+    // While a row is being opened its button shows a ring.
+    let before = ui.host.adapter().batches().len();
+    ui.send(Msg::FindingsOpen(0))?;
+    let rings = created(
+        &ui.host.adapter().batches()[before..],
+        ObjectType::ProgressRing,
+    );
+    assert!(rings >= 1, "no ring on the row that is being opened");
+    // A row that is not there, and a second ask while one is open, do nothing.
+    ui.send(Msg::FindingsOpen(99))?;
+    ui.send(Msg::FindingsOpen(1))?;
+    // The app took the file but could not point at the value: the button's tooltip says so.
+    let opened = ui.send(Msg::FindingsOpened(0, goto::Outcome::Opened))?;
+    expect_drawn("opened only", &opened, &[OPENED_ONLY])?;
+    // An app that was taken to the value needs no apology.
+    let placed = ui.send(Msg::FindingsOpened(1, goto::Outcome::Placed))?;
+    expect_not_drawn("placed", &placed, &[OPENED_ONLY])
+}
+
+/// What the button of a row says before it was pressed.
+const OPEN_AT_THIS_PLACE: &str = "Open at this place";
+
+/// What it says after the app could only open the file.
+const OPENED_ONLY: &str =
+    "Opened the file. piikey cannot jump to the value in this app: search for it there.";
+
+#[test]
+fn a_file_that_cannot_be_read_and_a_folder_with_nothing_in_it_say_so_in_the_view() -> Test {
+    let mut ui = Headless::open(stub_controller)?;
+    let file = ui.dir.0.join("a.bin");
+    let asked = ui.send(Msg::Dash(Store::Inventory, Dash::Found(file.clone())))?;
+    expect_drawn("asked", &asked, &[&file.display().to_string()])?;
+    let listed = FindingFiles {
+        files: vec![FindingFile {
+            path: file.clone(),
+            label: "a.bin".to_owned(),
+        }],
+        left_out: 0,
+    };
+    ui.send(Msg::FindingsListed(1, listed))?;
+    let failed = ui.send(Msg::FindingsRead(
+        1,
+        vec![(
+            file,
+            Err("piikey does not read this type of file".to_owned()),
+        )],
     ))?;
-    expect_drawn("again", &again, &["Reading the file\u{2026}"])?;
-    expect_not_drawn("again", &again, &["jan.jansen@acme.nl"])
+    expect_drawn(
+        "failed",
+        &failed,
+        &["piikey does not read this type of file"],
+    )?;
+    // A folder none of whose files holds anything: the view is done at once and says so.
+    let folder = ui.dir.0.join("empty");
+    ui.send(Msg::Dash(Store::Inventory, Dash::Found(folder)))?;
+    let listed = ui.send(Msg::FindingsListed(2, FindingFiles::default()))?;
+    expect_drawn("empty", &listed, &["No personal data found."])
 }
 
 #[test]

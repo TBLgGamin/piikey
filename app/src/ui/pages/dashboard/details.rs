@@ -96,7 +96,7 @@ impl Action {
 pub(super) fn actions(target: Target, store: Store, on_show: bool) -> Vec<Action> {
     let mut list = match target {
         Target::File => vec![Action::Open, Action::Show, Action::Found, Action::Mask],
-        Target::Folder => vec![Action::Show],
+        Target::Folder => vec![Action::Show, Action::Found],
         Target::Top | Target::Other => Vec::new(),
     };
     if target == Target::Folder && !on_show {
@@ -632,12 +632,17 @@ mod tests {
         );
         assert_eq!(
             labels(actions(Target::Folder, Store::Inventory, false)),
-            ["Show only this folder", "Show in Explorer", "Scan this"]
+            [
+                "Show only this folder",
+                "Show in Explorer",
+                "Show what was found",
+                "Scan this"
+            ]
         );
         // The folder on show cannot be shown again.
         assert_eq!(
             labels(actions(Target::Folder, Store::Inventory, true)),
-            ["Show in Explorer", "Scan this"]
+            ["Show in Explorer", "Show what was found", "Scan this"]
         );
         // The watch keeps its files scanned by itself.
         assert_eq!(

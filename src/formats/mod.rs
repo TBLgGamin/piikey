@@ -16,6 +16,14 @@
 //! [`scan`] reads the same inputs the same way but rewrites nothing: it reports what the
 //! detector finds. All three go through one `Pass`, so a scan sees exactly the texts a rewrite
 //! would change.
+//!
+//! [`findings`] is a scan that keeps each value it finds with the text around it, in reading
+//! order, and says where in the file the format puts it ([`Location`]): the line and column in
+//! a text (and in an e-mail, whose rendering is looked up again in its file), the page of a PDF,
+//! the cell of a workbook or of a sheet. Only the file itself has places: a value in an
+//! attachment, in an embedded package or in a picture has none. A format says where its texts
+//! stand by handing a `Layout` (`places.rs`) to the pass beside them, and a pass that was not
+//! asked for findings never looks at it.
 
 mod eml;
 mod image;
@@ -24,6 +32,8 @@ mod odf;
 mod ooxml;
 mod package;
 mod pdf;
+mod places;
+mod sheets;
 #[cfg(test)]
 mod tests;
 mod text;
@@ -40,6 +50,7 @@ use crate::{
     engine::{Engine, Replacement},
     restore::Restorer,
 };
+use places::Layout;
 
 /// Result of processing one input.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,8 +181,31 @@ pub fn scan(engine: &Engine, bytes: &[u8], keep_texts: bool) -> Result<Scanned> 
 
 /// How many characters of text a [`Finding`]'s snippet shows on each side of the value.
 const SNIPPET_CONTEXT: usize = 40;
-/// How many characters of a value a [`Finding`] shows: a secret can be a whole key block.
+/// How many characters of a value a [`Finding`]'s snippet shows: a secret can be a whole key block.
 const SNIPPET_VALUE: usize = 120;
+/// How many characters of a value a [`Finding`] keeps: more than any value a person reads, but a
+/// run that a detector takes for a secret can be as long as the file.
+const MAX_VALUE: usize = 4_096;
+
+/// Where a value stands in its file, as far as the format says. A value in an attachment, in an
+/// embedded document or in a picture has no place of the file's own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Location {
+    /// A line and a column of a text, both counted from 1. The text is the file as an editor
+    /// shows it once decoded (a byte order mark is no column), a line ends at `\n`, at `\r\n` or
+    /// at a lone `\r`, and the column counts characters (a tab is one). In a text file this is
+    /// where the value is; in an `.eml` message the value is looked up in the file as it is
+    /// written there (the `k`th finding of a value at its `k`th occurrence), so a value that the
+    /// file encodes (a base64 body, a header word) or that spans a line break has no place.
+    Line { line: u32, column: u32 },
+    /// A page of a PDF, counted from 1; pages that were read by OCR count too.
+    Page(u32),
+    /// A cell of a sheet: the name of the sheet and the cell's address (`B7`). In a workbook
+    /// (`.xlsx`) a shared string is at the first cell that shows it, in the order of the sheets
+    /// and then of the cells; in an `OpenDocument` sheet (`.ods`) a cell that stands for several
+    /// is at the first of them.
+    Cell { sheet: Box<str>, cell: Box<str> },
+}
 
 /// A value the detector found in a file, with the text around it, for showing to the person who
 /// asked. It is personal data: keep it out of logs and out of files (the `Debug` output only
@@ -180,12 +214,14 @@ const SNIPPET_VALUE: usize = 120;
 pub struct Finding {
     pub kind: EntityKind,
     /// The value, each run of white space (a line break, a tab) one space, and cut to the first
-    /// 120 characters when it is longer, with `…` after them.
+    /// 4,096 characters when it is longer, with `…` after them.
     pub value: Box<str>,
     /// The value with up to 40 characters of the text before and after it, white space
     /// collapsed as in `value`, and `…` where the text goes on beyond what is shown. The value
-    /// is inside it, as it is in `value`.
+    /// in it is cut to 120 characters, with `…` after them, when it is longer.
     pub snippet: Box<str>,
+    /// Where it is in the file, when the format has a place to name.
+    pub location: Option<Location>,
 }
 
 impl fmt::Debug for Finding {
@@ -197,9 +233,12 @@ impl fmt::Debug for Finding {
 }
 
 /// Sniffs `bytes` like [`scan`] and lists what the detector finds in it, each value with the
-/// text around it, grouped by kind and in reading order within a kind. It reads what a scan
-/// reads, and nothing is kept: the vault is left as it was and the values only go to the
-/// caller.
+/// text around it, in reading order: the order in which the format hands its texts to the
+/// detector (the parts of a package in the order of its entries, the headers of a message before
+/// its bodies and these before its attachments), and within a text by position. Each finding
+/// says where it stands in the file when the format has a place to name ([`Location`]). It
+/// reads what a scan reads, and nothing is kept: the vault is left as it was and the values only
+/// go to the caller.
 ///
 /// # Errors
 /// `UnsupportedFormat` and per-format parse errors, as for [`process`].
@@ -217,11 +256,9 @@ pub fn findings(engine: &Engine, bytes: &[u8]) -> Result<Vec<Finding>> {
         bytes,
         0,
     )?;
-    let mut list = collect
+    let list = collect
         .findings
         .map_or_else(|| Ok(Vec::new()), Mutex::into_inner)?;
-    // Stable: the reading order of a kind stays.
-    list.sort_by_key(|finding| finding.kind);
     Ok(list)
 }
 
@@ -251,8 +288,9 @@ struct Collect {
 }
 
 impl Collect {
-    /// Takes note of what was found in `texts`, and of `texts` when they are kept.
-    fn record(&self, texts: &[&str], spans: &[Vec<Span>]) -> Result<()> {
+    /// Takes note of what was found in `texts`, and of `texts` when they are kept. A scan that
+    /// was asked for findings also keeps each value with the place that `layout` says it is at.
+    fn record(&self, layout: &Layout<'_>, texts: &[&str], spans: &[Vec<Span>]) -> Result<()> {
         let mut values = self.found.lock()?;
         for (text, spans) in texts.iter().zip(spans) {
             values.extend(
@@ -267,9 +305,11 @@ impl Collect {
         }
         if let Some(shown) = &self.findings {
             let mut shown = shown.lock()?;
+            let from = shown.len();
             for (text, spans) in texts.iter().zip(spans) {
                 shown.extend(spans.iter().map(|span| finding(text, span)));
             }
+            layout.locate(texts, spans, &mut shown[from..]);
         }
         Ok(())
     }
@@ -280,7 +320,9 @@ fn finding(text: &str, span: &Span) -> Finding {
     let before = &text[..span.start];
     let value = &text[span.start..span.end];
     let after = &text[span.end..];
-    let value = shorten(collapse(value).trim(), SNIPPET_VALUE);
+    let whole = collapse(value);
+    let whole = whole.trim();
+    let shown = shorten(whole, SNIPPET_VALUE);
     let (near, cut_before) = tail(before, SNIPPET_CONTEXT);
     let (far, cut_after) = head(after, SNIPPET_CONTEXT);
     let mut snippet = String::new();
@@ -288,15 +330,16 @@ fn finding(text: &str, span: &Span) -> Finding {
         snippet.push('…');
     }
     snippet.push_str(collapse(near).trim_start());
-    snippet.push_str(&value);
+    snippet.push_str(&shown);
     snippet.push_str(collapse(far).trim_end());
     if cut_after {
         snippet.push('…');
     }
     Finding {
         kind: span.kind,
-        value: value.into(),
+        value: shorten(whole, MAX_VALUE).into(),
         snippet: snippet.into(),
+        location: None,
     }
 }
 
@@ -347,8 +390,9 @@ fn head(text: &str, n: usize) -> (&str, bool) {
 
 impl Pass<'_> {
     /// [`Engine::plan`] for a rewrite; for a restore, what [`Restorer::plan_with`] makes of each
-    /// text. A scan records what the engine finds and plans nothing.
-    fn plan(&self, texts: &[&str]) -> Result<Vec<Vec<Replacement>>> {
+    /// text. A scan records what the engine finds, and where `layout` says that is, and plans
+    /// nothing.
+    fn plan(&self, layout: &Layout<'_>, texts: &[&str]) -> Result<Vec<Vec<Replacement>>> {
         match &self.how {
             How::Rewrite(mode) => self.engine.plan(*mode, texts),
             How::Restore(restorer) => Ok(texts
@@ -356,7 +400,7 @@ impl Pass<'_> {
                 .map(|text| restorer.plan_with(text.as_bytes(), self.engine))
                 .collect()),
             How::Scan(collect) => {
-                collect.record(texts, &self.engine.scan(texts)?)?;
+                collect.record(layout, texts, &self.engine.scan(texts)?)?;
                 Ok(vec![Vec::new(); texts.len()])
             }
         }
@@ -364,19 +408,25 @@ impl Pass<'_> {
 
     /// [`Engine::run`] for a rewrite and a restore. A scan has no output: it looks at the texts
     /// and answers with empty ones.
-    fn run(&self, texts: &[&str]) -> Result<Vec<String>> {
+    fn run(&self, layout: &Layout<'_>, texts: &[&str]) -> Result<Vec<String>> {
         match &self.how {
             How::Rewrite(mode) => self.engine.run(*mode, texts),
             How::Restore(_) => Ok(texts
                 .par_iter()
-                .zip(self.plan(texts)?)
+                .zip(self.plan(layout, texts)?)
                 .map(|(text, reps)| Engine::apply(text, &reps))
                 .collect()),
             How::Scan(_) => {
-                self.plan(texts)?;
+                self.plan(layout, texts)?;
                 Ok(vec![String::new(); texts.len()])
             }
         }
+    }
+
+    /// Whether the places of the texts of a file at nesting `depth` are wanted: only the file
+    /// itself has places, and only a scan that was asked for findings works them out.
+    fn wants_places(&self, depth: u8) -> bool {
+        depth == 0 && matches!(&self.how, How::Scan(collect) if collect.findings.is_some())
     }
 
     /// `bytes` as the output of a file nothing was rewritten in: a copy of it, except for a
@@ -399,11 +449,11 @@ fn process_pass(pass: &Pass<'_>, bytes: &[u8], depth: u8) -> Result<Output> {
             let (archive, scope) = open_package(bytes)?;
             package::rewrite(pass, archive, scope, depth).map(Output::Same)
         }
-        Format::Pdf => pdf::process(pass, bytes),
+        Format::Pdf => pdf::process(pass, bytes, depth),
         Format::Image => image::process(pass, bytes),
         Format::Cfb => msg::process(pass, bytes, depth),
         Format::Mail => eml::process(pass, bytes, depth),
-        Format::Text => text::process(pass, bytes),
+        Format::Text => text::process(pass, bytes, depth),
     }
 }
 
@@ -514,7 +564,12 @@ fn same_text(bytes: &[u8]) -> Result<String> {
     }
 }
 
-/// Runs the pass over one text; empty for a scan, which has no output.
-fn run_text(pass: &Pass<'_>, text: &str) -> Result<String> {
-    Ok(pass.run(&[text])?.into_iter().next().unwrap_or_default())
+/// Runs the pass over one text, which stands in its file as `layout` says; empty for a scan,
+/// which has no output.
+fn run_text(pass: &Pass<'_>, layout: &Layout<'_>, text: &str) -> Result<String> {
+    Ok(pass
+        .run(layout, &[text])?
+        .into_iter()
+        .next()
+        .unwrap_or_default())
 }

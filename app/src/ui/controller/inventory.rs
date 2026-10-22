@@ -1,12 +1,13 @@
 //! The inventory as the controller serves it: the scans that fill it and the thread that runs
 //! them, what the dialog of a scan shows, the views of both inventories (the user's own and the
-//! watch's), the findings of one file, and the files written from it.
+//! watch's), the findings of the files a result names, and the files written from it.
 //!
 //! The inventory is scanned when somebody asks: the Scan button, a folder or file the user
 //! points at, Explorer's menu, the API. Nothing is scanned on a timer. The watch fills an
 //! inventory of its own, see [`watch`](super::watch); both are read through the same views.
 
 use std::{
+    collections::{HashMap, HashSet},
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::{
@@ -21,6 +22,7 @@ use piikey::{
     inventory::{self, Entry, Finding, Inventory, Node, Progress, Tiles, TypeTotal},
     sys,
 };
+use rayon::prelude::*;
 
 use super::{Controller, Edit, Notice, PROGRESS_EVERY, ScanSummary, State};
 use crate::{
@@ -33,6 +35,12 @@ use crate::{
 
 /// How long a quitting app waits for the scan it cancelled to save what it did.
 const SCAN_STOP_WAIT: Duration = Duration::from_secs(2);
+
+/// The most files a findings view reads: a folder can hold thousands that have personal data.
+pub const MOST_FILES: usize = 500;
+
+/// How many files the findings of a view are read for at once.
+const FINDINGS_BATCH: usize = 4;
 
 /// Which of the two inventories a view reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +99,107 @@ fn under(path: &Path) -> Option<&Path> {
     (!path.as_os_str().is_empty()).then_some(path)
 }
 
+/// A file whose findings a view lists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FindingFile {
+    pub path: PathBuf,
+    /// What the view calls the file: its name, or its path below the folder it was found in; the
+    /// whole path when two files would have the same.
+    pub label: String,
+}
+
+/// The files a findings view reads, see [`Controller::finding_files`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FindingFiles {
+    /// The files to read, in the order the view lists them.
+    pub files: Vec<FindingFile>,
+    /// How many more there are than the view reads.
+    pub left_out: usize,
+}
+
+/// Keeps the detection model loaded while the findings of files are read, and gives it back when
+/// the read ends, however it ends.
+struct FindingsRead<'a>(&'a Controller);
+
+impl<'a> FindingsRead<'a> {
+    fn start(controller: &'a Controller) -> Self {
+        controller.update(|state| state.findings += 1);
+        controller.sync_model();
+        Self(controller)
+    }
+}
+
+impl Drop for FindingsRead<'_> {
+    fn drop(&mut self) {
+        self.0
+            .update(|state| state.findings = state.findings.saturating_sub(1));
+        self.0.sync_model();
+    }
+}
+
+/// The name of the file or folder at `path`; the whole path for one that has none (a drive).
+fn name_of(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
+/// `path` as seen from the folder `root` it was found in; its name when it is not below it.
+fn label_under(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .ok()
+        .filter(|rest| !rest.as_os_str().is_empty())
+        .map_or_else(|| name_of(path), |rest| rest.display().to_string())
+}
+
+/// What identifies a file among the ones listed: its path as Windows compares it.
+fn key_of(path: &Path) -> String {
+    path.to_string_lossy().replace('/', "\\").to_lowercase()
+}
+
+/// The files of a findings view: the `named` ones first, then the ones found in folders as
+/// `(values, path, label)`, the one with the most values first; a file listed twice is listed
+/// once. At most `most` files are kept.
+fn pick_files(
+    named: Vec<(PathBuf, String)>,
+    mut held: Vec<(u64, PathBuf, String)>,
+    most: usize,
+) -> FindingFiles {
+    held.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut files: Vec<FindingFile> = Vec::new();
+    let mut all = 0_usize;
+    for (path, label) in named
+        .into_iter()
+        .chain(held.into_iter().map(|(_, path, label)| (path, label)))
+    {
+        if !seen.insert(key_of(&path)) {
+            continue;
+        }
+        all += 1;
+        if files.len() < most {
+            files.push(FindingFile { path, label });
+        }
+    }
+    let mut labels: HashMap<String, usize> = HashMap::new();
+    for file in &files {
+        *labels.entry(file.label.to_lowercase()).or_default() += 1;
+    }
+    for file in &mut files {
+        if labels
+            .get(&file.label.to_lowercase())
+            .is_some_and(|&n| n > 1)
+        {
+            file.label = file.path.display().to_string();
+        }
+    }
+    FindingFiles {
+        left_out: all - files.len(),
+        files,
+    }
+}
+
 impl Controller {
     /// The inventory: which files hold personal data.
     pub fn inventory(&self) -> Arc<Inventory> {
@@ -144,23 +253,55 @@ impl Controller {
         self.store(store).type_totals(under(at))
     }
 
-    /// What the detector finds in the file at `path`, read now, each value with the text around
-    /// it. It is for showing: nothing is stored, not by the inventory and not anywhere else. The
-    /// detection model is loaded while it runs, as for a scan.
-    ///
-    /// # Errors
-    /// A message when the file cannot be read, is bigger than piikey reads, or is not a format
-    /// it understands.
-    pub fn findings(&self, path: &Path) -> Res<Vec<Finding>> {
-        self.update(|state| state.findings += 1);
-        self.sync_model();
+    /// The files the findings view of `roots` reads: every file that was named, and for each folder
+    /// the files `store` found personal data in, the ones with the most first. A folder holds
+    /// thousands of files at worst, so the list stops at [`MOST_FILES`] and says how many it left
+    /// out. Waits on the disk (a root may be a folder or a file), so it is for the background.
+    pub fn finding_files(&self, store: Store, roots: &[PathBuf]) -> FindingFiles {
+        let inventory = self.store(store);
+        let mut named: Vec<(PathBuf, String)> = Vec::new();
+        let mut held: Vec<(u64, PathBuf, String)> = Vec::new();
+        for root in roots {
+            if root.is_dir() {
+                for entry in inventory.entries(Some(root), 1) {
+                    let hits = entry.hits();
+                    let label = label_under(root, &entry.path);
+                    held.push((hits, entry.path, label));
+                }
+            } else {
+                named.push((root.clone(), name_of(root)));
+            }
+        }
+        pick_files(named, held, MOST_FILES)
+    }
+
+    /// Reads what the detector finds in each of `files`, a few at a time in the scan pool, and hands
+    /// every batch to `batch` as it is done, in the order of `files`; `batch` says whether to go
+    /// on. It is for showing: nothing is stored, not by the inventory and not anywhere else. The
+    /// detection model stays loaded from the first file to the last, as for a scan. A file that
+    /// cannot be read, is bigger than piikey reads or is not a format it understands comes with a
+    /// message for the user instead of its findings.
+    pub fn read_findings(
+        &self,
+        files: &[PathBuf],
+        mut batch: impl FnMut(Vec<(PathBuf, Res<Vec<Finding>>)>) -> bool,
+    ) {
+        if files.is_empty() {
+            return;
+        }
+        let _reading = FindingsRead::start(self);
         let engine = self.engine();
-        let found = self
-            .in_scan_pool(|| inventory::findings(&engine, path))
-            .describe();
-        self.update(|state| state.findings = state.findings.saturating_sub(1));
-        self.sync_model();
-        found
+        for chunk in files.chunks(FINDINGS_BATCH) {
+            let done: Vec<(PathBuf, Res<Vec<Finding>>)> = self.in_scan_pool(|| {
+                chunk
+                    .par_iter()
+                    .map(|path| (path.clone(), inventory::findings(&engine, path).describe()))
+                    .collect()
+            });
+            if !batch(done) {
+                break;
+            }
+        }
     }
 
     /// Writes what the inventory found under `under` (everything for an empty path) as CSV to a
@@ -532,9 +673,12 @@ fn scan_loop(controller: &Weak<Controller>, scanner: &Scanner) {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
 
-    use super::{reveal_target, under};
+    use super::{FindingFiles, label_under, name_of, pick_files, reveal_target, under};
     use crate::{Describe, ui::testing::TempDir};
 
     #[test]
@@ -551,8 +695,100 @@ mod tests {
 
     #[test]
     fn the_empty_path_means_all_of_an_inventory() {
-        assert_eq!(under(std::path::Path::new("")), None);
-        let some = std::path::Path::new(r"C:\a");
+        assert_eq!(under(Path::new("")), None);
+        let some = Path::new(r"C:\a");
         assert_eq!(under(some), Some(some));
+    }
+
+    fn held(hits: u64, path: &str, label: &str) -> (u64, PathBuf, String) {
+        (hits, PathBuf::from(path), label.to_owned())
+    }
+
+    fn labels(files: &FindingFiles) -> Vec<&str> {
+        files.files.iter().map(|file| file.label.as_str()).collect()
+    }
+
+    #[test]
+    fn a_view_reads_the_named_files_first_then_the_folders_files_with_the_most_values() {
+        let named = vec![(PathBuf::from(r"C:\Other\a.txt"), "a.txt".to_owned())];
+        let picked = pick_files(
+            named,
+            vec![
+                held(1, r"C:\Docs\small.txt", "small.txt"),
+                held(9, r"C:\Docs\sub\big.txt", r"sub\big.txt"),
+                held(5, r"C:\Docs\mid.txt", "mid.txt"),
+                held(5, r"C:\Docs\also-mid.txt", "also-mid.txt"),
+            ],
+            10,
+        );
+        assert_eq!(
+            labels(&picked),
+            [
+                "a.txt",
+                r"sub\big.txt",
+                "also-mid.txt",
+                "mid.txt",
+                "small.txt"
+            ]
+        );
+        assert_eq!(picked.left_out, 0);
+    }
+
+    #[test]
+    fn a_view_stops_at_the_most_files_and_counts_the_ones_it_leaves_out() {
+        let many: Vec<_> = (0..7)
+            .map(|i| held(100 - i, &format!(r"C:\Docs\f{i}.txt"), &format!("f{i}.txt")))
+            .collect();
+        let picked = pick_files(Vec::new(), many, 3);
+        assert_eq!(labels(&picked), ["f0.txt", "f1.txt", "f2.txt"]);
+        assert_eq!(picked.left_out, 4);
+        assert_eq!(
+            pick_files(Vec::new(), Vec::new(), 3),
+            FindingFiles::default()
+        );
+    }
+
+    #[test]
+    fn a_file_that_two_roots_hold_is_listed_once_whatever_its_letter_case() {
+        let picked = pick_files(
+            vec![(PathBuf::from(r"C:\DOCS\A.txt"), "A.txt".to_owned())],
+            vec![
+                held(3, r"c:\docs\a.TXT", "a.TXT"),
+                held(2, r"C:\Docs\b.txt", "b.txt"),
+            ],
+            10,
+        );
+        assert_eq!(labels(&picked), ["A.txt", "b.txt"]);
+        assert_eq!(picked.left_out, 0);
+    }
+
+    #[test]
+    fn two_files_that_would_have_the_same_label_are_told_apart_by_their_paths() {
+        let picked = pick_files(
+            Vec::new(),
+            vec![
+                held(4, r"C:\One\notes.txt", "notes.txt"),
+                held(3, r"C:\Two\notes.txt", "notes.txt"),
+                held(2, r"C:\Two\other.txt", "other.txt"),
+            ],
+            10,
+        );
+        assert_eq!(
+            labels(&picked),
+            [r"C:\One\notes.txt", r"C:\Two\notes.txt", "other.txt"]
+        );
+    }
+
+    #[test]
+    fn a_label_is_the_path_below_the_folder_or_the_name() {
+        let root = Path::new(r"C:\Docs");
+        assert_eq!(
+            label_under(root, Path::new(r"C:\Docs\sub\a.txt")),
+            r"sub\a.txt"
+        );
+        assert_eq!(label_under(root, Path::new(r"C:\Docs\a.txt")), "a.txt");
+        assert_eq!(label_under(root, Path::new(r"D:\Elsewhere\a.txt")), "a.txt");
+        assert_eq!(label_under(root, root), "Docs");
+        assert_eq!(name_of(Path::new(r"C:\")), r"C:\");
     }
 }

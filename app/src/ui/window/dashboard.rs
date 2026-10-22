@@ -16,12 +16,12 @@ use std::{
 
 use piikey::{
     detect::EntityKind,
-    inventory::{Entry, Finding, Node, Tiles, TypeTotal},
+    inventory::{Entry, Node, Tiles, TypeTotal},
     sys::is_under,
 };
 use windows_reactor::ComponentContext;
 
-use super::{FindingsState, MainWindow, Msg, Page};
+use super::{MainWindow, Msg, Page};
 use crate::ui::{
     controller::{Command, Controller, Store},
     explorer,
@@ -63,7 +63,8 @@ pub enum Dash {
     Mask(PathBuf),
     /// Scan the file or folder again, into the main inventory, and show the result.
     Scan(PathBuf),
-    /// Run the detection over the file and show what it finds.
+    /// Run the detection over the file, or over the files of the folder that hold personal data,
+    /// and show every value it finds in the findings view.
     Found(PathBuf),
     /// Write a report of everything under the folder on show to Downloads and show it.
     Report,
@@ -369,7 +370,7 @@ impl MainWindow {
                 paths: vec![path],
                 reveal: true,
             }),
-            Dash::Found(path) => self.show_findings(path, true, context),
+            Dash::Found(path) => self.open_findings(vec![path], store, context),
             Dash::Report => {
                 let under = self.dash(store).at.clone();
                 self.background(context, move |controller| {
@@ -378,26 +379,6 @@ impl MainWindow {
                 });
             }
         }
-    }
-
-    /// Reads what the detection finds in `path`, in the background, and keeps it for the dialog
-    /// that lists it. `ask` says whether that dialog is the one of "Show what was found"; the
-    /// findings of a scan that shows its result belong to that result's dialog instead.
-    pub(super) fn show_findings(
-        &mut self,
-        path: PathBuf,
-        ask: bool,
-        context: &ComponentContext<Self>,
-    ) {
-        self.findings = Some((path.clone(), FindingsState::Loading));
-        self.findings_open = ask;
-        context.spawn_background({
-            let controller = Arc::clone(&self.input.controller.0);
-            move |_| {
-                let found: Result<Vec<Finding>, String> = controller.findings(&path);
-                Msg::FindingsLoaded(path, found)
-            }
-        });
     }
 
     /// Goes to Inventory, at `at`, with `select` chosen: where "Show in Inventory" leads.

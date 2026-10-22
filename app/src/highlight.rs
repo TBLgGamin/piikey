@@ -16,6 +16,9 @@
 //!
 //! Capture says where the outline goes every time it looks at the focus. A request that is not
 //! repeated within [`STALE`] therefore means capture stopped, stalled or died, and the outline goes.
+//!
+//! [`Overlay::flash`] is for an outline that nothing asks for again, such as the one that shows
+//! where "Open at this place" put a value: it stays for the time it is given and goes by itself.
 
 use std::{
     num::NonZeroU32,
@@ -184,6 +187,11 @@ enum Cmd {
         field: Rect,
         mark: Mark,
     },
+    Flash {
+        field: Rect,
+        mark: Mark,
+        how_long: Duration,
+    },
     Hide,
     Hotkey {
         on: bool,
@@ -244,6 +252,18 @@ impl Overlay {
     pub(crate) fn show(&self, field: Rect, mark: Mark) {
         // An overlay that is gone shows nothing: capture goes on without it.
         let _ = self.events.send_event(Cmd::Show { field, mark });
+    }
+
+    /// Outlines `field` in the colour of `mark` for `how_long`, then takes the outline away by
+    /// itself: for an outline that nothing asks for again, such as the one that shows where a
+    /// value was found. Another outline, or [`Overlay::hide`], replaces it sooner.
+    pub(crate) fn flash(&self, field: Rect, mark: Mark, how_long: Duration) {
+        // An overlay that is gone shows nothing.
+        let _ = self.events.send_event(Cmd::Flash {
+            field,
+            mark,
+            how_long,
+        });
     }
 
     /// Takes the outline away.
@@ -310,7 +330,7 @@ struct Bars {
     /// Answers [`Overlay::start`] once the windows exist.
     ready: Option<Ready>,
     windows: Option<Windows>,
-    /// The outline that is up, and when capture last asked for it.
+    /// The outline that is up, and when it goes unless it is asked for again.
     shown: Option<(Rect, Mark, Instant)>,
     hotkey: Option<Hotkey>,
 }
@@ -343,7 +363,12 @@ impl ApplicationHandler<Cmd> for Bars {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, cmd: Cmd) {
         match cmd {
-            Cmd::Show { field, mark } => self.show(event_loop, field, mark),
+            Cmd::Show { field, mark } => self.show(event_loop, field, mark, STALE),
+            Cmd::Flash {
+                field,
+                mark,
+                how_long,
+            } => self.show(event_loop, field, mark, how_long),
             Cmd::Hide => self.hide(),
             Cmd::Hotkey { on, answer } => {
                 let _ = answer.send(self.set_hotkey(on));
@@ -366,27 +391,22 @@ impl ApplicationHandler<Cmd> for Bars {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        match self.shown {
-            Some((_, _, asked)) if asked.elapsed() >= STALE => {
+        match due(self.shown.map(|(_, _, hide_at)| hide_at), Instant::now()) {
+            Due::Now => {
                 self.hide();
                 event_loop.set_control_flow(ControlFlow::Wait);
             }
-            Some((_, _, asked)) => {
-                event_loop.set_control_flow(ControlFlow::WaitUntil(asked + STALE));
-            }
-            None => event_loop.set_control_flow(ControlFlow::Wait),
+            Due::At(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
+            Due::Nothing => event_loop.set_control_flow(ControlFlow::Wait),
         }
     }
 }
 
 impl Bars {
-    fn show(&mut self, event_loop: &ActiveEventLoop, field: Rect, mark: Mark) {
-        let now = Instant::now();
-        if let Some((shown, marked, asked)) = &mut self.shown
-            && *shown == field
-            && *marked == mark
-        {
-            *asked = now;
+    /// Outlines `field` and takes the outline away `stays` from now, unless it is asked for again.
+    fn show(&mut self, event_loop: &ActiveEventLoop, field: Rect, mark: Mark, stays: Duration) {
+        let hide_at = deadline(Instant::now(), stays);
+        if refresh(&mut self.shown, field, mark, hide_at) {
             return;
         }
         let Some(windows) = &mut self.windows else {
@@ -400,7 +420,7 @@ impl Bars {
         for (bar, place) in windows.bars.iter_mut().zip(places) {
             bar.put(place, color);
         }
-        self.shown = Some((field, mark, now));
+        self.shown = Some((field, mark, hide_at));
     }
 
     fn hide(&mut self) {
@@ -445,6 +465,51 @@ impl Bars {
             global_hotkey::Error::AlreadyRegistered(_) => HOTKEY_TAKEN.to_owned(),
             other => format!("could not register Ctrl+Alt+P: {other}"),
         })
+    }
+}
+
+/// When an outline that is asked for at `now` to stay `stays` goes. A time that cannot be added
+/// ends the outline at once.
+fn deadline(now: Instant, stays: Duration) -> Instant {
+    now.checked_add(stays).unwrap_or(now)
+}
+
+/// Keeps the outline that is up when it is the one asked for: `field` in the colour of `mark`.
+/// Its end moves to `hide_at` then, and the answer is `true`; `false` when `shown` is no outline
+/// or another one, which is then to be drawn.
+fn refresh(
+    shown: &mut Option<(Rect, Mark, Instant)>,
+    field: Rect,
+    mark: Mark,
+    hide_at: Instant,
+) -> bool {
+    if let Some((up, marked, until)) = shown
+        && *up == field
+        && *marked == mark
+    {
+        *until = hide_at;
+        return true;
+    }
+    false
+}
+
+/// What the overlay thread does about the outline that is up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Due {
+    /// None is up.
+    Nothing,
+    /// Its time is up.
+    Now,
+    /// It goes at this time.
+    At(Instant),
+}
+
+/// What is due for an outline that goes at `hide_at`, seen at `now`.
+fn due(hide_at: Option<Instant>, now: Instant) -> Due {
+    match hide_at {
+        None => Due::Nothing,
+        Some(at) if at <= now => Due::Now,
+        Some(at) => Due::At(at),
     }
 }
 
@@ -698,5 +763,49 @@ mod tests {
         // Nothing to compare with: the outline goes where the field is.
         assert!(outline(rect(2000, 100, 2600, 140), None).is_some());
         Ok(())
+    }
+
+    #[test]
+    fn an_outline_goes_when_its_time_is_up() {
+        let now = Instant::now();
+        let later = now + Duration::from_secs(2);
+        assert_eq!(due(None, now), Due::Nothing);
+        assert_eq!(due(Some(later), now), Due::At(later));
+        // Reaching its time is enough, and so is being past it.
+        assert_eq!(due(Some(later), later), Due::Now);
+        assert_eq!(due(Some(now), later), Due::Now);
+    }
+
+    #[test]
+    fn the_same_outline_again_only_moves_its_end() {
+        let now = Instant::now();
+        let later = now + STALE;
+        let field = rect(10, 20, 300, 60);
+        let mut shown = None;
+        // Nothing is up: there is nothing to keep.
+        assert!(!refresh(&mut shown, field, Mark::Pii, now));
+        assert_eq!(shown, None);
+
+        shown = Some((field, Mark::Pii, now));
+        assert!(refresh(&mut shown, field, Mark::Pii, later));
+        assert_eq!(shown, Some((field, Mark::Pii, later)));
+
+        // Another field or another mark is another outline: it has to be drawn, so nothing is
+        // kept and nothing changes here.
+        assert!(!refresh(&mut shown, rect(10, 20, 300, 61), Mark::Pii, now));
+        assert!(!refresh(&mut shown, field, Mark::Clean, now));
+        assert_eq!(shown, Some((field, Mark::Pii, later)));
+    }
+
+    #[test]
+    fn a_flash_and_a_show_each_end_after_their_own_time() {
+        let now = Instant::now();
+        assert_eq!(deadline(now, STALE), now + STALE);
+        assert_eq!(
+            deadline(now, Duration::from_secs(2)),
+            now + Duration::from_secs(2)
+        );
+        // A time that cannot be added ends the outline at once instead of panicking.
+        assert_eq!(deadline(now, Duration::MAX), now);
     }
 }

@@ -4,7 +4,7 @@
 
 use std::borrow::Cow;
 
-use super::{Output, Pass};
+use super::{Output, Pass, places::Layout};
 use crate::{Error, Result, engine::Engine};
 
 pub(super) const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
@@ -118,10 +118,17 @@ pub(super) fn encode(text: String, encoding: Encoding) -> Result<Vec<u8>> {
     }
 }
 
-/// Anonymizes or deanonymizes a text file, keeping its encoding and BOM.
-pub(super) fn process(pass: &Pass<'_>, bytes: &[u8]) -> Result<Output> {
+/// Anonymizes or deanonymizes a text file, keeping its encoding and BOM. A scan that is asked for
+/// findings names the line and column of each value in the decoded text, when the file is not
+/// one that sits inside another (`depth` above 0).
+pub(super) fn process(pass: &Pass<'_>, bytes: &[u8], depth: u8) -> Result<Output> {
     let (text, encoding) = decode(bytes)?;
-    let reps = pass.plan(&[&*text])?.pop().unwrap_or_default();
+    let layout = if pass.wants_places(depth) {
+        Layout::Lines
+    } else {
+        Layout::Nowhere
+    };
+    let reps = pass.plan(&layout, &[&*text])?.pop().unwrap_or_default();
     if reps.is_empty() {
         return Ok(Output::Same(pass.unchanged(bytes)));
     }

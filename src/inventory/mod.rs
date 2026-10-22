@@ -50,7 +50,7 @@ use std::{
 use rayon::prelude::*;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
-pub use crate::formats::Finding;
+pub use crate::formats::{Finding, Location};
 use crate::{
     Error, Result,
     detect::EntityKind,
@@ -1139,7 +1139,8 @@ fn detect(engine: &Engine, bytes: &[u8], modified: &mut u64) -> (Status, Vec<(En
 
 /// What the detector finds in the file at `path`, read now, each with the text around it. It is
 /// for showing to the person who asked: nothing is stored, and the values go nowhere else. The
-/// findings come grouped by kind, in reading order within a kind.
+/// findings come in reading order, and each says where it stands in the file when the format has
+/// a place to name (a line and column, a page, a cell: see [`Location`]).
 ///
 /// # Errors
 /// `Io` when the file cannot be read; `UnsupportedFormat` when it is a format piikey does not
@@ -3107,11 +3108,16 @@ mod tests {
         assert_eq!(kinds, [Email, Iban], "{found:?}");
         let email = &found[0];
         assert_eq!(&*email.value, EMAIL);
+        // Where each stands in the file: the third line, after the 28 characters before it, and
+        // the fourth line, after 22.
+        let at = |line, column| Some(Location::Line { line, column });
+        assert_eq!(email.location, at(3, 29));
         assert_eq!(
             &*email.snippet,
             "Dear Jan, please send the invoice to jan.jansen@acme.nl before Friday, or pay NL91ABNA041716430…"
         );
         assert_eq!(&*found[1].value, IBAN);
+        assert_eq!(found[1].location, at(4, 23));
         assert!(found[1].snippet.contains("or pay NL91ABNA0417164300."));
 
         // Nothing was written: not the inventory, not a file of any kind. The values are in the

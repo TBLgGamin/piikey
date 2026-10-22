@@ -14,6 +14,11 @@
 //! packages follow one at a time, in entry order, so a scan reports the values of the
 //! package itself before those of what it embeds. The output keeps the original entry order;
 //! entries without changes are copied compressed, byte for byte.
+//!
+//! A scan that is asked for findings also says which cell of a workbook or of an `OpenDocument`
+//! sheet each text is in. Once the engine has found the values, the parts of the sheets are
+//! walked again, for the texts that hold one and no others (`sheets.rs`, `ooxml::places`,
+//! `odf::places`); what lies in an embedded package has no place.
 
 use std::{
     collections::HashMap,
@@ -27,7 +32,11 @@ use zip::{
 };
 
 use super::{
-    Output, Pass, ooxml, open_package, process_pass, thumbnail,
+    Output, Pass, odf, ooxml, open_package,
+    places::Layout,
+    process_pass,
+    sheets::Docs,
+    thumbnail,
     xmltext::{Attrs, XmlDoc, segments},
 };
 use crate::{Error, Result, engine::Replacement};
@@ -69,13 +78,30 @@ pub(super) fn rewrite(
     scope: Scope,
     depth: u8,
 ) -> Result<Vec<u8>> {
-    let Parts { xml, packages } = parts(&archive, scope, ooxml::matches(&archive), MAX_XML)?;
+    let office = ooxml::matches(&archive);
+    let Parts { xml, packages } = parts(&archive, scope, office, MAX_XML)?;
     let docs = read_docs(&archive, &xml)?;
     let texts: Vec<&str> = docs.iter().flat_map(|(_, doc)| doc.texts()).collect();
     let plans = if texts.is_empty() {
         Vec::new()
     } else {
-        pass.plan(&texts)?
+        // Only the package itself has places, and only for the findings of a scan.
+        let book = pass.wants_places(depth).then(|| Docs::new(&archive, &docs));
+        let locate = |wanted: &[usize]| {
+            book.as_ref().map_or_else(Vec::new, |book| {
+                if office {
+                    ooxml::places(book, wanted)
+                } else {
+                    odf::places(book, wanted)
+                }
+            })
+        };
+        let layout = if book.is_some() {
+            Layout::Texts(&locate)
+        } else {
+            Layout::Nowhere
+        };
+        pass.plan(&layout, &texts)?
     };
 
     let mut jobs: Vec<(usize, &XmlDoc, &[Vec<Replacement>])> = Vec::new();

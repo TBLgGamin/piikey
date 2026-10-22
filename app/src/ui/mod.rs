@@ -14,6 +14,7 @@ pub(crate) mod assets;
 pub(crate) mod controller;
 mod explorer;
 mod exports;
+mod goto;
 mod instance;
 mod pages;
 mod scanner;

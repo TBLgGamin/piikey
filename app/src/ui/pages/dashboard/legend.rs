@@ -4,7 +4,7 @@
 
 use piikey::{detect::EntityKind, inventory::TypeTotal};
 use windows_reactor::{
-    Border, Button, ButtonStyle, DataItem, Grid, GridLength, KeyedView, ListView,
+    Border, Button, ButtonStyle, Callback, DataItem, Grid, GridLength, KeyedView, ListView,
     ListViewSelectionMode, Orientation, ScrollBarVisibility, ScrollViewer, StackPanel, TextBlock,
     TextTrimming, ThemeBrush, Thickness, VerticalAlignment, View,
 };
@@ -24,15 +24,15 @@ fn all_hits(totals: &[TypeTotal]) -> u64 {
     totals.iter().map(|total| total.hits).sum()
 }
 
-/// A chip: the swatch of a type (none for "All types"), its name and its total. The chip of the
-/// type on show has a ring; a click on it shows every type again.
-fn chip(
+/// A chip: the swatch of a type (none for "All types"), its name and its total. The chip that is
+/// `active` has a ring. `on_click` is what a click asks for: the one who builds the chip knows
+/// whether that is the type, or every type again.
+pub(super) fn chip(
     kind: Option<EntityKind>,
     name: &str,
     hits: u64,
     active: bool,
-    store: Store,
-    context: Context<'_>,
+    on_click: Callback<()>,
 ) -> View {
     let mut parts: Vec<View> = Vec::new();
     parts.extend(kind.map(|kind| View::from(swatch(kind))));
@@ -49,8 +49,6 @@ fn chip(
             .vertical_alignment(VerticalAlignment::Center)
             .into(),
     );
-    // A chip of the type on show asks for every type; any other asks for its own.
-    let asks = if active { None } else { kind };
     Border::new()
         .border_brush(if active {
             ThemeBrush::Accent
@@ -63,7 +61,7 @@ fn chip(
             Button::new()
                 .style(ButtonStyle::Subtle)
                 .automation_name(format!("{name}, {}", thousands(hits)))
-                .on_click(context.message(Msg::Dash(store, Dash::Type(asks))))
+                .on_click(on_click)
                 .content(
                     StackPanel::new()
                         .orientation(Orientation::Horizontal)
@@ -74,32 +72,8 @@ fn chip(
         .into()
 }
 
-/// One row of chips, one chip for each type found and the one for all of them first; it scrolls
-/// sideways when they do not fit.
-pub(super) fn strip(
-    totals: &[TypeTotal],
-    shown: Option<EntityKind>,
-    store: Store,
-    context: Context<'_>,
-) -> View {
-    let mut chips: Vec<View> = vec![chip(
-        None,
-        "All types",
-        all_hits(totals),
-        shown.is_none(),
-        store,
-        context,
-    )];
-    chips.extend(totals.iter().map(|total| {
-        chip(
-            Some(total.kind),
-            total.kind.label(),
-            total.hits,
-            shown == Some(total.kind),
-            store,
-            context,
-        )
-    }));
+/// A row of chips that scrolls sideways when they do not fit.
+pub(super) fn strip_of(chips: Vec<View>) -> View {
     ScrollViewer::new()
         .horizontal_scroll_bar_visibility(ScrollBarVisibility::Auto)
         .vertical_scroll_bar_visibility(ScrollBarVisibility::Disabled)
@@ -112,6 +86,35 @@ pub(super) fn strip(
                 .children(chips),
         )
         .into()
+}
+
+/// One row of chips, one chip for each type found and the one for all of them first. A click on
+/// the chip of the type on show shows every type again.
+pub(super) fn strip(
+    totals: &[TypeTotal],
+    shown: Option<EntityKind>,
+    store: Store,
+    context: Context<'_>,
+) -> View {
+    let asks = |kind: Option<EntityKind>| context.message(Msg::Dash(store, Dash::Type(kind)));
+    let mut chips: Vec<View> = vec![chip(
+        None,
+        "All types",
+        all_hits(totals),
+        shown.is_none(),
+        asks(None),
+    )];
+    chips.extend(totals.iter().map(|total| {
+        let active = shown == Some(total.kind);
+        chip(
+            Some(total.kind),
+            total.kind.label(),
+            total.hits,
+            active,
+            asks(if active { None } else { Some(total.kind) }),
+        )
+    }));
+    strip_of(chips)
 }
 
 /// How tall the list is for `types` types: a row for each, the one for all of them, and the room

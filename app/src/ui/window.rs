@@ -29,20 +29,21 @@ use windows_reactor::{
 use super::{
     assets,
     controller::{
-        Command, Controller, Edit, KeyedPage, KeyedQuery, Model, Notice, Period, Snapshot, Store,
-        apply_edit,
+        Command, Controller, Edit, FindingFiles, KeyedPage, KeyedQuery, Model, Notice, Period,
+        Snapshot, Store, apply_edit,
     },
-    explorer, pages,
+    explorer, goto, pages,
     status::Status,
 };
 use crate::{Res, startup};
 
 mod dashboard;
+mod findings;
 mod report;
 
 pub use self::{
     dashboard::{Dash, Dashboard, Loaded, Origin},
-    report::{FindingsState, single_file},
+    findings::{FindingsView, Reading, Row},
 };
 
 /// How long one background poll waits for a change before it checks for cancellation.
@@ -234,14 +235,31 @@ pub enum Msg {
     Dropped(Vec<String>),
     /// Something a dashboard's controls ask for; the store says which dashboard.
     Dash(Store, Dash),
-    /// What the detection found in a file, or why it did not.
-    FindingsLoaded(PathBuf, Result<Vec<Finding>, String>),
-    /// The list of what was found in a file was closed.
-    FindingsClosed,
+    /// The files the findings view will read.
+    FindingsListed(u64, FindingFiles),
+    /// What a batch of those files held, or why one could not be read; the number says which
+    /// reading it belongs to.
+    FindingsRead(u64, Vec<(PathBuf, Result<Vec<Finding>, String>)>),
+    /// The reading that has this number is over.
+    FindingsDone(u64),
+    /// The findings view's search box.
+    FindingsSearch(String),
+    /// A type chosen in the findings view; `None` is every type.
+    FindingsType(Option<EntityKind>),
+    /// A file chosen in the findings view, by its place in the list; `None` is every file.
+    FindingsFile(Option<usize>),
+    /// The findings view was left.
+    FindingsClose,
+    /// "Open at this place" on the row with this number.
+    FindingsOpen(u32),
+    /// What "Open at this place" did for that row.
+    FindingsOpened(u32, goto::Outcome),
     /// The result of a scan was closed.
     ReportClose,
     /// "Show in Inventory" on the result of a scan.
     ReportShow,
+    /// "Show what was found" on the result of a scan.
+    ReportFound,
     CopyToken,
     RotateToken,
     /// What Developer access says after a token action.
@@ -331,11 +349,11 @@ pub struct MainWindow {
     pub(super) inventory: Dashboard,
     /// The same for the Watch page.
     pub(super) watch: Dashboard,
-    /// What the detection found in one file, while a dialog lists it: the file and how far the
-    /// reading is. Never kept past the dialog.
-    pub(super) findings: Option<(PathBuf, FindingsState)>,
-    /// The dialog of "Show what was found" is on show.
-    pub(super) findings_open: bool,
+    /// The findings view while it is open: the values of the files of a result and how the list is
+    /// narrowed down. Never kept past the view.
+    pub(super) findings: Option<FindingsView>,
+    /// Numbers the findings views, so what an older reading brings is dropped.
+    findings_seq: u64,
     /// The newest scan request whose result the user has seen and put away.
     pub(super) dismissed: u64,
     timer: Option<ComponentTimer>,
@@ -376,7 +394,7 @@ impl MainWindow {
             inventory: Dashboard::new(),
             watch: Dashboard::new(),
             findings: None,
-            findings_open: false,
+            findings_seq: 0,
             dismissed,
             timer: None,
             flavor: 0,
@@ -447,7 +465,6 @@ impl MainWindow {
             || (self.snap.scan.is_some() && snapshot.scan.is_none());
         let watch_changed = self.snap.watch.totals != snapshot.watch.totals
             || (self.snap.watch.scanning.is_some() && snapshot.watch.scanning.is_none());
-        let reveal_changed = self.snap.reveal != snapshot.reveal;
         self.snap = snapshot;
         if self.snap.busy.is_none() && self.snap.pending == 0 {
             self.asked = Asked::default();
@@ -463,9 +480,6 @@ impl MainWindow {
         }
         if watch_changed && self.page == Page::Watch {
             self.load_dashboard(Store::Watch, context);
-        }
-        if reveal_changed {
-            self.follow_reveal(context);
         }
     }
 
@@ -484,6 +498,7 @@ impl MainWindow {
     }
 
     fn navigate(&mut self, page: Page, context: &ComponentContext<Self>) {
+        self.close_findings();
         self.open_page(page);
         match page {
             Page::Overview => self.input.controller.submit(Command::Refresh),
@@ -836,8 +851,6 @@ impl Component for MainWindow {
         let mut window = Self::new(input);
         window.flavor_timer = Some(context.set_timeout(FLAVOR_EVERY, Msg::Flavor));
         window.poll(context);
-        // A window that opens for a scan shows its result at once.
-        window.follow_reveal(context);
         window
     }
 
@@ -924,9 +937,18 @@ impl Component for MainWindow {
             | Msg::VaultSite(_)
             | Msg::VaultPeriod(_)
             | Msg::VaultLoaded(..) => self.update_vault(message, context),
-            Msg::FindingsLoaded(..) | Msg::FindingsClosed | Msg::ReportClose | Msg::ReportShow => {
-                self.update_report(message, context);
+            Msg::ReportClose | Msg::ReportShow | Msg::ReportFound => {
+                self.update_report(&message, context);
             }
+            Msg::FindingsListed(..)
+            | Msg::FindingsRead(..)
+            | Msg::FindingsDone(_)
+            | Msg::FindingsSearch(_)
+            | Msg::FindingsType(_)
+            | Msg::FindingsFile(_)
+            | Msg::FindingsClose
+            | Msg::FindingsOpen(_)
+            | Msg::FindingsOpened(..) => self.update_findings(message, context),
         }
     }
 

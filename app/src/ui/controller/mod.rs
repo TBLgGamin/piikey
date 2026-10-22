@@ -14,7 +14,7 @@
 //! - [`model`]: the detection model's download, load and release.
 //! - [`keyed`]: the vault's values, where they went, and the activity feed.
 //! - [`inventory`]: the inventory, its scans and the scan thread, the views of both inventories
-//!   and the findings of one file.
+//!   and the findings of the files a result names.
 //! - [`watch`]: the folders the user asked to be watched, and what is done with their changes.
 //! - [`edit`]: the edits of the settings, applied to a [`Policy`].
 //!
@@ -56,15 +56,15 @@ use crate::{
     proxy::{Event, Shared},
 };
 
-#[cfg(test)]
-pub use self::keyed::RECENT;
 pub use self::{
     edit::{Edit, apply_edit},
-    inventory::{Reveal, RevealState, Store},
+    inventory::{FindingFiles, Reveal, RevealState, Store},
     keyed::{Keyed, KeyedPage, KeyedQuery, Period, Sent},
     model::Model,
     watch::{Change, FolderStatus, Started, Watch, WatchedFolder},
 };
+#[cfg(test)]
+pub use self::{inventory::FindingFile, keyed::RECENT};
 /// What a scan found, added up: the summary a [`Reveal`] carries once its scan is done.
 pub use piikey::inventory::Summary as ScanSummary;
 
@@ -312,8 +312,8 @@ struct State {
     inventory_totals: Totals,
     /// What the controller keeps of the watch.
     watch: watch::WatchState,
-    /// How many lists of the findings of a file are being made: the detection model is wanted
-    /// while there are any.
+    /// How many reads of the findings of files are running: the detection model is wanted while
+    /// there are any.
     findings: usize,
 }
 
@@ -528,6 +528,12 @@ impl Controller {
     /// Path of the vault the engine runs on.
     pub fn vault_path(&self) -> &Path {
         &self.vault_path
+    }
+
+    /// What capture and the highlight overlay read their mode from. The overlay starts with it, so
+    /// whatever draws an outline (the highlight, "Open at this place") passes this one.
+    pub(crate) fn purpose(&self) -> Arc<crate::proxy::Purpose> {
+        Arc::clone(&self.shared.purpose)
     }
 
     /// Copies the state out for rendering.
