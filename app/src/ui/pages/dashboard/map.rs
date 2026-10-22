@@ -192,7 +192,9 @@ fn lay_out(folder: &Folder, items: &[Item], rect: Rect, out: &mut Vec<Placed>) {
     }
 }
 
-/// The folders on the way from `at` to `file`, as names.
+/// The folders on the way from `at` to `file`, as the names Windows tells them apart by: letter
+/// case does not count, so the files of `C:\Docs` and `c:\docs` lie in one folder. A drive and its
+/// root come first when `at` is the top.
 fn way(file: &Path, at: &Path) -> Vec<String> {
     let skip = if is_under(file, at) {
         at.components().count()
@@ -202,7 +204,7 @@ fn way(file: &Path, at: &Path) -> Vec<String> {
     let names: Vec<String> = file
         .components()
         .skip(skip)
-        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .map(|part| part.as_os_str().to_string_lossy().to_lowercase())
         .collect();
     // Without the file's own name.
     names
@@ -329,7 +331,7 @@ pub(super) enum Focus {
 
 /// How the tile `of` looks given what is `selected`.
 pub(super) fn focus(of: &Of, selected: Option<&Path>, folder_selected: bool) -> Focus {
-    let Some(selected) = selected.filter(|selected| !selected.as_os_str().is_empty()) else {
+    let Some(selected) = selected else {
         return Focus::None;
     };
     match of {
@@ -584,8 +586,43 @@ mod tests {
             tile(r"C:\Docs\cv.docx", &[(EntityKind::Person, 8)]),
         ]);
         assert_eq!(place(&only, at, None, AREA).len(), 2);
-        assert_eq!(way(Path::new(r"C:\Docs\Taxes\2023.pdf"), at), ["Taxes"]);
+        assert_eq!(way(Path::new(r"C:\Docs\Taxes\2023.pdf"), at), ["taxes"]);
         assert!(way(Path::new(r"C:\Docs\cv.docx"), at).is_empty());
+    }
+
+    #[test]
+    fn the_files_of_a_drive_lie_together_and_so_do_two_spellings_of_a_folder() {
+        let on_two = tiles(vec![
+            tile(r"C:\Docs\a.pdf", &[(EntityKind::Email, 30)]),
+            tile(r"c:\DOCS\b.pdf", &[(EntityKind::Email, 20)]),
+            tile(r"D:\Backup\c.pdf", &[(EntityKind::Email, 25)]),
+            tile(r"D:\Other\d.pdf", &[(EntityKind::Email, 5)]),
+        ]);
+        let placed = place(&on_two, Path::new(""), None, AREA);
+        assert_eq!(placed.len(), 4);
+        let rect = |name: &str| placed.iter().find(|t| t.name == name).map(|t| t.rect);
+        let (Some(a), Some(b)) = (rect("a.pdf"), rect("b.pdf")) else {
+            panic!("the Docs files have tiles");
+        };
+        // Both spellings are one folder, so the two files are all of it: their union holds no
+        // other tile, not even one of the other drive.
+        let (left, top) = (a.x.min(b.x), a.y.min(b.y));
+        let (right, bottom) = ((a.x + a.w).max(b.x + b.w), (a.y + a.h).max(b.y + b.h));
+        for other in placed
+            .iter()
+            .filter(|t| t.name != "a.pdf" && t.name != "b.pdf")
+        {
+            let r = other.rect;
+            let inside = r.x >= left - 1e-6
+                && r.y >= top - 1e-6
+                && r.x + r.w <= right + 1e-6
+                && r.y + r.h <= bottom + 1e-6;
+            assert!(
+                !inside,
+                "{} lies in the room of the Docs folder",
+                other.name
+            );
+        }
     }
 
     #[test]
@@ -601,7 +638,6 @@ mod tests {
         assert_eq!(focus(&outside, Some(file), false), Focus::Chosen);
         assert_eq!(focus(&inside, Some(file), false), Focus::None);
         assert_eq!(focus(&inside, None, false), Focus::None);
-        assert_eq!(focus(&inside, Some(Path::new("")), true), Focus::None);
     }
 
     #[test]

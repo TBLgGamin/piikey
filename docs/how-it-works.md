@@ -92,15 +92,20 @@ existed load fine and get one the next time the file changes. The scan treats a 
 as clean. The fingerprint is stored in the file but is never shown in the API, the CLI or a report.
 
 The Inventory page shows the result as a dashboard, like a disk-usage viewer. A tree of folders and
-files has a bar by type on each row; a legend lists the types found (a chip row in a narrow window,
-a list in a wide one) and picking one shows only that type; a treemap has a tile for every file,
-coloured by type (up to 400 tiles, the rest one "+N files" tile); and a details pane describes
-what is selected. Selecting a tile opens the tree along the way to its file. For a file the details
-can open it, show it in Explorer, show what was found or make a masked copy (beside the file; it
-never replaces an existing file); for a folder they can show only that folder, show it in Explorer
-or show what was found. What is listed was scanned already, so the details offer no scan. The
-inventory has no exclusions and no switch: what is in it is what was scanned. The boxes that add a
-location or a watched folder have Browse buttons that open the Windows folder (or file) picker.
+files has a bar by type on each row and follows the computer's real folders: its top is the drives
+(and network shares) that hold scanned files, such as `C:`, and below a drive come its real
+folders down to the files, however they came to be scanned (the locations only say what the Scan
+button looks through; they group nothing). The breadcrumb above it is the same path (This PC,
+`C:`, Users, ...) and each step goes back to that folder. A legend lists the types found (a chip
+row in a narrow window, a list in a wide one) and picking one shows only that type; a treemap has a
+tile for every file, nested by folder and coloured by type (up to 400 tiles, the rest one "+N
+files" tile); and a details pane describes what is selected. Selecting a tile opens the tree along
+the way to its file, from its drive. For a file the details can open it, show it in Explorer, show
+what was found or make a masked copy (beside the file; it never replaces an existing file); for a
+folder they can show only that folder, show it in Explorer or show what was found. What is listed
+was scanned already, so the details offer no scan. The inventory has no exclusions and no switch:
+what is in it is what was scanned. The boxes that add a location or a watched folder have Browse
+buttons that open the Windows folder (or file) picker.
 
 A scan started from the page, the box, a drop or Explorer opens a result dialog in the window
 (scanning, then how much was found, with "Show what was found" and "Show in Inventory" when
@@ -144,7 +149,8 @@ is looked at, which still reads only what changed. Switching the watch on, addin
 starting the app catch up the same way, because a folder is not watched while the app is not
 running. Turning the watch off keeps what it found; removing a folder forgets that folder's
 entries. The Watch page shows each folder as watching, scanning, not watched (the watch is off)
-or not available, with the time of its last change, above the same dashboard as the inventory.
+or not available, with the time of its last change, above the same dashboard as the inventory: its
+tree too starts at the drives that hold what the watch found and goes down their real folders.
 
 ## API
 

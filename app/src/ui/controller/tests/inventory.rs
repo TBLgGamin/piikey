@@ -1,6 +1,9 @@
 use std::sync::mpsc;
 
-use piikey::inventory::Inventory;
+use piikey::{
+    inventory::{Inventory, Node},
+    sys::volume_len,
+};
 
 use super::*;
 use crate::ui::controller::FindingsEvent;
@@ -12,6 +15,16 @@ fn docs(dir: &TempDir) -> Result<PathBuf, String> {
     fs::create_dir(&folder).describe()?;
     fs::write(folder.join("a.txt"), "mail jan.jansen@acme.nl").describe()?;
     Ok(folder)
+}
+
+/// The drive `path` is on as the top of the tree names it, and the root of the drive.
+fn drive_of(path: &Path) -> (String, PathBuf) {
+    let name = path
+        .components()
+        .next()
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .unwrap_or_default();
+    (name, path.components().take(volume_len(path)).collect())
 }
 
 /// The latest scan that asked to be shown, once it is over.
@@ -76,14 +89,16 @@ fn an_explorer_scan_fills_the_inventory_and_the_dialog_gets_its_result() -> Test
     assert_eq!(rig.controller.snapshot().watch.totals, (0, 0));
     assert_eq!(rig.controller.watch_store.totals().files, 0);
 
-    // Outside the locations: the node for "Other scans", which has no path.
+    // The top of the tree is the drive the folder is on, a location or not.
+    let (drive, root) = drive_of(&folder);
     let top = rig
         .controller
         .inventory_view(Store::Inventory, Path::new(""), None);
     assert_eq!(top.nodes.len(), 1);
-    assert!(top.nodes[0].path.as_os_str().is_empty());
-    // No location chosen: nothing to group by.
-    assert!(top.roots.is_empty());
+    assert_eq!((&top.nodes[0].name, &top.nodes[0].path), (&drive, &root));
+    assert!(top.nodes[0].is_dir);
+    // No location chosen: nothing to count by place.
+    assert!(rig.controller.places(Store::Inventory).is_empty());
     let level = rig
         .controller
         .inventory_view(Store::Inventory, &folder, Some(&file));
@@ -252,12 +267,17 @@ fn a_scan_nobody_asked_to_see_leaves_the_window_alone_and_nothing_scans_by_itsel
         "a scan nobody asked to see does not take the window"
     );
     assert_eq!(rig.controller.tray().reveal, 0);
+    let (drive, root) = drive_of(&folder);
     let top = rig
         .controller
         .inventory_view(Store::Inventory, Path::new(""), None);
     assert_eq!(top.nodes.len(), 1);
-    assert_eq!(top.nodes[0].path, folder);
-    assert_eq!(top.roots, std::slice::from_ref(&folder));
+    assert_eq!((&top.nodes[0].name, &top.nodes[0].path), (&drive, &root));
+    // The location counts what lies in its folder, wherever the folder is in the tree.
+    let places = rig.controller.places(Store::Inventory);
+    assert_eq!(places.len(), 1);
+    assert_eq!(places[0].path, folder);
+    assert_eq!((places[0].hits, places[0].files), (1, 1));
 
     // A second press reads nothing again: the file did not change.
     fs::write(folder.join("b.txt"), "call +31 6 12345678").describe()?;
@@ -581,14 +601,22 @@ fn the_views_read_the_inventory_they_are_asked_for() -> Test {
 
     let top = |store| rig.controller.inventory_view(store, Path::new(""), None);
     let main = top(Store::Inventory);
-    assert_eq!(main.roots, std::slice::from_ref(&folder));
     assert_eq!(main.nodes.len(), 1);
     assert_eq!(main.nodes[0].hits, 1);
     let watch = top(Store::Watch);
-    assert_eq!(watch.roots, std::slice::from_ref(&watched));
     assert_eq!(watch.nodes.len(), 1);
     assert_eq!((watch.nodes[0].hits, watch.nodes[0].files), (5, 2));
     assert_eq!(watch.nodes[0].dominant(), Some(EntityKind::Iban));
+    // What each holds in its own folders is counted by their paths.
+    let held = |store: Store| -> Vec<(PathBuf, u64, u32)> {
+        rig.controller
+            .places(store)
+            .into_iter()
+            .map(|node| (node.path, node.hits, node.files))
+            .collect()
+    };
+    assert_eq!(held(Store::Inventory), [(folder.clone(), 1, 1)]);
+    assert_eq!(held(Store::Watch), [(watched.clone(), 5, 2)]);
 
     let tiles = rig.controller.tiles(Store::Watch, Path::new(""), 1);
     assert_eq!(tiles.tiles.len(), 1);
@@ -615,6 +643,64 @@ fn the_views_read_the_inventory_they_are_asked_for() -> Test {
         .controller
         .inventory_view(Store::Watch, &watched, Some(&file("w2.txt")));
     assert_eq!(selected.entry.map(|entry| entry.hits()), Some(2));
+    Ok(())
+}
+
+#[test]
+fn the_tree_goes_down_the_real_folders_from_the_drive_and_a_place_counts_what_lies_in_its_folder()
+-> Test {
+    let dir = TempDir::new()?;
+    let folder = docs(&dir)?;
+    let sub = folder.join("sub");
+    fs::create_dir(&sub).describe()?;
+    fs::write(sub.join("b.txt"), "call +31 6 12345678").describe()?;
+    let other = dir.0.join("other");
+    fs::create_dir(&other).describe()?;
+    fs::write(other.join("c.txt"), "call +31 6 87654321").describe()?;
+    // Two locations, one inside the other.
+    let rig = rig(
+        true,
+        Policy {
+            inventory_roots: vec![dir.0.clone(), folder.clone()],
+            ..quiet()
+        },
+    )?;
+    rig.run(Command::ScanAll)?;
+    assert!(rig.controller.wait_scans(Duration::from_secs(20)));
+
+    let view = |at: &Path| {
+        rig.controller
+            .inventory_view(Store::Inventory, at, None)
+            .nodes
+    };
+    let names = |level: &[Node]| -> Vec<String> { level.iter().map(|n| n.name.clone()).collect() };
+    let (drive, root) = drive_of(&folder);
+    assert_eq!(names(&view(Path::new(""))), [drive]);
+    // Every folder from the drive down to the scanned one lists the next, and nothing else.
+    let mut at = root;
+    for part in folder.components().skip(volume_len(&folder)) {
+        let level = view(&at);
+        let name = part.as_os_str().to_string_lossy().into_owned();
+        let next = level
+            .iter()
+            .find(|node| node.name == name)
+            .ok_or_else(|| format!("{name} is not listed in {}", at.display()))?;
+        assert!(next.is_dir, "{name}");
+        assert_eq!(level.len(), if at == dir.0 { 2 } else { 1 }, "{at:?}");
+        at = next.path.clone();
+    }
+    assert_eq!(names(&view(&dir.0)), ["docs", "other"]);
+    assert_eq!(names(&view(&folder)), ["a.txt", "sub"]);
+    assert_eq!(names(&view(&sub)), ["b.txt"]);
+
+    // A location counts what lies in its folder; locations inside one another each do.
+    let held: Vec<(PathBuf, u64, u32)> = rig
+        .controller
+        .places(Store::Inventory)
+        .into_iter()
+        .map(|node| (node.path, node.hits, node.files))
+        .collect();
+    assert_eq!(held, [(dir.0.clone(), 3, 3), (folder, 2, 2)]);
     Ok(())
 }
 

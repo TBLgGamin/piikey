@@ -153,8 +153,8 @@ pub(super) fn empty_card(text: &str) -> Border {
 }
 
 /// The way back up from the folder on show: every crumb but the last is a link.
-fn crumb_bar(dash: &Dashboard, loaded: &Loaded, store: Store, context: Context<'_>) -> View {
-    let trail = crumbs(&dash.at, &loaded.roots, top_label(store));
+fn crumb_bar(dash: &Dashboard, store: Store, context: Context<'_>) -> View {
+    let trail = crumbs(&dash.at, top_label(store));
     let mut steps: Vec<View> = Vec::new();
     for (i, crumb) in trail.iter().enumerate() {
         if i > 0 {
@@ -243,7 +243,7 @@ fn row_caption(row: &Row<'_>, kind: Option<EntityKind>) -> String {
 /// bar and the types it holds, and what it holds.
 fn row_view(row: &Row<'_>, kind: Option<EntityKind>, store: Store, context: Context<'_>) -> View {
     let node = row.node;
-    let chevron: View = if row.expandable() {
+    let chevron: View = if node.is_dir {
         Button::new()
             .style(ButtonStyle::Subtle)
             .grid_column(1)
@@ -281,11 +281,7 @@ fn row_view(row: &Row<'_>, kind: Option<EntityKind>, store: Store, context: Cont
                 .text_trimming(TextTrimming::CharacterEllipsis)
                 .grid_column(1),
         ));
-    let shown = if node.path.as_os_str().is_empty() {
-        "Scans of files outside the folders piikey looks through".to_owned()
-    } else {
-        node.path.display().to_string()
-    };
+    let shown = node.path.display().to_string();
     Grid::new()
         .columns([
             GridLength::Pixel(INDENT * f64::from(u32::try_from(row.depth).unwrap_or(0))),
@@ -336,13 +332,12 @@ fn tree_card(dash: &Dashboard, loaded: &Loaded, store: Store, context: Context<'
         .selected
         .as_deref()
         .and_then(|path| position(&all, path));
-    // A row's key says how deep it is as well: a folder that is a location and also lies in another
-    // location is two rows, and two rows must not share a key.
+    // A row is a folder or file of the real tree, which lists each once: its path is its key.
     let keys: Vec<String> = all
         .iter()
         .enumerate()
         .map(|(i, line)| match line {
-            Line::Row(row) => format!("row:{}:{}", row.depth, row.node.path.display()),
+            Line::Row(row) => format!("row:{}", row.node.path.display()),
             Line::More { .. } | Line::Cut => format!("more:{i}"),
         })
         .collect();
@@ -430,7 +425,7 @@ pub(super) fn dashboard(
     let Some(loaded) = dash.loaded.as_ref() else {
         return loading(space);
     };
-    let crumb_bar = crumb_bar(dash, loaded, store, context);
+    let crumb_bar = crumb_bar(dash, store, context);
     if is_empty(dash, loaded) {
         return StackPanel::new()
             .spacing(GAP)

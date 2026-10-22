@@ -30,14 +30,6 @@ pub(super) struct Row<'a> {
     pub(super) share: f64,
 }
 
-impl Row<'_> {
-    /// Whether it is a folder that can be opened. The node that stands for the scans outside every
-    /// location has an empty path and no folder to open.
-    pub(super) fn expandable(&self) -> bool {
-        self.node.is_dir && !self.node.path.as_os_str().is_empty()
-    }
-}
-
 /// One line of the tree.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum Line<'a> {
@@ -92,9 +84,7 @@ fn level<'a>(
         .map(|node| (node, weigh(&node.counts, node.hits, kind)))
         .filter(|&(_, found)| found > 0)
         .collect();
-    let pinned = |node: &Node| {
-        pin.is_some_and(|pin| !node.path.as_os_str().is_empty() && is_under(pin, &node.path))
-    };
+    let pinned = |node: &Node| pin.is_some_and(|pin| is_under(pin, &node.path));
     held.sort_by(|a, b| {
         pinned(b.0)
             .cmp(&pinned(a.0))
@@ -143,7 +133,7 @@ fn list<'a>(
             found,
             share: share(found, whole),
         };
-        let inner = row.open && row.expandable();
+        let inner = row.open && node.is_dir;
         out.push(Line::Row(row));
         if inner {
             list(&node.path, depth + 1, levels, open, pin, kind, out);
@@ -216,7 +206,12 @@ mod tests {
         let hits = counts.iter().map(|&(_, n)| u64::from(n)).sum();
         Node {
             path: PathBuf::from(path),
-            name: path.rsplit('\\').next().unwrap_or_default().to_owned(),
+            name: path
+                .trim_end_matches('\\')
+                .rsplit('\\')
+                .next()
+                .unwrap_or_default()
+                .to_owned(),
             is_dir,
             hits,
             files: 1,
@@ -224,10 +219,22 @@ mod tests {
         }
     }
 
+    /// Two drives; `C:` holds `Docs` (with `Taxes` in it and a file) and `Mail`.
     fn levels() -> HashMap<PathBuf, Vec<Node>> {
         let mut levels = HashMap::new();
         levels.insert(
             PathBuf::new(),
+            vec![
+                node(
+                    r"C:\",
+                    true,
+                    &[(EntityKind::Email, 45), (EntityKind::Person, 10)],
+                ),
+                node(r"D:\", true, &[(EntityKind::Iban, 2)]),
+            ],
+        );
+        levels.insert(
+            PathBuf::from(r"C:\"),
             vec![
                 node(
                     r"C:\Docs",
@@ -235,7 +242,6 @@ mod tests {
                     &[(EntityKind::Email, 40), (EntityKind::Person, 10)],
                 ),
                 node(r"C:\Mail", true, &[(EntityKind::Email, 5)]),
-                node("", true, &[(EntityKind::Iban, 2)]),
             ],
         );
         levels.insert(
@@ -263,19 +269,26 @@ mod tests {
             .collect()
     }
 
+    fn open(folders: &[&str]) -> HashSet<PathBuf> {
+        folders.iter().map(PathBuf::from).collect()
+    }
+
     #[test]
-    fn the_top_level_lists_what_holds_most_first() {
+    fn the_top_level_lists_the_drives_that_hold_most_first() {
         let levels = levels();
         let lines = lines(&levels, Path::new(""), &HashSet::new(), None, None);
-        assert_eq!(names(&lines), ["Docs", "Mail", ""]);
+        assert_eq!(names(&lines), ["C:", "D:"]);
     }
 
     #[test]
     fn an_open_folder_lists_its_contents_under_it_indented() {
         let levels = levels();
-        let open: HashSet<PathBuf> = [PathBuf::from(r"C:\Docs")].into();
+        let open = open(&[r"C:\", r"C:\Docs"]);
         let lines = lines(&levels, Path::new(""), &open, None, None);
-        assert_eq!(names(&lines), ["Docs", "Taxes", "a.pdf", "Mail", ""]);
+        assert_eq!(
+            names(&lines),
+            ["C:", "Docs", "Taxes", "a.pdf", "Mail", "D:"]
+        );
         let depths: Vec<usize> = lines
             .iter()
             .filter_map(|line| match line {
@@ -283,33 +296,26 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(depths, [0, 1, 1, 0, 0]);
+        assert_eq!(depths, [0, 1, 2, 2, 1, 0]);
         // Whether it is open is what the row says.
         assert!(matches!(&lines[0], Line::Row(row) if row.open));
-        assert!(matches!(&lines[3], Line::Row(row) if !row.open));
+        assert!(matches!(&lines[4], Line::Row(row) if !row.open));
     }
 
     #[test]
     fn a_folder_that_is_open_but_not_loaded_has_nothing_under_it_yet() {
         let levels = levels();
-        let open: HashSet<PathBuf> = [PathBuf::from(r"C:\Mail")].into();
-        let lines = lines(&levels, Path::new(""), &open, None, None);
-        assert_eq!(names(&lines), ["Docs", "Mail", ""]);
+        let lines = lines(&levels, Path::new(""), &open(&[r"D:\"]), None, None);
+        assert_eq!(names(&lines), ["C:", "D:"]);
         assert!(matches!(&lines[1], Line::Row(row) if !row.open));
     }
 
     #[test]
-    fn the_scans_outside_the_locations_cannot_be_opened() {
+    fn a_folder_on_show_is_the_top_of_the_tree_and_not_a_row() {
         let levels = levels();
-        let lines = lines(&levels, Path::new(""), &HashSet::new(), None, None);
-        let expandable: Vec<bool> = lines
-            .iter()
-            .filter_map(|line| match line {
-                Line::Row(row) => Some(row.expandable()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(expandable, [true, true, false]);
+        let lines = lines(&levels, Path::new(r"C:\"), &open(&[r"C:\Docs"]), None, None);
+        assert_eq!(names(&lines), ["Docs", "Taxes", "a.pdf", "Mail"]);
+        assert!(matches!(&lines[0], Line::Row(row) if row.depth == 0));
     }
 
     #[test]
@@ -322,7 +328,7 @@ mod tests {
             None,
             Some(EntityKind::Person),
         );
-        assert_eq!(names(&lines), ["Docs"]);
+        assert_eq!(names(&lines), ["C:"]);
         let Line::Row(row) = &lines[0] else {
             panic!("a row");
         };
@@ -341,33 +347,44 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!((shares[0] - 50.0 / 57.0).abs() < 1e-9);
+        assert!((shares[0] - 55.0 / 57.0).abs() < 1e-9);
         assert!((shares.iter().sum::<f64>() - 1.0).abs() < 1e-9);
     }
 
     #[test]
     fn the_way_to_the_pinned_path_comes_first_at_each_level() {
         let levels = levels();
-        let open: HashSet<PathBuf> = [PathBuf::from(r"C:\Docs")].into();
         // The small file is pinned: its folder is listed first anyway, and the file before the
         // folder next to it that holds more.
         let lines = lines(
             &levels,
             Path::new(""),
-            &open,
+            &open(&[r"C:\", r"C:\Docs"]),
             Some(Path::new(r"C:\Docs\a.pdf")),
             None,
         );
-        assert_eq!(names(&lines), ["Docs", "a.pdf", "Taxes", "Mail", ""]);
+        assert_eq!(
+            names(&lines),
+            ["C:", "Docs", "a.pdf", "Taxes", "Mail", "D:"]
+        );
         // A pin on the mail puts Mail ahead of Docs.
         let lines = super::lines(
             &levels,
             Path::new(""),
-            &HashSet::new(),
+            &open(&[r"C:\"]),
             Some(Path::new(r"C:\Mail")),
             None,
         );
-        assert_eq!(names(&lines), ["Mail", "Docs", ""]);
+        assert_eq!(names(&lines), ["C:", "Mail", "Docs", "D:"]);
+        // A pin on a file of the smaller drive puts that drive first.
+        let lines = super::lines(
+            &levels,
+            Path::new(""),
+            &HashSet::new(),
+            Some(Path::new(r"D:\Backup\a.txt")),
+            None,
+        );
+        assert_eq!(names(&lines), ["D:", "C:"]);
     }
 
     #[test]
@@ -461,9 +478,9 @@ mod tests {
     #[test]
     fn a_row_is_found_again_by_its_path() {
         let levels = levels();
-        let open: HashSet<PathBuf> = [PathBuf::from(r"C:\Docs")].into();
+        let open = open(&[r"C:\", r"C:\Docs"]);
         let lines = lines(&levels, Path::new(""), &open, None, None);
-        assert_eq!(position(&lines, Path::new(r"C:\Docs\a.pdf")), Some(2));
+        assert_eq!(position(&lines, Path::new(r"C:\Docs\a.pdf")), Some(3));
         assert_eq!(position(&lines, Path::new(r"C:\Gone")), None);
     }
 }

@@ -250,7 +250,7 @@ impl Headless {
         for (name, text) in files {
             fs::write(folder.join(name), text).describe()?;
         }
-        // A location, so its files are a folder of the tree and not "Other scans".
+        // A location, so the Inventory page has a row for it.
         self.controller.submit(Command::Edit(Edit::InventoryRoot {
             path: folder.clone(),
             on: true,
@@ -1111,6 +1111,29 @@ fn a_scan_that_counts_files_rebuilds_nothing_but_its_own_progress() -> Test {
     Ok(())
 }
 
+/// The drive `path` is on as the top of the tree names it, and the root of the drive.
+fn drive_of(path: &Path) -> (String, PathBuf) {
+    let name = path
+        .components()
+        .next()
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .unwrap_or_default();
+    (
+        name,
+        path.components()
+            .take(piikey::sys::volume_len(path))
+            .collect(),
+    )
+}
+
+/// The names of the folders of `path` below its drive, the first one first.
+fn below_the_drive(path: &Path) -> Vec<String> {
+    path.components()
+        .skip(piikey::sys::volume_len(path))
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .collect()
+}
+
 /// A window on a controller whose inventory holds what `files` hold, in a folder that is one of
 /// its locations.
 fn scanned_window(files: &[(&str, &str)]) -> Result<(Headless, PathBuf), String> {
@@ -1128,20 +1151,45 @@ fn the_inventory_dashboard_lists_what_was_scanned_in_the_tree_the_legend_the_map
     ])?;
     ui.send(Msg::Nav(Page::Inventory))?;
     let drawn = ui.loaded(Store::Inventory, Path::new(""))?;
+    // The tree starts at the drive the files are on, as the computer does, with no grouping of
+    // its own.
+    let (drive, root) = drive_of(&folder);
     expect_drawn(
         "the dashboard",
         &drawn,
         &[
             "This PC",
+            drive.as_str(),
             "All types",
             "Email",
             "The most personal data first",
             "Found",
-            "scanned",
             "a.txt",
             "3 found in 2 files",
         ],
     )?;
+    expect_not_drawn("no grouping of its own", &drawn, &["Other scans"])?;
+    // The drive opens onto its real folders: the first one on the way to what was scanned.
+    let ways = below_the_drive(&folder);
+    ui.send(Msg::Dash(Store::Inventory, Dash::Toggle(root.clone())))?;
+    let opened = ui.loaded_with(
+        Store::Inventory,
+        Path::new(""),
+        std::slice::from_ref(&root),
+        None,
+    )?;
+    expect_drawn("the drive opened", &opened, &[ways[0].as_str()])?;
+
+    // The folder the files lie in on show: the way back is there at once, from This PC through
+    // the drive and the real folders down to it, and its rows are what lies in it.
+    let parent = ui.dir.0.clone();
+    let entered = ui.send(Msg::Dash(Store::Inventory, Dash::Enter(parent.clone())))?;
+    let mut way: Vec<String> = vec!["This PC".to_owned(), drive];
+    way.extend(below_the_drive(&parent));
+    let way: Vec<&str> = way.iter().map(String::as_str).collect();
+    expect_drawn("the way back", &entered, &way)?;
+    let inside = ui.loaded(Store::Inventory, &parent)?;
+    expect_drawn("the folder on show", &inside, &["scanned"])?;
     // A folder row selected: the details offer what applies to a folder.
     let folder_row = ui.send(Msg::Dash(
         Store::Inventory,
@@ -1170,7 +1218,7 @@ fn the_inventory_dashboard_lists_what_was_scanned_in_the_tree_the_legend_the_map
     )?;
     expect_not_drawn("nothing to scan again", &picked, &["Scan this"])?;
     // The load that follows brings the entry of the file: when it was scanned, and how big.
-    let entry = ui.loaded_with(Store::Inventory, Path::new(""), &[folder], Some(&file))?;
+    let entry = ui.loaded_with(Store::Inventory, &parent, &[folder], Some(&file))?;
     assert!(
         entry.iter().any(|text| text.starts_with("Last scanned ")),
         "{entry:?}"
@@ -1303,10 +1351,17 @@ fn the_dialog_of_a_running_scan_shows_each_file_and_closing_it_stops_the_scan() 
         &[
             "Scanned 3 of 12 files\u{2026}",
             "report.pdf",
-            "Reading scanned page 3 of 9\u{2026}",
+            "22 %",
             "letters.txt",
-            "Looking for names and addresses\u{2026} 40 %",
+            "40 %",
             "notes.docx",
+        ],
+    )?;
+    expect_not_drawn(
+        "a bar, not words",
+        &drawn,
+        &[
+            "Looking for names and addresses\u{2026} 40 %",
             "Reading\u{2026}",
         ],
     )?;
@@ -1780,14 +1835,17 @@ fn inventory_lists_its_locations_like_watch_lists_its_folders() -> Test {
     expect_not_drawn("no location rows", &empty, &["Remove"])?;
     let before = ui.poll()?;
     // A row for the location, with what the inventory holds of it before the load says more.
-    expect_drawn("locations", &before, &["Remove", "Nothing found yet"])?;
-    let drawn = ui.loaded(Store::Inventory, Path::new(""))?;
     let path = folder.display().to_string();
     expect_drawn(
-        "the scanned location",
-        &drawn,
-        &[path.as_str(), "3 found in 2 files"],
+        "locations",
+        &before,
+        &[path.as_str(), "Remove", "Nothing found yet"],
     )?;
+    let drawn = ui.loaded(Store::Inventory, Path::new(""))?;
+    expect_drawn("the scanned location", &drawn, &["3 found in 2 files"])?;
+    // The row of the location counts what lies in its folder, by its path; the details of the
+    // top say the same of everything: that makes two.
+    assert_eq!(times(&drawn, "3 found in 2 files"), 2, "{drawn:?}");
     // Taking a location off the list asks the controller, which saves it.
     ui.send(Msg::RemoveLocation(folder))?;
     assert!(ui.controller.wait_idle(WAIT));
@@ -1827,8 +1885,11 @@ fn picking_a_tile_of_another_folder_makes_a_new_tree_and_never_moves_the_rows_of
     if !ui.controller.wait_idle(WAIT) || !ui.controller.wait_scans(WAIT) {
         return Err("the scan did not finish".to_owned());
     }
+    // The folder the two lie in is on show, so its rows are the two folders.
+    let top = ui.dir.0.clone();
     ui.send(Msg::Nav(Page::Inventory))?;
-    ui.loaded(Store::Inventory, Path::new(""))?;
+    ui.send(Msg::Dash(Store::Inventory, Dash::Enter(top.clone())))?;
+    ui.loaded(Store::Inventory, &top)?;
     // The folder that holds more is listed first; a tile of the other one is picked, so its way
     // comes first: the rows would have to change places.
     let first = mail.join("a.txt");
@@ -1837,12 +1898,7 @@ fn picking_a_tile_of_another_folder_makes_a_new_tree_and_never_moves_the_rows_of
         Store::Inventory,
         Dash::Select(first, Origin::Map),
     ))?;
-    ui.loaded_with(
-        Store::Inventory,
-        Path::new(""),
-        std::slice::from_ref(&mail),
-        None,
-    )?;
+    ui.loaded_with(Store::Inventory, &top, std::slice::from_ref(&mail), None)?;
     let before = ui.host.adapter().batches().len();
     ui.send(Msg::Dash(
         Store::Inventory,
@@ -1852,8 +1908,33 @@ fn picking_a_tile_of_another_folder_makes_a_new_tree_and_never_moves_the_rows_of
     assert_eq!(made, 1, "the rows changed places in a list that stayed");
     // The same rows again keep their list.
     let before = ui.host.adapter().batches().len();
-    ui.loaded_with(Store::Inventory, Path::new(""), &[mail, docs], None)?;
+    ui.loaded_with(Store::Inventory, &top, &[mail, docs], None)?;
     let made = created(&ui.host.adapter().batches()[before..], ObjectType::ListView);
     assert_eq!(made, 0, "rows that only came made a new list");
+    Ok(())
+}
+
+#[test]
+fn each_folder_on_show_gets_a_tree_list_of_its_own() -> Test {
+    // A list whose rows were all replaced twice showed stale rows, so going into a folder and back
+    // out makes a list each time, and the load that fills it goes into it.
+    let (mut ui, folder) = scanned_window(&[("a.txt", "mail jan.jansen@acme.nl")])?;
+    ui.send(Msg::Nav(Page::Inventory))?;
+    ui.loaded(Store::Inventory, Path::new(""))?;
+    let lists = |ui: &Headless, from: usize| {
+        created(&ui.host.adapter().batches()[from..], ObjectType::ListView)
+    };
+    let before = ui.host.adapter().batches().len();
+    ui.send(Msg::Dash(Store::Inventory, Dash::Enter(folder.clone())))?;
+    ui.loaded(Store::Inventory, &folder)?;
+    assert_eq!(lists(&ui, before), 1, "into a folder");
+    let before = ui.host.adapter().batches().len();
+    ui.send(Msg::Dash(Store::Inventory, Dash::Enter(PathBuf::new())))?;
+    ui.loaded(Store::Inventory, Path::new(""))?;
+    assert_eq!(lists(&ui, before), 1, "back to the top");
+    // The same folder read again (a folder opened, a scan that ended) keeps its list.
+    let before = ui.host.adapter().batches().len();
+    ui.loaded(Store::Inventory, Path::new(""))?;
+    assert_eq!(lists(&ui, before), 0, "the same folder again");
     Ok(())
 }

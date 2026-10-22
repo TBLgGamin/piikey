@@ -89,8 +89,6 @@ const SKIPPED_DIRS: [&str; 6] = [
 ];
 /// `FILE_ATTRIBUTE_HIDDEN` and `_SYSTEM`: not the user's files.
 const HIDDEN_OR_SYSTEM: u32 = 0x2 | 0x4;
-/// What a node that stands for entries under none of the folders it is grouped by is called.
-const OTHER: &str = "Other scans";
 
 /// What a scan found out about one file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -242,10 +240,10 @@ impl Entry {
 /// A folder or a file of the tree: what lies under it, added up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Node {
-    /// Empty for the node that stands for the scans outside every folder the tree is grouped
-    /// by.
+    /// Where it is. For a volume at the top of the tree, its root (`C:\`).
     pub path: PathBuf,
-    /// The last component of `path`, for display.
+    /// The last component of `path`, for display. A volume is called what Explorer calls it:
+    /// the drive (`C:`) or the share (`\\server\share`).
     pub name: String,
     pub is_dir: bool,
     /// Values found in the files under it.
@@ -1028,19 +1026,35 @@ impl Inventory {
     ///
     /// With `under`, the entries below it, grouped by the next component of their path: a
     /// folder node for what lies deeper, a file node for a file in `under` itself. Without,
-    /// one folder node per folder in `roots` (the locations, or the watched folders) that has
-    /// entries; entries under none of them make one more node, with an empty `path` and the
-    /// name "Other scans". Of nested roots the deepest one takes an entry.
+    /// the top of the tree: one node for each volume that holds entries, a drive (`C:`) or a
+    /// share (`\\server\share`), with the root of the volume as its path (`C:\`). Below a volume
+    /// lie its real folders and files, spelled as the first entry under them spells them.
     #[must_use]
-    pub fn children(&self, under: Option<&Path>, roots: &[PathBuf]) -> Vec<Node> {
+    pub fn children(&self, under: Option<&Path>) -> Vec<Node> {
         let state = self.read();
         let held = state.entries.values().filter(|entry| entry.hits() > 0);
-        let mut nodes = match under {
-            Some(under) => below(held, under),
-            None => top_level(held, roots),
-        };
+        let mut nodes = below(held, under);
         nodes.sort_by(|a, b| b.hits.cmp(&a.hits).then_with(|| a.name.cmp(&b.name)));
         nodes
+    }
+
+    /// The node of the tree at `path`, any folder or file of it: what lies at and under it,
+    /// added up, with the path as it was given. `None` when no file there holds personal data.
+    #[must_use]
+    pub fn node(&self, path: &Path) -> Option<Node> {
+        let state = self.read();
+        let depth = path.components().count();
+        let mut tally: Option<Tally> = None;
+        for entry in state
+            .entries
+            .values()
+            .filter(|entry| entry.hits() > 0 && sys::is_under(&entry.path, path))
+        {
+            tally
+                .get_or_insert_with(|| Tally::new(path.to_path_buf(), name_of(path)))
+                .add(entry, entry.path.components().count() > depth);
+        }
+        tally.map(Tally::finish)
     }
 
     /// Writes the entries at and under `under` (all for `None`) that hold personal data, or
@@ -1411,18 +1425,18 @@ fn lowercase_into(name: &OsStr, into: &mut String) {
     into.extend(name.to_string_lossy().chars().flat_map(char::to_lowercase));
 }
 
-/// What a folder the nodes are grouped by is called: its last component, or all of it for a
-/// drive.
-fn folder_name(root: &Path) -> String {
-    root.file_name().map_or_else(
-        || root.display().to_string(),
-        |name| name.to_string_lossy().into_owned(),
-    )
+/// What a node at `path` is called: its last component, or for a drive or a share, its name.
+fn name_of(path: &Path) -> String {
+    path.file_name()
+        .or_else(|| path.components().next().map(Component::as_os_str))
+        .map_or_else(String::new, |name| name.to_string_lossy().into_owned())
 }
 
-/// The component of `path` right below `base`, and whether something lies below that (it is a
-/// folder), or `None` when `path` is not below `base`.
-fn child_of<'a>(path: &'a Path, base: &[Component<'_>]) -> Option<(Component<'a>, bool)> {
+/// The component of `path` right below `base`, how many components of `path` lead to it, and
+/// whether something lies below that (it is a folder); `None` when `path` is not below `base`.
+/// Below nothing (an empty `base`) lie the volumes, and a drive or a share takes its root along:
+/// the two are one step.
+fn child_of<'a>(path: &'a Path, base: &[Component<'_>]) -> Option<(Component<'a>, usize, bool)> {
     let mut components = path.components();
     for want in base {
         if !components
@@ -1433,18 +1447,32 @@ fn child_of<'a>(path: &'a Path, base: &[Component<'_>]) -> Option<(Component<'a>
         }
     }
     let next = components.next()?;
-    Some((next, components.next().is_some()))
+    let step = if base.is_empty() {
+        sys::volume_len(path).max(1)
+    } else {
+        1
+    };
+    for _ in 1..step {
+        components.next();
+    }
+    Some((next, base.len() + step, components.next().is_some()))
 }
 
 /// The nodes one level below `under`, one for each next component of the paths of `entries`: a
-/// folder node for what lies deeper, a file node for a file in `under` itself. A node is spelled
+/// folder node for what lies deeper, a file node for a file in `under` itself. Without `under`
+/// the level is the volumes, a drive or a share with its root being one step. A node is spelled
 /// as the first entry under it spells it.
-fn below<'a>(entries: impl Iterator<Item = &'a Entry>, under: &Path) -> Vec<Node> {
-    let base: Vec<Component<'_>> = under.components().collect();
+fn below<'a>(entries: impl Iterator<Item = &'a Entry>, under: Option<&Path>) -> Vec<Node> {
+    let mut base: Vec<Component<'_>> =
+        under.map_or_else(Vec::new, |under| under.components().collect());
+    // A drive named without its root (`C:`) is the drive, as it is for `sys::is_under`.
+    if matches!(base.as_slice(), [Component::Prefix(_)]) {
+        base.push(Component::RootDir);
+    }
     let mut tallies: HashMap<String, Tally> = HashMap::new();
     let mut key = String::new();
     for entry in entries {
-        let Some((next, deeper)) = child_of(&entry.path, &base) else {
+        let Some((next, taken, deeper)) = child_of(&entry.path, &base) else {
             continue;
         };
         lowercase_into(next.as_os_str(), &mut key);
@@ -1452,43 +1480,13 @@ fn below<'a>(entries: impl Iterator<Item = &'a Entry>, under: &Path) -> Vec<Node
             tally.add(entry, deeper);
             continue;
         }
-        let path: PathBuf = entry.path.components().take(base.len() + 1).collect();
+        let path: PathBuf = entry.path.components().take(taken).collect();
         let name = next.as_os_str().to_string_lossy().into_owned();
         let mut tally = Tally::new(path, name);
         tally.add(entry, deeper);
         tallies.insert(key.clone(), tally);
     }
     tallies.into_values().map(Tally::finish).collect()
-}
-
-/// The top nodes: one for each folder in `roots` that holds any of `entries`, and one with an
-/// empty path for the entries under none of them. Of nested roots the deepest one takes an
-/// entry.
-fn top_level<'a>(entries: impl Iterator<Item = &'a Entry>, roots: &[PathBuf]) -> Vec<Node> {
-    let mut tops: Vec<(&PathBuf, usize, Option<Tally>)> = roots
-        .iter()
-        .map(|root| (root, root.components().count(), None))
-        .collect();
-    let mut other: Option<Tally> = None;
-    for entry in entries {
-        let deepest = tops
-            .iter_mut()
-            .filter(|(root, ..)| sys::is_under(&entry.path, root))
-            .max_by_key(|(_, depth, _)| *depth);
-        let tally = match deepest {
-            Some((root, _, held)) => {
-                let root = *root;
-                held.get_or_insert_with(|| Tally::new(root.clone(), folder_name(root)))
-            }
-            None => other.get_or_insert_with(|| Tally::new(PathBuf::new(), OTHER.to_owned())),
-        };
-        tally.add(entry, true);
-    }
-    tops.into_iter()
-        .filter_map(|(_, _, held)| held)
-        .chain(other)
-        .map(Tally::finish)
-        .collect()
 }
 
 /// A node being added up.
@@ -2000,6 +1998,18 @@ mod tests {
         Ok(())
     }
 
+    /// What a level of the tree lists, as `(name, is_dir, hits, files)`.
+    fn listed(nodes: Vec<Node>) -> Vec<(String, bool, u64, u32)> {
+        nodes
+            .into_iter()
+            .map(|n| (n.name, n.is_dir, n.hits, n.files))
+            .collect()
+    }
+
+    fn row(name: &str, is_dir: bool, hits: u64, files: u32) -> (String, bool, u64, u32) {
+        (name.to_owned(), is_dir, hits, files)
+    }
+
     #[test]
     fn children_group_by_the_next_component_most_values_first() -> Res {
         let tmp = TempDir::new()?;
@@ -2010,72 +2020,176 @@ mod tests {
             entry(r"C:\Users\jan\Documents\work\deep\c.txt", &[(Email, 1)]),
             entry(r"C:\Users\jan\Documents\clean.txt", &[]),
             entry(r"C:\Users\jan\Desktop\d.txt", &[(Email, 2)]),
-            entry(r"D:\elsewhere\e.txt", &[(Email, 1)]),
         ])?;
-        let roots = [
-            PathBuf::from(r"C:\Users\jan\Documents"),
-            PathBuf::from(r"C:\Users\jan\Desktop"),
-            PathBuf::from(r"C:\Users\jan\Pictures"),
-        ];
-        let summary = |nodes: Vec<Node>| -> Vec<(String, bool, u64, u32)> {
-            nodes
-                .into_iter()
-                .map(|n| (n.name, n.is_dir, n.hits, n.files))
-                .collect()
-        };
+        let jan = Path::new(r"C:\Users\jan");
+        let documents = jan.join("Documents");
 
-        let top = inv.children(None, &roots);
+        let level = inv.children(Some(jan));
         assert_eq!(
-            summary(top.clone()),
-            [
-                ("Documents".to_owned(), true, 10, 3),
-                ("Desktop".to_owned(), true, 2, 1),
-                (OTHER.to_owned(), true, 1, 1),
-            ]
+            listed(level.clone()),
+            [row("Documents", true, 10, 3), row("Desktop", true, 2, 1)]
         );
-        assert_eq!(top[0].path, roots[0], "a folder node carries its root");
-        assert!(
-            top[2].path.as_os_str().is_empty(),
-            "the virtual node has no path"
-        );
-        assert_eq!(top[0].counts, [(Phone, 5), (Email, 4), (Iban, 1)]);
-
-        let documents = inv.children(Some(&roots[0]), &roots);
+        assert_eq!(level[0].path, documents, "a folder node carries its path");
+        assert_eq!(level[0].counts, [(Phone, 5), (Email, 4), (Iban, 1)]);
         assert_eq!(
-            summary(documents),
-            [
-                ("work".to_owned(), true, 6, 2),
-                ("a.docx".to_owned(), false, 4, 1)
-            ]
+            listed(inv.children(Some(&documents))),
+            [row("work", true, 6, 2), row("a.docx", false, 4, 1)]
         );
-        let work = inv.children(Some(&roots[0].join("work")), &roots);
         assert_eq!(
-            summary(work),
-            [
-                ("b.xlsx".to_owned(), false, 5, 1),
-                ("deep".to_owned(), true, 1, 1)
-            ]
+            listed(inv.children(Some(&documents.join("work")))),
+            [row("b.xlsx", false, 5, 1), row("deep", true, 1, 1)]
         );
         // Letter case does not matter, and the nodes keep the stored spelling.
-        let shouted = inv.children(Some(Path::new(r"c:\USERS\jan\documents")), &roots);
+        let shouted = inv.children(Some(Path::new(r"c:\USERS\jan\documents")));
         assert_eq!(shouted.len(), 2);
         assert_eq!(shouted[0].path, Path::new(r"C:\Users\jan\Documents\work"));
-        // A file has nothing below it.
+        // A file has nothing below it, and neither has a file that holds nothing.
         assert!(
-            inv.children(Some(Path::new(r"C:\Users\jan\Desktop\d.txt")), &roots)
+            inv.children(Some(Path::new(r"C:\Users\jan\Desktop\d.txt")))
                 .is_empty()
         );
+        assert!(inv.children(Some(&documents.join("clean.txt"))).is_empty());
+        Ok(())
+    }
 
-        // Of nested roots the deepest takes the entry.
-        let nested = [roots[0].clone(), roots[0].join("work")];
+    #[test]
+    fn the_top_of_the_tree_is_the_drives_and_shares_that_hold_entries() -> Res {
+        let tmp = TempDir::new()?;
+        let inv = tmp.inventory()?;
+        inv.record(vec![
+            entry(r"C:\Users\jan\a.txt", &[(Email, 3)]),
+            // The same drive and folders, spelled otherwise.
+            entry(r"c:\users\JAN\b.txt", &[(Phone, 1)]),
+            entry(r"C:\clean.txt", &[]),
+            entry(r"C:\top.txt", &[(Iban, 1)]),
+            entry(r"D:\Backup\c.txt", &[(Email, 2)]),
+            entry(r"\\nas\share\docs\d.txt", &[(Email, 5)]),
+            entry(r"\\NAS\Share\e.txt", &[(Phone, 1)]),
+            entry(r"\\nas\other\f.txt", &[(Iban, 1)]),
+            // A drive that holds nothing is not listed.
+            entry(r"E:\empty\g.txt", &[]),
+        ])?;
+
+        let top = inv.children(None);
+        let names: Vec<String> = top.iter().map(|node| node.name.to_lowercase()).collect();
+        assert_eq!(names, [r"\\nas\share", "c:", "d:", r"\\nas\other"]);
+        // Every volume is a folder, and the files of both spellings of a drive count once.
+        let counts: Vec<(u64, u32, bool)> = top
+            .iter()
+            .map(|node| (node.hits, node.files, node.is_dir))
+            .collect();
         assert_eq!(
-            summary(inv.children(None, &nested)),
+            counts,
+            [(6, 2, true), (5, 3, true), (2, 1, true), (1, 1, true)]
+        );
+        // A volume is called as Explorer calls it and its path is its root; a spelling is the
+        // one of the first entry under it.
+        assert_eq!(top[0].name, r"\\NAS\Share");
+        assert_eq!(top[0].path, Path::new(r"\\NAS\Share\"));
+        assert_eq!(
+            (top[1].name.as_str(), top[1].path.as_path()),
+            ("C:", Path::new(r"C:\"))
+        );
+        assert_eq!(
+            (top[2].name.as_str(), top[2].path.as_path()),
+            ("D:", Path::new(r"D:\"))
+        );
+
+        // Below a drive lie its folders and files, however the drive is asked for.
+        for drive in [r"C:\", r"c:\", "C:", "c:"] {
+            assert_eq!(
+                listed(inv.children(Some(Path::new(drive)))),
+                [row("Users", true, 4, 2), row("top.txt", false, 1, 1)],
+                "{drive}"
+            );
+        }
+        // And below a share, whatever case or ending the name has.
+        for share in [r"\\nas\share\", r"\\nas\share", r"\\NAS\SHARE\"] {
+            assert_eq!(
+                listed(inv.children(Some(Path::new(share)))),
+                [row("docs", true, 5, 1), row("e.txt", false, 1, 1)],
+                "{share}"
+            );
+        }
+        assert_eq!(
+            listed(inv.children(Some(Path::new(r"D:\")))),
+            [row("Backup", true, 2, 1)]
+        );
+        assert!(inv.children(Some(Path::new(r"E:\"))).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_path_that_names_no_drive_still_has_a_top() -> Res {
+        let tmp = TempDir::new()?;
+        let inv = tmp.inventory()?;
+        inv.record(vec![
+            entry(r"\rooted\a.txt", &[(Email, 2)]),
+            entry(r"rel\b.txt", &[(Email, 1)]),
+            entry(r"C:\c.txt", &[(Email, 1)]),
+        ])?;
+        let top = inv.children(None);
+        assert_eq!(
+            listed(top.clone()),
             [
-                ("work".to_owned(), true, 6, 2),
-                ("Documents".to_owned(), true, 4, 1),
-                (OTHER.to_owned(), true, 3, 2),
+                row(r"\", true, 2, 1),
+                row("C:", true, 1, 1),
+                row("rel", true, 1, 1)
             ]
         );
+        assert_eq!(top[0].path, Path::new(r"\"));
+        assert_eq!(top[2].path, Path::new("rel"));
+        assert_eq!(
+            listed(inv.children(Some(Path::new("rel")))),
+            [row("b.txt", false, 1, 1)]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_node_of_a_path_adds_up_what_lies_at_and_under_it() -> Res {
+        let tmp = TempDir::new()?;
+        let inv = tmp.inventory()?;
+        inv.record(vec![
+            entry(r"C:\Users\jan\Documents\a.docx", &[(Email, 3), (Iban, 1)]),
+            entry(r"C:\Users\jan\Documents\work\b.xlsx", &[(Phone, 5)]),
+            entry(r"C:\Users\jan\Documents\clean.txt", &[]),
+            entry(r"C:\Users\jan\Desktop\d.txt", &[(Email, 2)]),
+            entry(r"D:\Backup\e.txt", &[(Email, 1)]),
+        ])?;
+        let node = |path: &str| {
+            inv.node(Path::new(path))
+                .map(|n| (n.name, n.is_dir, n.hits, n.files))
+        };
+        let some = |name: &str, is_dir, hits, files| Some(row(name, is_dir, hits, files));
+        // A folder, in the spelling it is asked for; folders inside one another each count what
+        // lies in them.
+        assert_eq!(
+            node(r"c:\users\JAN\documents"),
+            some("documents", true, 9, 2)
+        );
+        assert_eq!(
+            node(r"C:\Users\jan\Documents\work"),
+            some("work", true, 5, 1)
+        );
+        // A file is a node with nothing below it.
+        assert_eq!(
+            node(r"C:\Users\jan\Desktop\d.txt"),
+            some("d.txt", false, 2, 1)
+        );
+        // A drive is called as the top of the tree calls it.
+        assert_eq!(node(r"C:\"), some("C:", true, 11, 3));
+        // Nothing found there: no node.
+        assert_eq!(node(r"C:\Users\jan\Documents\clean.txt"), None);
+        assert_eq!(node(r"E:\"), None);
+
+        // It is what the listing of the parent says of the folder.
+        let listed = inv
+            .children(Some(Path::new(r"C:\Users\jan")))
+            .into_iter()
+            .find(|node| node.name == "Documents")
+            .ok_or("not listed")?;
+        assert_eq!(inv.node(&listed.path), Some(listed));
         Ok(())
     }
 

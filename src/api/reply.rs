@@ -137,7 +137,8 @@ pub struct Entries {
     pub total: usize,
 }
 
-/// `inventory_tree`: what lies directly under a folder, or the watched folders.
+/// `inventory_tree`: what lies directly under a folder, or the drives and shares that hold files
+/// with personal data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Nodes {
     pub nodes: Vec<Node>,

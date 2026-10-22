@@ -340,6 +340,17 @@ pub fn same_component(a: Component<'_>, b: Component<'_>) -> bool {
         })
 }
 
+/// How many leading components of `path` name the volume it is on: the drive and its root (`C:`
+/// and `\`), a network share and its root (`\\server\share` and `\`), or only the root of a
+/// path that names no drive. 0 for a relative path. `std` gives the root of a share as a
+/// component of its own, so a drive and a share count alike.
+#[must_use]
+pub fn volume_len(path: &Path) -> usize {
+    path.components()
+        .take_while(|part| matches!(part, Component::Prefix(_) | Component::RootDir))
+        .count()
+}
+
 /// `%SystemRoot%\System32`, where the tools that ship with Windows are.
 #[must_use]
 pub fn system_dir() -> PathBuf {
@@ -657,6 +668,27 @@ mod tests {
             let (a, b) = (Path::new(a), Path::new(b));
             assert_eq!(path_key(a) == path_key(b), same_path(a, b), "{a:?} {b:?}");
         }
+    }
+
+    #[test]
+    fn a_volume_is_the_drive_or_share_with_its_root() {
+        let len = |path: &str| volume_len(Path::new(path));
+        assert_eq!(len(r"C:\Users\jan\a.txt"), 2);
+        assert_eq!(len("c:/users"), 2);
+        assert_eq!(len(r"C:\"), 2);
+        assert_eq!(len(r"\\server\share\dir\a.txt"), 2);
+        assert_eq!(
+            len(r"\\server\share"),
+            2,
+            "a share has its root without a separator"
+        );
+        assert_eq!(len(r"\\?\C:\a"), 2);
+        assert_eq!(len(r"\\?\UNC\server\share\a"), 2);
+        // Only the root, or nothing at all.
+        assert_eq!(len(r"\Users\jan"), 1);
+        assert_eq!(len("C:"), 1, "a drive named without its root is not rooted");
+        assert_eq!(len(r"docs\a.txt"), 0);
+        assert_eq!(len(""), 0);
     }
 
     #[test]

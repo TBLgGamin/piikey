@@ -1,9 +1,9 @@
-//! The way back up from the folder a dashboard shows: "This PC", the location the folder lies in,
-//! and the folders below it, each a step to go back to.
+//! The way back up from the folder a dashboard shows: "This PC", the drive the folder is on and
+//! the real folders from there down to it, each a step to go back to.
 
 use std::path::{Component, Path, PathBuf};
 
-use piikey::sys::is_under;
+use piikey::sys::volume_len;
 
 use crate::ui::controller::Store;
 
@@ -15,12 +15,12 @@ pub(super) struct Crumb {
     pub(super) target: PathBuf,
 }
 
-/// The last component of `path`: the name of a folder or a file; a drive keeps its whole path.
+/// The name of a file or folder: its last component. A drive or a share has none and is called
+/// by its own name (`C:`, `\\server\share`), as the tree calls it.
 pub(super) fn name_of(path: &Path) -> String {
-    path.file_name().map_or_else(
-        || path.display().to_string(),
-        |name| name.to_string_lossy().into_owned(),
-    )
+    path.file_name()
+        .or_else(|| path.components().next().map(Component::as_os_str))
+        .map_or_else(String::new, |name| name.to_string_lossy().into_owned())
 }
 
 /// What the top level of a store is called.
@@ -31,33 +31,22 @@ pub(super) const fn top_label(store: Store) -> &'static str {
     }
 }
 
-/// The crumbs from the top level, called `top`, to `at`. Everything up to the deepest of the
-/// `roots` that holds `at` is one crumb, named after that folder. Without such a folder every
-/// component is a crumb, except that the drive and its root (`C:` and `\`) are one: `C:\`.
-pub(super) fn crumbs(at: &Path, roots: &[PathBuf], top: &str) -> Vec<Crumb> {
+/// The crumbs from the top level, called `top`, to `at`: the drive or share it is on (its name
+/// and its root are one crumb, `C:` leading to `C:\`) and every folder from there down.
+pub(super) fn crumbs(at: &Path, top: &str) -> Vec<Crumb> {
     let mut trail = vec![Crumb {
         label: top.to_owned(),
         target: PathBuf::new(),
     }];
-    let deepest = roots
-        .iter()
-        .filter(|root| is_under(at, root))
-        .max_by_key(|root| root.components().count());
-    let (mut path, skip) = if let Some(root) = deepest {
-        (root.clone(), root.components().count())
-    } else {
-        let lead = at
-            .components()
-            .take_while(|part| matches!(part, Component::Prefix(_) | Component::RootDir));
-        (lead.clone().collect::<PathBuf>(), lead.count())
-    };
-    if skip > 0 {
+    let mut parts = at.components();
+    let mut path: PathBuf = parts.by_ref().take(volume_len(at)).collect();
+    if !path.as_os_str().is_empty() {
         trail.push(Crumb {
             label: name_of(&path),
             target: path.clone(),
         });
     }
-    for part in at.components().skip(skip) {
+    for part in parts {
         path.push(part.as_os_str());
         trail.push(Crumb {
             label: part.as_os_str().to_string_lossy().into_owned(),
@@ -71,10 +60,6 @@ pub(super) fn crumbs(at: &Path, roots: &[PathBuf], top: &str) -> Vec<Crumb> {
 mod tests {
     use super::*;
 
-    fn roots(paths: &[&str]) -> Vec<PathBuf> {
-        paths.iter().map(PathBuf::from).collect()
-    }
-
     fn labels(trail: &[Crumb]) -> Vec<&str> {
         trail.iter().map(|crumb| crumb.label.as_str()).collect()
     }
@@ -84,88 +69,75 @@ mod tests {
     }
 
     #[test]
-    fn the_way_up_starts_at_this_pc_and_folds_the_location_into_one_crumb() {
-        let roots = roots(&[r"C:\Users\me\Documents"]);
-        let top = crumbs(Path::new(""), &roots, "This PC");
+    fn the_way_up_starts_at_this_pc_and_goes_down_through_the_real_folders_from_the_drive() {
+        let top = crumbs(Path::new(""), "This PC");
         assert_eq!(labels(&top), ["This PC"]);
         assert_eq!(targets(&top), [Path::new("")]);
 
-        let deep = crumbs(
-            Path::new(r"C:\Users\me\Documents\Taxes\2024"),
-            &roots,
-            "This PC",
+        let deep = crumbs(Path::new(r"C:\Users\me\Documents\Taxes"), "This PC");
+        assert_eq!(
+            labels(&deep),
+            ["This PC", "C:", "Users", "me", "Documents", "Taxes"]
         );
-        assert_eq!(labels(&deep), ["This PC", "Documents", "Taxes", "2024"]);
         assert_eq!(
             targets(&deep),
             [
                 Path::new(""),
+                Path::new(r"C:\"),
+                Path::new(r"C:\Users"),
+                Path::new(r"C:\Users\me"),
                 Path::new(r"C:\Users\me\Documents"),
                 Path::new(r"C:\Users\me\Documents\Taxes"),
-                Path::new(r"C:\Users\me\Documents\Taxes\2024"),
             ]
         );
 
-        let at_root = crumbs(Path::new(r"C:\Users\me\Documents"), &roots, "This PC");
-        assert_eq!(labels(&at_root), ["This PC", "Documents"]);
+        let drive = crumbs(Path::new(r"C:\"), "This PC");
+        assert_eq!(labels(&drive), ["This PC", "C:"]);
+        assert_eq!(targets(&drive), [Path::new(""), Path::new(r"C:\")]);
     }
 
     #[test]
-    fn the_deepest_location_names_the_first_crumb() {
-        let roots = roots(&[r"C:\Users\me", r"C:\Users\me\Documents"]);
-        let trail = crumbs(Path::new(r"C:\Users\me\Documents\Taxes"), &roots, "This PC");
-        assert_eq!(labels(&trail), ["This PC", "Documents", "Taxes"]);
-        let trail = crumbs(Path::new(r"C:\Users\me\Pictures"), &roots, "This PC");
-        assert_eq!(labels(&trail), ["This PC", "me", "Pictures"]);
-    }
-
-    #[test]
-    fn locations_match_without_regard_to_case_even_beyond_ascii() {
-        let roots = roots(&[r"C:\Users\Me\Documents"]);
-        let trail = crumbs(Path::new(r"c:\users\me\documents\x"), &roots, "This PC");
-        assert_eq!(labels(&trail), ["This PC", "Documents", "x"]);
-        assert_eq!(trail[1].target, Path::new(r"C:\Users\Me\Documents"));
-
-        let roots = self::roots(&[r"C:\Users\ÜNAL\Documents"]);
-        let trail = crumbs(Path::new(r"c:\users\ünal\documents\x"), &roots, "This PC");
-        assert_eq!(labels(&trail), ["This PC", "Documents", "x"]);
-        assert_eq!(trail[1].target, Path::new(r"C:\Users\ÜNAL\Documents"));
-    }
-
-    #[test]
-    fn without_a_location_every_component_is_a_crumb_and_the_drive_is_one() {
-        let trail = crumbs(
-            Path::new(r"C:\Temp\pk"),
-            &roots(&[r"C:\Users\me\Documents"]),
-            "This PC",
-        );
-        assert_eq!(labels(&trail), ["This PC", r"C:\", "Temp", "pk"]);
+    fn a_network_share_is_a_drive_and_the_spelling_of_the_path_is_kept() {
+        let trail = crumbs(Path::new(r"\\nas\Share\docs\2024"), "This PC");
+        assert_eq!(labels(&trail), ["This PC", r"\\nas\Share", "docs", "2024"]);
         assert_eq!(
             targets(&trail),
             [
                 Path::new(""),
-                Path::new(r"C:\"),
-                Path::new(r"C:\Temp"),
-                Path::new(r"C:\Temp\pk"),
+                Path::new(r"\\nas\Share\"),
+                Path::new(r"\\nas\Share\docs"),
+                Path::new(r"\\nas\Share\docs\2024"),
             ]
         );
+        let lower = crumbs(Path::new(r"d:\Mixed\Case"), "This PC");
+        assert_eq!(labels(&lower), ["This PC", "d:", "Mixed", "Case"]);
+    }
+
+    #[test]
+    fn a_path_that_names_no_drive_has_a_crumb_for_each_component() {
+        let trail = crumbs(Path::new(r"docs\2024"), "This PC");
+        assert_eq!(labels(&trail), ["This PC", "docs", "2024"]);
+        assert_eq!(
+            targets(&trail),
+            [Path::new(""), Path::new("docs"), Path::new(r"docs\2024")]
+        );
+        let rooted = crumbs(Path::new(r"\docs"), "This PC");
+        assert_eq!(labels(&rooted), ["This PC", r"\", "docs"]);
     }
 
     #[test]
     fn each_store_names_its_top_level() {
         assert_eq!(top_label(Store::Inventory), "This PC");
         assert_eq!(top_label(Store::Watch), "Watched folders");
-        let trail = crumbs(
-            Path::new(r"C:\Down"),
-            &roots(&[r"C:\Down"]),
-            "Watched folders",
-        );
-        assert_eq!(labels(&trail), ["Watched folders", "Down"]);
+        let trail = crumbs(Path::new(r"C:\Down"), "Watched folders");
+        assert_eq!(labels(&trail), ["Watched folders", "C:", "Down"]);
     }
 
     #[test]
-    fn a_file_or_a_drive_is_named_by_its_last_component() {
+    fn a_file_or_folder_is_named_by_its_last_component_and_a_drive_by_its_own_name() {
         assert_eq!(name_of(Path::new(r"C:\Docs\a.pdf")), "a.pdf");
-        assert_eq!(name_of(Path::new(r"C:\")), r"C:\");
+        assert_eq!(name_of(Path::new(r"C:\")), "C:");
+        assert_eq!(name_of(Path::new(r"\\nas\share\")), r"\\nas\share");
+        assert_eq!(name_of(Path::new(r"\\nas\share\docs")), "docs");
     }
 }

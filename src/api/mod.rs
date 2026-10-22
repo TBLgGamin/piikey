@@ -152,8 +152,9 @@ pub enum Request {
         #[serde(default)]
         offset: usize,
     },
-    /// The tiles of the inventory's tree at one level: what lies directly under `under`, or its
-    /// folders (the locations it scans) without it. Result: [`reply::Nodes`].
+    /// The tiles of the inventory's tree at one level: what lies directly under `under`, or
+    /// without it the drives and network shares that hold files with personal data (`C:`, with
+    /// `C:\` as the path). Result: [`reply::Nodes`].
     InventoryTree {
         #[serde(skip_serializing_if = "Option::is_none")]
         under: Option<PathBuf>,

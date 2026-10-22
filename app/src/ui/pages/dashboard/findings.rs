@@ -99,9 +99,8 @@ fn working_text(working: &Working) -> String {
     }
 }
 
-/// What the reading of a file is busy with, in words: the findings view and a scan's dialog say
-/// it alike.
-pub(super) fn busy_text(busy: Busy) -> String {
+/// What the reading of a file is busy with, in words.
+fn busy_text(busy: Busy) -> String {
     match busy {
         Busy::Picture => "Reading a picture\u{2026}".to_owned(),
         Busy::Pages { done, total } => {

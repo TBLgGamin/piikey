@@ -106,9 +106,9 @@ fn status_line(window: &MainWindow) -> View {
 }
 
 /// What the inventory found in `location`, for the row of the location: how much, or that nothing
-/// was found there yet.
-fn location_state(top: &[Node], location: &Path) -> (String, Tone) {
-    match top.iter().find(|node| same_path(&node.path, location)) {
+/// was found there yet. `places` is what a load counted for each location.
+fn location_state(places: &[Node], location: &Path) -> (String, Tone) {
+    match places.iter().find(|node| same_path(&node.path, location)) {
         Some(node) => (
             format!(
                 "{} found in {}",
@@ -135,16 +135,16 @@ fn locations(window: &MainWindow, context: Context<'_>) -> (View, f64) {
             60.0,
         );
     }
-    let top: &[Node] = window
+    let places: &[Node] = window
         .inventory
         .loaded
         .as_ref()
-        .map_or(&[], |loaded| &loaded.top);
+        .map_or(&[], |loaded| &loaded.places);
     places_card(
         roots
             .iter()
             .map(|location| {
-                let (state, tone) = location_state(top, location);
+                let (state, tone) = location_state(places, location);
                 place_row(
                     location,
                     &state,
@@ -251,13 +251,13 @@ mod tests {
             files: 51,
             counts: Vec::new(),
         };
-        let top = [node];
+        let places = [node];
         assert_eq!(
-            location_state(&top, Path::new(r"c:\users\ME\documents")),
+            location_state(&places, Path::new(r"c:\users\ME\documents")),
             ("711 found in 51 files".to_owned(), Tone::Good)
         );
         assert_eq!(
-            location_state(&top, Path::new(r"C:\Users\me\Desktop")),
+            location_state(&places, Path::new(r"C:\Users\me\Desktop")),
             ("Nothing found yet".to_owned(), Tone::Neutral)
         );
         assert_eq!(location_state(&[], Path::new(r"C:\Docs")).1, Tone::Neutral);

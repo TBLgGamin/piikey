@@ -100,6 +100,11 @@ fn a_change_is_scanned_once_it_has_settled_and_a_removed_file_is_forgotten() -> 
         .inventory_view(Store::Watch, Path::new(""), None);
     assert_eq!(top.nodes.len(), 1);
     assert_eq!((top.nodes[0].files, top.nodes[0].hits), (2, 2));
+    // The top of the tree is the drive; the watched folder's own counts are its place's.
+    let places = rig.controller.places(Store::Watch);
+    assert_eq!(places.len(), 1);
+    assert_eq!(places[0].path, folder);
+    assert_eq!((places[0].files, places[0].hits), (2, 2));
 
     // A file that is removed is gone from what the watch found.
     fs::remove_file(&new).describe()?;

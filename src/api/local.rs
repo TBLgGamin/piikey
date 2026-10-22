@@ -344,8 +344,7 @@ impl Local {
 
     fn inventory_tree(&self, under: Option<&Path>) -> Result<Value, ApiError> {
         under.map(require_absolute).transpose()?;
-        let roots = self.policy()?.inventory_roots;
-        let nodes = self.inventory.children(under, &roots);
+        let nodes = self.inventory.children(under);
         to_json(&reply::Nodes { nodes })
     }
 
@@ -937,6 +936,20 @@ mod tests {
         assert_eq!(tree["nodes"][0]["name"], "a.txt", "{tree}");
         assert_eq!(tree["nodes"][0]["is_dir"], false);
         assert_eq!(tree["nodes"][0]["hits"], 1);
+
+        // Without a folder the tree starts at the drive the files are on, with its root as the
+        // path.
+        let top = fx.ask(Request::InventoryTree { under: None })?;
+        let drive = folder
+            .components()
+            .next()
+            .map(|part| part.as_os_str().to_string_lossy().into_owned())
+            .ok_or("the folder has no drive")?;
+        assert_eq!(top["nodes"].as_array().map(Vec::len), Some(1), "{top}");
+        assert_eq!(top["nodes"][0]["name"], drive.as_str());
+        assert_eq!(top["nodes"][0]["path"], format!(r"{drive}\"));
+        assert_eq!(top["nodes"][0]["is_dir"], true);
+        assert_eq!(top["nodes"][0]["hits"], 1);
 
         let status = fx.ask(Request::InventoryStatus)?;
         assert_eq!(status["files"], 1);

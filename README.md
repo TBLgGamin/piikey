@@ -74,7 +74,7 @@ back into your values by `piikey-cli deanonymize --tolerant`: the full names, th
   </tr>
   <tr>
     <td><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/icons/dark/inventory.svg"><img src="docs/assets/icons/light/inventory.svg" width="28" height="28" alt=""></picture></td>
-    <td><b>Inventory</b><br>Scan your folders and see where personal data is stored: a folder tree with bars by type, a legend of the types found, a treemap with a tile for every file, and details with actions per file: open, show in Explorer, show what was found, make a masked copy, export a report. Pick folders and files with Browse or drop them on the page. It scans only when you ask, and skips files that did not change.</td>
+    <td><b>Inventory</b><br>Scan your folders and see where personal data is stored: a tree of your real folders from the drive down (<code>C:</code>, Users, ...) with bars by type, a legend of the types found, a treemap with a tile for every file, and details with actions per file: open, show in Explorer, show what was found, make a masked copy, export a report. Pick folders and files with Browse or drop them on the page. It scans only when you ask, and skips files that did not change.</td>
   </tr>
   <tr>
     <td><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/icons/dark/explorer.svg"><img src="docs/assets/icons/light/explorer.svg" width="28" height="28" alt=""></picture></td>
@@ -169,13 +169,15 @@ keeps are described in [docs/how-it-works.md](docs/how-it-works.md).
   holds and a Remove button, which also breaks off a scan of it; the Scan button looks through them,
   the box below scans one more folder or file,
   and you can drop files and folders from Explorer onto the page. The dashboard shows a tree of
-  folders and files with bars by type, the types found, a treemap of the files, and the details of
-  what you select. A scan that you start from the page, the box, a drop or Explorer ends in a result
-  dialog. The inventory keeps counts, never the values; "Show what was found" reads the files again
-  and lists every value with search, type and file filters, where it is (line, page or cell) and a
-  button that opens the file at that place, without storing anything.
+  your real folders, from the drive down (This PC, `C:`, Users, ...), with bars by type, the types
+  found, a treemap of the files, and the details of what you select. A scan that you start from the
+  page, the box, a drop or Explorer ends in a result dialog. The inventory keeps counts, never the
+  values; "Show what was found" reads the files again and lists every value with search, type and
+  file filters, where it is (line, page or cell) and a button that opens the file at that place,
+  without storing anything.
 - **Watch** has its own switch, the folders it keeps an eye on (with what each is doing), a box to
-  add one, and the same dashboard for what it found. Nothing is watched until you add a folder.
+  add one, and the same dashboard, down the same real folders, for what it found. Nothing is
+  watched until you add a folder.
 - **Vault** lists every value next to its stand-in, newest first, with search and filters by type,
   site and time. Tick values (or Select all) and choose Forget to remove them; Export writes them
   to a CSV file.
@@ -203,13 +205,13 @@ piikey starts in the tray at sign-in without a window.
     <td width="50%">
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/inventory-dark.png">
-        <img alt="Inventory page: the Scan button and the dashboard, with a tree of the folders and files that hold personal data, the types found, a treemap of the files and the details of the selection" src="docs/assets/screenshots/inventory-light.png">
+        <img alt="Inventory page: the Scan button and the dashboard, with a tree of the real folders and files that hold personal data from the drive down, the types found, a treemap of the files and the details of the selection" src="docs/assets/screenshots/inventory-light.png">
       </picture>
     </td>
   </tr>
   <tr>
     <td><b>Protection</b>: what piikey masks and highlights. The highlighting mode and the sites and apps you protect.</td>
-    <td><b>Inventory</b>: where personal data is stored on this PC, as a tree, a legend of types and a treemap with a tile for every file, from what you scanned.</td>
+    <td><b>Inventory</b>: where personal data is stored on this PC, as a tree of your real folders from the drive down, a legend of types and a treemap with a tile for every file, from what you scanned.</td>
   </tr>
   <tr>
     <td width="50%">
@@ -310,7 +312,7 @@ which answer `app_required`.
 | `vault_export` | Writes the vault to a new file as JSON or CSV. | `vault export --out FILE` |
 | `vault_wipe` | Deletes every record. Needs `"confirm": true`. | `vault wipe --yes` |
 | `inventory_status` | The locations, file counts, hits and the scan in progress. | `inventory status` |
-| `inventory_list`, `inventory_tree` | The files with personal data, or the tree's nodes under a path. | `inventory list`, `inventory tree` |
+| `inventory_list`, `inventory_tree` | The files with personal data, or the tree's nodes under a path (the drives that hold them without one). | `inventory list`, `inventory tree` |
 | `inventory_rescan`, `inventory_report` | Scans the inventory locations now and answers when the scan is over (the inventory scans only when asked); writes a JSON or CSV report. | `inventory rescan`, `inventory report` |
 | `settings_get`, `settings_set` | Reads or changes the settings (the `guard.cfg` keys). | `settings get`, `settings set KEY=VALUE...` |
 | `kinds` | The types of personal data (the `kind` field), their groups, and whether each is on. | `kinds` |

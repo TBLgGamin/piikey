@@ -100,10 +100,6 @@ pub struct InventoryView {
     pub nodes: Vec<Node>,
     /// What the inventory knows of the selected file.
     pub entry: Option<Entry>,
-    /// The folders the top level is grouped by: the locations of the inventory, or the folders
-    /// the watch watches. The breadcrumb names a folder below one of them by it, not by its
-    /// whole path.
-    pub roots: Vec<PathBuf>,
 }
 
 /// `path` as the `Option` the inventories take: the empty path means all of it.
@@ -225,7 +221,7 @@ impl Controller {
         }
     }
 
-    /// The folders the top level of `store` is grouped by.
+    /// The folders `store` looks through: the inventory's locations, or the watched folders.
     fn roots(&self, store: Store) -> Vec<PathBuf> {
         let policy = self.policy();
         match store {
@@ -234,22 +230,31 @@ impl Controller {
         }
     }
 
-    /// One level of the tree of `store`: what lies directly under `at` or, for an empty `at`, one
-    /// node per folder it is grouped by that has findings, and one for the scans outside them (the
-    /// node with an empty path). `selected` is a file whose entry is wanted.
+    /// One level of the tree of `store`, the real folders of the computer: what lies directly
+    /// under `at` or, for an empty `at`, one node for each drive or network share that holds
+    /// findings. `selected` is a file whose entry is wanted.
     pub fn inventory_view(
         &self,
         store: Store,
         at: &Path,
         selected: Option<&Path>,
     ) -> InventoryView {
-        let roots = self.roots(store);
         let inventory = self.store(store);
         InventoryView {
-            nodes: inventory.children(under(at), &roots),
+            nodes: inventory.children(under(at)),
             entry: selected.and_then(|file| inventory.entry(file)),
-            roots,
         }
+    }
+
+    /// What `store` found in each of the folders it looks through (the inventory's locations, the
+    /// watched folders), counted by path: one node for each that holds anything. Folders inside
+    /// one another each count what lies in them.
+    pub fn places(&self, store: Store) -> Vec<Node> {
+        let inventory = self.store(store);
+        self.roots(store)
+            .iter()
+            .filter_map(|root| inventory.node(root))
+            .collect()
     }
 
     /// Every file of `store` that holds personal data at and under `under` (all of it for an

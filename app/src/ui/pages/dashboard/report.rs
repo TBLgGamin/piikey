@@ -5,19 +5,18 @@
 
 use std::path::PathBuf;
 
-use piikey::detect::EntityKind;
+use piikey::{detect::EntityKind, formats::Busy, inventory::Reading as ScanReading};
 use windows_reactor::{
     ContentDialog, ContentDialogButton, ContentDialogResult, Grid, GridLength, ProgressBar,
     ProgressRing, StackPanel, TextBlock, TextTrimming, TooltipExt, VerticalAlignment, View,
 };
 
-use super::{findings::busy_text, palette::swatch};
+use super::palette::swatch;
 use crate::ui::pages::kit::{Context, body, caption, counted, subtitle, thousands};
 use crate::ui::{
     controller::{Reveal, RevealState, ScanSummary},
     window::{MainWindow, Msg},
 };
-use piikey::inventory::Reading as ScanReading;
 
 /// The most types a result lists.
 const TYPES: usize = 8;
@@ -156,26 +155,44 @@ fn progress(scan: Option<(u64, u64)>, reading: &[ScanReading]) -> View {
     StackPanel::new().spacing(6.0).children(parts).into()
 }
 
-/// The line of a file being read: its name, and what the reading of it is busy with.
+/// The width of the bar of a file being read, in DIPs.
+const FILE_BAR: f64 = 140.0;
+
+/// The line of a file being read: its name, a bar of how far its reading is and the percentage; a
+/// bar that only moves while it is not known how far (the file is read, a picture is looked at).
 fn file_row(file: &ScanReading) -> View {
+    let percent = percent_of(file.busy);
+    let bar = ProgressBar::new()
+        .width(FILE_BAR)
+        .vertical_alignment(VerticalAlignment::Center)
+        .grid_column(1);
+    let bar = match percent {
+        Some(percent) => bar.minimum(0.0).maximum(100.0).value(f64::from(percent)),
+        None => bar.is_indeterminate(true),
+    };
     Grid::new()
-        .columns([GridLength::STAR, GridLength::Auto])
+        .columns([GridLength::STAR, GridLength::Auto, GridLength::Pixel(40.0)])
         .column_spacing(12.0)
         .children((
             body(file_name(&file.path))
                 .text_trimming(TextTrimming::CharacterEllipsis)
                 .tooltip(file.path.display().to_string()),
-            caption(reading_text(file))
+            bar,
+            caption(percent.map(|p| format!("{p} %")).unwrap_or_default())
                 .vertical_alignment(VerticalAlignment::Center)
-                .grid_column(1),
+                .grid_column(2),
         ))
         .into()
 }
 
-/// What the reading of `file` is busy with, in words.
-fn reading_text(file: &ScanReading) -> String {
-    file.busy
-        .map_or_else(|| "Reading\u{2026}".to_owned(), busy_text)
+/// How far the reading of a file is, in percent, when that is known: the pages of a PDF that are
+/// pictures, or the text the model has read.
+fn percent_of(busy: Option<Busy>) -> Option<u8> {
+    let (done, total) = match busy? {
+        Busy::Pages { done, total } | Busy::Model { done, total } => (done, total),
+        Busy::Picture => return None,
+    };
+    (total > 0).then(|| u8::try_from((done.min(total) * 100) / total).unwrap_or(100))
 }
 
 /// The name of a file, or its whole path when it has none.

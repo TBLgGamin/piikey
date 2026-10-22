@@ -74,12 +74,12 @@ pub struct Loaded {
     /// The folder on show when it was read: a load that comes back for another one is old.
     pub at: PathBuf,
     /// The nodes of each folder the tree lists: the one of the folder on show is the top level.
+    /// For the top of the store (an empty `at`) that is its drives.
     pub levels: HashMap<PathBuf, Vec<Node>>,
-    /// The top level of the store, whatever folder is on show: one node for each of its locations
-    /// that holds something.
-    pub top: Vec<Node>,
-    /// The folders the store looks through, which the top level is grouped by.
-    pub roots: Vec<PathBuf>,
+    /// What the store found in each of its locations, whatever folder is on show: one node for
+    /// each that holds something. Only the Inventory's rows say that; the Watch page's have no use
+    /// for it, so a load for the watch leaves it empty.
+    pub places: Vec<Node>,
     /// The map's files.
     pub tiles: Tiles,
     /// The types found under the folder on show, for the legend.
@@ -107,9 +107,10 @@ pub struct Dashboard {
     /// The number of the load that `loaded` came from: one that is older than that, or was made
     /// for another folder, is not shown.
     shown: u64,
-    /// The keys of the tree's rows as they were last drawn, and the number of the list they were
-    /// drawn in: see [`Dashboard::tree_list`].
+    /// The keys of the tree's rows as they were last drawn, the folder on show then, and the number
+    /// of the list they were drawn in: see [`Dashboard::tree_list`].
     tree_keys: RefCell<Vec<String>>,
+    tree_at: RefCell<PathBuf>,
     tree_epoch: Cell<u64>,
 }
 
@@ -126,6 +127,7 @@ impl Dashboard {
             seq: 0,
             shown: 0,
             tree_keys: RefCell::new(Vec::new()),
+            tree_at: RefCell::new(PathBuf::new()),
             tree_epoch: Cell::new(0),
         }
     }
@@ -134,44 +136,38 @@ impl Dashboard {
     /// number of the list to draw it in. Rows that come or go keep the list; rows that change places
     /// make it a new one, because moving the rows of a list that has a selection makes `WinUI` fail
     /// fast (`0xC000027B`): the old list is dropped and the new one made, which also starts it at the
-    /// top, where the way to the selection is listed first.
+    /// top, where the way to the selection is listed first. So does a new folder on show: `WinUI`
+    /// showed stale rows, without their content, in a list that had all its rows replaced twice,
+    /// which is what going into a folder and back out does, so each folder gets a list of its own.
     pub(in crate::ui) fn tree_list(&self, keys: Vec<String>) -> u64 {
         let mut last = self.tree_keys.borrow_mut();
-        if !keeps_order(&last, &keys) {
+        let mut at = self.tree_at.borrow_mut();
+        if *at != self.at || !keeps_order(&last, &keys) {
             self.tree_epoch.set(self.tree_epoch.get() + 1);
+            at.clone_from(&self.at);
         }
         *last = keys;
         self.tree_epoch.get()
     }
 
-    /// The folders the store looks through, as the last load knew them.
-    fn roots(&self) -> &[PathBuf] {
-        self.loaded.as_ref().map_or(&[], |loaded| &loaded.roots)
-    }
-
-    /// Whether `path` is a folder, as far as the last load knows: the folder on show, a folder of
-    /// the tree, or a location. Anything else is taken for a file.
+    /// Whether `path` is a folder, as far as the last load knows: the folder on show, or a folder
+    /// of the tree. Anything else is taken for a file.
     pub(in crate::ui) fn is_folder(&self, path: &Path) -> bool {
-        if path.as_os_str().is_empty() {
-            return false;
-        }
-        if path == self.at || self.roots().iter().any(|root| root == path) {
-            return true;
-        }
-        self.loaded.as_ref().is_some_and(|loaded| {
-            loaded
-                .levels
-                .values()
-                .flatten()
-                .any(|node| node.is_dir && node.path == path)
-        })
+        path == self.at
+            || self.loaded.as_ref().is_some_and(|loaded| {
+                loaded
+                    .levels
+                    .values()
+                    .flatten()
+                    .any(|node| node.is_dir && node.path == path)
+            })
     }
 
     /// The selected file, if the selection is one.
     fn selected_file(&self) -> Option<&Path> {
         self.selected
             .as_deref()
-            .filter(|path| !path.as_os_str().is_empty() && !self.is_folder(path))
+            .filter(|path| !self.is_folder(path))
     }
 
     /// Selects `path`; `false` when it was selected already, which a row the user clicked says
@@ -182,7 +178,7 @@ impl Dashboard {
         }
         self.pinned = origin == Origin::Map;
         if self.pinned {
-            let way = ancestors(&path, &self.at, self.roots());
+            let way = ancestors(&path, &self.at);
             self.open.extend(way);
         }
         self.selected = Some(path);
@@ -241,15 +237,13 @@ fn keeps_order(old: &[String], new: &[String]) -> bool {
 }
 
 /// The folders that have to be open for the row of `path` to show, from the outermost in: the ones
-/// between `at` and `path`. At the top level the rows start at the `roots`, the folders the store
-/// looks through, so the folders above those are not rows.
-fn ancestors(path: &Path, at: &Path, roots: &[PathBuf]) -> Vec<PathBuf> {
-    let top = at.as_os_str().is_empty();
+/// between `at` and `path`. At the top level the rows start at the drives, so the way to a file
+/// starts with its drive.
+fn ancestors(path: &Path, at: &Path) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = path
         .ancestors()
         .skip(1)
         .take_while(|folder| is_under(folder, at) && !folder.as_os_str().is_empty())
-        .filter(|folder| !top || roots.iter().any(|root| is_under(folder, root)))
         .map(Path::to_path_buf)
         .collect();
     // `at` itself is the top of the tree, not a row.
@@ -269,11 +263,6 @@ impl Loaded {
         file: Option<&Path>,
     ) -> Self {
         let top = controller.inventory_view(store, at, file);
-        let places = if at.as_os_str().is_empty() {
-            top.nodes.clone()
-        } else {
-            controller.inventory_view(store, Path::new(""), None).nodes
-        };
         let mut levels = HashMap::new();
         for folder in open
             .iter()
@@ -286,8 +275,11 @@ impl Loaded {
         Self {
             at: at.to_path_buf(),
             levels,
-            top: places,
-            roots: top.roots,
+            places: if store == Store::Inventory {
+                controller.places(store)
+            } else {
+                Vec::new()
+            },
             tiles: controller.tiles(store, at, TILES),
             totals: controller.type_totals(store, at),
             entry: top.entry,
@@ -402,14 +394,14 @@ mod tests {
         }
     }
 
-    fn loaded(roots: &[&str], nodes: &[Node]) -> Loaded {
-        let mut levels = HashMap::new();
-        levels.insert(PathBuf::new(), nodes.to_vec());
+    fn loaded(levels: &[(&str, &[Node])]) -> Loaded {
         Loaded {
             at: PathBuf::new(),
-            levels,
-            top: Vec::new(),
-            roots: roots.iter().map(PathBuf::from).collect(),
+            levels: levels
+                .iter()
+                .map(|(at, nodes)| (PathBuf::from(at), nodes.to_vec()))
+                .collect(),
+            places: Vec::new(),
             tiles: Tiles {
                 tiles: Vec::new(),
                 rest: piikey::inventory::Rest::default(),
@@ -419,12 +411,14 @@ mod tests {
         }
     }
 
+    /// A dashboard whose store holds one drive, with `Docs` in it and a file in that.
     fn dashboard() -> Dashboard {
         let mut dash = Dashboard::new();
-        dash.loaded = Some(loaded(
-            &[r"C:\Docs"],
-            &[node(r"C:\Docs", true), node(r"C:\Docs\a.pdf", false)],
-        ));
+        dash.loaded = Some(loaded(&[
+            ("", &[node(r"C:\", true)]),
+            (r"C:\", &[node(r"C:\Docs", true)]),
+            (r"C:\Docs", &[node(r"C:\Docs\a.pdf", false)]),
+        ]));
         dash
     }
 
@@ -453,6 +447,31 @@ mod tests {
     }
 
     #[test]
+    fn each_folder_on_show_gets_a_list_of_its_own() {
+        let keys = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>()
+        };
+        let mut dash = Dashboard::new();
+        let top = dash.tree_list(keys(&["c:", "d:"]));
+        assert_eq!(dash.tree_list(keys(&["c:", "c:/users", "d:"])), top);
+        // Another folder shown, whatever its rows are: a list of its own, and the rows that come
+        // after (the load that was asked for) go into it.
+        dash.enter(PathBuf::from(r"C:\Users"));
+        let users = dash.tree_list(keys(&[]));
+        assert_ne!(users, top);
+        assert_eq!(dash.tree_list(keys(&["me"])), users);
+        // And back to the top: another list again, not the one the top had.
+        dash.enter(PathBuf::new());
+        let back = dash.tree_list(keys(&["c:", "d:"]));
+        assert_ne!(back, users);
+        assert_ne!(back, top);
+        assert_eq!(dash.tree_list(keys(&["c:", "d:"])), back);
+    }
+
+    #[test]
     fn a_new_dashboard_shows_everything_and_has_chosen_nothing() {
         let dash = Dashboard::new();
         assert!(dash.at.as_os_str().is_empty());
@@ -465,6 +484,10 @@ mod tests {
         let mut dash = dashboard();
         assert!(dash.select(PathBuf::from(r"C:\Docs\Taxes\2023.pdf"), Origin::Map));
         assert!(dash.pinned);
+        assert!(
+            dash.open.contains(Path::new(r"C:\")),
+            "the way starts at the drive"
+        );
         assert!(dash.open.contains(Path::new(r"C:\Docs")));
         assert!(dash.open.contains(Path::new(r"C:\Docs\Taxes")));
 
@@ -535,7 +558,7 @@ mod tests {
         let mut dash = Dashboard::new();
         let read = |at: &str| Loaded {
             at: PathBuf::from(at),
-            ..loaded(&[], &[])
+            ..loaded(&[])
         };
         assert!(dash.take(2, read("")));
         // An older load that comes back late.
@@ -565,34 +588,36 @@ mod tests {
     #[test]
     fn folders_are_told_from_files_by_what_the_load_knows() {
         let dash = dashboard();
+        assert!(dash.is_folder(Path::new(r"C:\")), "a drive is a folder");
         assert!(dash.is_folder(Path::new(r"C:\Docs")));
         assert!(!dash.is_folder(Path::new(r"C:\Docs\a.pdf")));
-        assert!(
-            !dash.is_folder(Path::new("")),
-            "the empty path is the top, not a folder"
-        );
         // What is not known is taken for a file: the map only has files.
         assert!(!dash.is_folder(Path::new(r"C:\Else\b.pdf")));
     }
 
     #[test]
     fn the_folders_to_open_for_a_file_are_the_ones_between_it_and_the_top() {
-        let roots = [PathBuf::from(r"C:\Docs")];
+        let way = |path: &str, at: &str| ancestors(Path::new(path), Path::new(at));
+        let paths = |list: &[&str]| list.iter().map(PathBuf::from).collect::<Vec<_>>();
+        // At the top the tree starts at the drives: the way to a file starts at its drive.
         assert_eq!(
-            ancestors(Path::new(r"C:\Docs\Taxes\2023.pdf"), Path::new(""), &roots),
-            [PathBuf::from(r"C:\Docs"), PathBuf::from(r"C:\Docs\Taxes")],
-            "the folders above a location are not rows"
+            way(r"C:\Docs\Taxes\2023.pdf", ""),
+            paths(&[r"C:\", r"C:\Docs", r"C:\Docs\Taxes"])
         );
         assert_eq!(
-            ancestors(
-                Path::new(r"C:\Docs\Taxes\2023.pdf"),
-                Path::new(r"C:\Docs"),
-                &roots
-            ),
-            [PathBuf::from(r"C:\Docs\Taxes")]
+            way(r"C:\Docs\Taxes\2023.pdf", r"C:\Docs"),
+            paths(&[r"C:\Docs\Taxes"])
         );
-        assert!(ancestors(Path::new(r"C:\Docs\a.pdf"), Path::new(r"C:\Docs"), &roots).is_empty());
-        // A file outside every location is in no folder of the tree.
-        assert!(ancestors(Path::new(r"D:\Other\a.pdf"), Path::new(""), &roots).is_empty());
+        // The folder on show is the top of the tree, not a row.
+        assert_eq!(way(r"C:\Docs\a.pdf", r"C:\"), paths(&[r"C:\Docs"]));
+        assert!(way(r"C:\Docs\a.pdf", r"C:\Docs").is_empty());
+        assert!(way(r"C:\a.pdf", r"C:\").is_empty());
+        // A file on another drive is not in the folder on show.
+        assert!(way(r"D:\Other\a.pdf", r"C:\").is_empty());
+        // A network share is a drive.
+        assert_eq!(
+            way(r"\\nas\share\docs\a.pdf", ""),
+            paths(&[r"\\nas\share\", r"\\nas\share\docs"])
+        );
     }
 }

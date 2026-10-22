@@ -471,10 +471,7 @@ fn nodes(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
         .iter()
         .map(|node| {
             let path = node.path.display().to_string();
-            // The node for scans outside every watched folder has no path.
-            let place = if path.is_empty() {
-                node.name.clone()
-            } else if node.is_dir {
+            let place = if node.is_dir {
                 format!("{}\\", path.trim_end_matches('\\'))
             } else {
                 path

@@ -345,16 +345,16 @@ fn inventory_entries_and_nodes_are_tables() {
         "no files with personal data in the inventory\n"
     );
     let nodes = json!({"nodes": [
-        {"path": r"C:\Docs", "name": "Docs", "is_dir": true, "hits": 30, "files": 4, "counts": {"email": 30}},
+        {"path": r"C:\", "name": "C:", "is_dir": true, "hits": 32, "files": 5, "counts": {"email": 30, "iban": 2}},
         {"path": r"C:\Docs\a.txt", "name": "a.txt", "is_dir": false, "hits": 2, "files": 1, "counts": {"iban": 2}},
-        {"path": "", "name": "Other scans", "is_dir": true, "hits": 1, "files": 1, "counts": {"phone": 1}}
+        {"path": r"\\nas\share\", "name": r"\\nas\share", "is_dir": true, "hits": 1, "files": 1, "counts": {"phone": 1}}
     ]});
     assert_eq!(
         out_of(&View::Nodes, &nodes),
-        "HITS  FILES  FOUND      PATH\n\
-         \x20 30      4  email: 30  C:\\Docs\\\n\
-         \x20  2      1  iban: 2    C:\\Docs\\a.txt\n\
-         \x20  1      1  phone: 1   Other scans\n"
+        "HITS  FILES  FOUND               PATH\n\
+         \x20 32      5  email: 30, iban: 2  C:\\\n\
+         \x20  2      1  iban: 2             C:\\Docs\\a.txt\n\
+         \x20  1      1  phone: 1            \\\\nas\\share\\\n"
     );
     assert_eq!(
         out_of(&View::Nodes, &json!({"nodes": []})),

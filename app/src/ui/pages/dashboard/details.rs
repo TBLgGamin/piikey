@@ -27,8 +27,6 @@ use crate::ui::{
 pub(super) enum Target {
     /// Everything the dashboard covers, with no folder chosen.
     Top,
-    /// The scans of files outside every location: no folder to open or show.
-    Other,
     Folder,
     File,
 }
@@ -39,7 +37,7 @@ pub(super) struct Subject {
     pub(super) target: Target,
     /// The name of the folder or file.
     pub(super) title: String,
-    /// Where it is; empty for the top and the scans outside every location.
+    /// Where it is; empty for the top.
     pub(super) path: PathBuf,
     /// "12 found in 3 files", or why a file has none.
     pub(super) summary: String,
@@ -94,7 +92,7 @@ pub(super) fn actions(target: Target, on_show: bool) -> Vec<Action> {
     let mut list = match target {
         Target::File => vec![Action::Open, Action::Show, Action::Found, Action::Mask],
         Target::Folder => vec![Action::Show, Action::Found],
-        Target::Top | Target::Other => Vec::new(),
+        Target::Top => Vec::new(),
     };
     if target == Target::Folder && !on_show {
         list.insert(0, Action::Enter);
@@ -251,19 +249,6 @@ pub(super) fn subject(dash: &Dashboard, loaded: &Loaded, store: Store) -> Subjec
     let Some(selected) = dash.selected.as_deref() else {
         return on_show(dash, loaded, store);
     };
-    if selected.as_os_str().is_empty() {
-        let node = node_in(loaded, selected);
-        return Subject {
-            target: Target::Other,
-            title: "Other scans".to_owned(),
-            path: PathBuf::new(),
-            summary: node.map_or_else(String::new, |node| {
-                found_in(node.hits, u64::from(node.files))
-            }),
-            types: node.map_or_else(Vec::new, |node| wide(&node.counts)),
-            note: Some("Scans of files outside the folders piikey looks through.".to_owned()),
-        };
-    }
     if dash.is_folder(selected) {
         folder_subject(dash, loaded, store, selected)
     } else {
@@ -358,7 +343,7 @@ pub(super) fn details(dash: &Dashboard, store: Store, height: f64, context: Cont
     let subject = subject(dash, loaded, store);
     let icon = match subject.target {
         Target::File => "\u{E7C3}",
-        Target::Top | Target::Other | Target::Folder => "\u{E8B7}",
+        Target::Top | Target::Folder => "\u{E8B7}",
     };
     let on_show = subject.path == dash.at;
     let todo = actions(subject.target, on_show);
@@ -469,12 +454,20 @@ mod tests {
             PathBuf::new(),
             vec![
                 node(
-                    r"C:\Docs",
+                    r"C:\",
                     true,
                     &[(EntityKind::Email, 5), (EntityKind::Person, 2)],
                 ),
-                node("", true, &[(EntityKind::Iban, 1)]),
+                node(r"D:\", true, &[(EntityKind::Iban, 1)]),
             ],
+        );
+        levels.insert(
+            PathBuf::from(r"C:\"),
+            vec![node(
+                r"C:\Docs",
+                true,
+                &[(EntityKind::Email, 5), (EntityKind::Person, 2)],
+            )],
         );
         levels.insert(
             PathBuf::from(r"C:\Docs"),
@@ -483,8 +476,7 @@ mod tests {
         Loaded {
             at: PathBuf::new(),
             levels,
-            top: Vec::new(),
-            roots: vec![PathBuf::from(r"C:\Docs")],
+            places: Vec::new(),
             tiles: Tiles {
                 tiles: vec![Tile {
                     path: PathBuf::from(r"C:\Docs\a.pdf"),
@@ -539,6 +531,11 @@ mod tests {
         let inside = subject_of(&dashboard(None, r"C:\Docs"));
         assert_eq!(inside.target, Target::Folder);
         assert_eq!(inside.title, "Docs");
+        // A drive on show is a folder named as the tree names it, with its root as the path.
+        let drive = subject_of(&dashboard(None, r"C:\"));
+        assert_eq!(drive.target, Target::Folder);
+        assert_eq!(drive.title, "C:");
+        assert_eq!(drive.path, Path::new(r"C:\"));
     }
 
     #[test]
@@ -602,13 +599,16 @@ mod tests {
     }
 
     #[test]
-    fn the_scans_outside_every_location_have_nothing_to_open() {
-        let subject = subject_of(&dashboard(Some(""), ""));
-        assert_eq!(subject.target, Target::Other);
-        assert_eq!(subject.title, "Other scans");
-        assert!(subject.path.as_os_str().is_empty());
-        assert_eq!(subject.summary, "1 found in 2 files");
-        assert!(actions(Target::Other, false).is_empty());
+    fn a_selected_drive_is_a_folder_described_by_its_row() {
+        let subject = subject_of(&dashboard(Some(r"C:\"), ""));
+        assert_eq!(subject.target, Target::Folder);
+        assert_eq!(subject.title, "C:");
+        assert_eq!(subject.path, Path::new(r"C:\"));
+        assert_eq!(subject.summary, "7 found in 2 files");
+        assert_eq!(
+            subject.types,
+            [(EntityKind::Email, 5), (EntityKind::Person, 2)]
+        );
     }
 
     #[test]

@@ -4462,7 +4462,7 @@ dependencies = [
 [[package]]
 name = "windows-collections"
 version = "0.100.0"
-source = "git+https://github.com/microsoft/windows-rs?rev=20f6de7473ebb2761a19a73dcc2c25ac9499db6e#20f6de7473ebb2761a19a73dcc2c25ac9499db6e"
+source = "git+https://github.com/TBLgGamin/windows-rs?rev=5fe8f5decadf4f64bcad485005d47769e9067b5a#5fe8f5decadf4f64bcad485005d47769e9067b5a"
 dependencies = [
  "windows-core 0.100.0",
 ]
@@ -4483,7 +4483,7 @@ dependencies = [
 [[package]]
 name = "windows-core"
 version = "0.100.0"
-source = "git+https://github.com/microsoft/windows-rs?rev=20f6de7473ebb2761a19a73dcc2c25ac9499db6e#20f6de7473ebb2761a19a73dcc2c25ac9499db6e"
+source = "git+https://github.com/TBLgGamin/windows-rs?rev=5fe8f5decadf4f64bcad485005d47769e9067b5a#5fe8f5decadf4f64bcad485005d47769e9067b5a"
 dependencies = [
  "windows-link 0.100.0",
  "windows-result 0.100.0",
@@ -4515,7 +4515,7 @@ dependencies = [
 [[package]]
 name = "windows-future"
 version = "0.100.0"
-source = "git+https://github.com/microsoft/windows-rs?rev=20f6de7473ebb2761a19a73dcc2c25ac9499db6e#20f6de7473ebb2761a19a73dcc2c25ac9499db6e"
+source = "git+https://github.com/TBLgGamin/windows-rs?rev=5fe8f5decadf4f64bcad485005d47769e9067b5a#5fe8f5decadf4f64bcad485005d47769e9067b5a"
 dependencies = [
  "windows-core 0.100.0",
  "windows-link 0.100.0",
@@ -4553,7 +4553,7 @@ checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
 [[package]]
 name = "windows-link"
 version = "0.100.0"
-source = "git+https://github.com/microsoft/windows-rs?rev=20f6de7473ebb2761a19a73dcc2c25ac9499db6e#20f6de7473ebb2761a19a73dcc2c25ac9499db6e"
+source = "git+https://github.com/TBLgGamin/windows-rs?rev=5fe8f5decadf4f64bcad485005d47769e9067b5a#5fe8f5decadf4f64bcad485005d47769e9067b5a"
 
 [[package]]
 name = "windows-numerics"
@@ -4568,7 +4568,7 @@ dependencies = [
 [[package]]
 name = "windows-reactor"
 version = "0.100.0"
-source = "git+https://github.com/microsoft/windows-rs?rev=20f6de7473ebb2761a19a73dcc2c25ac9499db6e#20f6de7473ebb2761a19a73dcc2c25ac9499db6e"
+source = "git+https://github.com/TBLgGamin/windows-rs?rev=5fe8f5decadf4f64bcad485005d47769e9067b5a#5fe8f5decadf4f64bcad485005d47769e9067b5a"
 dependencies = [
  "windows-collections 0.100.0",
  "windows-core 0.100.0",
@@ -4582,12 +4582,12 @@ dependencies = [
 [[package]]
 name = "windows-reactor-setup"
 version = "0.100.0"
-source = "git+https://github.com/microsoft/windows-rs?rev=20f6de7473ebb2761a19a73dcc2c25ac9499db6e#20f6de7473ebb2761a19a73dcc2c25ac9499db6e"
+source = "git+https://github.com/TBLgGamin/windows-rs?rev=5fe8f5decadf4f64bcad485005d47769e9067b5a#5fe8f5decadf4f64bcad485005d47769e9067b5a"
 
 [[package]]
 name = "windows-reference"
 version = "0.100.0"
-source = "git+https://github.com/microsoft/windows-rs?rev=20f6de7473ebb2761a19a73dcc2c25ac9499db6e#20f6de7473ebb2761a19a73dcc2c25ac9499db6e"
+source = "git+https://github.com/TBLgGamin/windows-rs?rev=5fe8f5decadf4f64bcad485005d47769e9067b5a#5fe8f5decadf4f64bcad485005d47769e9067b5a"
 dependencies = [
  "windows-core 0.100.0",
  "windows-time",
@@ -4605,7 +4605,7 @@ dependencies = [
 [[package]]
 name = "windows-result"
 version = "0.100.0"
-source = "git+https://github.com/microsoft/windows-rs?rev=20f6de7473ebb2761a19a73dcc2c25ac9499db6e#20f6de7473ebb2761a19a73dcc2c25ac9499db6e"
+source = "git+https://github.com/TBLgGamin/windows-rs?rev=5fe8f5decadf4f64bcad485005d47769e9067b5a#5fe8f5decadf4f64bcad485005d47769e9067b5a"
 dependencies = [
  "windows-link 0.100.0",
 ]
@@ -4622,7 +4622,7 @@ dependencies = [
 [[package]]
 name = "windows-strings"
 version = "0.100.0"
-source = "git+https://github.com/microsoft/windows-rs?rev=20f6de7473ebb2761a19a73dcc2c25ac9499db6e#20f6de7473ebb2761a19a73dcc2c25ac9499db6e"
+source = "git+https://github.com/TBLgGamin/windows-rs?rev=5fe8f5decadf4f64bcad485005d47769e9067b5a#5fe8f5decadf4f64bcad485005d47769e9067b5a"
 dependencies = [
  "windows-link 0.100.0",
 ]
@@ -4708,7 +4708,7 @@ dependencies = [
 [[package]]
 name = "windows-threading"
 version = "0.100.0"
-source = "git+https://github.com/microsoft/windows-rs?rev=20f6de7473ebb2761a19a73dcc2c25ac9499db6e#20f6de7473ebb2761a19a73dcc2c25ac9499db6e"
+source = "git+https://github.com/TBLgGamin/windows-rs?rev=5fe8f5decadf4f64bcad485005d47769e9067b5a#5fe8f5decadf4f64bcad485005d47769e9067b5a"
 dependencies = [
  "windows-link 0.100.0",
 ]
@@ -4716,7 +4716,7 @@ dependencies = [
 [[package]]
 name = "windows-time"
 version = "0.100.0"
-source = "git+https://github.com/microsoft/windows-rs?rev=20f6de7473ebb2761a19a73dcc2c25ac9499db6e#20f6de7473ebb2761a19a73dcc2c25ac9499db6e"
+source = "git+https://github.com/TBLgGamin/windows-rs?rev=5fe8f5decadf4f64bcad485005d47769e9067b5a#5fe8f5decadf4f64bcad485005d47769e9067b5a"
 dependencies = [
  "windows-core 0.100.0",
 ]
@@ -4724,7 +4724,7 @@ dependencies = [
 [[package]]
 name = "windows-window"
 version = "0.100.0"
-source = "git+https://github.com/microsoft/windows-rs?rev=20f6de7473ebb2761a19a73dcc2c25ac9499db6e#20f6de7473ebb2761a19a73dcc2c25ac9499db6e"
+source = "git+https://github.com/TBLgGamin/windows-rs?rev=5fe8f5decadf4f64bcad485005d47769e9067b5a#5fe8f5decadf4f64bcad485005d47769e9067b5a"
 dependencies = [
  "windows-core 0.100.0",
 ]
