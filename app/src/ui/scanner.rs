@@ -349,6 +349,24 @@ impl Scanner {
         dropped
     }
 
+    /// Stops the scan that is shown as `reveal`: a queued one is dropped, and `true` is returned
+    /// (nobody will scan it); a running one is broken off, and not picked up again.
+    pub fn stop_request(&self, reveal: u64) -> bool {
+        let mut jobs = self.lock();
+        let queued = jobs.asked.len();
+        jobs.asked.retain(|request| request.reveal != Some(reveal));
+        let dropped = jobs.asked.len() != queued;
+        if let Some(running) = jobs.running.as_mut().filter(|running| {
+            matches!(&running.kind, Kind::Asked(request) if request.reveal == Some(reveal))
+        }) {
+            running.rest = None;
+            running.cancel.store(true, Ordering::Relaxed);
+        }
+        drop(jobs);
+        self.wake.notify_all();
+        dropped
+    }
+
     /// The watch was switched off: what it saw is not scanned, and the scan of it that runs is
     /// stopped and not started again.
     pub fn stop_watch(&self) {
@@ -434,6 +452,26 @@ mod tests {
             Pick::Wait => Err("waits".to_owned()),
             Pick::Stop => Err("stops".to_owned()),
         }
+    }
+
+    #[test]
+    fn closing_the_dialog_of_a_scan_drops_it_from_the_queue_or_breaks_it_off_for_good()
+    -> Result<(), String> {
+        let scanner = Scanner::default();
+        let shown = |reveal| Request {
+            paths: vec![PathBuf::from(r"C:\a")],
+            reveal: Some(reveal),
+        };
+        scanner.ask(shown(1));
+        scanner.ask(shown(2));
+        let running = run(&mut scanner.lock())?;
+        assert!(scanner.stop_request(2), "a queued scan is dropped");
+        assert!(!running.cancelled(), "and the one that runs is another");
+        assert!(!scanner.stop_request(1), "a running scan is not queued");
+        assert!(running.cancelled(), "it stops at once");
+        assert!(!scanner.done(&running), "and nothing of it is run again");
+        assert!(matches!(scanner.lock().pick(), Pick::Wait));
+        Ok(())
     }
 
     #[test]

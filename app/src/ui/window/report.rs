@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use windows_reactor::ComponentContext;
 
 use super::{MainWindow, Msg};
-use crate::ui::controller::{Reveal, Store};
+use crate::ui::controller::{Command, Reveal, RevealState, Store};
 
 impl MainWindow {
     /// The newest scan that was asked to be shown and whose result the user has not put away.
@@ -32,7 +32,15 @@ impl MainWindow {
     /// them here.
     pub(super) fn update_report(&mut self, message: &Msg, context: &ComponentContext<Self>) {
         match message {
-            Msg::ReportClose => self.put_away_reveal(),
+            Msg::ReportClose => {
+                // Closing the dialog of a scan that waits or runs stops it.
+                if let Some(reveal) = self.pending_reveal()
+                    && matches!(reveal.state, RevealState::Waiting | RevealState::Scanning)
+                {
+                    self.input.controller.submit(Command::StopScan(reveal.seq));
+                }
+                self.put_away_reveal();
+            }
             Msg::ReportShow => {
                 let target: Option<(PathBuf, Option<PathBuf>)> = self
                     .pending_reveal()

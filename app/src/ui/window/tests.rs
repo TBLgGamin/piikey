@@ -1267,6 +1267,67 @@ fn the_watch_page_shows_its_folders_what_they_are_doing_and_what_was_found_there
 }
 
 #[test]
+fn the_dialog_of_a_running_scan_shows_each_file_and_closing_it_stops_the_scan() -> Test {
+    let mut ui = Headless::open(stub_controller)?;
+    let folder = ui.dir.0.join("docs");
+    let drawn = ui.poll_with(|snap| {
+        snap.reveal = Some(Reveal {
+            seq: 1,
+            paths: vec![folder.clone()],
+            at: folder.clone(),
+            select: None,
+            state: RevealState::Scanning,
+        });
+        snap.scan = Some((3, 12));
+        snap.scan_reading = vec![
+            piikey::inventory::Reading {
+                path: folder.join("report.pdf"),
+                busy: Some(piikey::formats::Busy::Pages { done: 2, total: 9 }),
+            },
+            piikey::inventory::Reading {
+                path: folder.join("letters.txt"),
+                busy: Some(piikey::formats::Busy::Model {
+                    done: 40,
+                    total: 100,
+                }),
+            },
+            piikey::inventory::Reading {
+                path: folder.join("notes.docx"),
+                busy: None,
+            },
+        ];
+    })?;
+    expect_drawn(
+        "each file",
+        &drawn,
+        &[
+            "Scanned 3 of 12 files\u{2026}",
+            "report.pdf",
+            "Reading scanned page 3 of 9\u{2026}",
+            "letters.txt",
+            "Looking for names and addresses\u{2026} 40 %",
+            "notes.docx",
+            "Reading\u{2026}",
+        ],
+    )?;
+    // The controller's own reveal is none: closing asks it to stop the scan, and puts the dialog
+    // away, so it is not shown again.
+    ui.send(Msg::ReportClose)?;
+    assert!(ui.controller.wait_idle(WAIT));
+    let again = ui.poll_with(|snap| {
+        snap.reveal = Some(Reveal {
+            seq: 1,
+            paths: vec![folder.clone()],
+            at: folder.clone(),
+            select: None,
+            state: RevealState::Scanning,
+        });
+    })?;
+    expect_not_drawn("put away", &again, &["Scanning\u{2026}"])?;
+    Ok(())
+}
+
+#[test]
 fn a_scan_that_was_asked_for_shows_its_progress_and_its_result_in_a_dialog() -> Test {
     let mut ui = Headless::open(stub_controller)?;
     let folder = ui.dir.0.join("docs");

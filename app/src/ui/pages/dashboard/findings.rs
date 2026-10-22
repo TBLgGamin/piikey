@@ -95,20 +95,26 @@ fn reading_parts(view: &FindingsView, done: usize, total: usize, parts: &mut Vec
 fn working_text(working: &Working) -> String {
     match working {
         Working::Model => "Loading the detection model\u{2026}".to_owned(),
-        Working::File(_, Busy::Picture) => "Reading a picture\u{2026}".to_owned(),
-        Working::File(_, Busy::Pages { done, total }) => {
+        Working::File(_, busy) => busy_text(*busy),
+    }
+}
+
+/// What the reading of a file is busy with, in words: the findings view and a scan's dialog say
+/// it alike.
+pub(super) fn busy_text(busy: Busy) -> String {
+    match busy {
+        Busy::Picture => "Reading a picture\u{2026}".to_owned(),
+        Busy::Pages { done, total } => {
             format!(
                 "Reading scanned page {} of {total}\u{2026}",
-                (done + 1).min(*total)
+                (done + 1).min(total)
             )
         }
-        Working::File(_, Busy::Model { done, total }) if *total > 0 => format!(
+        Busy::Model { done, total } if total > 0 => format!(
             "Looking for names and addresses\u{2026} {} %",
             (done * 100 / total).min(100)
         ),
-        Working::File(_, Busy::Model { .. }) => {
-            "Looking for names and addresses\u{2026}".to_owned()
-        }
+        Busy::Model { .. } => "Looking for names and addresses\u{2026}".to_owned(),
     }
 }
 

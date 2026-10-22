@@ -215,17 +215,20 @@ impl Entry {
     /// that cannot be read is an entry with a [`Status::Failed`], not an error.
     #[must_use]
     pub fn scan(engine: &Engine, path: &Path) -> Self {
+        let failed = |why: String| Self {
+            path: path.to_path_buf(),
+            size: 0,
+            modified: 0,
+            scanned: unix_now(),
+            status: Status::Failed(why),
+            counts: Vec::new(),
+            hash: None,
+        };
         match fs::metadata(path) {
-            Ok(meta) => scan_file(engine, path, &meta, None),
-            Err(err) => Self {
-                path: path.to_path_buf(),
-                size: 0,
-                modified: 0,
-                scanned: unix_now(),
-                status: Status::Failed(err.to_string()),
-                counts: Vec::new(),
-                hash: None,
-            },
+            // Nobody follows this scan, so nothing stops it.
+            Ok(meta) => scan_file(engine, path, &meta, None, &|_| true)
+                .unwrap_or_else(|| failed("the scan was stopped".to_owned())),
+            Err(err) => failed(err.to_string()),
         }
     }
 
@@ -342,6 +345,52 @@ pub struct Progress {
     /// Files this scan has to scan: the new and the changed ones. Known once the folders were
     /// walked, 0 before.
     pub total: AtomicU64,
+    /// The files being read now (several at once, one per worker of the pool) and what each is
+    /// busy with, in the order they were started.
+    reading: Mutex<Vec<Reading>>,
+}
+
+/// A file a scan is reading now, and what it is busy with: `None` while it is read and the
+/// patterns run, which takes no time worth showing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reading {
+    pub path: PathBuf,
+    pub busy: Option<Busy>,
+}
+
+impl Progress {
+    /// The files being read now, the first started first.
+    #[must_use]
+    pub fn reading(&self) -> Vec<Reading> {
+        self.reading
+            .lock()
+            .map(|reading| reading.clone())
+            .unwrap_or_default()
+    }
+
+    fn begin(&self, path: &Path) {
+        if let Ok(mut reading) = self.reading.lock() {
+            reading.push(Reading {
+                path: path.to_path_buf(),
+                busy: None,
+            });
+        }
+    }
+
+    fn busy(&self, path: &Path, busy: Busy) {
+        if let Ok(mut reading) = self.reading.lock()
+            && let Some(file) = reading.iter_mut().find(|file| file.path == path)
+        {
+            file.busy = Some(busy);
+        }
+    }
+
+    fn end(&self, path: &Path) {
+        if let Ok(mut reading) = self.reading.lock() {
+            reading.retain(|file| file.path != path);
+        }
+        self.done.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// The inventory in numbers.
@@ -686,9 +735,15 @@ impl Inventory {
                         return None;
                     }
                     let (path, meta) = found;
-                    let entry = scan_file(engine, path, meta, prior.as_ref());
-                    progress.done.fetch_add(1, Ordering::Relaxed);
-                    Some(entry)
+                    progress.begin(path);
+                    let follow = |busy: Busy| {
+                        progress.busy(path, busy);
+                        !cancel.load(Ordering::Relaxed)
+                    };
+                    let entry = scan_file(engine, path, meta, prior.as_ref(), &follow);
+                    progress.end(path);
+                    // A file the scan was stopped in is not known whole: it keeps what it had.
+                    entry
                 })
                 .collect();
             self.insert(scanned);
@@ -1083,7 +1138,13 @@ impl Prior {
 
 /// Reads and scans one file, or says why not. `prior` is what the file was known as before it
 /// changed: when its contents are the same, that stands and the detector does not run.
-fn scan_file(engine: &Engine, path: &Path, meta: &Metadata, prior: Option<&Prior>) -> Entry {
+fn scan_file(
+    engine: &Engine,
+    path: &Path,
+    meta: &Metadata,
+    prior: Option<&Prior>,
+    follow: &(dyn Fn(Busy) -> bool + Sync),
+) -> Option<Entry> {
     let mut modified = meta.last_write_time();
     let mut hash = None;
     let (status, counts) = if meta.len() > MAX_FILE {
@@ -1103,12 +1164,12 @@ fn scan_file(engine: &Engine, path: &Path, meta: &Metadata, prior: Option<&Prior
                 hash = Some(seen);
                 match prior.filter(|prior| prior.hash == seen) {
                     Some(prior) => (prior.status.clone(), prior.counts.clone()),
-                    None => detect(engine, &bytes, &mut modified),
+                    None => detect(engine, &bytes, &mut modified, follow)?,
                 }
             }
         }
     };
-    Entry {
+    Some(Entry {
         path: path.to_path_buf(),
         size: meta.len(),
         modified,
@@ -1116,14 +1177,21 @@ fn scan_file(engine: &Engine, path: &Path, meta: &Metadata, prior: Option<&Prior
         status,
         counts,
         hash,
-    }
+    })
 }
 
-/// What the detector makes of the contents of a file. A failure that says nothing about the
-/// file sets `modified` to 0, so the next scan tries the file again.
-fn detect(engine: &Engine, bytes: &[u8], modified: &mut u64) -> (Status, Vec<(EntityKind, u32)>) {
-    match formats::scan(engine, bytes, false) {
-        Ok(scanned) => (Status::Ok, tally(&scanned.found)),
+/// What the detector makes of the contents of a file, `follow` told what it is busy with; `None`
+/// when `follow` stopped it. A failure that says nothing about the file sets `modified` to 0, so
+/// the next scan tries the file again.
+fn detect(
+    engine: &Engine,
+    bytes: &[u8],
+    modified: &mut u64,
+    follow: &(dyn Fn(Busy) -> bool + Sync),
+) -> Option<(Status, Vec<(EntityKind, u32)>)> {
+    Some(match formats::scan_with(engine, bytes, follow) {
+        Ok(Some(scanned)) => (Status::Ok, tally(&scanned.found)),
+        Ok(None) => return None,
         Err(Error::UnsupportedFormat(_)) => (Status::Unsupported, Vec::new()),
         Err(err) => {
             // A damaged file fails the same way again, so it waits for a change. The vault, the
@@ -1134,7 +1202,7 @@ fn detect(engine: &Engine, bytes: &[u8], modified: &mut u64) -> (Status, Vec<(En
             }
             (Status::Failed(err.to_string()), Vec::new())
         }
-    }
+    })
 }
 
 /// Reads the file at `path` now and reports what the detector finds in it to `report`, each value
@@ -1649,6 +1717,31 @@ mod tests {
 
     const EMAIL: &str = "jan.jansen@acme.nl";
     const IBAN: &str = "NL91ABNA0417164300";
+
+    #[test]
+    fn progress_lists_the_files_being_read_with_what_each_is_busy_with() {
+        let progress = Progress::default();
+        let (a, b) = (Path::new(r"C:\a.pdf"), Path::new(r"C:\b.txt"));
+        progress.begin(a);
+        progress.begin(b);
+        progress.busy(a, Busy::Pages { done: 2, total: 9 });
+        assert_eq!(
+            progress.reading(),
+            [
+                Reading {
+                    path: a.to_path_buf(),
+                    busy: Some(Busy::Pages { done: 2, total: 9 })
+                },
+                Reading {
+                    path: b.to_path_buf(),
+                    busy: None
+                },
+            ]
+        );
+        progress.end(a);
+        assert_eq!(progress.reading().len(), 1);
+        assert_eq!(progress.done.load(Ordering::Relaxed), 1);
+    }
 
     /// Temp directory removed on drop.
     struct TempDir(PathBuf);
@@ -2261,8 +2354,8 @@ mod tests {
         // being written can be far bigger by the time it is read.
         let listed = fs::metadata(&small)?;
         assert_eq!(
-            scan_file(&engine, &big, &listed, None).status,
-            Status::TooLarge
+            scan_file(&engine, &big, &listed, None, &|_| true).map(|entry| entry.status),
+            Some(Status::TooLarge)
         );
         assert_eq!(read_capped(&small)?.as_deref(), Some(&b"tiny"[..]));
         assert_eq!(read_capped(&big)?, None);

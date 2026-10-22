@@ -8,18 +8,21 @@ use std::path::PathBuf;
 use piikey::detect::EntityKind;
 use windows_reactor::{
     ContentDialog, ContentDialogButton, ContentDialogResult, Grid, GridLength, ProgressBar,
-    ProgressRing, StackPanel, TextBlock, TextTrimming, VerticalAlignment, View,
+    ProgressRing, StackPanel, TextBlock, TextTrimming, TooltipExt, VerticalAlignment, View,
 };
 
-use super::palette::swatch;
+use super::{findings::busy_text, palette::swatch};
 use crate::ui::pages::kit::{Context, body, caption, counted, subtitle, thousands};
 use crate::ui::{
     controller::{Reveal, RevealState, ScanSummary},
     window::{MainWindow, Msg},
 };
+use piikey::inventory::Reading as ScanReading;
 
 /// The most types a result lists.
 const TYPES: usize = 8;
+/// The most files a scan's dialog shows the reading of at once.
+const READING_ROWS: usize = 4;
 
 /// The count of each type found, the types that hold most first.
 fn type_rows(counts: &[(EntityKind, u32)]) -> Vec<View> {
@@ -100,40 +103,87 @@ pub(super) fn tally(summary: &ScanSummary) -> String {
     }
 }
 
-/// How far a scan is, in one row: a ring while the files are still being looked for, a bar and
-/// how many are scanned once they are counted.
-fn progress(scan: Option<(u64, u64)>) -> View {
-    match scan {
+/// How far a scan is: a ring while the files are still being looked for, then a bar and how many
+/// are scanned, and under it a line for each file being read now with what it is busy with.
+fn progress(scan: Option<(u64, u64)>, reading: &[ScanReading]) -> View {
+    let mut parts: Vec<View> = match scan {
         Some((done, total)) if total > 0 => {
             #[expect(
                 clippy::cast_precision_loss,
                 reason = "a progress bar needs no precision beyond 2^53 files"
             )]
             let (done_f, total_f) = (done as f64, total as f64);
-            StackPanel::new()
-                .spacing(6.0)
-                .children((
-                    ProgressBar::new()
-                        .minimum(0.0)
-                        .maximum(total_f)
-                        .value(done_f),
-                    caption(format!(
-                        "Scanned {} of {} files\u{2026}",
-                        thousands(done),
-                        thousands(total)
-                    )),
+            vec![
+                ProgressBar::new()
+                    .minimum(0.0)
+                    .maximum(total_f)
+                    .value(done_f)
+                    .into(),
+                caption(format!(
+                    "Scanned {} of {} files\u{2026}",
+                    thousands(done),
+                    thousands(total)
                 ))
-                .into()
+                .into(),
+            ]
         }
-        _ => StackPanel::new()
-            .orientation(windows_reactor::Orientation::Horizontal)
-            .spacing(10.0)
-            .children((
-                ProgressRing::new().is_active(true).width(16.0).height(16.0),
-                caption("Looking for files\u{2026}").vertical_alignment(VerticalAlignment::Center),
+        _ => vec![
+            StackPanel::new()
+                .orientation(windows_reactor::Orientation::Horizontal)
+                .spacing(10.0)
+                .children((
+                    ProgressRing::new().is_active(true).width(16.0).height(16.0),
+                    caption("Looking for files\u{2026}")
+                        .vertical_alignment(VerticalAlignment::Center),
+                ))
+                .into(),
+        ],
+    };
+    parts.extend(reading.iter().take(READING_ROWS).map(file_row));
+    if reading.len() > READING_ROWS {
+        parts.push(
+            caption(format!(
+                "and {} more",
+                counted(
+                    u64::try_from(reading.len() - READING_ROWS).unwrap_or(u64::MAX),
+                    "file",
+                    "files"
+                )
             ))
             .into(),
+        );
     }
+    StackPanel::new().spacing(6.0).children(parts).into()
+}
+
+/// The line of a file being read: its name, and what the reading of it is busy with.
+fn file_row(file: &ScanReading) -> View {
+    Grid::new()
+        .columns([GridLength::STAR, GridLength::Auto])
+        .column_spacing(12.0)
+        .children((
+            body(file_name(&file.path))
+                .text_trimming(TextTrimming::CharacterEllipsis)
+                .tooltip(file.path.display().to_string()),
+            caption(reading_text(file))
+                .vertical_alignment(VerticalAlignment::Center)
+                .grid_column(1),
+        ))
+        .into()
+}
+
+/// What the reading of `file` is busy with, in words.
+fn reading_text(file: &ScanReading) -> String {
+    file.busy
+        .map_or_else(|| "Reading\u{2026}".to_owned(), busy_text)
+}
+
+/// The name of a file, or its whole path when it has none.
+fn file_name(path: &std::path::Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
 }
 
 /// The content of the result dialog for a scan that is `reveal`.
@@ -149,7 +199,9 @@ fn result_content(window: &MainWindow, reveal: &Reveal) -> View {
         RevealState::Waiting => {
             parts.push(body("Waiting for the scan that is running to finish\u{2026}").into());
         }
-        RevealState::Scanning => parts.push(progress(window.snap.scan)),
+        RevealState::Scanning => {
+            parts.push(progress(window.snap.scan, &window.snap.scan_reading));
+        }
         RevealState::Failed(error) => parts.push(body(error).into()),
         RevealState::Done(summary) => {
             parts.push(subtitle(&headline(summary)).into());

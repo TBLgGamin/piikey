@@ -6,8 +6,10 @@ use std::ops::Range;
 use super::gate::{key, worth_running};
 use crate::detect::Span;
 
-/// Longest text the model reads in one piece. A longer one is cut after a whitespace.
-const CHUNK_BYTES: usize = 256 << 10;
+/// Longest text the model reads in one piece. A longer one is cut after a whitespace. A piece is
+/// what a caller that follows the model waits for before it can stop it (a scan whose dialog was
+/// closed, a findings view that went away): some 16,000 tokens, two or three seconds.
+const CHUNK_BYTES: usize = 64 << 10;
 
 /// A run of this many bytes without whitespace is data, not prose: the model never reads it.
 const BLOB_BYTES: usize = 1024;

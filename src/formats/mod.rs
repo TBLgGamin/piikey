@@ -177,22 +177,55 @@ pub fn scan(engine: &Engine, bytes: &[u8], keep_texts: bool) -> Result<Scanned> 
         found: Some(Mutex::new(Vec::new())),
         texts: keep_texts.then(|| Mutex::new(Vec::new())),
         sink: None,
+        watch: None,
     };
+    run_scan(engine, bytes, &collect)
+}
+
+/// [`scan`] that tells `busy` what it is doing while it goes (the OCR of a picture or of the pages
+/// of a PDF, how far the model is), the way [`findings`] does. `busy` answers whether to go on:
+/// when it says no, the scan ends early (after the group of texts the model is in) and this
+/// returns `Ok(None)`, as what it found by then is not all of the file.
+///
+/// # Errors
+/// As [`scan`].
+pub fn scan_with(
+    engine: &Engine,
+    bytes: &[u8],
+    busy: &(dyn Fn(Busy) -> bool + Sync),
+) -> Result<Option<Scanned>> {
+    let collect = Collect {
+        found: Some(Mutex::new(Vec::new())),
+        texts: None,
+        sink: None,
+        watch: Some(Watch {
+            busy,
+            stopped: AtomicBool::new(false),
+        }),
+    };
+    let scanned = run_scan(engine, bytes, &collect)?;
+    Ok((!collect.stopped()).then_some(scanned))
+}
+
+/// Runs a scan pass over `bytes` into `collect` and takes out what it found.
+fn run_scan(engine: &Engine, bytes: &[u8], collect: &Collect<'_>) -> Result<Scanned> {
     process_pass(
         &Pass {
             engine,
-            how: How::Scan(&collect),
+            how: How::Scan(collect),
         },
         bytes,
         0,
     )?;
     Ok(Scanned {
-        found: collect
-            .found
-            .map_or_else(|| Ok(Vec::new()), Mutex::into_inner)?,
-        texts: collect
-            .texts
-            .map_or_else(|| Ok(Vec::new()), Mutex::into_inner)?,
+        found: match &collect.found {
+            Some(found) => std::mem::take(&mut *found.lock()?),
+            None => Vec::new(),
+        },
+        texts: match &collect.texts {
+            Some(texts) => std::mem::take(&mut *texts.lock()?),
+            None => Vec::new(),
+        },
     })
 }
 
@@ -313,6 +346,7 @@ pub fn findings(
             report,
             stopped: AtomicBool::new(false),
         }),
+        watch: None,
     };
     process_pass(
         &Pass {
@@ -356,11 +390,19 @@ struct Collect<'a> {
     texts: Option<Mutex<Vec<String>>>,
     /// Where the findings go, for a scan that was asked to show them.
     sink: Option<Sink<'a>>,
+    /// Who follows a scan that counts, and may stop it: see [`scan_with`].
+    watch: Option<Watch<'a>>,
 }
 
 /// The reader of a read of findings, and whether it asked to stop.
 struct Sink<'a> {
     report: &'a (dyn Fn(Report) -> bool + Sync),
+    stopped: AtomicBool,
+}
+
+/// Who follows a scan that counts (see [`scan_with`]), and whether it asked to stop.
+struct Watch<'a> {
+    busy: &'a (dyn Fn(Busy) -> bool + Sync),
     stopped: AtomicBool,
 }
 
@@ -384,22 +426,33 @@ impl Collect<'_> {
         Ok(())
     }
 
-    /// Whether a read of findings asked to stop.
+    /// Whether a read of findings, or whoever follows a scan, asked to stop.
     fn stopped(&self) -> bool {
         self.sink
             .as_ref()
             .is_some_and(|sink| sink.stopped.load(Ordering::Relaxed))
+            || self
+                .watch
+                .as_ref()
+                .is_some_and(|watch| watch.stopped.load(Ordering::Relaxed))
     }
 
-    /// Gives `report` to the reader of the findings; `false` once it has asked to stop, by this
-    /// answer or an earlier one. Nothing is given after that.
+    /// Gives `report` to the reader of the findings, and what the scan is busy with to whoever
+    /// follows it; `false` once either has asked to stop, by this answer or an earlier one.
+    /// Nothing is given after that.
     fn tell(&self, report: Report) -> bool {
+        if self.stopped() {
+            return false;
+        }
+        if let (Some(watch), Report::Busy(busy)) = (&self.watch, &report)
+            && !(watch.busy)(*busy)
+        {
+            watch.stopped.store(true, Ordering::Relaxed);
+            return false;
+        }
         let Some(sink) = &self.sink else {
             return true;
         };
-        if sink.stopped.load(Ordering::Relaxed) {
-            return false;
-        }
         let go = (sink.report)(report);
         if !go {
             sink.stopped.store(true, Ordering::Relaxed);
@@ -529,6 +582,8 @@ impl Pass<'_> {
             How::Scan(collect) => {
                 if collect.sink.is_some() {
                     self.scan_in_steps(collect, layout, texts)?;
+                } else if collect.watch.is_some() {
+                    self.count_in_steps(collect, texts)?;
                 } else {
                     collect.record(texts, &self.engine.scan(texts)?)?;
                 }
@@ -572,6 +627,28 @@ impl Pass<'_> {
         }
         collect.found(layout, texts, &all);
         Ok(())
+    }
+
+    /// Counts what the engine finds in `texts` a step at a time, telling whoever follows the scan
+    /// how far the model is, and stopping when they say so.
+    fn count_in_steps(&self, collect: &Collect<'_>, texts: &[&str]) -> Result<()> {
+        if collect.stopped() {
+            return Ok(());
+        }
+        let mut failed = None;
+        self.engine.scan_steps(texts, |step| {
+            if let Err(error) = collect.record(texts, &step.spans) {
+                failed = Some(error);
+                return ControlFlow::Break(());
+            }
+            match step.more {
+                Some((done, total)) if !collect.tell(Report::Busy(Busy::Model { done, total })) => {
+                    ControlFlow::Break(())
+                }
+                _ => ControlFlow::Continue(()),
+            }
+        })?;
+        failed.map_or(Ok(()), Err)
     }
 
     /// [`Engine::run`] for a rewrite and a restore. A scan has no output: it looks at the texts

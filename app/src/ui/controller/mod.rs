@@ -45,7 +45,7 @@ use std::{
 use piikey::{
     api::EngineSource,
     engine::Engine,
-    inventory::{Inventory, Progress, Totals},
+    inventory::{Inventory, Progress, Reading, Totals},
     policy::{Policy, SettingsPatch},
 };
 
@@ -211,6 +211,8 @@ pub struct Snapshot {
     /// Files scanned and files to scan, while the inventory scans: the Scan button's scan or one
     /// somebody asked for (Explorer's, "Scan this"). The watch's scan is [`Watch::scanning`].
     pub scan: Option<(u64, u64)>,
+    /// The files that scan is reading now, and what each is busy with.
+    pub scan_reading: Vec<Reading>,
     /// The latest scan somebody asked to see the result of, from queued to done: the window
     /// comes forward and shows a dialog for it. It stays until a newer request replaces it.
     pub reveal: Option<Reveal>,
@@ -277,6 +279,9 @@ pub enum Command {
     /// Add a folder to the inventory's locations, and scan it with the dialog. A path that is no
     /// folder is refused with a notice, and nothing is scanned.
     AddLocation(PathBuf),
+    /// Stop the scan that was asked to be shown as this reveal (its dialog was closed while it
+    /// waited or ran): it is dropped from the queue, or broken off where it is.
+    StopScan(u64),
     /// Remove the vault records whose value or stand-in is one of these.
     Forget(Vec<String>),
     /// Start the local API again: its token changed.
@@ -570,6 +575,11 @@ impl Controller {
                     progress.total.load(Ordering::Relaxed),
                 )
             }),
+            scan_reading: state
+                .scan
+                .as_ref()
+                .map(|progress| progress.reading())
+                .unwrap_or_default(),
             reveal: state.reveal.clone(),
             show: state.show,
             inventory_totals: (
@@ -798,6 +808,7 @@ impl Controller {
                 Command::ScanAll => self.scan_all(),
                 Command::ScanFiles { paths, reveal } => self.ask_scan(paths, reveal),
                 Command::AddLocation(path) => self.add_location(path),
+                Command::StopScan(seq) => self.stop_scan(seq),
                 Command::Forget(values) => self.forget(&values),
                 Command::RestartHttp => self.restart_http(),
             }

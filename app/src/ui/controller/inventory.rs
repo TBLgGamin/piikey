@@ -528,6 +528,15 @@ impl Controller {
         });
     }
 
+    /// Stops the scan shown as `seq`: its dialog was closed while it waited or ran. A queued scan
+    /// is dropped and its dialog told so here; a running one stops within the file it is in, keeps
+    /// what it scanned before, and the scan thread tells the dialog once it has saved.
+    pub(super) fn stop_scan(&self, seq: u64) {
+        if self.scanner.stop_request(seq) {
+            self.reveals_stopped(&[seq]);
+        }
+    }
+
     /// `folder` was removed from `store`'s folders: what the store holds under it goes, unless
     /// a folder that is still listed holds it.
     fn run_forget(&self, store: Store, folder: &Path) {

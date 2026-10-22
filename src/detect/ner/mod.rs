@@ -936,8 +936,8 @@ mod tests {
     -> Result<()> {
         let (cpu, seen) = Fake::new(Duration::ZERO);
         let ner = detector(cpu, None)?;
-        // Some 360 KB: more than a group holds.
-        let texts = texts_of(10_000, "a");
+        // Some 90 KB: more than a group (64 KiB) holds, less than two.
+        let texts = texts_of(2_500, "a");
         let steps = steps_of(&ner, &texts, usize::MAX);
         assert_eq!(steps.len(), 2, "two groups, two steps");
         // The first says how far the model has got of the text it reads; the last says that nothing
@@ -957,8 +957,8 @@ mod tests {
     fn what_the_cache_knows_is_the_first_step_and_costs_no_run() -> Result<()> {
         let (cpu, seen) = Fake::new(Duration::ZERO);
         let ner = detector(cpu, None)?;
-        // Fewer than the cache keeps (8192), and no more than one group holds.
-        let texts = texts_of(5_000, "a");
+        // Fewer than the cache keeps (8192), and no more than one group holds (some 50 KB).
+        let texts = texts_of(1_500, "a");
         assert_eq!(detect_all(&ner, &texts), expected(&texts));
         let runs = seen.runs();
         let steps = steps_of(&ner, &texts, usize::MAX);
