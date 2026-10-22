@@ -4,18 +4,19 @@
 //!
 //! Colours come from the theme. The reactor offers no app-wide accent, so interactive controls
 //! follow the accent the user chose in Windows, and nothing here competes with it: the brand purple
-//! is for the logo and the treemap only. Status is a glyph and words first, and a colour second.
+//! is for the logo only: the dashboards colour by type of personal data. Status is a glyph and words first, and a colour second.
 
 use windows_reactor::{
-    Border, Brush, Button, ButtonStyle, Callback, Color, FontIcon, FontWeight, Grid, GridLength,
-    HorizontalAlignment, HyperlinkButton, InfoBar, InfoBarSeverity, Orientation, ProgressRing,
-    ScrollViewer, StackPanel, TextBlock, TextWrapping, ThemeBrush, Thickness, ToggleSwitch,
-    VerticalAlignment, View, ViewContext,
+    Border, Brush, Button, ButtonStyle, Callback, Color, DateTime, FontIcon, FontWeight, Grid,
+    GridLength, HorizontalAlignment, HyperlinkButton, InfoBar, InfoBarSeverity, Orientation,
+    ProgressRing, ScrollViewer, StackPanel, TextBlock, TextWrapping, ThemeBrush, Thickness,
+    ToggleSwitch, VerticalAlignment, View, ViewContext,
 };
 
 use crate::ui::{
+    activity,
     controller::{Busy, Model, Severity, Snapshot},
-    status::{Action, Cause, Fix, Status, Tone},
+    status::{Cause, Fix, Status, Tone},
     window::{MainWindow, Msg, Page},
 };
 
@@ -28,6 +29,8 @@ pub(super) const COLUMN: f64 = 1000.0;
 pub(super) const MEASURE: f64 = 560.0;
 /// Space between the sections of a page.
 const SECTIONS: f64 = 28.0;
+/// Space between the parts of a dashboard page.
+const DASHBOARD_GAP: f64 = 12.0;
 /// Space between a section's header and its first row.
 const HEADER_GAP: f64 = 8.0;
 /// Space between the rows of a section.
@@ -161,6 +164,19 @@ pub(super) fn column(children: Vec<View>) -> View {
                 .columns([GridLength::STAR.max(COLUMN)])
                 .margin(Thickness::new(0.0, 0.0, 16.0, 0.0))
                 .children((StackPanel::new().spacing(SECTIONS).children(children),)),
+        )
+        .into()
+}
+
+/// A page that uses the whole width, for the dashboards: its sections in a column that scrolls
+/// when the window is too small for them, with room for the scroll bar on the right.
+pub(super) fn wide_column(children: Vec<View>) -> View {
+    ScrollViewer::new()
+        .content(
+            StackPanel::new()
+                .spacing(DASHBOARD_GAP)
+                .margin(Thickness::new(0.0, 0.0, 16.0, 0.0))
+                .children(children),
         )
         .into()
 }
@@ -525,19 +541,6 @@ fn fix_available(window: &MainWindow, fix: Fix) -> bool {
     }
 }
 
-/// The switch of protection: the same state as the button of the hero, and the tray's menu. It
-/// stops while the controller works, and while the certificate is missing; switching off is always
-/// possible.
-pub(super) fn protection_switch(status: &Status, context: Context<'_>) -> ToggleSwitch {
-    ToggleSwitch::new()
-        .is_on(status.is_on())
-        .is_enabled(matches!(status.action(), Action::TurnOn | Action::TurnOff))
-        .on_content("On")
-        .off_content("Off")
-        .automation_name("Protection")
-        .on_toggled(context.callback(Msg::Toggle))
-}
-
 /// The switch of a feature of the settings; `to_message` turns the new state into the message.
 pub(super) fn feature_switch(
     name: &str,
@@ -603,7 +606,15 @@ pub(in crate::ui) fn status_chip(
         .into()
 }
 
-// ---- Numbers ----
+// ---- Numbers and times ----
+
+/// A time, in seconds since the Unix epoch, as the vault's list tells times: `14:05`,
+/// `yesterday 14:05`, `Mon 14:05`, `12 Oct`.
+pub(super) fn when(unix: u64) -> String {
+    let secs = i64::try_from(unix).unwrap_or(i64::MAX);
+    let local = DateTime::from_unix_secs(secs).to_local().ticks();
+    activity::when(local, activity::now())
+}
 
 /// `12,345`.
 pub(super) fn thousands(n: u64) -> String {

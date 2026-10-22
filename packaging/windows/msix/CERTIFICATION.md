@@ -79,8 +79,9 @@ it). The Windows App SDK runtime is part of the package.
 
 **runFullTrust**: piikey is a desktop app (WinUI 3 and Win32). It runs a local proxy, changes the
 Windows proxy settings the user switches on, reads the focused text field of other programs through
-UI Automation, keeps a tray icon and a global hotkey, and scans the files the user chooses. None of
-that works in an app container.
+UI Automation, keeps a tray icon and a global hotkey, scans the files the user chooses and, if the
+user switches the Watch on, watches the folders the user picks for changes. None of that works in
+an app container.
 
 **unvirtualizedResources**: piikey's purpose is to change things that other programs read, which
 the package's private copy of the registry and of AppData would hide from them. It declares exactly
@@ -91,8 +92,8 @@ these, and Windows keeps the rest of its writes private:
 | `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings` | `ProxyEnable`, `ProxyServer`, `ProxyOverride` | The Windows (WinINET) proxy setting is where browsers and most programs look. Only while the user has protection on, it points at the local proxy `127.0.0.1:7979`; when it ends, piikey writes the user's previous values back exactly (they are saved in `%LOCALAPPDATA%\piikey\proxy.prev`) and never touches a proxy it did not set. |
 | `HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce` | one value, `piikey proxy restore` | A safety net for a shutdown or sign-out that ends piikey while the proxy is on: Windows runs it once at the next sign-in, and it gives the proxy settings back. In this package it is a `cmd.exe` line that starts piikey's alias and, if the alias is gone because the package was removed, switches the proxy off. piikey deletes it when protection goes off. |
 | `HKCU\Software\Microsoft\SystemCertificates\Root` | piikey's local certificate, with the user's consent | The user's Root store is where Windows, browsers and other programs read the trusted roots from. |
-| `HKCU\Software\Classes\*\shell\piikey.scan`, `...\Directory\shell\piikey.scan`, `...\Directory\Background\shell\piikey.scan` | the Explorer verb "Scan for personal data" (a classic registry verb; the user can switch it off on the Inventory page) | Explorer, not piikey, reads these keys. They run piikey through its execution alias, because the folder of the package changes with every version and is closed to other programs. |
-| `%LOCALAPPDATA%\piikey` (folder) | the encrypted vault, the settings, the local certificate and key, the downloaded model, the inventory | `piikey-cli.exe` exists in the package and as a download outside the Store; both must read the same vault, because a stand-in issued by one has to be restored by the other. The vault is also what lets the user restore earlier stand-ins after an update or a reinstall. |
+| `HKCU\Software\Classes\*\shell\piikey.scan`, `...\Directory\shell\piikey.scan`, `...\Directory\Background\shell\piikey.scan` | the Explorer verb "Scan for personal data" (a classic registry verb; the user can switch it off in Settings > General) | Explorer, not piikey, reads these keys. They run piikey through its execution alias, because the folder of the package changes with every version and is closed to other programs. |
+| `%LOCALAPPDATA%\piikey` (folder) | the encrypted vault, the settings, the local certificate and key, the downloaded model, the inventory and the watch's results | `piikey-cli.exe` exists in the package and as a download outside the Store; both must read the same vault, because a stand-in issued by one has to be restored by the other. The vault is also what lets the user restore earlier stand-ins after an update or a reinstall. |
 
 Windows 10 has no such lists. There the package also states `RegistryWriteVirtualization` and
 `FilesystemWriteVirtualization` as disabled, which switches virtualization of HKCU and AppData off
@@ -109,8 +110,8 @@ what other programs read are outside the package:
 |---|---|---|
 | The Windows proxy | Only if protection was on when the package was removed. `ProxyEnable` stays 1 and `ProxyServer` stays `127.0.0.1:7979` until the next sign-in. Then the `RunOnce` entry (no piikey code) switches `ProxyEnable` off. The settings the user had before piikey stay in `proxy.prev` but are not put back. | Turn protection off (tray icon > Quit piikey) before removing the package, or switch the proxy off in Settings > Network & internet > Proxy. |
 | The local certificate | "piikey Guard CA" stays in the user's Root store, and its key (wrapped with DPAPI for the user) in `%LOCALAPPDATA%\piikey\ca.key`. The installer of the download version removes it at uninstall; the Store has no uninstall step. | `certutil -user -delstore Root "piikey Guard CA"`, or certmgr.msc > Trusted Root Certification Authorities > "piikey Guard CA". Deleting the data folder removes the key. |
-| The Explorer verb | The three `piikey.scan` keys stay and point at an alias that no longer exists, so "Scan for personal data" is still in the menu and does nothing. | Switch the Explorer menu off on piikey's Inventory page before removing the package, or remove the keys: `reg delete "HKCU\Software\Classes\*\shell\piikey.scan" /f`, the same for `Directory\shell` and `Directory\Background\shell`. |
-| The data folder | `%LOCALAPPDATA%\piikey`: the vault (encrypted), settings, inventory (paths and counts, never values), the model (about 343 MB), the certificate and its key. It stays on purpose: the vault restores earlier stand-ins, and the installer of the download version shares the folder. | Delete the folder to remove everything piikey stored. |
+| The Explorer verb | The three `piikey.scan` keys stay and point at an alias that no longer exists, so "Scan for personal data" is still in the menu and does nothing. | Switch the Explorer menu off in piikey's Settings > General before removing the package, or remove the keys: `reg delete "HKCU\Software\Classes\*\shell\piikey.scan" /f`, the same for `Directory\shell` and `Directory\Background\shell`. |
+| The data folder | `%LOCALAPPDATA%\piikey`: the vault (encrypted), settings, inventory and watch results (paths, counts and content fingerprints, never values), the model (about 343 MB), the certificate and its key. It stays on purpose: the vault restores earlier stand-ins, and the installer of the download version shares the folder. | Delete the folder to remove everything piikey stored. |
 
 Everything the package writes into its own private copy (Windows' per-package registry and AppData
 files) is removed by Windows.

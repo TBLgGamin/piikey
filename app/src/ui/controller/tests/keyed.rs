@@ -167,12 +167,14 @@ fn the_feed_is_loaded_at_start_filtered_by_time_and_saved_at_shutdown() -> Test 
         ..Fake::default()
     });
     let inventory = fake.open_inventory()?;
+    let watch = fake.open_watch()?;
     let controller = Controller::new(
         Box::new(Arc::clone(&fake)),
         vault,
         quiet(),
         engine,
         inventory,
+        watch,
         None,
     )?;
     let period = |period: Period| KeyedQuery {
@@ -201,7 +203,7 @@ fn the_feed_is_loaded_at_start_filtered_by_time_and_saved_at_shutdown() -> Test 
 }
 
 #[test]
-fn forgetting_and_wiping_remove_vault_records() -> Test {
+fn forgetting_removes_vault_records() -> Test {
     let rig = rig(true, quiet())?;
     issue(&rig, &["mail jan.jansen@acme.nl", "call +31 6 12345678"])?;
     rig.run(Command::Refresh)?;
@@ -210,7 +212,7 @@ fn forgetting_and_wiping_remove_vault_records() -> Test {
     assert_eq!(rig.controller.snapshot().issued, 1);
     assert_eq!(rig.controller.keyed(&text("jan.jansen"), 10).matched, 0);
     assert_eq!(rig.controller.keyed(&text("6 12345678"), 10).matched, 1);
-    rig.run(Command::WipeVault)?;
+    rig.run(Command::Forget(vec!["+31 6 12345678".to_owned()]))?;
     let snapshot = rig.controller.snapshot();
     assert_eq!(snapshot.issued, 0);
     assert!(snapshot.recent.is_empty());

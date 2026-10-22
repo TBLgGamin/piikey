@@ -7,7 +7,8 @@
 //! enabled=true
 //! highlight=hotkey
 //! explorer_menu=true
-//! inventory=false
+//! background=true
+//! watch=false
 //! http_api=false
 //! http_port=7980
 //! site=chat.openai.com
@@ -15,18 +16,21 @@
 //! program=chrome.exe
 //! disabled_kind=email
 //! inventory_root=C:\Users\jan\Documents
-//! inventory_exclude=C:\Users\jan\Documents\Private
+//! watch_folder=C:\Users\jan\Downloads
 //! ```
 //!
 //! `disabled_kind=<kind>` lines (the `EntityKind::as_str` name) list the kinds
 //! that are NOT masked; no line means every kind is masked, which is also what
 //! an old file means. An unknown kind name is skipped like any unknown key.
 //!
-//! `highlight` is `off`, `always` or `hotkey`. `explorer_menu` is on unless it says `false`;
-//! `inventory`, `http_api` and `enabled` are off unless they say `true`. `http_port` is a
-//! port from 1 to 65535. `program` is an exe name; a path stands for its file name.
-//! `inventory_root` and `inventory_exclude` repeat, one absolute folder each. A file from an
-//! older version lacks the newer keys and gets their defaults.
+//! `highlight` is `off`, `always` or `hotkey`. `explorer_menu` and `background` are on unless
+//! they say `false`; `watch`, `http_api` and `enabled` are off unless they say `true`.
+//! `http_port` is a port from 1 to 65535. `program` is an exe name; a path stands for its file
+//! name. `inventory_root` (the folders the inventory scans when asked) and `watch_folder` (the
+//! folders the watch keeps an eye on) repeat, one absolute folder each. A file from an older
+//! version lacks the newer keys and gets their defaults; the keys of features that are gone
+//! (`inventory`, `inventory_exclude`) are skipped like any unknown key, and the next save leaves
+//! them out.
 //!
 //! Blank lines and `#` comments are ignored, unknown keys are skipped, and
 //! every value is normalized on load, so a hand-edited file cannot make the
@@ -64,18 +68,19 @@ const FILE_NAME: &str = "guard.cfg";
 
 /// The keys of `guard.cfg`, in the order the file lists them. `settings set` takes all but
 /// `enabled`: protection is switched on and off by itself.
-pub const KEYS: [&str; 11] = [
+pub const KEYS: [&str; 12] = [
     "enabled",
     "highlight",
     "explorer_menu",
-    "inventory",
+    "background",
+    "watch",
     "http_api",
     "http_port",
     "site",
     "program",
     "disabled_kind",
     "inventory_root",
-    "inventory_exclude",
+    "watch_folder",
 ];
 
 /// The port of the local HTTP API unless `http_port` says otherwise.
@@ -143,23 +148,28 @@ pub struct Policy {
     pub disabled_kinds: Vec<EntityKind>,
     /// When the field in focus is outlined if it holds personal data.
     pub highlight: Highlight,
-    /// Whether Explorer's right-click menu offers "Scan for PII".
+    /// Whether Explorer's right-click menu offers "Scan for personal data".
     pub explorer_menu: bool,
-    /// Whether the PII inventory keeps scanning [`Self::inventory_roots`] in the background.
-    pub inventory: bool,
-    /// Absolute folders the inventory scans; empty means [`default_inventory_roots`] when the
-    /// inventory is switched on.
+    /// Whether closing the window leaves piikey running in the tray, with protection, the
+    /// highlight, the watch and the API still working. Off: closing the window quits piikey.
+    pub background: bool,
+    /// Absolute folders the inventory scans when asked (its locations); empty means
+    /// [`default_inventory_roots`].
     pub inventory_roots: Vec<PathBuf>,
-    /// Absolute folders (and files) the inventory leaves out, with everything below them.
-    pub inventory_exclude: Vec<PathBuf>,
+    /// Whether the watch keeps an eye on [`Self::watch_folders`]: every change in them is
+    /// scanned as it happens, into a store of its own.
+    pub watch: bool,
+    /// Absolute folders the watch keeps an eye on, below them too. Empty until the user picks
+    /// some: nothing is watched by default.
+    pub watch_folders: Vec<PathBuf>,
     /// Whether the app serves the local HTTP API on `127.0.0.1`.
     pub http_api: bool,
     /// The port of the local HTTP API, 1 to 65535.
     pub http_port: u16,
 }
 
-// Hand-written: a derived `Default` would switch the Explorer menu off and give the HTTP API
-// port 0.
+// Hand-written: a derived `Default` would switch the Explorer menu and the tray off and give the
+// HTTP API port 0.
 impl Default for Policy {
     fn default() -> Self {
         Self {
@@ -169,9 +179,10 @@ impl Default for Policy {
             disabled_kinds: Vec::new(),
             highlight: Highlight::default(),
             explorer_menu: true,
-            inventory: false,
+            background: true,
             inventory_roots: Vec::new(),
-            inventory_exclude: Vec::new(),
+            watch: false,
+            watch_folders: Vec::new(),
             http_api: false,
             http_port: DEFAULT_HTTP_PORT,
         }
@@ -298,7 +309,8 @@ impl Policy {
                 "enabled" => policy.enabled = value.eq_ignore_ascii_case("true"),
                 "highlight" => policy.highlight = Highlight::parse(value).unwrap_or_default(),
                 "explorer_menu" => policy.explorer_menu = !value.eq_ignore_ascii_case("false"),
-                "inventory" => policy.inventory = value.eq_ignore_ascii_case("true"),
+                "background" => policy.background = !value.eq_ignore_ascii_case("false"),
+                "watch" => policy.watch = value.eq_ignore_ascii_case("true"),
                 "http_api" => policy.http_api = value.eq_ignore_ascii_case("true"),
                 "http_port" => {
                     policy.http_port = value
@@ -319,8 +331,8 @@ impl Policy {
                 "inventory_root" => {
                     push_unique_folder(&mut policy.inventory_roots, Self::parse_folder(value));
                 }
-                "inventory_exclude" => {
-                    push_unique_folder(&mut policy.inventory_exclude, Self::parse_folder(value));
+                "watch_folder" => {
+                    push_unique_folder(&mut policy.watch_folders, Self::parse_folder(value));
                 }
                 _ => {}
             }
@@ -344,7 +356,8 @@ impl Policy {
             vec![self.enabled.to_string()],
             vec![self.highlight.as_str().to_owned()],
             vec![self.explorer_menu.to_string()],
-            vec![self.inventory.to_string()],
+            vec![self.background.to_string()],
+            vec![self.watch.to_string()],
             vec![self.http_api.to_string()],
             vec![self.http_port.to_string()],
             sites.collect(),
@@ -355,7 +368,7 @@ impl Policy {
                 .map(|kind| kind.as_str().to_owned())
                 .collect(),
             folders(&self.inventory_roots),
-            folders(&self.inventory_exclude),
+            folders(&self.watch_folders),
         ];
         let mut out = String::new();
         for (key, values) in KEYS.into_iter().zip(values) {
@@ -377,8 +390,8 @@ impl Policy {
             .fold(KindSet::ALL, |set, &kind| set.without(kind))
     }
 
-    /// The folders the inventory scans: the saved ones, or [`default_inventory_roots`] when
-    /// none were saved.
+    /// The folders the inventory scans when asked: the saved ones, or
+    /// [`default_inventory_roots`] when none were saved.
     #[must_use]
     pub fn inventory_roots_or_default(&self) -> Vec<PathBuf> {
         if self.inventory_roots.is_empty() {
@@ -411,15 +424,18 @@ pub struct SettingsPatch {
     /// Replaces [`Policy::explorer_menu`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub explorer_menu: Option<bool>,
-    /// Replaces [`Policy::inventory`].
+    /// Replaces [`Policy::background`].
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub inventory: Option<bool>,
+    pub background: Option<bool>,
     /// Replaces [`Policy::inventory_roots`]; each entry goes through [`Policy::parse_folder`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inventory_roots: Option<Vec<PathBuf>>,
-    /// Replaces [`Policy::inventory_exclude`]; each entry goes through [`Policy::parse_folder`].
+    /// Replaces [`Policy::watch`].
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub inventory_exclude: Option<Vec<PathBuf>>,
+    pub watch: Option<bool>,
+    /// Replaces [`Policy::watch_folders`]; each entry goes through [`Policy::parse_folder`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub watch_folders: Option<Vec<PathBuf>>,
     /// Replaces [`Policy::http_api`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub http_api: Option<bool>,
@@ -453,14 +469,17 @@ impl SettingsPatch {
         if let Some(value) = self.explorer_menu {
             next.explorer_menu = value;
         }
-        if let Some(value) = self.inventory {
-            next.inventory = value;
+        if let Some(value) = self.background {
+            next.background = value;
         }
         if let Some(folders) = &self.inventory_roots {
             next.inventory_roots = checked_folders(folders, "inventory folder")?;
         }
-        if let Some(folders) = &self.inventory_exclude {
-            next.inventory_exclude = checked_folders(folders, "excluded path")?;
+        if let Some(value) = self.watch {
+            next.watch = value;
+        }
+        if let Some(folders) = &self.watch_folders {
+            next.watch_folders = checked_folders(folders, "watch folder")?;
         }
         if let Some(value) = self.http_api {
             next.http_api = value;
@@ -634,8 +653,8 @@ mod tests {
     use super::*;
 
     /// The new switches at their defaults, as `to_text` writes them after `enabled`.
-    const DEFAULT_SWITCHES: &str =
-        "highlight=hotkey\nexplorer_menu=true\ninventory=false\nhttp_api=false\nhttp_port=7980\n";
+    const DEFAULT_SWITCHES: &str = "highlight=hotkey\nexplorer_menu=true\nbackground=true\nwatch=false\n\
+                                    http_api=false\nhttp_port=7980\n";
 
     fn policy() -> Policy {
         Policy {
@@ -645,12 +664,13 @@ mod tests {
             disabled_kinds: vec![EntityKind::Email, EntityKind::Person],
             highlight: Highlight::Always,
             explorer_menu: false,
-            inventory: true,
+            background: false,
             inventory_roots: vec![
                 PathBuf::from(r"C:\Users\jan\Documents"),
                 PathBuf::from(r"D:\Archive"),
             ],
-            inventory_exclude: vec![PathBuf::from(r"C:\Users\jan\Documents\Private")],
+            watch: true,
+            watch_folders: vec![PathBuf::from(r"C:\Users\jan\Downloads")],
             http_api: true,
             http_port: 8123,
         }
@@ -676,9 +696,9 @@ mod tests {
                 r#"{"sites":["HTTPS://Chat.OpenAI.com/x","*.example.org","chat.openai.com"],
                 "programs":["Firefox"],
                 "disabled_kinds":["phone","email","phone"],
-                "highlight":"always","explorer_menu":false,"inventory":true,
+                "highlight":"always","explorer_menu":false,"background":true,"watch":false,
                 "inventory_roots":["\"C:\\Users\\jan\\Documents\"","C:\\Users\\jan\\documents\\"],
-                "inventory_exclude":["C:\\Users\\jan\\Documents\\Private"],
+                "watch_folders":["C:\\Users\\jan\\Pictures"],
                 "http_api":true,"http_port":8123}"#,
             )
             .apply(&mut p)
@@ -688,15 +708,12 @@ mod tests {
         assert_eq!(p.programs, ["firefox.exe"]);
         assert_eq!(p.disabled_kinds, [EntityKind::Email, EntityKind::Phone]);
         assert_eq!(p.highlight, Highlight::Always);
-        assert!(!p.explorer_menu && p.inventory && p.http_api);
+        assert!(!p.explorer_menu && p.background && !p.watch && p.http_api);
         assert_eq!(
             p.inventory_roots,
             [PathBuf::from(r"C:\Users\jan\Documents")]
         );
-        assert_eq!(
-            p.inventory_exclude,
-            [PathBuf::from(r"C:\Users\jan\Documents\Private")]
-        );
+        assert_eq!(p.watch_folders, [PathBuf::from(r"C:\Users\jan\Pictures")]);
         assert_eq!(p.http_port, 8123);
         assert_eq!(p.enabled, before.enabled);
 
@@ -708,12 +725,12 @@ mod tests {
     #[test]
     fn an_invalid_value_is_rejected_and_changes_nothing() {
         for json in [
-            r#"{"inventory":true,"sites":["chatgpt.com","not a host"]}"#,
-            r#"{"inventory":true,"programs":["a|b.exe"]}"#,
-            r#"{"inventory":true,"disabled_kinds":["nonsense"]}"#,
-            r#"{"inventory":true,"inventory_roots":["relative\\folder"]}"#,
-            r#"{"inventory":true,"inventory_exclude":[""]}"#,
-            r#"{"inventory":true,"http_port":0}"#,
+            r#"{"background":true,"sites":["chatgpt.com","not a host"]}"#,
+            r#"{"background":true,"programs":["a|b.exe"]}"#,
+            r#"{"background":true,"disabled_kinds":["nonsense"]}"#,
+            r#"{"background":true,"inventory_roots":["relative\\folder"]}"#,
+            r#"{"background":true,"watch_folders":[""]}"#,
+            r#"{"background":true,"http_port":0}"#,
         ] {
             let mut p = policy();
             let before = p.clone();
@@ -734,6 +751,10 @@ mod tests {
         assert!(serde_json::from_str::<SettingsPatch>(r#"{"enabled":true}"#).is_err());
         assert!(serde_json::from_str::<SettingsPatch>(r#"{"highlight":"loud"}"#).is_err());
         assert!(serde_json::from_str::<SettingsPatch>(r#"{"http_port":70000}"#).is_err());
+        // The inventory's switch and its exclusions are gone: a patch that still names them is
+        // refused, not silently half applied.
+        assert!(serde_json::from_str::<SettingsPatch>(r#"{"inventory":true}"#).is_err());
+        assert!(serde_json::from_str::<SettingsPatch>(r#"{"inventory_exclude":[]}"#).is_err());
     }
 
     #[test]
@@ -751,6 +772,7 @@ mod tests {
             sites: vec!["chatgpt.com".into()],
             disabled_kinds: vec![EntityKind::CreditCard, EntityKind::Email],
             inventory_roots: vec![PathBuf::from(r"C:\Docs")],
+            watch_folders: vec![PathBuf::from(r"D:\Inbox")],
             ..Policy::default()
         };
         let Ok(json) = serde_json::to_value(&p) else {
@@ -765,9 +787,10 @@ mod tests {
                 "disabled_kinds": ["credit_card", "email"],
                 "highlight": "hotkey",
                 "explorer_menu": true,
-                "inventory": false,
+                "background": true,
                 "inventory_roots": ["C:\\Docs"],
-                "inventory_exclude": [],
+                "watch": false,
+                "watch_folders": ["D:\\Inbox"],
                 "http_api": false,
                 "http_port": 7980,
             })
@@ -780,11 +803,11 @@ mod tests {
         assert_eq!(Policy::parse(&p.to_text()), p);
         assert_eq!(
             p.to_text(),
-            "enabled=true\nhighlight=always\nexplorer_menu=false\ninventory=true\n\
+            "enabled=true\nhighlight=always\nexplorer_menu=false\nbackground=false\nwatch=true\n\
              http_api=true\nhttp_port=8123\nsite=chatgpt.com\nsite=*.anthropic.com\n\
              program=chrome.exe\ndisabled_kind=email\ndisabled_kind=person\n\
              inventory_root=C:\\Users\\jan\\Documents\ninventory_root=D:\\Archive\n\
-             inventory_exclude=C:\\Users\\jan\\Documents\\Private\n"
+             watch_folder=C:\\Users\\jan\\Downloads\n"
         );
     }
 
@@ -907,9 +930,44 @@ mod tests {
         assert_eq!(p, expected);
         assert_eq!(p.highlight, Highlight::Hotkey);
         assert!(p.explorer_menu);
-        assert!(!p.inventory && !p.http_api);
+        assert!(p.background, "closing the window keeps piikey in the tray");
+        assert!(!p.watch && !p.http_api);
         assert_eq!(p.http_port, 7980);
-        assert!(p.inventory_roots.is_empty() && p.inventory_exclude.is_empty());
+        assert!(p.inventory_roots.is_empty() && p.watch_folders.is_empty());
+    }
+
+    #[test]
+    fn the_keys_of_the_features_that_are_gone_load_and_are_dropped() {
+        // A file of the version that had the inventory's switch, its exclusions and no watch.
+        let old = "enabled=true\nhighlight=always\nexplorer_menu=false\ninventory=true\n\
+                   http_api=true\nhttp_port=8123\nsite=claude.ai\n\
+                   inventory_root=C:\\Users\\jan\\Documents\n\
+                   inventory_exclude=C:\\Users\\jan\\Documents\\Private\n";
+        let p = Policy::parse(old);
+        assert!(p.enabled && p.http_api && !p.explorer_menu);
+        assert_eq!(p.highlight, Highlight::Always);
+        assert_eq!(p.http_port, 8123);
+        assert_eq!(p.sites, ["claude.ai"]);
+        assert_eq!(
+            p.inventory_roots,
+            [PathBuf::from(r"C:\Users\jan\Documents")]
+        );
+        assert!(p.background && !p.watch && p.watch_folders.is_empty());
+        // The next save leaves them out.
+        let saved = p.to_text();
+        assert!(!saved.contains("inventory=") && !saved.contains("inventory_exclude"));
+        assert_eq!(Policy::parse(&saved), p);
+
+        // The same through the file, and through an API reply of that version.
+        let path = temp_dir("old").join(FILE_NAME);
+        assert!(write_atomic(&path, old.as_bytes()).is_ok());
+        assert_eq!(Policy::load_from(&path).ok().as_ref(), Some(&p));
+        let reply = r#"{"enabled":true,"inventory":true,"inventory_roots":["C:\\a"],"inventory_exclude":["C:\\a\\b"]}"#;
+        let from_reply = serde_json::from_str::<Policy>(reply);
+        assert_eq!(
+            from_reply.ok().map(|policy| policy.inventory_roots),
+            Some(vec![PathBuf::from(r"C:\a")])
+        );
     }
 
     #[test]
@@ -930,16 +988,22 @@ mod tests {
     #[test]
     fn the_switches_follow_their_own_defaults() {
         let read = |text: &str| Policy::parse(text);
-        // On by default: only the word `false` turns it off.
+        // On by default: only the word `false` turns them off.
         assert!(!read("explorer_menu=false\n").explorer_menu);
         assert!(!read("explorer_menu=FALSE\n").explorer_menu);
         assert!(read("explorer_menu=true\n").explorer_menu);
         assert!(read("explorer_menu=no\n").explorer_menu);
         assert!(read("explorer_menu=\n").explorer_menu);
+        assert!(!read("background=false\n").background);
+        assert!(!read("background = FALSE\n").background);
+        assert!(read("background=true\n").background);
+        assert!(read("background=0\n").background);
+        assert!(read("background=\n").background);
+        assert!(read("").background);
         // Off by default: only the word `true` turns them on.
-        assert!(read("inventory=true\n").inventory);
+        assert!(read("watch=true\n").watch);
         assert!(read("http_api=TRUE\n").http_api);
-        assert!(!read("inventory=yes\n").inventory);
+        assert!(!read("watch=yes\n").watch);
         assert!(!read("http_api=1\n").http_api);
     }
 
@@ -958,14 +1022,14 @@ mod tests {
     fn parse_reads_every_key() {
         for key in KEYS {
             let sample = match key {
-                "enabled" | "inventory" | "http_api" => "true",
+                "enabled" | "watch" | "http_api" => "true",
                 "highlight" => "off",
-                "explorer_menu" => "false",
+                "explorer_menu" | "background" => "false",
                 "http_port" => "1",
                 "site" => "a.com",
                 "program" => "a.exe",
                 "disabled_kind" => "email",
-                "inventory_root" | "inventory_exclude" => r"C:\a",
+                "inventory_root" | "watch_folder" => r"C:\a",
                 other => panic!("{other} needs a sample"),
             };
             assert_ne!(
@@ -1007,7 +1071,7 @@ mod tests {
     }
 
     #[test]
-    fn inventory_folders_are_normalized_and_deduplicated() {
+    fn inventory_and_watch_folders_are_normalized_and_deduplicated() {
         let p = Policy::parse(
             "inventory_root=C:\\Users\\jan\\Documents\n\
              inventory_root=\"C:\\Users\\jan\\Desktop\"\n\
@@ -1018,8 +1082,9 @@ mod tests {
              inventory_root=\n\
              inventory_root=\"\"\n\
              inventory_root=C:\\a\u{1}b\n\
-             inventory_exclude=D:\\Private\n\
-             inventory_exclude=D:\\Private\n",
+             watch_folder=D:\\Inbox\n\
+             watch_folder = d:\\inbox\\\n\
+             watch_folder=Inbox\n",
         );
         assert_eq!(
             p.inventory_roots,
@@ -1028,7 +1093,7 @@ mod tests {
                 PathBuf::from(r"C:\Users\jan\Desktop"),
             ]
         );
-        assert_eq!(p.inventory_exclude, [PathBuf::from(r"D:\Private")]);
+        assert_eq!(p.watch_folders, [PathBuf::from(r"D:\Inbox")]);
     }
 
     #[test]
@@ -1067,14 +1132,14 @@ mod tests {
                 PathBuf::from("relative"),
                 not_unicode,
             ],
-            inventory_exclude: vec![PathBuf::from(r"C:\ok\skip")],
+            watch_folders: vec![PathBuf::from(r"C:\ok\watched")],
             ..Policy::default()
         };
         assert_eq!(
             p.to_text(),
             format!(
                 "enabled=false\n{DEFAULT_SWITCHES}\
-                 inventory_root=C:\\ok\ninventory_exclude=C:\\ok\\skip\n"
+                 inventory_root=C:\\ok\nwatch_folder=C:\\ok\\watched\n"
             )
         );
     }

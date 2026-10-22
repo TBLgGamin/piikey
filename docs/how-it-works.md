@@ -58,20 +58,64 @@ stored. Password fields are never read.
 
 ## Inventory and Explorer
 
-The inventory records which files hold personal data. A background loop scans your folders (the
-Documents, Desktop and Downloads folders unless you choose others) on a half-sized thread pool and
-skips files that did not change since the last scan. For each file, `inventory.jsonl` keeps how many
-values of each type it holds, never the values, and the scan treats a file piikey masked as clean.
-The Inventory page shows the result as a treemap: one tile per folder or file, sized by the number
-of values, and clicking a folder opens it. A tile's side panel can open the file, show it in
-Explorer, rescan it, make a masked copy (beside the file; it never replaces an existing file) or
-exclude it. A folder excluded while a scan runs is dropped from the inventory when that scan ends.
+The inventory records which files hold personal data. It scans only when somebody asks: the Scan
+button on the Inventory page (which looks through your locations, the Documents, Desktop and
+Downloads folders until you choose others), the box that adds one more folder or file, files and
+folders dropped on the page, Explorer's menu, `explorer_scan`, `scan_files` and `inventory_rescan`
+through the API and the CLI. Nothing scans on a timer. Scans run on one scan thread in a
+half-sized thread pool, and a scan you asked for goes before whatever the watch has queued.
 
-"Scan for personal data" in Explorer's right-click menu (under "Show more options" on Windows 11)
-starts `piikey.exe --scan <path>`. It hands the paths to the running app, which scans them and,
-when the scan ends, brings its window forward on the Inventory page at the scanned path, also when
-the app was only a tray icon (a timer on the application thread looks four times a second); if the
-app is not running, the command starts it.
+For each file, `inventory.jsonl` keeps its size, write time, a BLAKE3 fingerprint of its contents
+and how many values of each type it holds, never the values. A scan is incremental. A file whose
+size and write time are the ones stored is not read. A file that changed is read and fingerprinted;
+when the fingerprint is the one stored (a sync client touched it, a save changed nothing) it is not
+detected again, and only the new size, write time and scan time are kept. A file that failed
+before, with no write time on record, is never trusted. Records from before the fingerprint
+existed load fine and get one the next time the file changes. The scan treats a file piikey masked
+as clean. The fingerprint is stored in the file but is never shown in the API, the CLI or a report.
+
+The Inventory page shows the result as a dashboard, like a disk-usage viewer. A tree of folders and
+files has a bar by type on each row; a legend lists the types found (a chip row in a narrow window,
+a list in a wide one) and picking one shows only that type; a treemap has a tile for every file,
+coloured by type (up to 400 tiles, the rest one "+N files" tile); and a details pane describes
+what is selected. Selecting a tile opens the tree along the way to its file. For a file the details
+can open it, show it in Explorer, show what was found, make a masked copy (beside the file; it
+never replaces an existing file) or scan it again; for a folder
+they can show only that folder, show it in Explorer or scan it. "Show what was found" runs
+detection on that one file when asked and lists its values (at most 200) in a dialog: they are read
+from the file at that moment and never stored. The inventory has no exclusions and no switch: what
+is in it is what was scanned.
+
+A scan started from the page, the box, a drop or Explorer opens a result dialog in the window
+(scanning, then how much was found, with "Show in Inventory" when anything was). A newer scan
+replaces an older dialog, and a window the user opens does not replay old results.
+
+"Scan for personal data" in Explorer's right-click menu (under "Show more options" on Windows 11;
+the General setting "Scan for personal data in Explorer" adds or removes it) starts
+`piikey.exe --scan <path>`. It hands the paths to the running app, which scans them into the
+inventory and shows the result dialog, bringing its window forward also when the app was only a
+tray icon (a timer on the application thread looks four times a second); if the app is not
+running, the command starts it.
+
+## Watch
+
+The Watch is a separate feature with its own switch, its own folders (`watch_folder` in
+`guard.cfg`, none by default) and its own store, `watch.jsonl`, in the inventory's format but with
+its own locks (`watch.lock`, `watch.save.lock`). It shares nothing with the inventory: what it
+finds never appears there, and what the inventory scans never appears here.
+
+While it is on, Windows reports changes in the watched folders (through the `notify` crate, because
+the Windows call takes `unsafe` and the project's own code forbids it). Saving one document is a
+dozen reports, so each path has to settle first: a path is looked at once it has been quiet for
+two seconds, and one that never goes quiet (a log) at most every 30 seconds. Only the settled paths
+are scanned, through the same incremental rule as the inventory, in the same pool and on the same
+scan thread, behind any scan you asked for (a running watch scan is stopped and resumed). When 64
+or more paths settle at once, or Windows says it may have lost reports, everything in the folders
+is looked at, which still reads only what changed. Switching the watch on, adding a folder and
+starting the app catch up the same way, because a folder is not watched while the app is not
+running. Turning the watch off keeps what it found; removing a folder forgets that folder's
+entries. The Watch page shows each folder as watching, scanning, not watched (the watch is off)
+or not available, with the time of its last change, above the same dashboard as the inventory.
 
 ## API
 
@@ -84,7 +128,9 @@ process. The operations, their results and the error codes are in the
 
 ## Vault management
 
-You can search the vault, export it (JSON or CSV), forget values and wipe it. Forget and wipe
+You can search the vault, export it (JSON or CSV), forget values and wipe it. In the app, tick
+values on the Vault page (or Select all) and choose Forget, which asks before it does; the app has
+no wipe, but the API (`vault_wipe`) and the CLI (`vault wipe --yes`) do. Forget and wipe
 rewrite the vault file: the kept records are sealed again under a new vault id and the new file
 replaces the old one through `vault.pkv.compact`, so a forgotten value is gone from disk and a crash
 in between is completed at the next open or write. The app clears its typed-value cache afterwards. A second
@@ -92,37 +138,43 @@ process notices the new id and reloads.
 
 ## The app
 
-One window with a navigation pane and five pages, a tray icon, and a controller behind both. The
-pane has Overview, Protection, Inventory and Vault, Settings at its foot, and a status chip under
-it that is a button to Overview.
+One window with a navigation pane and six pages, a tray icon, and a controller behind both. The
+pane has Overview, Protection, Inventory, Watch and Vault, Settings at its foot, and a status chip
+under it that is a button to Overview.
 
 - **Overview**: the status hero (a title, one sentence, and the one Turn on / Turn off button, which
-  says why when it is unavailable), at most one attention block with its single fix button, five
-  clickable rows (Masking, Highlighting, Inventory, Vault, Detection, each with its own state and
-  no switches) and the five most recent swaps with a link to the Vault.
-- **Protection**: the master switch, the certificate, the protected sites, the protected apps and
-  the highlighting mode. The masking switch stays off until the certificate is installed, and the
-  page says so.
-- **Inventory**: the inventory switch and a status line, the treemap (described under Inventory
-  and Explorer above) with Export report and Rescan, the watched folders, what is left out, and the
-  Explorer menu switch.
+  says why when it is unavailable; it is the only master switch in the window), at most one
+  attention block with its single fix button, six clickable rows (Masking, Highlighting, Inventory,
+  Watch, Vault, Detection, each with its own state and no switches) and the five most recent swaps
+  with a link to the Vault.
+- **Protection**: the certificate, the protected sites, the protected apps and the highlighting
+  mode. It has no switch of its own: turning masking on is the Overview button (and the tray menu),
+  and the page says why it cannot be turned on while the certificate is missing.
+- **Inventory**: the Scan button, Export report, a Locations flyout (the folders the button looks
+  through, each with a Remove button), the box that adds a folder or file and scans it, a status
+  line (progress or what the inventory holds) and the dashboard described under Inventory and
+  Explorer above. Files and folders dropped on the page are scanned.
+- **Watch**: its switch, the folder list with each folder's state and a Remove button, the box that
+  adds a folder (or "Watch Documents, Desktop and Downloads" when the list is empty), a status line
+  and the same dashboard over the watch's store.
 - **Vault**: an activity feed of every value in the vault next to its stand-in, the most recently
   sent first (including values first stored long ago), then the ones never sent. Search matches
   values, stand-ins, sites and apps; filters narrow it to a type, a site (subdomains included) or a
-  time (today, last 7 days, last 30 days). The feed persists in
-  `%LOCALAPPDATA%\piikey\activity.cfg`, which holds stand-ins, sites, apps and times only; the
-  values themselves stay in the encrypted vault. Forgetting a value or wiping the vault also removes
-  its lines from the feed. Under Manage: where the vault file is, how many records it holds, Export
-  (CSV in Downloads) and Wipe, which takes two clicks and names the number of records.
-- **Settings**: one scrolling page with six sections. General has Start piikey when I sign in.
-  Detection shows the model's state and where it runs (CPU, or CPU and GPU), with a button to
-  download it after a skip or to try again after a failure. Types of personal data has a switch for every type,
-  all on by default; a value masked earlier still comes back after its type is switched off, and
-  the setting applies to masking, the highlight, scans and the inventory. Developer access has the
-  local HTTP API switch, its address and whether it listens, the token (copy it or make a new one),
-  the pipe name and a note about the CLI. Privacy & data shows the data folder, with Open folder.
-  About has the version, the state of the local proxy and links to the source, the issue tracker
-  and the license.
+  time (today, last 7 days, last 30 days). Every row has a check box; Select all ticks the listed
+  rows and Forget N removes the ticked ones after a confirmation. Export writes every value to a CSV
+  file in Downloads. The feed persists in `%LOCALAPPDATA%\piikey\activity.cfg`, which holds
+  stand-ins, sites, apps and times only; the values themselves stay in the encrypted vault.
+  Forgetting a value also removes its lines from the feed.
+- **Settings**: one scrolling page with five sections. General has Start piikey when I sign in,
+  Scan for personal data in Explorer (the right-click menu entry) and Keep piikey running in the
+  tray when I close the window. Types of personal data has a switch for every type, all on by
+  default; a value masked earlier still comes back after its type is switched off, and the setting
+  applies to masking, the highlight, scans and the inventory. When the detection model was skipped
+  or failed, a row above the types says so and has a button to download it or try again; a model
+  that is there needs no row. Developer access has the local HTTP API switch, its address and
+  whether it listens, and the token (copy it or make a new one). Privacy & data shows the data
+  folder, with Open folder, and links to the Vault and the Inventory. About has the version, the
+  state of the local proxy and links to the source, the issue tracker and the license.
 
 ### Status
 
@@ -149,9 +201,11 @@ it is on, and the app icon with an amber dot when it needs you. Its tooltip is t
 line, and its menu is the status as a header, Open piikey, Turn protection on or off, and Quit
 piikey.
 
-Closing the window while protection is on, or while the highlight, the inventory or the local API
-is, leaves the app running in the tray; with all of them off, closing the window ends the app. Quit
-piikey (tray) ends it either way, and gives Windows its previous proxy settings back.
+Closing the window leaves the app running in the tray when "Keep piikey running in the tray when I
+close the window" is on, which is the default (`background` in `guard.cfg`): protection, the
+highlight, the watch and the API keep working with the window closed. With it off, closing the
+window quits piikey, as Quit piikey (tray) does either way; both give Windows its previous proxy
+settings back.
 
 Only one copy runs per Windows user. A second start of `piikey.exe` finds the running app over its
 named pipe and asks it (`show_window`) to bring its window forward, then ends quietly;
@@ -172,7 +226,8 @@ alone. The uninstaller removes the `Run` and its skip entry.
 
 ## Model and devices
 
-The app loads the model while protection is on, highlighting is on or the inventory is on, and
+The app loads the model while protection is on, highlighting is on, the watch has folders to watch,
+a scan is running or the findings of a file are being read, and
 frees it when none is. Small calls (a chat message) run on the CPU; large ones (documents, many
 messages) are shared between the CPU and the GPU, which work through the batch from both ends. The
 first load checks whether the GPU helps
@@ -212,9 +267,10 @@ Everything piikey keeps is in `%LOCALAPPDATA%\piikey`, readable only by your Win
 |---|---|
 | `vault.pkv` | the encrypted original↔stand-in pairs (XChaCha20-Poly1305, key wrapped with DPAPI) |
 | `models\` | the downloaded detection model and `device.cfg` |
-| `guard.cfg` | protected sites and apps, types switched off, on/off, the highlight mode, the Explorer menu, inventory folders and the HTTP API |
+| `guard.cfg` | protected sites and apps, types switched off, on/off, the highlight mode, the Explorer menu, whether closing the window keeps piikey in the tray, the inventory locations, the watch switch and folders, and the HTTP API |
 | `activity.cfg` | the activity feed (stand-ins only) |
-| `inventory.jsonl` | per file: size, change time and how many values of each type it holds, never the values |
+| `inventory.jsonl` | per scanned file: size, write time, a fingerprint of the contents and how many values of each type it holds, never the values |
+| `watch.jsonl` | the same for the files the watch looked at, with `watch.lock` and `watch.save.lock` beside it (the inventory has `inventory.lock` and `inventory.save.lock`) |
 | `api.token` | the token the local HTTP API asks for |
 | `ca.crt`, `ca.key` | the local certificate; the key is wrapped with DPAPI |
 | `proxy.prev` | the previous Windows proxy settings, only while piikey has them changed |

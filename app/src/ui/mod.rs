@@ -24,6 +24,7 @@ pub(crate) mod testing;
 mod ticker;
 mod treemap;
 mod watchdog;
+mod watcher;
 mod window;
 
 pub use self::watchdog::{RESTORE_FLAG, WATCH_FLAG, restore as restore_proxy, watch};
@@ -52,7 +53,7 @@ use windows_reactor::{
 
 use self::{
     assets::TrayIcon,
-    controller::{Command, Controller, Notice, Reveal},
+    controller::{Command, Controller, Notice},
     instance::Instance,
     status::Status,
     system::System,
@@ -309,9 +310,9 @@ struct PiikeyApp {
     /// What the tray shows right after a toggle from the tray, before the controller has caught
     /// up. The next message of any kind replaces it with the real state.
     wish: Option<bool>,
-    /// The latest scan that asked to be shown, until the window that showed it closes: the window
-    /// gets it with its input, so a window that opens for it knows where to go.
-    reveal: Option<Reveal>,
+    /// The number of the latest scan that asked to be shown, until the window that showed it
+    /// closes: the window gets it with its input, so a window that opens for it shows its result.
+    reveal: Option<u64>,
     /// The number of the latest request to show a scan that was handled.
     revealed: u64,
     /// The number of requests to bring the window forward that were handled: a second start of the
@@ -333,14 +334,14 @@ impl PiikeyApp {
         context.exit();
     }
 
-    /// A scan that has not been shown yet asks to be: the window comes forward at its result.
+    /// A scan that asks to be shown, and has not been yet: the window comes forward with its
+    /// progress and its result in a dialog. The request is numbered when it is queued, so the window
+    /// is there before the scan has found anything.
     fn show_scan(&mut self, context: &ApplicationContext<Self>) {
-        let Some(reveal) = self.controller.reveal() else {
-            return;
-        };
-        if reveal.seq > self.revealed {
-            self.revealed = reveal.seq;
-            self.reveal = Some(reveal);
+        let seq = self.controller.tray().reveal;
+        if seq > self.revealed {
+            self.revealed = seq;
+            self.reveal = Some(seq);
             context.show_window("main");
         }
     }
@@ -355,9 +356,9 @@ impl PiikeyApp {
         }
     }
 
-    /// Brings the window forward, at the result of the latest scan that was not shown yet: one
-    /// that finished while the window was closed and the ticker could not run is shown this way,
-    /// when the user opens the window.
+    /// Brings the window forward, with the dialog of the latest scan that was not shown yet: one
+    /// that was asked for while the ticker could not run is shown this way, when the user opens the
+    /// window.
     fn open_window(&mut self, context: &ApplicationContext<Self>) {
         self.show_scan(context);
         context.show_window("main");
@@ -375,10 +376,11 @@ fn tray_icons(input: &AppInput) -> Option<&Icons> {
     input.icons.as_ref()
 }
 
-/// Whether closing the window ends the app: it does when nothing works in the background, and
-/// when no tray icon is left to open the window again.
-const fn closing_ends_app(tray: bool, runs_in_background: bool) -> bool {
-    !tray || !runs_in_background
+/// Whether closing the window ends the app: it does when the user's setting says the app stays in
+/// the tray only while its window is open (`keep_in_tray` off), and when no tray icon is left to
+/// open the window again, whatever the setting says.
+const fn closing_ends_app(tray: bool, keep_in_tray: bool) -> bool {
+    !tray || !keep_in_tray
 }
 
 /// What the tray icon says when the pointer rests on it: the status, and a paused highlight.
@@ -482,7 +484,7 @@ impl Application for PiikeyApp {
                     .map(|icons| Rc::from(icons.app.to_string_lossy().as_ref())),
                 on_sync: context.callback(|()| AppMessage::Sync),
                 on_closed: context.callback(|()| AppMessage::WindowClosed),
-                reveal: self.reveal.clone(),
+                reveal: self.reveal,
             },
         );
         let Some(icons) = tray_icons(input) else {
@@ -512,11 +514,12 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     #[test]
-    fn a_window_closed_without_a_tray_icon_ends_the_app_even_when_features_run() {
+    fn closing_the_window_keeps_the_app_only_when_the_setting_says_so_and_a_tray_icon_is_there() {
         // With no tray icon nothing is left to open the window again: the app would run
-        // unseen, holding the proxy and the API.
+        // unseen, holding the proxy and the API, whatever the setting says.
         assert!(closing_ends_app(false, true));
         assert!(closing_ends_app(false, false));
+        // The setting off quits, with every feature stopped, as Quit piikey does.
         assert!(closing_ends_app(true, false));
         assert!(!closing_ends_app(true, true));
     }

@@ -306,7 +306,6 @@ impl Local {
         let policy = self.policy()?;
         let totals = self.inventory.totals();
         Ok(reply::InventoryStatus {
-            enabled: policy.inventory,
             roots: policy
                 .inventory_roots_or_default()
                 .iter()
@@ -351,14 +350,12 @@ impl Local {
     }
 
     fn inventory_rescan(&self) -> Result<Value, ApiError> {
-        let policy = self.policy()?;
-        let roots = policy.inventory_roots_or_default();
+        let roots = self.policy()?.inventory_roots_or_default();
         let _lock = self.inventory.lock_scan()?;
         let _running = Running::start(&self.rescanning);
         self.inventory.scan_paths(
             &self.engine(),
             &roots,
-            &policy.inventory_exclude,
             &self.rescan,
             &AtomicBool::new(false),
         )?;
@@ -437,7 +434,7 @@ impl Local {
             model: self.model_status()?,
             highlight: policy.highlight,
             explorer_menu: policy.explorer_menu,
-            inventory: policy.inventory,
+            watch: policy.watch,
             http_api: policy.http_api,
         })
     }
@@ -1037,22 +1034,30 @@ mod tests {
         let folder = fx.dir.file("watched");
         {
             let mut policy = fx.policy.lock().map_err(|_| "settings poisoned")?;
-            policy.inventory = true;
+            policy.watch = true;
+            policy.background = false;
             policy.inventory_roots = vec![folder.clone()];
+            policy.watch_folders = vec![folder.clone()];
             policy.disabled_kinds = vec![EntityKind::Email];
         }
         let settings = fx.ask(Request::SettingsGet)?;
-        assert_eq!(settings["inventory"], true);
+        assert_eq!(settings["watch"], true);
+        assert_eq!(settings["background"], false);
+        assert_eq!(settings["watch_folders"], json!([lossy(&folder)]));
+        assert!(settings.get("inventory").is_none() && settings.get("inventory_exclude").is_none());
         let status = fx.ask(Request::InventoryStatus)?;
-        assert_eq!(status["enabled"], true);
         assert_eq!(status["roots"], json!([lossy(&folder)]));
+        assert!(
+            status.get("enabled").is_none(),
+            "the inventory has no switch: {status}"
+        );
         let kinds = fx.ask(Request::Kinds)?;
         let email = kinds
             .as_array()
             .and_then(|all| all.iter().find(|k| k["kind"] == "email"))
             .ok_or("no email")?;
         assert_eq!(email["enabled"], false);
-        assert_eq!(fx.ask(Request::Status)?["inventory"], true);
+        assert_eq!(fx.ask(Request::Status)?["watch"], true);
         Ok(())
     }
 
@@ -1077,7 +1082,7 @@ mod tests {
         assert_eq!(status["vault_records"], 1);
         assert_eq!(status["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(status["model"]["state"], "missing");
-        for key in ["highlight", "explorer_menu", "inventory", "http_api"] {
+        for key in ["highlight", "explorer_menu", "watch", "http_api"] {
             assert!(status.get(key).is_some(), "{key} missing: {status}");
         }
         Ok(())

@@ -1,15 +1,15 @@
 //! The small widgets of the pages that edit a list: a list of check boxes, a row with a Remove
-//! button, a box to add an entry. Protection (sites and apps), Inventory (folders and what is left
-//! out) and Settings (the types of personal data) are built from them.
+//! button, a box to add an entry. Protection (sites and apps), Inventory (its locations), Watch
+//! (its folders) and Settings (the types of personal data) are built from them.
 
-use std::{path::PathBuf, rc::Rc};
+use std::rc::Rc;
 
 use windows_reactor::{
     Button, ButtonStyle, CheckBox, DataItem, Grid, GridLength, ListView, ListViewSelectionMode,
     TextBlock, TextBox, TextTrimming, Thickness, View,
 };
 
-use super::kit::{Context, caption};
+use super::kit::Context;
 use crate::ui::window::Msg;
 
 /// Height of one list row in DIPs.
@@ -93,30 +93,4 @@ pub(super) fn add_row(
                 .on_click(context.message(on_add)),
         ))
         .into()
-}
-
-/// A list of paths with a Remove button each, or `empty` when there are none; `key` and `remove`
-/// make the row of a path.
-pub(super) fn path_list(
-    paths: &[PathBuf],
-    key: &str,
-    empty: &str,
-    remove: impl Fn(PathBuf) -> Msg,
-    context: Context<'_>,
-) -> View {
-    if paths.is_empty() {
-        return caption(empty).into();
-    }
-    plain_list(
-        list_height(paths.len()),
-        paths.iter().map(|path| {
-            remove_row(
-                format!("{key}:{}", path.display()),
-                &path.display().to_string(),
-                remove(path.clone()),
-                context,
-            )
-        }),
-    )
-    .into()
 }

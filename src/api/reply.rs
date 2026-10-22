@@ -120,9 +120,8 @@ pub struct Progress {
 /// `inventory_status`: the inventory in numbers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InventoryStatus {
-    /// Whether the inventory keeps scanning its folders in the background.
-    pub enabled: bool,
-    /// The folders it scans.
+    /// The folders it scans when asked: the user's locations, or the usual ones when there are
+    /// none.
     pub roots: Vec<String>,
     pub files: u64,
     pub files_with_pii: u64,
@@ -230,7 +229,8 @@ pub struct Status {
     pub model: Model,
     pub highlight: Highlight,
     pub explorer_menu: bool,
-    pub inventory: bool,
+    /// Whether the watch keeps an eye on its folders.
+    pub watch: bool,
     pub http_api: bool,
 }
 
@@ -276,7 +276,6 @@ mod tests {
         assert_eq!(shown["downloading"], json!({"done": 1, "total": 2}));
 
         let status = to_json(&InventoryStatus {
-            enabled: true,
             roots: vec![],
             files: 0,
             files_with_pii: 0,
@@ -303,7 +302,7 @@ mod tests {
             },
             highlight: Highlight::Hotkey,
             explorer_menu: true,
-            inventory: false,
+            watch: false,
             http_api: false,
         };
         let wire = to_json(&status)?;

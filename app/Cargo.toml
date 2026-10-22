@@ -65,6 +65,12 @@ global-hotkey = "0.7.0"
 # Scans of files run on a pool of half the cores (`ui/controller/inventory.rs`), so the PC stays responsive;
 # the root crate already depends on it.
 rayon.workspace = true
+# The watch (`ui/watcher.rs`): file-system change notifications for the folders the user asks to be
+# watched, so a change is scanned when it happens and nothing polls. The Windows call behind it
+# (`ReadDirectoryChangesW`) is `unsafe` to make and `unsafe` is forbidden here, so a crate wraps it.
+# `default-features = false` leaves out the macOS backend; on Windows it adds `notify-types` and a
+# newer `windows-sys`, and uses `walkdir` and `log` as the rest of the build does.
+notify = { version = "8.2.0", default-features = false }
 
 [build-dependencies]
 # Embeds assets/piikey.ico as the exe icon resource (icon only: the manifest comes from windows-reactor-setup).

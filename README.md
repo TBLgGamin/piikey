@@ -39,9 +39,11 @@ in four ways:
   shape before the message leaves your PC, and puts your real values back into the answer.
 - **Flag what you type.** The field you are typing in gets a purple outline when it holds personal
   data, in any app, so you see it before you send it.
-- **Map what you store.** Scan files and folders, from Explorer's right-click menu or in the
-  background, and see on a treemap which of them hold personal data.
-- **Manage what is kept.** Search the vault, forget a value, export or wipe it, find every file that
+- **Map what you store.** Scan your folders, or any file or folder from Explorer's right-click menu,
+  and see which of them hold personal data, in a WinDirStat-style dashboard. Nothing is scanned
+  until you ask, and a rescan reads only what changed. A separate watch can keep an eye on folders
+  you pick.
+- **Manage what is kept.** Search the vault, forget values, export it, find every file that
   mentions a person, and gate scripts and CI on personal data with the CLI and the API.
 
 Detection, the stand-ins and the vault that remembers them all stay on your machine.
@@ -52,7 +54,7 @@ back into your values by `piikey-cli deanonymize --tolerant`: the full names, th
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/overview-dark.png">
-  <img alt="piikey's Overview page: protection is on, with one switch, what piikey is doing (masking, highlighting, inventory, vault, detection) and the latest swaps" src="docs/assets/screenshots/overview-light.png" width="900">
+  <img alt="piikey's Overview page: protection is on, with the one Turn off button, what piikey is doing (masking, highlighting, inventory, watch, vault, detection) and the latest swaps" src="docs/assets/screenshots/overview-light.png" width="900">
 </picture>
 
 ## Features
@@ -72,7 +74,11 @@ back into your values by `piikey-cli deanonymize --tolerant`: the full names, th
   </tr>
   <tr>
     <td><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/icons/dark/inventory.svg"><img src="docs/assets/icons/light/inventory.svg" width="28" height="28" alt=""></picture></td>
-    <td><b>Inventory</b><br>A treemap of your folders sized by the personal data in them, with actions per file: open, show in Explorer, rescan, make a masked copy, exclude, export a report.</td>
+    <td><b>Inventory</b><br>Scan your folders and see where personal data is stored: a folder tree with bars by type, a legend of the types found, a treemap with a tile for every file, and details with actions per file: open, show in Explorer, show what was found, make a masked copy, scan it again, export a report. It scans only when you ask, and skips files that did not change.</td>
+  </tr>
+  <tr>
+    <td><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/icons/dark/explorer.svg"><img src="docs/assets/icons/light/explorer.svg" width="28" height="28" alt=""></picture></td>
+    <td><b>Watch</b><br>Keeps an eye on folders you pick and looks at a file again a moment after it changes. It has its own switch and its own results, apart from the inventory.</td>
   </tr>
   <tr>
     <td><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/icons/dark/subject.svg"><img src="docs/assets/icons/light/subject.svg" width="28" height="28" alt=""></picture></td>
@@ -80,7 +86,7 @@ back into your values by `piikey-cli deanonymize --tolerant`: the full names, th
   </tr>
   <tr>
     <td><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/icons/dark/vault.svg"><img src="docs/assets/icons/light/vault.svg" width="28" height="28" alt=""></picture></td>
-    <td><b>An encrypted vault you control</b><br>Search it, export it, forget single values or wipe it. Forgetting rewrites the file, so the value is gone from disk. Records are sealed with XChaCha20-Poly1305 under a key that Windows DPAPI protects.</td>
+    <td><b>An encrypted vault you control</b><br>Search it, export it, forget the values you tick. Forgetting rewrites the file, so the value is gone from disk (the API and the CLI can also wipe it). Records are sealed with XChaCha20-Poly1305 under a key that Windows DPAPI protects.</td>
   </tr>
   <tr>
     <td><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/icons/dark/api.svg"><img src="docs/assets/icons/light/api.svg" width="28" height="28" alt=""></picture></td>
@@ -129,7 +135,9 @@ flowchart LR
     subgraph tray ["piikey.exe, in the tray"]
         capture["capture: focused field and clipboard"] --> overlay["highlight overlay"]
         capture --> typed["typed-value store"] --> proxy["proxy: mask and restore"]
-        loop["inventory loop"] --> inv[("inventory.jsonl")] --> map["Inventory map"]
+        scan["scan thread: inventory scans"] --> inv[("inventory.jsonl")] --> map["Inventory dashboard"]
+        watch["watch: file changes"] --> wstore[("watch.jsonl")] --> wmap["Watch dashboard"]
+        watch --> scan
         api["API"]
     end
     explorer["Explorer: Scan for personal data"] -->|pipe| api
@@ -137,76 +145,98 @@ flowchart LR
     scripts["scripts and CI"] -->|"HTTP and token"| api
     api --> core["engine and vault"]
     typed --> core
-    loop --> core
+    scan --> core
+    watch --> core
 ```
 
 piikey sets itself as the Windows proxy while protection is on. It only opens the traffic of sites
 and apps you protect; everything else passes through untouched. If the app crashes, a watchdog
-gives Windows its previous proxy settings back. The highlight, the inventory and the API run in the
-same app and need no proxy. Detection, the proxy, the app's pages and the files piikey keeps are
-described in [docs/how-it-works.md](docs/how-it-works.md).
+gives Windows its previous proxy settings back. The highlight, the inventory, the watch and the API
+run in the same app and need no proxy. Detection, the proxy, the app's pages and the files piikey
+keeps are described in [docs/how-it-works.md](docs/how-it-works.md).
 
 ## The app
 
-`piikey.exe` is one window with five pages, and a tray icon.
+`piikey.exe` is one window with six pages, and a tray icon.
 
 - **Overview** says in one sentence whether protection is on, and has the one Turn on / Turn off
   button. When something needs you, such as a certificate that is not installed, one message shows
-  with its fix button. Below it, five rows say what piikey is doing (Masking, Highlighting,
-  Inventory, Vault, Detection; each opens its page), then the five latest swaps.
-- **Protection** holds the master switch, the certificate, the protected sites, the protected apps
-  and the highlighting mode.
-- **Inventory** has its own switch, the treemap of where personal data is stored, the watched
-  folders, what is left out, and the "Scan for personal data" entry for Explorer's menu.
+  with its fix button. Below it, six rows say what piikey is doing (Masking, Highlighting,
+  Inventory, Watch, Vault, Detection; each opens its page), then the five latest swaps.
+- **Protection** holds the certificate, the protected sites, the protected apps and the
+  highlighting mode.
+- **Inventory** is where you scan. The Scan button looks through your locations (Documents,
+  Desktop and Downloads until you choose others), the box beside it scans one more folder or file,
+  and you can drop files and folders from Explorer onto the page. The dashboard shows a tree of
+  folders and files with bars by type, the types found, a treemap of the files, and the details of
+  what you select. A scan that you start from the page, the box, a drop or Explorer ends in a result
+  dialog. The inventory keeps counts, never the values; "Show what was found" reads the file again
+  and lists its values on screen, without storing them.
+- **Watch** has its own switch, the folders it keeps an eye on (with what each is doing), a box to
+  add one, and the same dashboard for what it found. Nothing is watched until you add a folder.
 - **Vault** lists every value next to its stand-in, newest first, with search and filters by type,
-  site and time, and Forget per value. Export and the two-click Wipe sit under Manage.
-- **Settings** is one scrolling page: General (Start piikey when I sign in), Detection (the model
-  and where it runs), Types of personal data, Developer access (the local HTTP API, token and
-  pipe), Privacy & data and About.
+  site and time. Tick values (or Select all) and choose Forget to remove them; Export writes them
+  to a CSV file.
+- **Settings** is one scrolling page: General (Start piikey when I sign in, the Explorer menu entry,
+  and Keep piikey running in the tray when I close the window), Types of personal data, Developer
+  access (the local HTTP API and its token), Privacy & data and About. A row for the detection model
+  appears only when it was skipped or failed.
 
 The tray icon shows the same status as Overview (the key in grey while protection is off, the app
 icon while it is on, with an amber dot when it needs you). Its menu has Open piikey, Turn protection
-on or off, and Quit piikey. Closing the window leaves piikey running in the tray while protection,
-highlighting, the inventory or the API is on. Starting piikey again while it runs brings the window
-forward instead of starting a second copy (`piikey-cli open` does the same). With "Start piikey when
-I sign in" on, piikey starts in the tray at sign-in without a window.
+on or off, and Quit piikey. With "Keep piikey running in the tray when I close the window" on (the
+default), closing the window leaves protection, highlighting, the watch and the API working; off,
+closing it quits piikey. Starting piikey again while it runs brings the window forward instead of
+starting a second copy (`piikey-cli open` does the same). With "Start piikey when I sign in" on,
+piikey starts in the tray at sign-in without a window.
 
 <table>
   <tr>
     <td width="50%">
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/protection-dark.png">
-        <img alt="Protection page: the master switch, the certificate, the protected sites and apps, and highlighting" src="docs/assets/screenshots/protection-light.png">
+        <img alt="Protection page: the certificate, the protected sites and apps, and highlighting" src="docs/assets/screenshots/protection-light.png">
       </picture>
     </td>
     <td width="50%">
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/inventory-dark.png">
-        <img alt="Inventory page: a treemap of the folders and files that hold personal data, with the watched folders and the Explorer menu entry" src="docs/assets/screenshots/inventory-light.png">
+        <img alt="Inventory page: the Scan button and the dashboard, with a tree of the folders and files that hold personal data, the types found, a treemap of the files and the details of the selection" src="docs/assets/screenshots/inventory-light.png">
       </picture>
     </td>
   </tr>
   <tr>
     <td><b>Protection</b>: what piikey masks and highlights. The certificate, the sites and apps you protect, and the highlighting mode.</td>
-    <td><b>Inventory</b>: where personal data is stored on this PC, as a treemap sized by the number of values, with the folders piikey watches.</td>
+    <td><b>Inventory</b>: where personal data is stored on this PC, as a tree, a legend of types and a treemap with a tile for every file, from what you scanned.</td>
   </tr>
   <tr>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/watch-dark.png">
+        <img alt="Watch page: the switch, the watched folders with their state, and the dashboard of what the watch found" src="docs/assets/screenshots/watch-light.png">
+      </picture>
+    </td>
     <td width="50%">
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/vault-dark.png">
-        <img alt="Vault page: every value next to its stand-in, with where and when it was sent, and search and filters" src="docs/assets/screenshots/vault-light.png">
-      </picture>
-    </td>
-    <td width="50%">
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/settings-dark.png">
-        <img alt="Settings page: start at sign-in, the detection model, the types of personal data, developer access, privacy and data, and about" src="docs/assets/screenshots/settings-light.png">
+        <img alt="Vault page: every value next to its stand-in, with where and when it was sent, check boxes, search and filters" src="docs/assets/screenshots/vault-light.png">
       </picture>
     </td>
   </tr>
   <tr>
-    <td><b>Vault</b>: every value next to its stand-in, most recently swapped first, with search and filters by type, site and time.</td>
-    <td><b>Settings</b>: start at sign-in, the detection model and the types of personal data piikey looks for, the local HTTP API, and where your data is kept.</td>
+    <td><b>Watch</b>: the folders piikey keeps an eye on, and what it found in them when their files changed.</td>
+    <td><b>Vault</b>: every value next to its stand-in, most recently swapped first, with search and filters by type, site and time, and Forget for the ticked ones.</td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/settings-dark.png">
+        <img alt="Settings page: start at sign-in, the Explorer menu entry, keep running in the tray, the types of personal data, developer access, privacy and data, and about" src="docs/assets/screenshots/settings-light.png" width="50%">
+      </picture>
+    </td>
+  </tr>
+  <tr>
+    <td colspan="2"><b>Settings</b>: start at sign-in, the Explorer menu, whether closing the window keeps piikey in the tray, the types of personal data piikey looks for, the local HTTP API, and where your data is kept.</td>
   </tr>
 </table>
 
@@ -277,16 +307,16 @@ which answer `app_required`.
 | `vault_forget` | Forgets the records whose value or stand-in is one of `values`. | `vault forget VALUE...` |
 | `vault_export` | Writes the vault to a new file as JSON or CSV. | `vault export --out FILE` |
 | `vault_wipe` | Deletes every record. Needs `"confirm": true`. | `vault wipe --yes` |
-| `inventory_status` | Folders, file counts, hits and the scan in progress. | `inventory status` |
-| `inventory_list`, `inventory_tree` | The files with personal data, or the treemap's nodes under a path. | `inventory list`, `inventory tree` |
-| `inventory_rescan`, `inventory_report` | Scans the inventory folders now; writes a JSON or CSV report. | `inventory rescan`, `inventory report` |
+| `inventory_status` | The locations, file counts, hits and the scan in progress. | `inventory status` |
+| `inventory_list`, `inventory_tree` | The files with personal data, or the tree's nodes under a path. | `inventory list`, `inventory tree` |
+| `inventory_rescan`, `inventory_report` | Scans the inventory locations now and answers when the scan is over (the inventory scans only when asked); writes a JSON or CSV report. | `inventory rescan`, `inventory report` |
 | `settings_get`, `settings_set` | Reads or changes the settings (the `guard.cfg` keys). | `settings get`, `settings set KEY=VALUE...` |
 | `kinds` | The types of personal data (the `kind` field), their groups, and whether each is on. | `kinds` |
 | `model_status`, `model_download` | The detection model's state; downloads it. | `model status`, `model download` |
 | `api_token` | The HTTP token; `rotate` makes a new one. | `token [--rotate]` |
-| `status` | Whether the app runs, protection, version, vault size, model and feature switches. | `status` |
+| `status` | Whether the app runs, protection, version, vault size, model and feature switches (including `watch`). | `status` |
 | `protection` | Turns masking on or off. App only. | `protection on\|off` |
-| `explorer_scan` | Scans paths and shows them on the Inventory page. App only; the Explorer menu uses it. | none |
+| `explorer_scan` | Scans paths into the inventory and shows the result in a dialog in the app, which opens if hidden. App only; answers when the scan is queued; the Explorer menu uses it. | none |
 | `show_window` | Brings the app's window forward. App only; a second start of `piikey.exe` uses it. | `open` |
 
 **Replies** share one envelope: `{"ok": true, "result": ...}`, or `{"ok": false, "error": {"code":
@@ -426,8 +456,8 @@ Checks: `cargo fmt-check`, `cargo lint`, and `cargo test --all-targets`.
 - Everything runs locally. piikey makes one network call of its own: the model download from
   Hugging Face, which is checked with SHA-256.
 - Your values exist in one place only, the encrypted vault in `%LOCALAPPDATA%\piikey`. The list of
-  swaps on the Vault page keeps stand-ins, sites and times. The inventory keeps paths and counts per
-  type, never values.
+  swaps on the Vault page keeps stand-ins, sites and times. The inventory and the watch keep paths,
+  counts per type and a fingerprint of each file's contents, never values.
 - Masking and the highlight read the focused field only, never a password field, and the highlight
   stores nothing.
 - The HTTP API is off by default. When on, it listens on loopback only, needs a token and refuses

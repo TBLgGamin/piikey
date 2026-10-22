@@ -58,7 +58,7 @@ Filename: "{app}\piikey.exe"; Description: "Start piikey"; Flags: nowait postins
 
 [UninstallRun]
 ; In this order: stop the app and its watchdog, give Windows its proxy settings back (a no-op when
-; piikey did not change them), remove the Explorer "Scan for PII" verb (a no-op when it was never
+; piikey did not change them), remove the Explorer "Scan for personal data" verb (a no-op when it was never
 ; added), remove the "Start piikey when I sign in" entry and Windows' note on it (a no-op when it
 ; was never switched on; reg.exe fails then, which does not stop the uninstall), then remove the
 ; local CA from the user's Root store.

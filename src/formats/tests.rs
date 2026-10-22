@@ -10,10 +10,13 @@ use lopdf::{
 };
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
-use super::{Format, Output, Scanned, msg, package, process, restore, same_text, scan, sniff};
+use super::{
+    Finding, Format, Output, Scanned, finding, findings, msg, package, process, restore, same_text,
+    scan, sniff,
+};
 use crate::{
     Error,
-    detect::{EntityKind, Mode},
+    detect::{EntityKind, Mode, Span},
     engine::Engine,
     restore::Restorer,
 };
@@ -1497,5 +1500,136 @@ fn scanning_a_clean_file_finds_nothing_and_what_cannot_be_read_is_an_error() -> 
         scan(&engine, b"%PDF-1.7 this is not a pdf", false),
         Err(Error::Pdf(_))
     ));
+    Ok(())
+}
+
+/// The finding for the first occurrence of `value` in `text`, taken as an email.
+fn finding_of(text: &str, value: &str) -> Res<Finding> {
+    let start = text.find(value).ok_or("the value is not in the text")?;
+    let span = Span {
+        start,
+        end: start + value.len(),
+        kind: EntityKind::Email,
+    };
+    Ok(finding(text, &span))
+}
+
+#[test]
+fn a_finding_shows_the_value_with_the_text_around_it() -> Res {
+    let text = "Please send the invoice to jan.jansen@example.org before Friday.";
+    let one = finding_of(text, EMAIL)?;
+    assert_eq!(one.kind, EntityKind::Email);
+    assert_eq!(&*one.value, EMAIL);
+    assert_eq!(&*one.snippet, text, "short enough to show whole");
+
+    // The value alone, at either end of the text.
+    assert_eq!(&*finding_of(EMAIL, EMAIL)?.snippet, EMAIL);
+    let at_start = finding_of(&format!("{EMAIL} wrote this"), EMAIL)?;
+    assert_eq!(&*at_start.snippet, format!("{EMAIL} wrote this"));
+    Ok(())
+}
+
+#[test]
+fn a_finding_cuts_the_text_to_forty_characters_a_side_and_says_so() -> Res {
+    let before = "a".repeat(55);
+    let after = "b".repeat(55);
+    let one = finding_of(&format!("{before} {EMAIL} {after}"), EMAIL)?;
+    assert_eq!(
+        &*one.snippet,
+        format!("…{} {EMAIL} {}…", "a".repeat(39), "b".repeat(39))
+    );
+    // The same at the exact limit: forty characters on a side fit, a forty-first is cut.
+    let fits = finding_of(
+        &format!("{} {EMAIL} {}", "c".repeat(39), "d".repeat(39)),
+        EMAIL,
+    )?;
+    assert!(!fits.snippet.contains('…'), "{}", fits.snippet);
+    let cut = finding_of(
+        &format!("{} {EMAIL} {}", "c".repeat(41), "d".repeat(41)),
+        EMAIL,
+    )?;
+    assert!(cut.snippet.starts_with('…') && cut.snippet.ends_with('…'));
+    Ok(())
+}
+
+#[test]
+fn a_finding_collapses_white_space_and_never_cuts_a_character_in_two() -> Res {
+    let text = "Name:\r\n\t  Jan\n\n\nmail:\t jan.jansen@example.org \r\n\r\n ok";
+    let one = finding_of(text, EMAIL)?;
+    assert_eq!(&*one.snippet, "Name: Jan mail: jan.jansen@example.org ok");
+
+    // Multi-byte characters on both sides, and a value that holds a line break: the cut falls
+    // between characters, and the value reads as one line.
+    let wide = format!("{}é{EMAIL}é{}", "é".repeat(60), "\u{1f600}".repeat(60));
+    let one = finding_of(&wide, EMAIL)?;
+    assert_eq!(one.snippet.chars().filter(|&c| c == 'é').count(), 40 + 1);
+    assert!(one.snippet.starts_with('…') && one.snippet.ends_with('…'));
+    let broken = "see Jan\n  Jansen, thanks";
+    let span = Span {
+        start: 4,
+        end: 17,
+        kind: EntityKind::Person,
+    };
+    let one = finding(broken, &span);
+    assert_eq!(&*one.value, "Jan Jansen,");
+    assert_eq!(&*one.snippet, "see Jan Jansen, thanks");
+    Ok(())
+}
+
+#[test]
+fn a_long_value_is_shown_cut_and_still_found_in_the_snippet() {
+    let key = format!("-----BEGIN KEY-----{}", "k".repeat(400));
+    let span = Span {
+        start: 5,
+        end: 5 + key.len(),
+        kind: EntityKind::Secret,
+    };
+    let one = finding(&format!("key: {key} end"), &span);
+    assert_eq!(one.value.chars().count(), 121);
+    assert!(one.value.ends_with('…'));
+    assert!(one.snippet.contains(&*one.value), "{}", one.snippet);
+    assert!(one.snippet.chars().count() < 121 + 2 * 40 + 4);
+}
+
+#[test]
+fn findings_list_what_a_scan_counts_grouped_by_kind_and_touch_nothing() -> Res {
+    let engine = engine()?;
+    let text = format!("Mail {EMAIL}, call {MOBILE}, pay {IBAN}, or mail {EMAIL} again.");
+    let listed = findings(&engine, text.as_bytes())?;
+    let kinds: Vec<EntityKind> = listed.iter().map(|one| one.kind).collect();
+    let scanned = scan(&engine, text.as_bytes(), false)?;
+    assert_eq!(
+        listed.len(),
+        scanned.found.len(),
+        "the same values a scan counts"
+    );
+    // Grouped by kind, each kind in reading order.
+    let mut grouped = kinds.clone();
+    grouped.sort();
+    assert_eq!(kinds, grouped);
+    let emails: Vec<&str> = listed
+        .iter()
+        .filter(|one| one.kind == EntityKind::Email)
+        .map(|one| &*one.snippet)
+        .collect();
+    assert_eq!(emails.len(), 2);
+    assert!(emails[0].starts_with("Mail jan.jansen"));
+    assert!(emails[1].contains("or mail jan.jansen@example.org again."));
+    assert_eq!(records(&engine)?, 0, "nothing was issued");
+    assert!(findings(&engine, b"just words")?.is_empty());
+    assert!(matches!(
+        findings(&engine, &build_zip(&[("a.txt", b"hello", DEFLATED)])?),
+        Err(Error::UnsupportedFormat("zip archive"))
+    ));
+    Ok(())
+}
+
+#[test]
+fn findings_read_a_document_the_way_a_scan_does() -> Res {
+    let engine = engine()?;
+    let listed = findings(&engine, &pdf(&format!("mail {EMAIL}"))?)?;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(&*listed[0].value, EMAIL);
+    assert!(listed[0].snippet.contains(&format!("mail {EMAIL}")));
     Ok(())
 }

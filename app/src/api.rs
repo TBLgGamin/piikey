@@ -171,7 +171,7 @@ impl AppApi {
     /// Scans the watched folders now and answers when the scan is over.
     fn inventory_rescan(&self) -> Result<Value, ApiError> {
         let controller = self.controller()?;
-        controller.submit(Command::Rescan);
+        controller.submit(Command::ScanAll);
         // The command has queued the scan once the controller is idle.
         if !controller.wait_idle(WAIT) {
             return Err(ApiError::busy("piikey is still starting the scan"));
@@ -312,7 +312,10 @@ mod tests {
     use super::*;
     use crate::{
         Describe,
-        ui::testing::{TempDir, stub_controller},
+        ui::{
+            controller::RevealState,
+            testing::{TempDir, stub_controller},
+        },
     };
 
     type Test = Result<(), String>;
@@ -405,15 +408,25 @@ mod tests {
         assert_eq!(ask(&api, scan(vec![file.clone()]))?, json!({}));
         let deadline = Instant::now() + Duration::from_secs(20);
         let reveal = loop {
-            if let Some(reveal) = controller.reveal() {
+            if let Some(reveal) = controller.snapshot().reveal
+                && matches!(reveal.state, RevealState::Done(_) | RevealState::Failed(_))
+            {
                 break reveal;
             }
             if Instant::now() > deadline {
-                return Err("the scan never asked to be shown".to_owned());
+                return Err("the scan never ended".to_owned());
             }
             std::thread::sleep(Duration::from_millis(10));
         };
-        assert_eq!(reveal.select, Some(file));
+        assert_eq!(reveal.select, Some(file.clone()));
+        assert_eq!(reveal.paths, [file]);
+        let RevealState::Done(summary) = reveal.state else {
+            return Err(format!("the scan failed: {:?}", reveal.state));
+        };
+        assert_eq!(
+            (summary.files, summary.files_with_data, summary.hits),
+            (1, 1, 1)
+        );
         Ok(())
     }
 
@@ -443,7 +456,7 @@ mod tests {
         ask(&api, Request::SettingsSet { settings: patch })?;
         // What the app holds, not what a file on this PC says: the stub saves nothing.
         let status = ask(&api, Request::InventoryStatus)?;
-        assert_eq!(status["enabled"], false);
+        assert!(status.get("enabled").is_none(), "no switch: {status}");
         assert_eq!(status["roots"], json!([docs.to_string_lossy()]));
         assert_eq!(status["files"], 0);
         assert_eq!(status["scanning"], Value::Null);

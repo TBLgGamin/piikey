@@ -50,41 +50,64 @@ fn feature_edits_report_whether_they_changed_anything() -> Test {
     assert!(policy.explorer_menu && policy.http_api);
     assert!(apply_edit(&mut policy, &Edit::HttpApi(false))?);
     assert!(!policy.http_api);
+    // Closing the window keeps piikey in the tray unless the user says otherwise.
+    assert!(policy.background);
+    assert!(!apply_edit(&mut policy, &Edit::Background(true))?);
+    assert!(apply_edit(&mut policy, &Edit::Background(false))?);
+    assert!(!policy.background);
+    assert!(apply_edit(&mut policy, &Edit::Background(true))?);
+    // The watch is off until the user switches it on.
+    assert!(!policy.watch);
+    assert!(apply_edit(&mut policy, &Edit::Watch(true))?);
+    assert!(!apply_edit(&mut policy, &Edit::Watch(true))?);
+    assert!(policy.watch);
+    assert!(apply_edit(&mut policy, &Edit::Watch(false))?);
+    assert!(!policy.watch);
     Ok(())
 }
 
 #[test]
-fn switching_the_inventory_on_watches_the_usual_folders_only_when_none_were_chosen() -> Test {
-    let mut policy = quiet();
-    assert!(apply_edit(&mut policy, &Edit::Inventory(true))?);
-    assert!(policy.inventory);
-    assert_eq!(policy.inventory_roots, quiet().inventory_roots_or_default());
-    assert!(!apply_edit(&mut policy, &Edit::Inventory(true))?);
-
+fn the_usual_folders_are_the_locations_until_the_first_change_makes_them_a_choice() -> Test {
+    let usual = quiet().inventory_roots_or_default();
     let dir = TempDir::new()?;
-    let mut chosen = Policy {
-        inventory_roots: vec![dir.0.clone()],
+    let root = |path: &Path, on| Edit::InventoryRoot {
+        path: path.to_path_buf(),
+        on,
+    };
+
+    // Adding a folder keeps the usual ones next to it, and saves them as the user's.
+    let mut added = quiet();
+    assert!(apply_edit(&mut added, &root(&dir.0, true))?);
+    let mut expected = usual.clone();
+    expected.push(dir.0.clone());
+    assert_eq!(added.inventory_roots, expected);
+
+    // One of the usual ones can be taken off, which it could not be before it was a choice.
+    if let Some(first) = usual.first() {
+        let mut removed = quiet();
+        assert!(apply_edit(&mut removed, &root(first, false))?);
+        assert_eq!(removed.inventory_roots, usual[1..]);
+    }
+
+    // A folder that is not among them changes nothing, and neither does one that already is.
+    let mut same = quiet();
+    assert!(!apply_edit(&mut same, &root(&dir.0, false))?);
+    assert!(same.inventory_roots.is_empty(), "still the usual ones");
+    if let Some(first) = usual.first() {
+        assert!(!apply_edit(&mut same, &root(first, true))?);
+        assert!(same.inventory_roots.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn locations_and_watched_folders_must_be_folders_and_are_not_added_twice() -> Test {
+    let dir = TempDir::new()?;
+    let anchor = TempDir::new()?;
+    let mut policy = Policy {
+        inventory_roots: vec![anchor.0.clone()],
         ..quiet()
     };
-    assert!(apply_edit(&mut chosen, &Edit::Inventory(true))?);
-    assert_eq!(
-        chosen.inventory_roots,
-        std::slice::from_ref(&dir.0),
-        "the user's folders stay"
-    );
-    assert!(apply_edit(&mut chosen, &Edit::Inventory(false))?);
-    assert_eq!(
-        chosen.inventory_roots,
-        std::slice::from_ref(&dir.0),
-        "also while it is off"
-    );
-    Ok(())
-}
-
-#[test]
-fn watched_folders_must_be_folders_and_are_not_added_twice() -> Test {
-    let dir = TempDir::new()?;
-    let mut policy = quiet();
     let root = |path: &Path, on| Edit::InventoryRoot {
         path: path.to_path_buf(),
         on,
@@ -99,7 +122,7 @@ fn watched_folders_must_be_folders_and_are_not_added_twice() -> Test {
         !apply_edit(&mut policy, &root(&shouted, true))?,
         "Windows paths ignore case"
     );
-    assert_eq!(policy.inventory_roots, std::slice::from_ref(&dir.0));
+    assert_eq!(policy.inventory_roots, [anchor.0.clone(), dir.0.clone()]);
     let missing = apply_edit(&mut policy, &root(&dir.0.join("missing"), true))
         .err()
         .ok_or("a folder that is not there is refused")?;
@@ -110,33 +133,33 @@ fn watched_folders_must_be_folders_and_are_not_added_twice() -> Test {
         apply_edit(&mut policy, &root(&file, true)).is_err(),
         "a file is no folder"
     );
-    assert!(apply_edit(&mut policy, &root(&dir.0, false))?);
+    // Taking one off ignores letter case too.
+    assert!(apply_edit(&mut policy, &root(&shouted, false))?);
     assert!(!apply_edit(&mut policy, &root(&dir.0, false))?);
-    assert!(policy.inventory_roots.is_empty());
-    Ok(())
-}
+    assert_eq!(policy.inventory_roots, std::slice::from_ref(&anchor.0));
 
-#[test]
-fn excluded_paths_need_not_exist_but_must_be_full_paths() -> Test {
+    // The watch's folders are a list of their own, and just as strict.
     let mut policy = quiet();
-    let exclude = |path: &str, on| Edit::InventoryExclude {
-        path: PathBuf::from(path),
+    let watch = |path: &Path, on| Edit::WatchFolder {
+        path: path.to_path_buf(),
         on,
     };
-    assert!(apply_edit(
-        &mut policy,
-        &exclude(r"C:\Users\you\Taxes\2024.pdf", true)
-    )?);
-    assert!(!apply_edit(
-        &mut policy,
-        &exclude(r"c:\users\YOU\taxes\2024.pdf", true)
-    )?);
-    assert_eq!(policy.inventory_exclude.len(), 1);
-    assert!(apply_edit(&mut policy, &exclude(r"relative\path", true)).is_err());
-    assert!(apply_edit(
-        &mut policy,
-        &exclude(r"C:\Users\you\Taxes\2024.pdf", false)
-    )?);
-    assert!(policy.inventory_exclude.is_empty());
+    assert!(apply_edit(&mut policy, &watch(&dir.0, true))?);
+    assert!(!apply_edit(&mut policy, &watch(&shouted, true))?);
+    assert!(apply_edit(&mut policy, &watch(&anchor.0, true))?);
+    assert_eq!(policy.watch_folders, [dir.0.clone(), anchor.0.clone()]);
+    assert!(
+        policy.inventory_roots.is_empty(),
+        "no folder of the inventory's"
+    );
+    assert!(apply_edit(&mut policy, &watch(&file, true)).is_err());
+    assert!(apply_edit(&mut policy, &watch(&dir.0.join("gone"), true)).is_err());
+    assert!(
+        apply_edit(&mut policy, &watch(Path::new(r"relative\folder"), true)).is_err(),
+        "a folder is a full path"
+    );
+    assert!(apply_edit(&mut policy, &watch(&shouted, false))?);
+    assert_eq!(policy.watch_folders, std::slice::from_ref(&anchor.0));
+    assert!(!apply_edit(&mut policy, &watch(&dir.0, false))?);
     Ok(())
 }

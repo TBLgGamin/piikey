@@ -5,10 +5,7 @@ use piikey::policy::{Highlight, PRESETS};
 use windows_reactor::{ComboBox, StackPanel, View};
 
 use super::{
-    kit::{
-        Context, Row, attention, caption, card, column, form_error, page_header, protection_switch,
-        section,
-    },
+    kit::{Context, Row, attention, caption, card, column, form_error, page_header, section},
     lists::{ROW, add_row, check_row, list_height, plain_list, remove_row},
 };
 use crate::ui::{
@@ -28,11 +25,7 @@ const HIGHLIGHTS: [(Highlight, &str); 3] = [
 ];
 
 pub(super) fn protection(window: &MainWindow, status: &Status, context: Context<'_>) -> View {
-    let mut children: Vec<View> = vec![page_header(
-        Page::Protection.title(),
-        DEFINITION,
-        [View::from(protection_switch(status, context))],
-    )];
+    let mut children: Vec<View> = vec![page_header(Page::Protection.title(), DEFINITION, [])];
     children.extend(form_error(window, context));
     children.push(certificate(window, context));
     children.push(section(
@@ -193,7 +186,7 @@ fn highlight_choice(window: &MainWindow, context: Context<'_>) -> ComboBox {
 fn highlighting(window: &MainWindow, status: &Status, context: Context<'_>) -> View {
     let mode = window.snap.policy.highlight;
     let mut row = Row::new("Highlight personal data as you type")
-        .icon("\u{E7B3}")
+        .icon("\u{E7E6}")
         .description("Outlines the field you type in when it holds personal data, in any app. Nothing leaves your PC.")
         .control(highlight_choice(window, context));
     if let Some(state) = paused_text(mode, window.snap.highlight_paused) {

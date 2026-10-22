@@ -203,14 +203,6 @@ impl Controller {
         self.vault_lost();
     }
 
-    /// Removes every vault record.
-    pub(super) fn wipe(&self) {
-        if let Err(error) = self.engine().wipe() {
-            self.notify(Notice::error(format!("Could not wipe the vault: {error}")));
-        }
-        self.vault_lost();
-    }
-
     /// What was typed may hold values the vault no longer knows, and the numbers of Overview are old.
     fn vault_lost(&self) {
         self.shared.typed.clear();

@@ -4,11 +4,12 @@
 //! poll; every user action becomes a message, then a [`Command`] for the controller. Edits to the
 //! lists and the feature switches are applied to the copy at once so the controls follow the
 //! click; the next snapshot is the truth and puts a rejected edit back. Work that waits on the
-//! disk, the registry or the clipboard (exports, the API token, masked copies, the inventory view,
-//! starting at sign-in) runs in the background, and its errors reach the user as the controller's
-//! notice.
+//! disk, the registry or the clipboard (exports, the API token, masked copies, the dashboards'
+//! views, starting at sign-in) runs in the background, and its errors reach the user as the
+//! controller's notice.
 
 use std::{
+    collections::HashSet,
     fs,
     ops::Deref,
     path::{Path, PathBuf},
@@ -17,24 +18,32 @@ use std::{
     time::Duration,
 };
 
-use piikey::{api::reply::Device, detect::EntityKind, inventory::Node, policy::Highlight};
+use piikey::{detect::EntityKind, inventory::Finding, policy::Highlight};
 use windows_reactor::{
-    Callback, Component, ComponentContext, ComponentTimer, Grid, GridLength, HorizontalAlignment,
-    Icon, Image, KeyedView, NavigationView, NavigationViewBackButtonVisible, NavigationViewItem,
-    NavigationViewPaneDisplayMode, Stretch, Thickness, TitleBar, View, ViewContext, WindowBackdrop,
-    WindowConstraints, WindowVisuals,
+    Callback, Component, ComponentContext, ComponentTimer, ContentDialogExt, Grid, GridLength,
+    HorizontalAlignment, Icon, Image, KeyedView, NavigationView, NavigationViewBackButtonVisible,
+    NavigationViewItem, NavigationViewPaneDisplayMode, Stretch, Thickness, TitleBar, View,
+    ViewContext, WindowBackdrop, WindowConstraints, WindowSize, WindowVisuals,
 };
 
 use super::{
     assets,
     controller::{
-        Command, Controller, Edit, InventoryView, KeyedPage, KeyedQuery, Model, Notice, Period,
-        Reveal, Snapshot, apply_edit,
+        Command, Controller, Edit, KeyedPage, KeyedQuery, Model, Notice, Period, Snapshot, Store,
+        apply_edit,
     },
     explorer, pages,
     status::Status,
 };
 use crate::{Res, startup};
+
+mod dashboard;
+mod report;
+
+pub use self::{
+    dashboard::{Dash, Dashboard, Loaded, Origin},
+    report::{FindingsState, single_file},
+};
 
 /// How long one background poll waits for a change before it checks for cancellation.
 const POLL: Duration = Duration::from_secs(2);
@@ -46,34 +55,48 @@ const APP_REFRESH: Duration = Duration::from_secs(5);
 const FLAVOR_EVERY: Duration = Duration::from_secs(4);
 
 /// Width of the navigation pane in DIPs.
-const PANE_WIDTH: f64 = 220.0;
+pub const PANE_WIDTH: f64 = 220.0;
+
+/// The size the window opens with, in DIPs: until it says otherwise, this is the room the pages
+/// have.
+const OPENS_AT: WindowSize = WindowSize {
+    width: 1_040.0,
+    height: 760.0,
+};
+
+/// How coarsely the window's size is followed, in DIPs: a smaller change leaves the layout of the
+/// dashboards alone, so dragging an edge builds them anew once in a while, not at every pixel.
+const SIZE_STEP: f64 = 8.0;
 
 /// Rows the Vault page lists at most; the search narrows the rest down.
 pub const VAULT_LIMIT: usize = 500;
 
-/// The pages of the navigation pane: four in its menu, and Settings at its foot.
+/// The pages of the navigation pane: five in its menu, and Settings at its foot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
     Overview,
     Protection,
     Inventory,
+    Watch,
     Vault,
     Settings,
 }
 
 impl Page {
     /// The pages of the pane's menu, in order. Settings is the pane's footer item.
-    const MENU: [Self; 4] = [
+    const MENU: [Self; 5] = [
         Self::Overview,
         Self::Protection,
         Self::Inventory,
+        Self::Watch,
         Self::Vault,
     ];
 
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Overview,
         Self::Protection,
         Self::Inventory,
+        Self::Watch,
         Self::Vault,
         Self::Settings,
     ];
@@ -83,6 +106,7 @@ impl Page {
             Self::Overview => "overview",
             Self::Protection => "protection",
             Self::Inventory => "inventory",
+            Self::Watch => "watch",
             Self::Vault => "vault",
             Self::Settings => "settings",
         }
@@ -98,17 +122,19 @@ impl Page {
             Self::Overview => "Overview",
             Self::Protection => "Protection",
             Self::Inventory => "Inventory",
+            Self::Watch => "Watch",
             Self::Vault => "Vault",
             Self::Settings => "Settings",
         }
     }
 
-    /// A Segoe Fluent Icons glyph: home, shield, folder, lock, gear.
+    /// A Segoe Fluent Icons glyph: home, shield, folder, eye, lock, gear.
     const fn glyph(self) -> &'static str {
         match self {
             Self::Overview => "\u{E80F}",
             Self::Protection => "\u{EA18}",
             Self::Inventory => "\u{E8B7}",
+            Self::Watch => "\u{E890}",
             Self::Vault => "\u{E72E}",
             Self::Settings => "\u{E713}",
         }
@@ -143,19 +169,10 @@ pub struct WindowInput {
     pub on_sync: Callback<()>,
     /// Tells the application that the window went away.
     pub on_closed: Callback<()>,
-    /// The latest "show this in the treemap" request the application handled (an Explorer scan
-    /// that finished); `None` once the window has closed. The window follows each request once.
-    pub reveal: Option<Reveal>,
-}
-
-/// What the Inventory treemap's side panel describes instead of the folder on show.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Selection {
-    /// A tile of the folder: a file, or the node with an empty path that stands for the scans
-    /// outside the watched folders.
-    Node(PathBuf),
-    /// The "+N more" tile: the nodes that did not get a tile of their own.
-    More,
+    /// The number of the scan request that opened the window, `None` when the user did: a window
+    /// that opens for a scan shows its result, one that opens for the user does not show the
+    /// results of scans it never saw.
+    pub reveal: Option<u64>,
 }
 
 /// Messages of the window; all `Send` so background work can return them.
@@ -165,6 +182,8 @@ pub enum Msg {
     /// A snapshot newer than the last one, or `None` when the poll was cancelled or the Windows
     /// theme changed.
     Polled(Option<Box<Snapshot>>),
+    /// The window has this size now.
+    Resized(WindowSize),
     /// The master switch: protection on (`true`) or off.
     Toggle(bool),
     InstallCertificate,
@@ -187,21 +206,44 @@ pub enum Msg {
     Highlight(Highlight),
     /// A Settings checkbox: whether piikey looks for that type of personal data.
     Kind(EntityKind, bool),
-    /// The Inventory switch of the Explorer "Scan for personal data" menu entry.
+    /// The Settings switch of the Explorer "Scan for personal data" menu entry.
     ExplorerMenu(bool),
-    /// The Inventory switch of the inventory.
-    Inventory(bool),
+    /// The Settings switch of keeping piikey in the tray when the window closes.
+    Background(bool),
     /// The Settings switch of the local HTTP API.
     HttpApi(bool),
-    /// The "add a folder" box of Inventory.
+    /// The "scan a folder or file" box of Inventory.
     RootDraft(String),
     AddRoot,
-    /// A folder the inventory scans: added (`true`) or removed.
-    Root(PathBuf, bool),
-    /// A folder or file the inventory leaves out: added (`true`) or taken back.
-    Exclude(PathBuf, bool),
-    /// "Rescan": the inventory scans all its folders again.
-    RescanAll,
+    /// The box's text names a folder or file that is there: it is being scanned.
+    RootAdded,
+    /// The box's text names nothing that can be scanned; the text says why.
+    RootRefused(String),
+    /// A location the Scan button looks through, taken off the list.
+    RemoveLocation(PathBuf),
+    /// The Scan button: the inventory scans all its locations now.
+    ScanAll,
+    /// The Watch switch.
+    Watch(bool),
+    /// The "add a folder to watch" box.
+    WatchDraft(String),
+    AddWatch,
+    /// A folder taken off the Watch list.
+    RemoveWatch(PathBuf),
+    /// Watch Documents, Desktop and Downloads.
+    WatchUsual,
+    /// Something was dropped on the window: the paths of the files and folders.
+    Dropped(Vec<String>),
+    /// Something a dashboard's controls ask for; the store says which dashboard.
+    Dash(Store, Dash),
+    /// What the detection found in a file, or why it did not.
+    FindingsLoaded(PathBuf, Result<Vec<Finding>, String>),
+    /// The list of what was found in a file was closed.
+    FindingsClosed,
+    /// The result of a scan was closed.
+    ReportClose,
+    /// "Show in Inventory" on the result of a scan.
+    ReportShow,
     CopyToken,
     RotateToken,
     /// What Developer access says after a token action.
@@ -211,16 +253,18 @@ pub enum Msg {
     StartupLoaded(Option<bool>),
     /// The Settings switch of starting piikey at sign-in.
     SetStartup(bool),
-    /// Where the detection model runs, as the model folder says; `None` before its first load.
-    DeviceLoaded(Option<Device>),
     /// Show the data folder in Explorer.
     OpenDataFolder,
     /// Write the vault to a CSV file in Downloads and show it in Explorer.
     ExportVault,
-    /// The Wipe vault button: the first click arms it, the second one wipes.
-    WipeVault,
-    /// Forget the vault records of this value.
-    Forget(String),
+    /// The Vault check box of this value was set or cleared.
+    VaultPick(String, bool),
+    /// Select all: every listed value, or none.
+    VaultPickAll(bool),
+    /// The Forget N button: ask before forgetting the selected values.
+    VaultAskForget,
+    /// The answer to that question: `true` forgets the selected values.
+    VaultForget(bool),
     /// The Vault search box.
     VaultQuery(String),
     /// The Vault type filter; `None` is every type.
@@ -231,26 +275,6 @@ pub enum Msg {
     VaultPeriod(Period),
     /// A Vault search finished; the number is the search it answers.
     VaultLoaded(u64, KeyedPage),
-    /// A breadcrumb of the treemap: show this folder (empty is the top level).
-    InvNav(PathBuf),
-    /// A tile of the treemap: a folder opens, a file is selected.
-    InvOpen(PathBuf),
-    /// The "+N more" tile.
-    InvMore,
-    /// A treemap level finished loading; the number is the load it answers.
-    InvLoaded(u64, InventoryView),
-    /// Open the file in the program Windows chooses for it.
-    InvLaunch(PathBuf),
-    /// Show the file or folder in Explorer.
-    InvShow(PathBuf),
-    /// Scan this file or folder again.
-    InvRescan(PathBuf),
-    /// Write a masked copy of this file beside it and show it in Explorer.
-    InvMask(PathBuf),
-    /// Leave this file or folder out of the inventory.
-    InvExclude(PathBuf),
-    /// Write a report of everything under the folder on show to Downloads and show it.
-    InvReport,
     /// Show the next line of the loading screen.
     Flavor,
     /// Download the detection model again.
@@ -258,61 +282,6 @@ pub enum Msg {
     /// Go on without the detection model.
     SkipModel,
     Noop,
-}
-
-/// What a click on a treemap tile does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Click {
-    /// Show that folder in the treemap.
-    Enter,
-    /// Describe it in the side panel.
-    Select,
-    /// The tile is not in the view any more.
-    Stale,
-}
-
-/// What a click on the tile of `path` does among `nodes`: folders open; files and the "Other
-/// scans" node, whose empty path has no folder to open, are selected.
-fn click_on(nodes: &[Node], path: &Path) -> Click {
-    match nodes.iter().find(|node| node.path == path) {
-        None => Click::Stale,
-        Some(node) if node.is_dir && !path.as_os_str().is_empty() => Click::Enter,
-        Some(_) => Click::Select,
-    }
-}
-
-/// What the model folder's `device.cfg` names, if it names a device. The app writes it plain;
-/// people write it by hand, and what `echo cpu > device.cfg` leaves in Windows `PowerShell` is
-/// UTF-16 with a byte-order mark, so that is read too. `gpu`, as an older version wrote it, is the
-/// CPU and the GPU together.
-fn parse_device(bytes: &[u8]) -> Option<Device> {
-    let text = match bytes {
-        [0xFF, 0xFE, rest @ ..] => decode_utf16(rest, u16::from_le_bytes),
-        [0xFE, 0xFF, rest @ ..] => decode_utf16(rest, u16::from_be_bytes),
-        [0xEF, 0xBB, 0xBF, rest @ ..] => String::from_utf8_lossy(rest).into_owned(),
-        _ => String::from_utf8_lossy(bytes).into_owned(),
-    };
-    match text.trim() {
-        "hybrid" | "gpu" => Some(Device::Hybrid),
-        "cpu" => Some(Device::Cpu),
-        _ => None,
-    }
-}
-
-/// `bytes` as UTF-16 text of the given byte order.
-fn decode_utf16(bytes: &[u8], unit: fn([u8; 2]) -> u16) -> String {
-    let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|pair| unit([pair[0], pair[1]]))
-        .collect();
-    String::from_utf16_lossy(&units)
-}
-
-/// Where the detection model runs, as its folder says; `None` when nothing says yet.
-fn read_device() -> Option<Device> {
-    let dir = piikey::detect::ner::files::default_dir().ok()?;
-    let bytes = fs::read(dir.join(piikey::detect::ner::files::DEVICE_FILE)).ok()?;
-    parse_device(&bytes)
 }
 
 /// What the user asked of the controller, and it has not yet finished: the switches show it at
@@ -330,6 +299,8 @@ pub struct MainWindow {
     pub(super) input: WindowInput,
     pub(super) snap: Snapshot,
     pub(super) page: Page,
+    /// The window's client size, as far as the layout follows it.
+    pub(super) size: WindowSize,
     /// Windows apps use the dark theme: picks the logo and the status colours.
     pub(super) dark: bool,
     /// What the user asked of the controller that it has not finished.
@@ -338,36 +309,37 @@ pub struct MainWindow {
     pub(super) apps: Vec<String>,
     pub(super) site_draft: String,
     pub(super) app_draft: String,
-    /// The inventory folder being typed in Inventory.
+    /// The folder or file being typed in Inventory.
     pub(super) root_draft: String,
+    /// The folder being typed in Watch.
+    pub(super) watch_draft: String,
     /// Why the last "Add" was refused.
     pub(super) form_error: Option<String>,
-    /// The first click on Wipe vault came; the next one wipes. Changing the page puts it back.
-    pub(super) wipe_armed: bool,
     /// What Developer access says about the last token action; changing the page clears it.
     pub(super) token_note: Option<&'static str>,
     /// Whether piikey starts at sign-in; `None` until the system has answered.
     pub(super) startup: Option<bool>,
-    /// Where the detection model runs; `None` until it has loaded once, or until read.
-    pub(super) device: Option<Device>,
     /// What the Vault page asks for.
     pub(super) vault: KeyedQuery,
     /// The latest search result; `None` until the first one arrives.
     pub(super) vault_page: Option<KeyedPage>,
+    /// The values ticked on the Vault page: only ever values of `vault_page`.
+    pub(super) vault_picked: HashSet<String>,
+    /// Forget was pressed and its question is on show.
+    pub(super) forget_asked: bool,
     /// Numbers the searches, so a slow old one cannot replace a newer result.
     vault_search: u64,
-    /// The folder the Inventory treemap shows; empty is the top level.
-    pub(super) inv_at: PathBuf,
-    /// What the treemap's side panel describes; `None` is the folder on show.
-    pub(super) inv_selected: Option<Selection>,
-    /// The tiles of `inv_at`, and the entry of the selected file.
-    pub(super) inv_view: InventoryView,
-    /// `inv_view` has been loaded at least once: until then the card does not claim it is empty.
-    pub(super) inv_loaded: bool,
-    /// Numbers the loads of `inv_view`, so a slow old one cannot replace a newer one.
-    inv_seq: u64,
-    /// The newest reveal request this window has followed.
-    revealed: u64,
+    /// What the Inventory page shows and what the user chose in it.
+    pub(super) inventory: Dashboard,
+    /// The same for the Watch page.
+    pub(super) watch: Dashboard,
+    /// What the detection found in one file, while a dialog lists it: the file and how far the
+    /// reading is. Never kept past the dialog.
+    pub(super) findings: Option<(PathBuf, FindingsState)>,
+    /// The dialog of "Show what was found" is on show.
+    pub(super) findings_open: bool,
+    /// The newest scan request whose result the user has seen and put away.
+    pub(super) dismissed: u64,
     timer: Option<ComponentTimer>,
     /// Which [`pages::loading::FLAVOR`] line the loading screen shows.
     pub(super) flavor: usize,
@@ -377,30 +349,37 @@ pub struct MainWindow {
 impl MainWindow {
     /// The window as it opens: on Overview.
     fn new(input: &WindowInput) -> Self {
+        let snap = input.controller.snapshot();
+        // A window that opens for a scan shows its result; any other shows only what comes after.
+        let dismissed = match input.reveal {
+            Some(seq) => seq.saturating_sub(1),
+            None => snap.reveal.as_ref().map_or(0, |reveal| reveal.seq),
+        };
         Self {
             input: input.clone(),
-            snap: input.controller.snapshot(),
+            snap,
             page: Page::Overview,
+            size: OPENS_AT,
             dark: assets::system_dark(),
             asked: Asked::default(),
             apps: Vec::new(),
             site_draft: String::new(),
             app_draft: String::new(),
             root_draft: String::new(),
+            watch_draft: String::new(),
             form_error: None,
-            wipe_armed: false,
             token_note: None,
             startup: None,
-            device: None,
             vault: KeyedQuery::default(),
             vault_page: None,
+            vault_picked: HashSet::new(),
+            forget_asked: false,
             vault_search: 0,
-            inv_at: PathBuf::new(),
-            inv_selected: None,
-            inv_view: InventoryView::default(),
-            inv_loaded: false,
-            inv_seq: 0,
-            revealed: 0,
+            inventory: Dashboard::new(),
+            watch: Dashboard::new(),
+            findings: None,
+            findings_open: false,
+            dismissed,
             timer: None,
             flavor: 0,
             flavor_timer: None,
@@ -465,9 +444,12 @@ impl MainWindow {
             || self.snap.reveal != snapshot.reveal
             || self.snap.show != snapshot.show;
         let vault_changed = self.snap.issued != snapshot.issued;
-        // The treemap follows what the scans find, while they run and once one has ended.
+        // The dashboards follow what the scans find, while they run and once one has ended.
         let inventory_changed = self.snap.inventory_totals != snapshot.inventory_totals
             || (self.snap.scan.is_some() && snapshot.scan.is_none());
+        let watch_changed = self.snap.watch.totals != snapshot.watch.totals
+            || (self.snap.watch.scanning.is_some() && snapshot.watch.scanning.is_none());
+        let reveal_changed = self.snap.reveal != snapshot.reveal;
         self.snap = snapshot;
         if self.snap.busy.is_none() && self.snap.pending == 0 {
             self.asked = Asked::default();
@@ -479,7 +461,13 @@ impl MainWindow {
             self.search(context);
         }
         if inventory_changed && self.page == Page::Inventory {
-            self.load_inventory(context);
+            self.load_dashboard(Store::Inventory, context);
+        }
+        if watch_changed && self.page == Page::Watch {
+            self.load_dashboard(Store::Watch, context);
+        }
+        if reveal_changed {
+            self.follow_reveal(context);
         }
     }
 
@@ -489,11 +477,11 @@ impl MainWindow {
         self.reset_transients();
     }
 
-    /// Puts back what a page leaves half done: a refused entry, a first click on Wipe vault, a
-    /// note about the token.
+    /// Puts back what a page leaves half done: a refused entry, an unanswered question about
+    /// forgetting, a note about the token.
     fn reset_transients(&mut self) {
         self.form_error = None;
-        self.wipe_armed = false;
+        self.forget_asked = false;
         self.token_note = None;
     }
 
@@ -506,7 +494,8 @@ impl MainWindow {
                 self.input.controller.submit(Command::Refresh);
                 self.watch_apps(context);
             }
-            Page::Inventory => self.load_inventory(context),
+            Page::Inventory => self.load_dashboard(Store::Inventory, context),
+            Page::Watch => self.load_dashboard(Store::Watch, context),
             Page::Vault => self.search(context),
             Page::Settings => self.load_settings(context),
         }
@@ -524,27 +513,12 @@ impl MainWindow {
         }
     }
 
-    /// What Settings shows that the controller does not know: whether piikey starts at sign-in,
-    /// and where the model runs.
+    /// What Settings shows that the controller does not know: whether piikey starts at sign-in.
     fn load_settings(&self, context: &ComponentContext<Self>) {
         // A setting that cannot be read is a notice, and its switch stays off limits.
         self.background(context, |_| {
             startup::enabled().map(|on| Msg::StartupLoaded(Some(on)))
         });
-        self.background(context, |_| Ok(Msg::DeviceLoaded(read_device())));
-    }
-
-    /// Follows the request to show an Explorer scan, once per request: Inventory, at the scanned
-    /// folder, with the scanned file selected. `false` when there is nothing new to show.
-    fn follow(&mut self, reveal: Option<&Reveal>, context: &ComponentContext<Self>) -> bool {
-        let Some(reveal) = reveal.filter(|reveal| reveal.seq > self.revealed) else {
-            return false;
-        };
-        self.revealed = reveal.seq;
-        self.inv_at.clone_from(&reveal.at);
-        self.inv_selected = reveal.select.clone().map(Selection::Node);
-        self.navigate(Page::Inventory, context);
-        true
     }
 
     /// Runs the Vault search in the background.
@@ -555,26 +529,6 @@ impl MainWindow {
         let query = self.vault.clone();
         context.spawn_background(move |_| {
             Msg::VaultLoaded(search, controller.keyed(&query, VAULT_LIMIT))
-        });
-    }
-
-    /// The selected file, whose entry (size, scan time, what was found) the side panel wants.
-    fn selected_file(&self) -> Option<PathBuf> {
-        match &self.inv_selected {
-            Some(Selection::Node(path)) if !path.as_os_str().is_empty() => Some(path.clone()),
-            _ => None,
-        }
-    }
-
-    /// Loads the tiles of `inv_at` in the background, with the entry of the selected file.
-    fn load_inventory(&mut self, context: &ComponentContext<Self>) {
-        self.inv_seq += 1;
-        let load = self.inv_seq;
-        let controller = Arc::clone(&self.input.controller.0);
-        let at = self.inv_at.clone();
-        let selected = self.selected_file();
-        context.spawn_background(move |_| {
-            Msg::InvLoaded(load, controller.inventory_view(&at, selected.as_deref()))
         });
     }
 
@@ -593,9 +547,21 @@ impl MainWindow {
         )
     }
 
-    /// The lists of Protection and Inventory: sites, apps, and the inventory's folders and
-    /// exclusions. [`Component::update`] routes the messages of these lists here.
-    fn update_lists(&mut self, message: Msg) {
+    /// The window has this size now; a change smaller than a step is not followed.
+    fn resize(&mut self, size: WindowSize) {
+        let snap = |value: f64| (value / SIZE_STEP).round() * SIZE_STEP;
+        let size = WindowSize {
+            width: snap(size.width),
+            height: snap(size.height),
+        };
+        if size != self.size {
+            self.size = size;
+        }
+    }
+
+    /// The lists of Protection, Inventory and Watch: sites, apps, and the folders the inventory
+    /// scans and the watch looks at. [`Component::update`] routes the messages of these here.
+    fn update_lists(&mut self, message: Msg, context: &ComponentContext<Self>) {
         match message {
             Msg::SiteDraft(text) => {
                 self.site_draft = text;
@@ -636,24 +602,64 @@ impl MainWindow {
                 self.root_draft = text;
                 self.form_error = None;
             }
-            Msg::AddRoot => {
-                let path = PathBuf::from(self.root_draft.trim());
-                match self.edit(Edit::InventoryRoot { path, on: true }) {
+            Msg::AddRoot => self.add_root(context),
+            Msg::RootAdded => {
+                self.root_draft.clear();
+                self.form_error = None;
+            }
+            Msg::RootRefused(error) => self.form_error = Some(error),
+            Msg::RemoveLocation(path) => {
+                let _ = self.edit(Edit::InventoryRoot { path, on: false });
+            }
+            Msg::WatchDraft(text) => {
+                self.watch_draft = text;
+                self.form_error = None;
+            }
+            Msg::AddWatch => {
+                let path = PathBuf::from(self.watch_draft.trim());
+                match self.edit(Edit::WatchFolder { path, on: true }) {
                     Ok(()) => {
-                        self.root_draft.clear();
+                        self.watch_draft.clear();
                         self.form_error = None;
                     }
                     Err(error) => self.form_error = Some(error),
                 }
             }
-            Msg::Root(path, on) => {
-                let _ = self.edit(Edit::InventoryRoot { path, on });
+            Msg::RemoveWatch(path) => {
+                let _ = self.edit(Edit::WatchFolder { path, on: false });
             }
-            Msg::Exclude(path, on) => {
-                let _ = self.edit(Edit::InventoryExclude { path, on });
+            Msg::WatchUsual => {
+                // A folder that is not there is left out; the others are watched.
+                for path in piikey::policy::default_inventory_roots() {
+                    let _ = self.edit(Edit::WatchFolder { path, on: true });
+                }
             }
             _ => {}
         }
+    }
+
+    /// The Inventory box: a folder is added to the locations and scanned, a file is scanned, both
+    /// with the result on show. Which it is, is for the disk to say, so that is asked in the
+    /// background.
+    fn add_root(&self, context: &ComponentContext<Self>) {
+        let path = PathBuf::from(self.root_draft.trim());
+        self.background(context, move |controller| match fs::metadata(&path) {
+            Ok(meta) if meta.is_dir() => {
+                controller.submit(Command::AddLocation(path));
+                Ok(Msg::RootAdded)
+            }
+            Ok(_) => {
+                controller.submit(Command::ScanFiles {
+                    paths: vec![path],
+                    reveal: true,
+                });
+                Ok(Msg::RootAdded)
+            }
+            Err(error) => Ok(Msg::RootRefused(format!(
+                "Cannot scan {}: {error}",
+                path.display()
+            ))),
+        });
     }
 
     /// The feature switches, the types of personal data, and Developer access.
@@ -672,13 +678,25 @@ impl MainWindow {
             Msg::ExplorerMenu(on) => {
                 let _ = self.edit(Edit::ExplorerMenu(*on));
             }
-            Msg::Inventory(on) => {
-                let _ = self.edit(Edit::Inventory(*on));
+            Msg::Background(on) => {
+                let _ = self.edit(Edit::Background(*on));
             }
             Msg::HttpApi(on) => {
                 let _ = self.edit(Edit::HttpApi(*on));
             }
-            Msg::RescanAll => self.input.controller.submit(Command::Rescan),
+            Msg::Watch(on) => {
+                let _ = self.edit(Edit::Watch(*on));
+            }
+            Msg::ScanAll => self.input.controller.submit(Command::ScanAll),
+            Msg::Dropped(paths) => {
+                let paths: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+                if !paths.is_empty() {
+                    self.input.controller.submit(Command::ScanFiles {
+                        paths,
+                        reveal: true,
+                    });
+                }
+            }
             Msg::CopyToken => self.background(context, |controller| {
                 let token = controller.token(false)?;
                 clipboard_win::set_clipboard_string(&token)
@@ -706,7 +724,6 @@ impl MainWindow {
                     Ok(Msg::StartupLoaded(startup::enabled().ok()))
                 });
             }
-            Msg::DeviceLoaded(device) => self.device = *device,
             Msg::OpenDataFolder => {
                 let folder = self
                     .input
@@ -725,18 +742,8 @@ impl MainWindow {
         }
     }
 
-    /// Wipe vault takes two clicks: the first one only arms the button, the second one wipes.
-    fn click_wipe(&mut self) {
-        if self.wipe_armed {
-            self.wipe_armed = false;
-            self.input.controller.submit(Command::WipeVault);
-        } else {
-            self.wipe_armed = true;
-        }
-    }
-
-    /// The Vault page: its search, its export, Forget and Wipe. [`Component::update`] routes its
-    /// messages here.
+    /// The Vault page: its search, its export, its selection and Forget. [`Component::update`]
+    /// routes its messages here.
     fn update_vault(&mut self, message: Msg, context: &ComponentContext<Self>) {
         match message {
             Msg::VaultQuery(text) => {
@@ -756,83 +763,51 @@ impl MainWindow {
                 self.search(context);
             }
             Msg::VaultLoaded(search, page) if search == self.vault_search => {
+                // Only what the list shows stays selected.
+                let listed: HashSet<&str> = page
+                    .items
+                    .iter()
+                    .map(|item| item.original.as_str())
+                    .collect();
+                self.vault_picked
+                    .retain(|value| listed.contains(value.as_str()));
                 self.vault_page = Some(page);
             }
-            Msg::Forget(original) => self
-                .input
-                .controller
-                .submit(Command::Forget(vec![original])),
+            Msg::VaultPick(original, on) => {
+                if on {
+                    self.vault_picked.insert(original);
+                } else {
+                    self.vault_picked.remove(&original);
+                }
+            }
+            Msg::VaultPickAll(on) => {
+                self.vault_picked.clear();
+                if on && let Some(page) = &self.vault_page {
+                    self.vault_picked
+                        .extend(page.items.iter().map(|item| item.original.clone()));
+                }
+            }
+            Msg::VaultAskForget => self.forget_asked = !self.vault_picked.is_empty(),
+            Msg::VaultForget(confirmed) => {
+                self.forget_asked = false;
+                if confirmed {
+                    let values: Vec<String> = self
+                        .vault_page
+                        .iter()
+                        .flat_map(|page| &page.items)
+                        .filter(|item| self.vault_picked.contains(&item.original))
+                        .map(|item| item.original.clone())
+                        .collect();
+                    self.vault_picked.clear();
+                    if !values.is_empty() {
+                        self.input.controller.submit(Command::Forget(values));
+                    }
+                }
+            }
             Msg::ExportVault => self.background(context, |controller| {
                 explorer::show(&controller.export_vault()?)?;
                 Ok(Msg::Noop)
             }),
-            Msg::WipeVault => self.click_wipe(),
-            _ => {}
-        }
-    }
-
-    /// The Inventory treemap: navigation, selection and the actions of its side panel.
-    /// [`Component::update`] routes its messages here.
-    fn update_inventory(&mut self, message: Msg, context: &ComponentContext<Self>) {
-        match message {
-            Msg::InvNav(path) => {
-                self.inv_at = path;
-                self.inv_selected = None;
-                self.load_inventory(context);
-            }
-            Msg::InvOpen(path) => match click_on(&self.inv_view.nodes, &path) {
-                Click::Enter => {
-                    self.inv_at = path;
-                    self.inv_selected = None;
-                    self.load_inventory(context);
-                }
-                Click::Select => {
-                    // The "Other scans" node has no file whose entry could be looked up.
-                    let is_file = !path.as_os_str().is_empty();
-                    self.inv_selected = Some(Selection::Node(path));
-                    if is_file {
-                        self.load_inventory(context);
-                    }
-                }
-                Click::Stale => {}
-            },
-            Msg::InvMore => self.inv_selected = Some(Selection::More),
-            Msg::InvLoaded(load, view) if load == self.inv_seq => {
-                self.inv_view = view;
-                self.inv_loaded = true;
-            }
-            Msg::InvLaunch(path) => self.background(context, move |_| {
-                explorer::open(&path)?;
-                Ok(Msg::Noop)
-            }),
-            Msg::InvShow(path) => self.background(context, move |_| {
-                explorer::show(&path)?;
-                Ok(Msg::Noop)
-            }),
-            Msg::InvRescan(path) => self.input.controller.submit(Command::ScanFiles {
-                paths: vec![path],
-                reveal: false,
-            }),
-            Msg::InvMask(path) => self.background(context, move |controller| {
-                explorer::show(&controller.masked_copy(&path)?)?;
-                Ok(Msg::Noop)
-            }),
-            Msg::InvExclude(path) => {
-                // Gone from the side panel at once; the controller forgets what lies under it, and
-                // the totals that change then load the view again.
-                self.inv_selected = None;
-                if let Err(error) = self.edit(Edit::InventoryExclude { path, on: true }) {
-                    self.input.controller.notify(Notice::error(error));
-                }
-                self.load_inventory(context);
-            }
-            Msg::InvReport => {
-                let under = self.inv_at.clone();
-                self.background(context, move |controller| {
-                    explorer::show(&controller.export_report(&under)?)?;
-                    Ok(Msg::Noop)
-                });
-            }
             _ => {}
         }
     }
@@ -869,14 +844,13 @@ impl Component for MainWindow {
         let mut window = Self::new(input);
         window.flavor_timer = Some(context.set_timeout(FLAVOR_EVERY, Msg::Flavor));
         window.poll(context);
-        // Overview is the first page, unless a reveal has just taken the window to the map.
-        window.follow(input.reveal.as_ref(), context);
+        // A window that opens for a scan shows its result at once.
+        window.follow_reveal(context);
         window
     }
 
-    fn input_changed(&mut self, input: &WindowInput, context: &ComponentContext<Self>) {
+    fn input_changed(&mut self, input: &WindowInput, _context: &ComponentContext<Self>) {
         self.input = input.clone();
-        self.follow(input.reveal.as_ref(), context);
     }
 
     fn update(&mut self, message: Msg, context: &ComponentContext<Self>) {
@@ -890,6 +864,7 @@ impl Component for MainWindow {
                 }
                 self.poll(context);
             }
+            Msg::Resized(size) => self.resize(size),
             Msg::Toggle(on) => {
                 self.asked.protection = Some(on);
                 self.input.controller.submit(Command::SetEnabled(on));
@@ -918,6 +893,7 @@ impl Component for MainWindow {
             Msg::RetryModel => self.input.controller.submit(Command::FetchModel),
             Msg::SkipModel => self.input.controller.submit(Command::SkipModel),
             Msg::Noop => {}
+            Msg::Dash(store, message) => self.update_dashboard(store, message, context),
             Msg::SiteDraft(_)
             | Msg::AddSite
             | Msg::Site(..)
@@ -926,39 +902,40 @@ impl Component for MainWindow {
             | Msg::App(..)
             | Msg::RootDraft(_)
             | Msg::AddRoot
-            | Msg::Root(..)
-            | Msg::Exclude(..) => self.update_lists(message),
+            | Msg::RootAdded
+            | Msg::RootRefused(_)
+            | Msg::RemoveLocation(_)
+            | Msg::WatchDraft(_)
+            | Msg::AddWatch
+            | Msg::RemoveWatch(_)
+            | Msg::WatchUsual => self.update_lists(message, context),
             Msg::Highlight(_)
             | Msg::Kind(..)
             | Msg::ExplorerMenu(_)
-            | Msg::Inventory(_)
+            | Msg::Background(_)
             | Msg::HttpApi(_)
-            | Msg::RescanAll
+            | Msg::Watch(_)
+            | Msg::ScanAll
+            | Msg::Dropped(_)
             | Msg::CopyToken
             | Msg::RotateToken
             | Msg::TokenNote(_)
             | Msg::StartupLoaded(_)
             | Msg::SetStartup(_)
-            | Msg::DeviceLoaded(_)
             | Msg::OpenDataFolder => self.update_features(&message, context),
             Msg::ExportVault
-            | Msg::WipeVault
-            | Msg::Forget(_)
+            | Msg::VaultPick(..)
+            | Msg::VaultPickAll(_)
+            | Msg::VaultAskForget
+            | Msg::VaultForget(_)
             | Msg::VaultQuery(_)
             | Msg::VaultKind(_)
             | Msg::VaultSite(_)
             | Msg::VaultPeriod(_)
             | Msg::VaultLoaded(..) => self.update_vault(message, context),
-            Msg::InvNav(_)
-            | Msg::InvOpen(_)
-            | Msg::InvMore
-            | Msg::InvLoaded(..)
-            | Msg::InvLaunch(_)
-            | Msg::InvShow(_)
-            | Msg::InvRescan(_)
-            | Msg::InvMask(_)
-            | Msg::InvExclude(_)
-            | Msg::InvReport => self.update_inventory(message, context),
+            Msg::FindingsLoaded(..) | Msg::FindingsClosed | Msg::ReportClose | Msg::ReportShow => {
+                self.update_report(message, context);
+            }
         }
     }
 
@@ -966,7 +943,7 @@ impl Component for MainWindow {
         let mut visuals = WindowVisuals::new()
             .backdrop(WindowBackdrop::Mica)
             .theme(assets::window_theme())
-            .client_size(1040.0, 760.0)
+            .client_size(OPENS_AT.width, OPENS_AT.height)
             .constraints(WindowConstraints {
                 min_width: Some(760.0),
                 min_height: Some(560.0),
@@ -977,6 +954,8 @@ impl Component for MainWindow {
         }
         context.window_visuals(visuals);
         context.window_title("piikey");
+        let resized = context.callback(Msg::Resized);
+        context.on_window_size(resized);
         context.use_effect("ready", (), || {
             println!("piikey: window ready");
             None
@@ -1020,10 +999,15 @@ impl Component for MainWindow {
         } else {
             navigation.into()
         };
-        Grid::new()
+        let frame: View = Grid::new()
             .rows([GridLength::Auto, GridLength::STAR])
             .children((title_bar, body))
-            .into()
+            .into();
+        // What a scan found, or what was found in a file, over whatever page is on show.
+        match pages::dialog(self, context) {
+            Some(dialog) => frame.content_dialog(dialog),
+            None => frame,
+        }
     }
 }
 

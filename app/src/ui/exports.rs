@@ -148,6 +148,7 @@ mod tests {
             scanned: 1_700_000_000,
             status: Status::Ok,
             counts: vec![(EntityKind::Iban, hits)],
+            hash: None,
         };
         inventory
             .record(vec![

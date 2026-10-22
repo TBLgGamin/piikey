@@ -1,15 +1,17 @@
-//! The pages of the window: Overview, Protection, Inventory, Vault and Settings, and the first-run
-//! screen.
+//! The pages of the window: Overview, Protection, Inventory, Watch, Vault and Settings, and the
+//! first-run screen.
 //!
 //! Text, cards, lists and controls take their colours from the theme, so they follow light or dark
 //! mode and the accent colour the user chose in Windows. The brand purple, `#6f49b1` in light mode
 //! and lilac `#d6c9f9` in dark mode, as the logo kit (`assets/brand/piikey-logo-kit`) prescribes,
-//! appears in the logo and in the treemap of the inventory only. Status is a glyph and words first,
-//! with Windows' own success and caution colours second.
+//! appears in the logo only; the dashboards of Inventory and Watch colour by type of personal
+//! data. Status is a glyph and words first, with Windows' own success and caution colours second.
 //!
 //! [`kit`] holds the page frame's parts and every widget the pages share (the type styles, the
-//! card, the row, the section); each page has its own file.
+//! card, the row, the section); each page has its own file, and [`dashboard`] is what Inventory and
+//! Watch show their files in.
 
+mod dashboard;
 mod inventory;
 mod kit;
 mod lists;
@@ -18,11 +20,12 @@ mod overview;
 mod protection;
 mod settings;
 mod vault;
+mod watch;
 
 use windows_reactor::{Grid, GridLength, KeyedView, StackPanel, Thickness, View};
 
-pub(super) use self::kit::status_chip;
 use self::kit::{Context, measured, notice};
+pub(super) use self::{dashboard::dialog, kit::status_chip};
 use super::{
     status::{Cause, Status},
     window::{MainWindow, Page},
@@ -35,6 +38,7 @@ pub fn page(window: &MainWindow, status: &Status, context: Context<'_>) -> View 
         Page::Overview => overview::overview(window, status, context),
         Page::Protection => protection::protection(window, status, context),
         Page::Inventory => inventory::inventory(window, context),
+        Page::Watch => watch::watch(window, context),
         Page::Vault => vault::vault(window, context),
         Page::Settings => settings::settings(window, context),
     };

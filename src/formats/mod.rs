@@ -150,6 +150,7 @@ pub fn scan(engine: &Engine, bytes: &[u8], keep_texts: bool) -> Result<Scanned> 
     let collect = Collect {
         found: Mutex::new(Vec::new()),
         texts: keep_texts.then(|| Mutex::new(Vec::new())),
+        findings: None,
     };
     process_pass(
         &Pass {
@@ -165,6 +166,63 @@ pub fn scan(engine: &Engine, bytes: &[u8], keep_texts: bool) -> Result<Scanned> 
             .texts
             .map_or_else(|| Ok(Vec::new()), Mutex::into_inner)?,
     })
+}
+
+/// How many characters of text a [`Finding`]'s snippet shows on each side of the value.
+const SNIPPET_CONTEXT: usize = 40;
+/// How many characters of a value a [`Finding`] shows: a secret can be a whole key block.
+const SNIPPET_VALUE: usize = 120;
+
+/// A value the detector found in a file, with the text around it, for showing to the person who
+/// asked. It is personal data: keep it out of logs and out of files (the `Debug` output only
+/// names the kind).
+#[derive(Clone, PartialEq, Eq)]
+pub struct Finding {
+    pub kind: EntityKind,
+    /// The value, each run of white space (a line break, a tab) one space, and cut to the first
+    /// 120 characters when it is longer, with `…` after them.
+    pub value: Box<str>,
+    /// The value with up to 40 characters of the text before and after it, white space
+    /// collapsed as in `value`, and `…` where the text goes on beyond what is shown. The value
+    /// is inside it, as it is in `value`.
+    pub snippet: Box<str>,
+}
+
+impl fmt::Debug for Finding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Finding")
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Sniffs `bytes` like [`scan`] and lists what the detector finds in it, each value with the
+/// text around it, grouped by kind and in reading order within a kind. It reads what a scan
+/// reads, and nothing is kept: the vault is left as it was and the values only go to the
+/// caller.
+///
+/// # Errors
+/// `UnsupportedFormat` and per-format parse errors, as for [`process`].
+pub fn findings(engine: &Engine, bytes: &[u8]) -> Result<Vec<Finding>> {
+    let collect = Collect {
+        found: Mutex::new(Vec::new()),
+        texts: None,
+        findings: Some(Mutex::new(Vec::new())),
+    };
+    process_pass(
+        &Pass {
+            engine,
+            how: How::Scan(&collect),
+        },
+        bytes,
+        0,
+    )?;
+    let mut list = collect
+        .findings
+        .map_or_else(|| Ok(Vec::new()), Mutex::into_inner)?;
+    // Stable: the reading order of a kind stays.
+    list.sort_by_key(|finding| finding.kind);
+    Ok(list)
 }
 
 /// What a run over a file does with the texts it hands the engine: rewrite them, or only look
@@ -188,13 +246,15 @@ enum How<'a> {
 struct Collect {
     found: Mutex<Vec<(EntityKind, Box<str>)>>,
     texts: Option<Mutex<Vec<String>>>,
+    /// The values with their surroundings, for a scan that was asked to show them.
+    findings: Option<Mutex<Vec<Finding>>>,
 }
 
 impl Collect {
     /// Takes note of what was found in `texts`, and of `texts` when they are kept.
-    fn record(&self, texts: &[&str], found: &[Vec<Span>]) -> Result<()> {
+    fn record(&self, texts: &[&str], spans: &[Vec<Span>]) -> Result<()> {
         let mut values = self.found.lock()?;
-        for (text, spans) in texts.iter().zip(found) {
+        for (text, spans) in texts.iter().zip(spans) {
             values.extend(
                 spans
                     .iter()
@@ -205,7 +265,83 @@ impl Collect {
             kept.lock()?
                 .extend(texts.iter().map(|&text| text.to_owned()));
         }
+        if let Some(shown) = &self.findings {
+            let mut shown = shown.lock()?;
+            for (text, spans) in texts.iter().zip(spans) {
+                shown.extend(spans.iter().map(|span| finding(text, span)));
+            }
+        }
         Ok(())
+    }
+}
+
+/// The finding for `span` of `text`.
+fn finding(text: &str, span: &Span) -> Finding {
+    let before = &text[..span.start];
+    let value = &text[span.start..span.end];
+    let after = &text[span.end..];
+    let value = shorten(collapse(value).trim(), SNIPPET_VALUE);
+    let (near, cut_before) = tail(before, SNIPPET_CONTEXT);
+    let (far, cut_after) = head(after, SNIPPET_CONTEXT);
+    let mut snippet = String::new();
+    if cut_before {
+        snippet.push('…');
+    }
+    snippet.push_str(collapse(near).trim_start());
+    snippet.push_str(&value);
+    snippet.push_str(collapse(far).trim_end());
+    if cut_after {
+        snippet.push('…');
+    }
+    Finding {
+        kind: span.kind,
+        value: value.into(),
+        snippet: snippet.into(),
+    }
+}
+
+/// `text` with each run of white space one space.
+fn collapse(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut spaced = false;
+    for c in text.chars() {
+        if c.is_whitespace() {
+            if !spaced {
+                out.push(' ');
+            }
+            spaced = true;
+        } else {
+            out.push(c);
+            spaced = false;
+        }
+    }
+    out
+}
+
+/// The first `max` characters of `text`, and `…` when there are more.
+fn shorten(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text.to_owned(),
+    }
+}
+
+/// The last `n` characters of `text`, and whether more came before them.
+fn tail(text: &str, n: usize) -> (&str, bool) {
+    let start = text
+        .char_indices()
+        .rev()
+        .take(n)
+        .last()
+        .map_or(0, |(at, _)| at);
+    (&text[start..], start > 0)
+}
+
+/// The first `n` characters of `text`, and whether more came after them.
+fn head(text: &str, n: usize) -> (&str, bool) {
+    match text.char_indices().nth(n) {
+        Some((end, _)) => (&text[..end], true),
+        None => (text, false),
     }
 }
 

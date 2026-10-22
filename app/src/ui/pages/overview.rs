@@ -18,7 +18,7 @@ use super::{
     vault::swap_row,
 };
 use crate::ui::{
-    controller::Model,
+    controller::{Model, Snapshot},
     status::{Action, Status, Work, protected, protected_text},
     window::{MainWindow, Msg, Page},
 };
@@ -96,7 +96,7 @@ fn doing(window: &MainWindow, status: &Status, context: Context<'_>) -> View {
                 .on_click(go(Page::Protection))
                 .build(),
             Row::new("Highlighting")
-                .icon("\u{E7B3}")
+                .icon("\u{E7E6}")
                 .description("Outlines the field you type in when it holds personal data.")
                 .state(highlighting_state(
                     snap.policy.highlight,
@@ -106,9 +106,15 @@ fn doing(window: &MainWindow, status: &Status, context: Context<'_>) -> View {
                 .build(),
             Row::new("Inventory")
                 .icon("\u{E8B7}")
-                .description("Maps which files on this PC hold personal data.")
+                .description("Lists the files you scanned that hold personal data.")
                 .state(inventory_state(window))
                 .on_click(go(Page::Inventory))
+                .build(),
+            Row::new("Watch")
+                .icon("\u{E890}")
+                .description("Keeps an eye on folders and looks at files again when they change.")
+                .state(watch_state(snap))
+                .on_click(go(Page::Watch))
                 .build(),
             Row::new("Vault")
                 .icon("\u{E72E}")
@@ -147,7 +153,7 @@ fn highlighting_state(mode: Highlight, paused: bool) -> String {
     .to_owned()
 }
 
-/// `711 found in 51 files`, `Scanning… 3,412 of 20,100`, `Nothing found yet` or `Off`.
+/// `711 found in 51 files`, `Scanning… 3,412 of 20,100` or `Nothing scanned yet`.
 fn inventory_state(window: &MainWindow) -> String {
     let snap = &window.snap;
     if let Some((done, total)) = snap.scan {
@@ -168,10 +174,46 @@ fn inventory_state(window: &MainWindow) -> String {
             thousands(hits),
             counted(files, "file", "files")
         )
-    } else if snap.policy.inventory {
-        "Nothing found yet".to_owned()
     } else {
-        "Off".to_owned()
+        "Nothing scanned yet".to_owned()
+    }
+}
+
+/// `Off`, `No folders yet`, `Scanning… 12 of 40`, `34 found in 5 files` or `Watching 2 folders`.
+fn watch_state(snap: &Snapshot) -> String {
+    if !snap.policy.watch {
+        return "Off".to_owned();
+    }
+    if snap.policy.watch_folders.is_empty() {
+        return "No folders yet".to_owned();
+    }
+    if let Some((done, total)) = snap.watch.scanning {
+        return if total == 0 {
+            "Scanning\u{2026}".to_owned()
+        } else {
+            format!(
+                "Scanning\u{2026} {} of {}",
+                thousands(done),
+                thousands(total)
+            )
+        };
+    }
+    let (files, hits) = snap.watch.totals;
+    if hits > 0 {
+        format!(
+            "{} found in {}",
+            thousands(hits),
+            counted(files, "file", "files")
+        )
+    } else {
+        format!(
+            "Watching {}",
+            counted(
+                u64::try_from(snap.policy.watch_folders.len()).unwrap_or(u64::MAX),
+                "folder",
+                "folders"
+            )
+        )
     }
 }
 
@@ -214,10 +256,7 @@ fn recent(window: &MainWindow, status: &Status, context: Context<'_>) -> View {
                 .into(),
         ]
     } else {
-        snap.recent
-            .iter()
-            .map(|item| swap_row(item, None))
-            .collect()
+        snap.recent.iter().map(swap_row).collect()
     };
     section_with(
         "Recent swaps",
@@ -236,7 +275,10 @@ fn recent(window: &MainWindow, status: &Status, context: Context<'_>) -> View {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
+    use crate::ui::testing::{TempDir, stub_controller};
 
     #[test]
     fn the_masking_row_says_on_with_what_is_protected() {
@@ -269,6 +311,24 @@ mod tests {
             highlighting_state(Highlight::Hotkey, false),
             "When you press Ctrl+Alt+P"
         );
+    }
+
+    #[test]
+    fn the_watch_row_says_off_what_it_waits_for_and_what_it_found() -> Result<(), String> {
+        let dir = TempDir::new()?;
+        let mut snap = stub_controller(&dir)?.snapshot();
+        assert_eq!(watch_state(&snap), "Off");
+        snap.policy.watch = true;
+        assert_eq!(watch_state(&snap), "No folders yet");
+        snap.policy.watch_folders = vec![PathBuf::from(r"C:\Users\me\Downloads")];
+        assert_eq!(watch_state(&snap), "Watching 1 folder");
+        snap.watch.totals = (5, 34);
+        assert_eq!(watch_state(&snap), "34 found in 5 files");
+        snap.watch.scanning = Some((12, 40));
+        assert_eq!(watch_state(&snap), "Scanning\u{2026} 12 of 40");
+        snap.watch.scanning = Some((0, 0));
+        assert_eq!(watch_state(&snap), "Scanning\u{2026}");
+        Ok(())
     }
 
     #[test]

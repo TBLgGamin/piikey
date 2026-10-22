@@ -1,20 +1,18 @@
 //! Vault: every value piikey has swapped for a stand-in, kept encrypted on this PC. The search and
-//! its filters over the vault's records, Forget on each of them, and, one level down, the vault
-//! file itself with its export and its wipe. The row of one swap is also what Overview lists as
-//! recent.
+//! its filters over the vault's records, a check box on each row, Select all, and Forget for the
+//! rows that are ticked. The row of one swap is also what Overview lists as recent.
 
 use std::rc::Rc;
 
 use piikey::detect::{EntityKind, KIND_GROUPS};
 use windows_reactor::{
-    Border, Button, ButtonStyle, Callback, ComboBox, DataItem, Expander, FontWeight, Grid,
-    GridLength, HorizontalAlignment, KeyedView, ListView, ListViewSelectionMode, ProgressRing,
-    StackPanel, TextBlock, TextBox, TextTrimming, Thickness, TooltipExt, VerticalAlignment, View,
+    Border, Button, CheckBox, ComboBox, ContentDialog, ContentDialogButton, ContentDialogExt,
+    ContentDialogResult, DataItem, FontIcon, FontWeight, Grid, GridLength, KeyedView, ListView,
+    ListViewSelectionMode, ProgressRing, StackPanel, TextBlock, TextBox, TextTrimming, Thickness,
+    TooltipExt, VerticalAlignment, View,
 };
 
-use super::kit::{
-    Context, Row, caption, counted, glyph, heading, measured, page_header, thousands,
-};
+use super::kit::{Context, caption, card, counted, glyph, measured, page_header, thousands};
 use crate::ui::{
     controller::{Keyed, Period},
     window::{MainWindow, Msg, Page, VAULT_LIMIT},
@@ -29,8 +27,8 @@ const DEFINITION: &str = "Encrypted on this PC with Windows. It remembers which 
 /// What Export… writes, and why to keep it safe.
 const EXPORT_NOTE: &str = "Writes every value with its stand-in to a CSV file in Downloads. The file holds the values themselves: keep it safe.";
 
-/// What Forget does, as its tooltip says.
-const FORGET_NOTE: &str = "Forget: its stand-in will no longer be turned back";
+/// What Forget does, as the question before it says.
+const FORGET_NOTE: &str = "Their stand-ins will no longer be turned back.";
 
 /// A Segoe Fluent Icons glyph for `kind`. Types of one group share a glyph.
 const fn kind_glyph(kind: EntityKind) -> &'static str {
@@ -91,49 +89,74 @@ fn detail(item: &Keyed) -> String {
     )
 }
 
-/// One swap: the icon of its type, the value over the stand-in that replaced it, and where and when
-/// it went. With `on_forget` the row ends in a button that forgets the value.
-pub(super) fn swap_row(item: &Keyed, on_forget: Option<Callback<()>>) -> View {
-    let mut columns = vec![GridLength::Auto, GridLength::STAR, GridLength::Auto];
-    let mut cells: Vec<View> = vec![
-        glyph(kind_glyph(item.kind), 20.0)
-            .width(32.0)
-            .vertical_alignment(VerticalAlignment::Center)
-            .into(),
-        StackPanel::new()
-            .grid_column(1)
-            .vertical_alignment(VerticalAlignment::Center)
-            .children((
-                TextBlock::new()
-                    .text(&item.original)
-                    .font_weight(FontWeight::SEMI_BOLD)
-                    .text_trimming(TextTrimming::CharacterEllipsis),
-                TextBlock::new()
-                    .text(format!("\u{2192} {}", item.proxy))
-                    .opacity(0.72)
-                    .text_trimming(TextTrimming::CharacterEllipsis),
-            ))
-            .into(),
-        caption(detail(item))
-            .grid_column(2)
-            .margin(Thickness::new(12.0, 0.0, 0.0, 0.0))
-            .vertical_alignment(VerticalAlignment::Center)
-            .into(),
-    ];
-    if let Some(on_forget) = on_forget {
-        columns.push(GridLength::Auto);
-        cells.push(
-            Button::new()
-                .content(glyph("\u{E74D}", 14.0))
-                .style(ButtonStyle::Subtle)
-                .automation_name(format!("Forget {}", item.original))
-                .grid_column(3)
+/// The icon of the type of a value.
+fn icon(item: &Keyed) -> FontIcon {
+    glyph(kind_glyph(item.kind), 20.0)
+        .width(32.0)
+        .vertical_alignment(VerticalAlignment::Center)
+}
+
+/// The value over the stand-in that replaced it.
+fn names(item: &Keyed) -> StackPanel {
+    StackPanel::new()
+        .vertical_alignment(VerticalAlignment::Center)
+        .children((
+            TextBlock::new()
+                .text(&item.original)
+                .font_weight(FontWeight::SEMI_BOLD)
+                .text_trimming(TextTrimming::CharacterEllipsis),
+            TextBlock::new()
+                .text(format!("\u{2192} {}", item.proxy))
+                .opacity(0.72)
+                .text_trimming(TextTrimming::CharacterEllipsis),
+        ))
+}
+
+/// Where and when a value went, on the right of its row.
+fn whereabouts(item: &Keyed) -> TextBlock {
+    caption(detail(item))
+        .margin(Thickness::new(12.0, 0.0, 0.0, 0.0))
+        .vertical_alignment(VerticalAlignment::Center)
+}
+
+/// One swap as Overview lists it: the icon of its type, the value over the stand-in that replaced
+/// it, and where and when it went.
+pub(super) fn swap_row(item: &Keyed) -> View {
+    Grid::new()
+        .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
+        .children((
+            icon(item),
+            names(item).grid_column(1),
+            whereabouts(item).grid_column(2),
+        ))
+        .into()
+}
+
+/// One swap on the Vault page: a check box ahead of what [`swap_row`] shows.
+fn vault_row(item: &Keyed, picked: bool, context: Context<'_>) -> View {
+    let original = item.original.clone();
+    Grid::new()
+        .columns([
+            GridLength::Auto,
+            GridLength::Auto,
+            GridLength::STAR,
+            GridLength::Auto,
+        ])
+        .children((
+            CheckBox::new()
+                .is_checked(picked)
+                .min_width(0.0)
+                .width(36.0)
                 .vertical_alignment(VerticalAlignment::Center)
-                .on_click(on_forget)
-                .tooltip(FORGET_NOTE),
-        );
-    }
-    Grid::new().columns(columns).children(cells).into()
+                .automation_name(format!("Select {}", item.original))
+                .on_is_checked_changed(context.callback(move |value: Option<bool>| {
+                    Msg::VaultPick(original.clone(), value.unwrap_or(false))
+                })),
+            icon(item).grid_column(1),
+            names(item).grid_column(2),
+            whereabouts(item).grid_column(3),
+        ))
+        .into()
 }
 
 // ---- The search ----
@@ -242,162 +265,146 @@ fn search_bar(window: &MainWindow, context: Context<'_>) -> Grid {
         ))
 }
 
-/// What the list says about itself, and the list: the rows the last search found.
-fn results(window: &MainWindow, context: Context<'_>) -> (String, View) {
+/// What the list says about itself.
+fn count_text(window: &MainWindow) -> String {
     match &window.vault_page {
-        None => (
-            "Loading\u{2026}".to_owned(),
-            ProgressRing::new()
-                .is_active(true)
-                .width(32.0)
-                .height(32.0)
-                .into(),
-        ),
-        Some(page) if page.items.is_empty() => (
+        None => "Loading\u{2026}".to_owned(),
+        Some(page) if page.items.is_empty() => {
             if window.snap.issued == 0 {
                 "Nothing swapped yet. Every value piikey gives a stand-in is listed here."
                     .to_owned()
             } else {
                 "No value matches.".to_owned()
-            },
-            StackPanel::new().into(),
-        ),
+            }
+        }
         Some(page) => {
-            let total = u64::try_from(page.matched).unwrap_or(u64::MAX);
-            let count = if page.matched > page.items.len() {
+            if page.matched > page.items.len() {
                 format!(
                     "Showing the {} most recent of {}. Search to narrow them down.",
                     thousands(u64::try_from(VAULT_LIMIT).unwrap_or(u64::MAX)),
-                    thousands(total)
+                    thousands(u64::try_from(page.matched).unwrap_or(u64::MAX))
                 )
             } else {
-                format!("{}, most recent first", counted(total, "value", "values"))
-            };
-            let list = ListView::new()
-                .selection_mode(ListViewSelectionMode::None)
-                .items(page.items.iter().map(|item| {
-                    let forget = context.message(Msg::Forget(item.original.clone()));
-                    DataItem::new(item.proxy.clone(), &item.original).content(
-                        Border::new()
-                            .height(SWAP_ROW)
-                            .content(swap_row(item, Some(forget))),
+                format!(
+                    "{}, most recent first",
+                    counted(
+                        u64::try_from(page.matched).unwrap_or(u64::MAX),
+                        "value",
+                        "values"
                     )
-                }))
-                .into();
-            (count, list)
+                )
+            }
         }
     }
 }
 
-// ---- The vault file ----
+/// The row between the search and the list: Select all, and what the list says about itself.
+fn commands(window: &MainWindow, context: Context<'_>) -> Grid {
+    let listed = window
+        .vault_page
+        .as_ref()
+        .map_or(0, |page| page.items.len());
+    Grid::new()
+        .columns([GridLength::Auto, GridLength::STAR])
+        .column_spacing(8.0)
+        .children((
+            CheckBox::new()
+                .content("Select all")
+                .is_checked(listed > 0 && window.vault_picked.len() == listed)
+                .is_enabled(listed > 0)
+                .on_is_checked_changed(
+                    context
+                        .callback(|value: Option<bool>| Msg::VaultPickAll(value.unwrap_or(false))),
+                ),
+            caption(count_text(window))
+                .grid_column(1)
+                .vertical_alignment(VerticalAlignment::Center),
+        ))
+}
 
-/// What the armed Wipe vault button says it will do.
-fn wipe_armed_text(records: u64) -> String {
-    if records == 1 {
-        "Click again to wipe the record".to_owned()
-    } else {
-        format!("Click again to wipe all {} records", thousands(records))
+/// The rows the last search found, or a ring while it runs.
+fn list(window: &MainWindow, context: Context<'_>) -> View {
+    match &window.vault_page {
+        None => ProgressRing::new()
+            .is_active(true)
+            .width(32.0)
+            .height(32.0)
+            .into(),
+        Some(page) if page.items.is_empty() => StackPanel::new().into(),
+        Some(page) => ListView::new()
+            .selection_mode(ListViewSelectionMode::None)
+            .items(page.items.iter().map(|item| {
+                let picked = window.vault_picked.contains(&item.original);
+                DataItem::new(item.proxy.clone(), &item.original).content(
+                    Border::new()
+                        .height(SWAP_ROW)
+                        .content(vault_row(item, picked, context)),
+                )
+            }))
+            .into(),
     }
 }
 
-/// The vault file, and what can be done with all of its records: one level down, closed until the
-/// user asks. Wiping takes two clicks: the first one only changes the button.
-fn manage(window: &MainWindow, context: Context<'_>) -> Expander {
-    let records = window.snap.issued;
-    let path = window.input.controller.vault_path().display().to_string();
-    let wipe = if window.wipe_armed {
-        wipe_armed_text(records)
-    } else {
-        "Wipe vault".to_owned()
-    };
-    Expander::new()
-        .is_expanded(false)
-        .horizontal_alignment(HorizontalAlignment::Stretch)
-        .horizontal_content_alignment(HorizontalAlignment::Stretch)
-        .header(
-            StackPanel::new().spacing(2.0).children((
-                heading("Manage"),
-                caption(counted(records, "record", "records")),
-            )),
-        )
-        .content(
-            StackPanel::new().spacing(4.0).children((
-                Row::new("Vault file")
-                    .icon("\u{E8B7}")
-                    .description(path)
-                    .selectable()
-                    .state(counted(records, "record", "records"))
-                    .build(),
-                Row::new("Export")
-                    .icon("\u{E896}")
-                    .description(EXPORT_NOTE)
-                    .control(
-                        Button::new()
-                            .content("Export\u{2026}")
-                            .is_enabled(records > 0)
-                            .on_click(context.message(Msg::ExportVault)),
-                    )
-                    .build(),
-                Row::new("Wipe the vault")
-                    .icon("\u{E74D}")
-                    .description(
-                        "Removes every record, so stand-ins that were already sent can no longer be turned back into values.",
-                    )
-                    .control(
-                        Button::new()
-                            .content(wipe)
-                            .style(if window.wipe_armed {
-                                ButtonStyle::Accent
-                            } else {
-                                ButtonStyle::Default
-                            })
-                            .is_enabled(records > 0)
-                            .on_click(context.message(Msg::WipeVault)),
-                    )
-                    .build(),
-            )),
-        )
+/// The button that forgets the selected values; it asks first.
+fn forget_button(window: &MainWindow, context: Context<'_>) -> Button {
+    let picked = window.vault_picked.len();
+    Button::new()
+        .content(format!("Forget {picked}"))
+        .is_enabled(picked > 0)
+        .on_click(context.message(Msg::VaultAskForget))
+}
+
+/// The question Forget asks before it forgets.
+fn forget_dialog(window: &MainWindow, context: Context<'_>) -> ContentDialog {
+    let picked = u64::try_from(window.vault_picked.len()).unwrap_or(u64::MAX);
+    ContentDialog::new()
+        .is_open(true)
+        .title(format!("Forget {}?", counted(picked, "value", "values")))
+        .content(TextBlock::new().text(FORGET_NOTE))
+        .primary_button_text("Forget")
+        .close_button_text("Cancel")
+        .default_button(ContentDialogButton::Close)
+        .on_closed(context.callback(|result: ContentDialogResult| {
+            Msg::VaultForget(result == ContentDialogResult::Primary)
+        }))
 }
 
 pub(super) fn vault(window: &MainWindow, context: Context<'_>) -> View {
-    let (count, list) = results(window, context);
     let export = Button::new()
         .content("Export\u{2026}")
         .is_enabled(window.snap.issued > 0)
         .on_click(context.message(Msg::ExportVault))
         .tooltip(EXPORT_NOTE);
-    measured(
+    let page = measured(
         Grid::new()
             .rows([
                 GridLength::Auto,
                 GridLength::Auto,
                 GridLength::Auto,
                 GridLength::STAR,
-                GridLength::Auto,
             ])
             .row_spacing(12.0)
             .children((
-                page_header(Page::Vault.title(), DEFINITION, [export]),
+                page_header(
+                    Page::Vault.title(),
+                    DEFINITION,
+                    [export, forget_button(window, context).into()],
+                ),
                 search_bar(window, context).grid_row(1),
-                caption(count).grid_row(2),
-                Border::new().grid_row(3).content(list),
-                manage(window, context).grid_row(4),
+                commands(window, context).grid_row(2),
+                card(list(window, context)).grid_row(3),
             )),
-    )
+    );
+    if window.forget_asked {
+        page.content_dialog(forget_dialog(window, context))
+    } else {
+        page
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_armed_wipe_button_names_how_many_records_go() {
-        assert!(
-            !wipe_armed_text(1).contains('1'),
-            "one record needs no number"
-        );
-        assert!(wipe_armed_text(12_345).contains("12,345"));
-    }
 
     #[test]
     fn a_row_says_where_and_when_a_value_went() {

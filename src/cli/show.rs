@@ -440,7 +440,6 @@ fn inventory_status(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
     pairs(
         out,
         &[
-            ("inventory", on_off(reply.enabled).to_owned()),
             ("folders", folders),
             ("files", reply.files.to_string()),
             ("with personal data", reply.files_with_pii.to_string()),
@@ -509,7 +508,8 @@ fn settings(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
     let settings = reply::<Policy>(value)?;
     writeln!(out, "highlight={}", settings.highlight.as_str())?;
     writeln!(out, "explorer_menu={}", settings.explorer_menu)?;
-    writeln!(out, "inventory={}", settings.inventory)?;
+    writeln!(out, "background={}", settings.background)?;
+    writeln!(out, "watch={}", settings.watch)?;
     writeln!(out, "http_api={}", settings.http_api)?;
     writeln!(out, "http_port={}", settings.http_port)?;
     let paths = |paths: &[PathBuf]| -> Vec<String> {
@@ -527,7 +527,7 @@ fn settings(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
                 .collect(),
         ),
         ("inventory_root", paths(&settings.inventory_roots)),
-        ("inventory_exclude", paths(&settings.inventory_exclude)),
+        ("watch_folder", paths(&settings.watch_folders)),
     ];
     for (key, list) in lists {
         for item in list {
@@ -610,7 +610,7 @@ fn status(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
             ("model", model_phrase(&status.model)),
             ("highlight", status.highlight.as_str().to_owned()),
             ("explorer menu", on_off(status.explorer_menu).to_owned()),
-            ("inventory", on_off(status.inventory).to_owned()),
+            ("watch", on_off(status.watch).to_owned()),
             ("HTTP API", on_off(status.http_api).to_owned()),
         ],
     )?;

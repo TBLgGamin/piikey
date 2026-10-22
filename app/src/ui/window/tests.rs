@@ -1,53 +1,18 @@
 use piikey::{
-    api::reply::Device,
     detect::{KIND_GROUPS, Mode},
-    service::default_pipe,
+    inventory::Finding,
 };
 use windows_reactor::{
     ComponentHost, ComponentSender, ComponentServices, ComponentTimerRegistration, Key, Mutation,
-    ObjectId, PropertyId, PropertyValue, RecordingAdapter, component,
+    ObjectId, ObjectType, PropertyId, PropertyValue, RecordingAdapter, component,
 };
 
 use super::{
     super::testing::{TempDir, stub_controller, stub_controller_with},
     *,
 };
+use crate::ui::controller::{FolderStatus, Reveal, RevealState, ScanSummary, Watch, WatchedFolder};
 use crate::{Describe, proxy::PORT};
-
-fn node(path: &str, is_dir: bool) -> Node {
-    Node {
-        path: PathBuf::from(path),
-        name: path.rsplit('\\').next().unwrap_or_default().to_owned(),
-        is_dir,
-        hits: 3,
-        files: 1,
-        counts: Vec::new(),
-    }
-}
-
-#[test]
-fn a_folder_tile_opens_and_a_file_tile_is_selected() {
-    let nodes = [node(r"C:\Docs\Taxes", true), node(r"C:\Docs\id.pdf", false)];
-    assert_eq!(click_on(&nodes, Path::new(r"C:\Docs\Taxes")), Click::Enter);
-    assert_eq!(
-        click_on(&nodes, Path::new(r"C:\Docs\id.pdf")),
-        Click::Select
-    );
-}
-
-#[test]
-fn the_other_scans_tile_has_no_folder_to_open() {
-    // Its path is empty and the inventory calls it a folder.
-    let nodes = [node("", true)];
-    assert_eq!(click_on(&nodes, Path::new("")), Click::Select);
-}
-
-#[test]
-fn a_tile_that_left_the_view_does_nothing() {
-    let nodes = [node(r"C:\Docs\Taxes", true)];
-    assert_eq!(click_on(&nodes, Path::new(r"C:\Docs\Gone")), Click::Stale);
-    assert_eq!(click_on(&[], Path::new(r"C:\Docs\Taxes")), Click::Stale);
-}
 
 type Test = Result<(), String>;
 
@@ -69,13 +34,13 @@ fn window() -> Result<(MainWindow, TempDir), String> {
 
 /// Leaves something half done on every control that a new page must put back.
 fn leave_half_done(window: &mut MainWindow) {
-    window.wipe_armed = true;
+    window.forget_asked = true;
     window.token_note = Some("Token copied to the clipboard.");
     window.form_error = Some("Not a folder".to_owned());
 }
 
 fn is_clean(window: &MainWindow) -> bool {
-    !window.wipe_armed && window.token_note.is_none() && window.form_error.is_none()
+    !window.forget_asked && window.token_note.is_none() && window.form_error.is_none()
 }
 
 #[test]
@@ -89,7 +54,7 @@ fn a_page_is_found_again_by_the_tag_the_pane_reports() {
     assert_eq!(tags.len(), Page::ALL.len(), "two pages share a tag");
     assert_eq!(Page::from_tag("keyed"), None);
     assert_eq!(Page::from_tag(""), None);
-    // The pane lists the four feature pages; Settings is its footer.
+    // The pane lists the five feature pages; Settings is its footer.
     assert!(!Page::MENU.contains(&Page::Settings));
     assert_eq!(Page::MENU.len() + 1, Page::ALL.len());
 }
@@ -125,57 +90,6 @@ fn a_new_page_starts_without_what_the_last_one_left_half_done() -> Test {
     Ok(())
 }
 
-#[test]
-fn wiping_the_vault_takes_two_clicks_and_another_page_in_between_starts_over() -> Test {
-    let (mut window, _dir) = window()?;
-    let controller = Arc::clone(&window.input.controller.0);
-    controller
-        .engine()
-        .run(Mode::Anonymize, &["mail jan.jansen@acme.nl"])
-        .describe()?;
-    controller.submit(Command::Refresh);
-    assert!(controller.wait_idle(WAIT));
-    assert_eq!(controller.snapshot().issued, 1);
-
-    window.open_page(Page::Vault);
-    window.click_wipe();
-    assert!(window.wipe_armed);
-    assert!(controller.wait_idle(WAIT));
-    assert_eq!(controller.snapshot().issued, 1, "one click must not wipe");
-
-    // Looking at another page disarms the button: the next click only arms it again.
-    window.open_page(Page::Overview);
-    window.open_page(Page::Vault);
-    window.click_wipe();
-    assert!(window.wipe_armed);
-    assert!(controller.wait_idle(WAIT));
-    assert_eq!(controller.snapshot().issued, 1, "the armed click was lost");
-
-    window.click_wipe();
-    assert!(!window.wipe_armed);
-    assert!(controller.wait_idle(WAIT));
-    assert_eq!(controller.snapshot().issued, 0);
-    Ok(())
-}
-
-#[test]
-fn the_device_file_is_read_as_the_app_and_a_person_write_it() {
-    assert_eq!(parse_device(b"cpu"), Some(Device::Cpu));
-    assert_eq!(parse_device(b"hybrid\r\n"), Some(Device::Hybrid));
-    // What an older version wrote for a GPU that won.
-    assert_eq!(parse_device(b" gpu "), Some(Device::Hybrid));
-    assert_eq!(parse_device(b"\xEF\xBB\xBFcpu\r\n"), Some(Device::Cpu));
-    // `echo cpu > device.cfg` in Windows PowerShell 5.1: UTF-16 with a byte-order mark.
-    let powershell = [
-        0xFF, 0xFE, 0x63, 0x00, 0x70, 0x00, 0x75, 0x00, 0x0D, 0x00, 0x0A, 0x00,
-    ];
-    assert_eq!(parse_device(&powershell), Some(Device::Cpu));
-    let big_endian = [0xFE, 0xFF, 0x00, 0x63, 0x00, 0x70, 0x00, 0x75];
-    assert_eq!(parse_device(&big_endian), Some(Device::Cpu));
-    assert_eq!(parse_device(b""), None);
-    assert_eq!(parse_device(b"tpu"), None);
-}
-
 // ---- The real window on the reactor's headless host ----
 
 /// Background work and timers that never run: the window's poll, its loads and its joke timer
@@ -207,7 +121,9 @@ struct Headless {
     host: ComponentHost<RecordingAdapter>,
     window: ComponentSender<Msg>,
     controller: Arc<Controller>,
-    _dir: TempDir,
+    /// The number of the last load a dashboard was given, which only has to grow.
+    loads: u64,
+    dir: TempDir,
 }
 
 impl Headless {
@@ -215,6 +131,15 @@ impl Headless {
     /// controller has looked at the certificate and the vault.
     fn open(
         controller: impl FnOnce(&TempDir) -> Result<Arc<Controller>, String>,
+    ) -> Result<Self, String> {
+        Self::open_for(controller, None)
+    }
+
+    /// As [`Headless::open`], for a window that the application opens for the scan request
+    /// number `reveal`, or for the user when it is `None`.
+    fn open_for(
+        controller: impl FnOnce(&TempDir) -> Result<Arc<Controller>, String>,
+        reveal: Option<u64>,
     ) -> Result<Self, String> {
         let dir = TempDir::new()?;
         let controller = controller(&dir)?;
@@ -227,7 +152,7 @@ impl Headless {
             icon: None,
             on_sync: Callback::new(|()| {}),
             on_closed: Callback::new(|()| {}),
-            reveal: None,
+            reveal,
         };
         let mut adapter = RecordingAdapter::new();
         adapter.record_batches(true);
@@ -245,7 +170,8 @@ impl Headless {
             host,
             window,
             controller,
-            _dir: dir,
+            loads: 0,
+            dir,
         })
     }
 
@@ -278,6 +204,63 @@ impl Headless {
     fn everything(&self) -> Vec<String> {
         texts(self.host.adapter().batches())
     }
+
+    /// Gives the dashboard of `store` what its load would bring for the folder `at`, read from the
+    /// controller as the window reads it, and returns what that drew.
+    fn loaded(&mut self, store: Store, at: &Path) -> Result<Vec<String>, String> {
+        self.loads += 1;
+        let loaded = Loaded::read(&self.controller, store, at, &[], None);
+        self.send(Msg::Dash(store, Dash::Loaded(self.loads, Box::new(loaded))))
+    }
+
+    /// As [`Headless::loaded`], with the folders `open` read as well and the entry of `file`.
+    fn loaded_with(
+        &mut self,
+        store: Store,
+        at: &Path,
+        open: &[PathBuf],
+        file: Option<&Path>,
+    ) -> Result<Vec<String>, String> {
+        self.loads += 1;
+        let loaded = Loaded::read(&self.controller, store, at, open, file);
+        self.send(Msg::Dash(store, Dash::Loaded(self.loads, Box::new(loaded))))
+    }
+
+    /// Opens `page` and gives it what the background work would bring: the dashboards' views and
+    /// the vault's rows. Returns what was drawn.
+    fn go(&mut self, page: Page) -> Result<Vec<String>, String> {
+        let mut drawn = self.send(Msg::Nav(page))?;
+        match page {
+            Page::Inventory => drawn.extend(self.loaded(Store::Inventory, Path::new(""))?),
+            Page::Watch => drawn.extend(self.loaded(Store::Watch, Path::new(""))?),
+            Page::Vault => drawn.extend(self.send(Msg::VaultLoaded(1, KeyedPage::default()))?),
+            Page::Overview | Page::Protection | Page::Settings => {}
+        }
+        Ok(drawn)
+    }
+
+    /// Writes `files` (name and text) to a folder of the test's own, has the controller scan it
+    /// into the main inventory, and returns the folder.
+    fn scanned(&self, files: &[(&str, &str)]) -> Result<PathBuf, String> {
+        let folder = self.dir.0.join("scanned");
+        fs::create_dir_all(&folder).describe()?;
+        for (name, text) in files {
+            fs::write(folder.join(name), text).describe()?;
+        }
+        // A location, so its files are a folder of the tree and not "Other scans".
+        self.controller.submit(Command::Edit(Edit::InventoryRoot {
+            path: folder.clone(),
+            on: true,
+        }));
+        self.controller.submit(Command::ScanFiles {
+            paths: vec![folder.clone()],
+            reveal: false,
+        });
+        if !self.controller.wait_idle(WAIT) || !self.controller.wait_scans(WAIT) {
+            return Err("the scan did not finish".to_owned());
+        }
+        Ok(folder)
+    }
 }
 
 /// The text that `batches` set on labels, buttons, titles and messages: what was drawn.
@@ -293,7 +276,11 @@ fn texts(batches: &[Vec<Mutation>]) -> Vec<String> {
         .filter(|property| {
             matches!(
                 property.id,
-                PropertyId::Text | PropertyId::Title | PropertyId::Message
+                PropertyId::Text
+                    | PropertyId::Title
+                    | PropertyId::Message
+                    | PropertyId::PrimaryButtonText
+                    | PropertyId::CloseButtonText
             )
         })
         .filter_map(|property| match &property.value {
@@ -301,6 +288,15 @@ fn texts(batches: &[Vec<Mutation>]) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+/// How many controls of `kind` the batches made.
+fn created(batches: &[Vec<Mutation>], kind: ObjectType) -> usize {
+    batches
+        .iter()
+        .flatten()
+        .filter(|mutation| matches!(mutation, Mutation::Create { kind: made, .. } if *made == kind))
+        .count()
 }
 
 /// Fails unless `drawn` holds every one of `wanted`, naming the step that missed them.
@@ -380,8 +376,11 @@ fn enabled(batches: &[Vec<Mutation>], text: &str) -> Option<bool> {
 /// What Off says.
 const OFF: &str = "Nothing is read or changed, and your Windows proxy settings are your own.";
 
+/// What the Inventory dashboard says while nothing was scanned.
+const INVENTORY_EMPTY: &str = "Scan your locations to see which files hold personal data, or right-click a file or folder in Explorer and choose Scan for personal data.";
+
 /// What each page other than Overview must say, with the controller of a fresh install.
-fn pages() -> [(Page, &'static [&'static str]); 4] {
+fn pages() -> [(Page, &'static [&'static str]); 5] {
     [
         (
             Page::Protection,
@@ -402,17 +401,25 @@ fn pages() -> [(Page, &'static [&'static str]); 4] {
             Page::Inventory,
             &[
                 "Inventory",
-                "Where personal data is stored on this PC",
-                "Turn on inventory",
-                "Map",
+                "Where personal data is stored on this PC. Only what you scan is listed.",
+                "Scan",
                 "Export report",
-                "Rescan",
-                "Watched folders",
+                "Add and scan",
+                "Nothing found yet.",
+                "This PC",
+                INVENTORY_EMPTY,
+            ],
+        ),
+        (
+            Page::Watch,
+            &[
+                "Watch",
+                "Keeps an eye on folders and checks a file again when it changes.",
+                "No folders yet. Add one below, or start with the usual ones.",
                 "Add folder",
-                "Left out",
-                "Nothing is left out.",
-                "Explorer menu",
-                "Scan for personal data",
+                "Watch is off.",
+                "Watched folders",
+                "Add a folder above to start watching it.",
             ],
         ),
         (
@@ -421,9 +428,8 @@ fn pages() -> [(Page, &'static [&'static str]); 4] {
                 "Vault",
                 "Encrypted on this PC with Windows. It remembers which stand-in replaced which value, so replies can be turned back.",
                 "Export\u{2026}",
-                "Manage",
-                "0 records",
-                "Wipe vault",
+                "Select all",
+                "Forget 0",
             ],
         ),
         (
@@ -432,11 +438,8 @@ fn pages() -> [(Page, &'static [&'static str]); 4] {
                 "Settings",
                 "General",
                 "Start piikey when I sign in",
-                "Closing the window",
-                "Detection",
-                "Detection model",
-                "Model ready",
-                "Used by Masking, Highlighting and Inventory.",
+                "Scan for personal data in Explorer",
+                "Keep piikey running in the tray when I close the window",
                 "Types of personal data",
                 "Developer access",
                 "Local HTTP API",
@@ -470,6 +473,7 @@ fn overview_says_what_piikey_is_doing_in_one_hero_and_a_row_for_each_job() -> Te
             "Masking",
             "Highlighting",
             "Inventory",
+            "Watch",
             "Vault",
             "Detection",
             "Model ready",
@@ -494,13 +498,7 @@ fn every_page_draws_its_own_content_and_opens_again_from_scratch() -> Test {
     let mut ui = Headless::open(stub_controller)?;
     let mut before: &[&str] = &[];
     for (page, wanted) in pages() {
-        let mut drawn = ui.send(Msg::Nav(page))?;
-        // What the background work would bring: the treemap's level and the vault's rows.
-        match page {
-            Page::Inventory => drawn.extend(ui.send(Msg::InvLoaded(1, InventoryView::default()))?),
-            Page::Vault => drawn.extend(ui.send(Msg::VaultLoaded(1, KeyedPage::default()))?),
-            _ => {}
-        }
+        let drawn = ui.go(page)?;
         expect_drawn(page.title(), &drawn, wanted)?;
         // The page before it is gone: nothing of it is drawn again, nor kept.
         let unique: Vec<&str> = before
@@ -517,22 +515,32 @@ fn every_page_draws_its_own_content_and_opens_again_from_scratch() -> Test {
 }
 
 #[test]
+fn protection_has_no_master_switch_of_its_own() -> Test {
+    // The hero of Overview is the one place in the window that turns protection on and off.
+    let mut ui = Headless::open(stub_controller)?;
+    let overview = created(ui.host.adapter().batches(), ObjectType::ToggleSwitch);
+    assert_eq!(overview, 0, "Overview has a button, not a switch");
+    let before = ui.host.adapter().batches().len();
+    ui.send(Msg::Nav(Page::Protection))?;
+    let made = created(
+        &ui.host.adapter().batches()[before..],
+        ObjectType::ToggleSwitch,
+    );
+    assert_eq!(made, 0, "Protection made {made} switches");
+    Ok(())
+}
+
+#[test]
 fn settings_shows_what_the_system_answers() -> Test {
     let mut ui = Headless::open(stub_controller)?;
     let drawn = ui.send(Msg::Nav(Page::Settings))?;
     let version = format!("piikey {}", env!("CARGO_PKG_VERSION"));
     let proxy = format!("Local proxy: 127.0.0.1:{PORT}, stopped");
-    let pipe = default_pipe();
     let http = piikey::api::http::url(piikey::policy::DEFAULT_HTTP_PORT);
     expect_drawn(
         "Settings",
         &drawn,
-        &[
-            version.as_str(),
-            proxy.as_str(),
-            pipe.as_str(),
-            http.as_str(),
-        ],
+        &[version.as_str(), proxy.as_str(), http.as_str()],
     )?;
     // The types of personal data sit in one collapsed expander per group.
     let group = KIND_GROUPS[0].0;
@@ -540,18 +548,37 @@ fn settings_shows_what_the_system_answers() -> Test {
         drawn.iter().any(|text| text.starts_with(group)),
         "no expander of {group}: {drawn:?}"
     );
+    // A section that is only text, and rows that told how to reach what works without the API, are
+    // gone; so is the old row that only described closing the window.
+    expect_not_drawn(
+        "Settings",
+        &drawn,
+        &[
+            "Detection",
+            "Detection model",
+            "Used by Masking, Highlighting and Inventory.",
+            "Model ready",
+            "Named pipe",
+            "Command line",
+            "Closing the window",
+        ],
+    )?;
+    // Nothing is said about a model that is there.
+    assert!(
+        !drawn.iter().any(|text| text.starts_with("Detection model")),
+        "the model is ready and has no row: {drawn:?}"
+    );
 
-    // The answers the poll of the window would bring: starting at sign-in, and where the model runs.
+    // The answer the poll of the window would bring: starting at sign-in.
     ui.send(Msg::StartupLoaded(Some(true)))?;
-    let device = ui.send(Msg::DeviceLoaded(Some(Device::Hybrid)))?;
-    expect_drawn("the device", &device, &["Runs on CPU and GPU"])
+    Ok(())
 }
 
 #[test]
 fn the_window_says_everything_in_the_words_of_the_glossary() -> Test {
     let mut ui = Headless::open(stub_controller)?;
     for (page, _) in pages() {
-        ui.send(Msg::Nav(page))?;
+        ui.go(page)?;
     }
     for text in ui.everything() {
         for banned in [
@@ -645,34 +672,120 @@ fn an_error_shows_once_on_overview_and_once_on_every_other_page() -> Test {
     Ok(())
 }
 
-#[test]
-fn the_vault_page_shows_the_second_click_and_another_page_takes_it_back() -> Test {
+/// The Vault page on a vault of two swapped values, loaded as the search would bring it, and the
+/// two values in the order of its rows.
+fn two_swaps() -> Result<(Headless, [String; 2]), String> {
     let mut ui = Headless::open(|dir| {
         let controller = stub_controller(dir)?;
         controller
             .engine()
-            .run(Mode::Anonymize, &["mail jan.jansen@acme.nl"])
+            .run(
+                Mode::Anonymize,
+                &["mail jan.jansen@acme.nl", "mail piet.pieters@acme.nl"],
+            )
             .describe()?;
         Ok(controller)
     })?;
+    ui.send(Msg::Nav(Page::Vault))?;
+    let page = ui.controller.keyed(&KeyedQuery::default(), VAULT_LIMIT);
+    let values: Vec<String> = page
+        .items
+        .iter()
+        .map(|item| item.original.clone())
+        .collect();
+    let values: [String; 2] = values
+        .try_into()
+        .map_err(|values: Vec<String>| format!("two values expected, found {values:?}"))?;
+    ui.send(Msg::VaultLoaded(1, page))?;
+    Ok((ui, values))
+}
+
+#[test]
+fn the_vault_page_has_select_all_and_a_forget_that_waits_for_a_selection() -> Test {
+    let mut ui = Headless::open(stub_controller)?;
     let vault = ui.send(Msg::Nav(Page::Vault))?;
-    expect_drawn("Vault", &vault, &["1 record", "Wipe vault"])?;
+    expect_drawn("Vault", &vault, &["Select all", "Forget 0"])?;
+    expect_not_drawn("Vault", &vault, &["Manage", "Wipe vault", "Vault file"])?;
+    assert_eq!(
+        enabled(ui.host.adapter().batches(), "Forget 0"),
+        Some(false)
+    );
+    Ok(())
+}
 
-    let armed = ui.send(Msg::WipeVault)?;
-    expect_drawn("first click", &armed, &["Click again to wipe the record"])?;
+#[test]
+fn ticking_rows_and_select_all_count_what_forget_would_forget() -> Test {
+    let (mut ui, [first, _]) = two_swaps()?;
+    let one = ui.send(Msg::VaultPick(first.clone(), true))?;
+    expect_drawn("one row", &one, &["Forget 1"])?;
+    assert_eq!(enabled(ui.host.adapter().batches(), "Forget 1"), Some(true));
 
-    // Another page in between puts the button back.
-    ui.send(Msg::Nav(Page::Settings))?;
-    let vault = ui.send(Msg::Nav(Page::Vault))?;
-    expect_drawn("Vault again", &vault, &["Wipe vault"])?;
-    expect_not_drawn("Vault again", &vault, &["Click again to wipe the record"])?;
+    let all = ui.send(Msg::VaultPickAll(true))?;
+    expect_drawn("select all", &all, &["Forget 2"])?;
 
-    // Two clicks in a row wipe, and the count follows.
-    ui.send(Msg::WipeVault)?;
-    ui.send(Msg::WipeVault)?;
+    let one = ui.send(Msg::VaultPick(first, false))?;
+    expect_drawn("one cleared", &one, &["Forget 1"])?;
+
+    let none = ui.send(Msg::VaultPickAll(false))?;
+    expect_drawn("cleared", &none, &["Forget 0"])?;
+    assert_eq!(
+        enabled(ui.host.adapter().batches(), "Forget 0"),
+        Some(false)
+    );
+    Ok(())
+}
+
+/// What the question before forgetting says, for two values.
+const ASKED: [&str; 3] = [
+    "Forget 2 values?",
+    "Their stand-ins will no longer be turned back.",
+    "Cancel",
+];
+
+#[test]
+fn forget_asks_first_and_cancel_keeps_the_vault_and_the_selection() -> Test {
+    let (mut ui, _) = two_swaps()?;
+    let picked = ui.send(Msg::VaultPickAll(true))?;
+    expect_not_drawn("before asking", &picked, &ASKED)?;
+    let asked = ui.send(Msg::VaultAskForget)?;
+    expect_drawn("asked", &asked, &ASKED)?;
+
+    let cancelled = ui.send(Msg::VaultForget(false))?;
+    expect_not_drawn("cancelled", &cancelled, &["Forget 0"])?;
     assert!(ui.controller.wait_idle(WAIT));
-    let wiped = ui.poll()?;
-    expect_drawn("after the wipe", &wiped, &["0 records"])?;
+    assert_eq!(ui.controller.snapshot().issued, 2);
+    // Still selected: asking again is about both values.
+    let again = ui.send(Msg::VaultAskForget)?;
+    expect_drawn("asked again", &again, &["Forget 2 values?"])?;
+    Ok(())
+}
+
+#[test]
+fn confirming_forget_forgets_the_selected_values_and_empties_the_selection() -> Test {
+    let (mut ui, [first, _]) = two_swaps()?;
+    ui.send(Msg::VaultPick(first, true))?;
+    let asked = ui.send(Msg::VaultAskForget)?;
+    expect_drawn("asked", &asked, &["Forget 1 value?"])?;
+    let confirmed = ui.send(Msg::VaultForget(true))?;
+    expect_drawn("confirmed", &confirmed, &["Forget 0"])?;
+    assert!(ui.controller.wait_idle(WAIT));
+    assert_eq!(ui.controller.snapshot().issued, 1);
+    Ok(())
+}
+
+#[test]
+fn a_new_result_drops_the_selected_values_it_no_longer_lists() -> Test {
+    let (mut ui, [first, _]) = two_swaps()?;
+    ui.send(Msg::VaultPickAll(true))?;
+    let query = KeyedQuery {
+        text: first.clone(),
+        ..KeyedQuery::default()
+    };
+    let page = ui.controller.keyed(&query, VAULT_LIMIT);
+    // The search that opening the page started is number 1; the query starts number 2.
+    ui.send(Msg::VaultQuery(first))?;
+    let drawn = ui.send(Msg::VaultLoaded(2, page))?;
+    expect_drawn("narrowed", &drawn, &["Forget 1"])?;
     Ok(())
 }
 
@@ -706,12 +819,16 @@ fn the_rows_of_overview_each_tell_their_own_state() -> Test {
         snap.policy.highlight = Highlight::Always;
         snap.highlight_paused = true;
         snap.model = Model::Skipped;
+        snap.policy.watch = true;
+        snap.policy.watch_folders = vec![PathBuf::from(r"C:\Users\me\Downloads")];
+        snap.watch.totals = (5, 34);
     })?;
     expect_drawn(
         "rows",
         &drawn,
         &[
             "711 found in 51 files",
+            "34 found in 5 files",
             "22 values remembered",
             "Paused",
             "Patterns only (model skipped)",
@@ -765,9 +882,16 @@ fn settings_offers_to_download_a_model_that_was_skipped() -> Test {
     expect_drawn(
         "skipped",
         &skipped,
-        &["Patterns only (model skipped)", "Download model"],
+        &[
+            "Detection model not installed",
+            "Names and addresses are found only by patterns.",
+            "Download model",
+        ],
     )?;
-    expect_not_drawn("skipped", &skipped, &["Model ready"])
+    expect_not_drawn("skipped", &skipped, &["Model ready", "Detection"])?;
+    // Once it is there again, the row goes.
+    ui.send(Msg::RetryModel)?;
+    Ok(())
 }
 
 #[test]
@@ -803,7 +927,6 @@ fn a_scan_that_waits_for_the_model_leaves_the_rest_of_the_page_alone() -> Test {
     let drawn = ui.poll_with(|snap| {
         snap.pending = 4;
         snap.scan = Some((0, 0));
-        snap.policy.inventory = true;
         snap.policy.inventory_roots = vec![PathBuf::from(r"C:\Docs"), PathBuf::from(r"C:\Mail")];
     })?;
     expect_drawn(
@@ -811,7 +934,7 @@ fn a_scan_that_waits_for_the_model_leaves_the_rest_of_the_page_alone() -> Test {
         &drawn,
         &["Looking for files\u{2026}", r"C:\Docs", r"C:\Mail"],
     )?;
-    // The buttons of the folders are not the scan's business.
+    // The buttons of the locations are not the scan's business.
     assert_eq!(enabled(ui.host.adapter().batches(), "Remove"), Some(true));
     Ok(())
 }
@@ -830,10 +953,12 @@ fn a_poll_that_brings_nothing_new_builds_nothing() -> Test {
         Ok(controller)
     })?;
     for page in Page::ALL {
-        ui.send(Msg::Nav(page))?;
         if page == Page::Vault {
+            ui.send(Msg::Nav(page))?;
             let found = ui.controller.keyed(&KeyedQuery::default(), VAULT_LIMIT);
             ui.send(Msg::VaultLoaded(1, found))?;
+        } else {
+            ui.go(page)?;
         }
         // A scan without files yet, and folders to watch: the busiest the pages get.
         let mut snapshot = ui.controller.snapshot();
@@ -881,7 +1006,6 @@ fn scan_look(ui: &mut Headless, scan: (u64, u64)) -> Result<Vec<String>, String>
     let before = ui.host.adapter().batches().len();
     ui.poll_with(|snap| {
         snap.scan = Some(scan);
-        snap.policy.inventory = true;
         snap.policy.inventory_roots = vec![PathBuf::from(r"C:\Docs"), PathBuf::from(r"C:\Mail")];
     })?;
     Ok(rebuilt(&ui.host.adapter().batches()[before..]))
@@ -904,5 +1028,266 @@ fn a_scan_that_counts_files_rebuilds_nothing_but_its_own_progress() -> Test {
         let ticked = scan_look(&mut ui, (done, 100))?;
         assert!(ticked.is_empty(), "{done} of 100 files: {ticked:?}");
     }
+    Ok(())
+}
+
+/// A window on a controller whose inventory holds what `files` hold, in a folder that is one of
+/// its locations.
+fn scanned_window(files: &[(&str, &str)]) -> Result<(Headless, PathBuf), String> {
+    let ui = Headless::open(stub_controller)?;
+    let folder = ui.scanned(files)?;
+    Ok((ui, folder))
+}
+
+#[test]
+fn the_inventory_dashboard_lists_what_was_scanned_in_the_tree_the_legend_the_map_and_the_details()
+-> Test {
+    let (mut ui, folder) = scanned_window(&[
+        ("a.txt", "mail jan.jansen@acme.nl and piet@acme.nl"),
+        ("b.txt", "call jan.jansen@acme.nl"),
+    ])?;
+    ui.send(Msg::Nav(Page::Inventory))?;
+    let drawn = ui.loaded(Store::Inventory, Path::new(""))?;
+    expect_drawn(
+        "the dashboard",
+        &drawn,
+        &[
+            "This PC",
+            "All types",
+            "Email",
+            "The most personal data first",
+            "Found",
+            "scanned",
+            "a.txt",
+            "3 found in 2 files",
+        ],
+    )?;
+    // A folder row selected: the details offer what applies to a folder.
+    let folder_row = ui.send(Msg::Dash(
+        Store::Inventory,
+        Dash::Select(folder.clone(), Origin::Tree),
+    ))?;
+    expect_drawn(
+        "a folder",
+        &folder_row,
+        &["Show only this folder", "Show in Explorer", "Scan this"],
+    )?;
+    // A tile of the map selected: the details offer what applies to a file.
+    let file = folder.join("a.txt");
+    let picked = ui.send(Msg::Dash(
+        Store::Inventory,
+        Dash::Select(file.clone(), Origin::Map),
+    ))?;
+    expect_drawn(
+        "a file",
+        &picked,
+        &[
+            "Open",
+            "Show what was found",
+            "Make masked copy",
+            "Scan this",
+        ],
+    )?;
+    // The load that follows brings the entry of the file: when it was scanned, and how big.
+    let entry = ui.loaded_with(Store::Inventory, Path::new(""), &[folder], Some(&file))?;
+    assert!(
+        entry.iter().any(|text| text.starts_with("Last scanned ")),
+        "{entry:?}"
+    );
+    // One type shown: its chip is the one that stays lit and the tree counts only it.
+    let email = ui.send(Msg::Dash(
+        Store::Inventory,
+        Dash::Type(Some(piikey::detect::EntityKind::Email)),
+    ))?;
+    expect_not_drawn("a type", &email, &["Show what was found"])
+}
+
+#[test]
+fn a_wide_window_lists_the_types_in_a_column_next_to_the_map() -> Test {
+    let (mut ui, _folder) = scanned_window(&[("a.txt", "mail jan.jansen@acme.nl")])?;
+    ui.send(Msg::Resized(WindowSize {
+        width: 1_920.0,
+        height: 1_080.0,
+    }))?;
+    ui.send(Msg::Nav(Page::Inventory))?;
+    let drawn = ui.loaded(Store::Inventory, Path::new(""))?;
+    expect_drawn(
+        "the wide dashboard",
+        &drawn,
+        &[
+            "All types",
+            "Email",
+            "1 file",
+            "The most personal data first",
+        ],
+    )
+}
+
+#[test]
+fn the_watch_page_shows_its_folders_what_they_are_doing_and_what_was_found_there() -> Test {
+    let mut ui = Headless::open(stub_controller)?;
+    ui.go(Page::Watch)?;
+    let folder = PathBuf::from(r"C:\Users\me\Downloads");
+    let drawn = ui.poll_with(|snap| {
+        snap.policy.watch = true;
+        snap.policy.watch_folders = vec![folder.clone()];
+        snap.watch = Watch {
+            folders: vec![WatchedFolder {
+                path: folder.clone(),
+                status: FolderStatus::Watching,
+                last_change: None,
+            }],
+            scanning: Some((3, 10)),
+            totals: (0, 0),
+        };
+    })?;
+    expect_drawn(
+        "watching",
+        &drawn,
+        &[
+            r"C:\Users\me\Downloads",
+            "Scanning 3 of 10",
+            "Remove",
+            "Looking at 3 of 10 files\u{2026}",
+        ],
+    )?;
+    // Switching it on asks the controller, which saves it.
+    ui.send(Msg::Watch(true))?;
+    assert!(ui.controller.wait_idle(WAIT));
+    assert!(ui.controller.snapshot().policy.watch);
+    Ok(())
+}
+
+#[test]
+fn a_scan_that_was_asked_for_shows_its_progress_and_its_result_in_a_dialog() -> Test {
+    let mut ui = Headless::open(stub_controller)?;
+    let folder = ui.dir.0.join("docs");
+    let reveal = |state: RevealState| Reveal {
+        seq: 1,
+        paths: vec![folder.clone()],
+        at: folder.clone(),
+        select: None,
+        state,
+    };
+    let scanning = ui.poll_with(|snap| snap.reveal = Some(reveal(RevealState::Scanning)))?;
+    expect_drawn(
+        "scanning",
+        &scanning,
+        &["Scanning\u{2026}", "Looking for files\u{2026}", "Close"],
+    )?;
+    let summary = ScanSummary {
+        files: 3,
+        files_with_data: 2,
+        hits: 7,
+        counts: vec![(piikey::detect::EntityKind::Email, 7)],
+        unread: 0,
+    };
+    let done =
+        ui.poll_with(|snap| snap.reveal = Some(reveal(RevealState::Done(summary.clone()))))?;
+    expect_drawn(
+        "done",
+        &done,
+        &[
+            "Scan result",
+            "7 found in 2 files",
+            "3 files scanned",
+            "Email",
+            "Show in Inventory",
+        ],
+    )?;
+    // "Show in Inventory" goes to the page and puts the result away: it is not shown again.
+    let shown = ui.send(Msg::ReportShow)?;
+    expect_drawn("show", &shown, &["Add and scan"])?;
+    let again =
+        ui.poll_with(|snap| snap.reveal = Some(reveal(RevealState::Done(summary.clone()))))?;
+    expect_not_drawn("put away", &again, &["Scan result"])?;
+    // A scan that found nothing has nothing to show in the inventory.
+    let nothing = ScanSummary {
+        hits: 0,
+        files_with_data: 0,
+        counts: Vec::new(),
+        ..summary
+    };
+    let none = ui.poll_with(|snap| {
+        snap.reveal = Some(Reveal {
+            seq: 2,
+            ..reveal(RevealState::Done(nothing.clone()))
+        });
+    })?;
+    expect_drawn("nothing", &none, &["No personal data found", "Close"])?;
+    expect_not_drawn("nothing", &none, &["Show in Inventory"])
+}
+
+#[test]
+fn a_window_that_opens_for_a_scan_shows_its_result_and_one_that_opens_for_the_user_does_not() -> Test
+{
+    let scan = |dir: &TempDir| -> Result<Arc<Controller>, String> {
+        let controller = stub_controller(dir)?;
+        let folder = dir.0.join("docs");
+        fs::create_dir_all(&folder).describe()?;
+        fs::write(folder.join("a.txt"), "mail jan.jansen@acme.nl").describe()?;
+        controller.submit(Command::ScanFiles {
+            paths: vec![folder],
+            reveal: true,
+        });
+        if !controller.wait_idle(WAIT) || !controller.wait_scans(WAIT) {
+            return Err("the scan did not finish".to_owned());
+        }
+        Ok(controller)
+    };
+    let ui = Headless::open_for(scan, Some(1))?;
+    expect_drawn(
+        "opened for the scan",
+        &ui.everything(),
+        &["Scan result", "1 found in 1 file", "Show in Inventory"],
+    )?;
+    let ui = Headless::open_for(scan, None)?;
+    expect_not_drawn("opened by the user", &ui.everything(), &["Scan result"])
+}
+
+#[test]
+fn what_was_found_in_a_file_is_listed_on_request_and_dropped_when_the_list_closes() -> Test {
+    let mut ui = Headless::open(stub_controller)?;
+    let file = PathBuf::from(r"C:\Docs\a.pdf");
+    let asked = ui.send(Msg::Dash(Store::Inventory, Dash::Found(file.clone())))?;
+    expect_drawn(
+        "asked",
+        &asked,
+        &["a.pdf", "Reading the file\u{2026}", "Close"],
+    )?;
+    let finding = Finding {
+        kind: piikey::detect::EntityKind::Email,
+        value: "jan.jansen@acme.nl".into(),
+        snippet: "write to jan.jansen@acme.nl today".into(),
+    };
+    let listed = ui.send(Msg::FindingsLoaded(file, Ok(vec![finding])))?;
+    expect_drawn(
+        "listed",
+        &listed,
+        &[
+            "jan.jansen@acme.nl",
+            "write to jan.jansen@acme.nl today",
+            "Email",
+        ],
+    )?;
+    // Closed, the values are gone from the window: asking again reads them again.
+    ui.send(Msg::FindingsClosed)?;
+    let again = ui.send(Msg::Dash(
+        Store::Inventory,
+        Dash::Found(PathBuf::from(r"C:\Docs\a.pdf")),
+    ))?;
+    expect_drawn("again", &again, &["Reading the file\u{2026}"])?;
+    expect_not_drawn("again", &again, &["jan.jansen@acme.nl"])
+}
+
+#[test]
+fn keeping_piikey_in_the_tray_when_the_window_closes_is_a_setting() -> Test {
+    let mut ui = Headless::open(stub_controller)?;
+    assert!(ui.controller.snapshot().policy.background, "on by default");
+    ui.send(Msg::Nav(Page::Settings))?;
+    ui.send(Msg::Background(false))?;
+    assert!(ui.controller.wait_idle(WAIT));
+    assert!(!ui.controller.snapshot().policy.background);
+    assert!(!ui.controller.runs_in_background());
     Ok(())
 }
