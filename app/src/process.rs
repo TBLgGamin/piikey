@@ -1,6 +1,8 @@
 //! The programs running on this PC, by name.
 
-use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessesToUpdate, System};
+use std::path::PathBuf;
+
+use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 /// The file name of the program running as process `pid`, in lowercase (`chrome.exe`); `None` when
 /// there is no such process or Windows gives it no name.
@@ -13,6 +15,19 @@ pub(crate) fn exe_name(pid: u32) -> Option<String> {
         ProcessRefreshKind::nothing(),
     );
     lowercase_name(system.process(pid)?)
+}
+
+/// The full path of the exe running as process `pid`; `None` when there is no such process or
+/// Windows does not say (a process of another user, or of the system).
+pub(crate) fn exe_path(pid: u32) -> Option<PathBuf> {
+    let pid = Pid::from_u32(pid);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
+    );
+    system.process(pid)?.exe().map(std::path::Path::to_path_buf)
 }
 
 /// The names of the programs running now: lowercase, unique, sorted.
@@ -36,7 +51,7 @@ fn lowercase_name(process: &Process) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{exe_name, running_names};
+    use super::{exe_name, exe_path, running_names};
     use crate::Describe;
 
     /// What this very test program is called, in lowercase.
@@ -58,6 +73,14 @@ mod tests {
     #[test]
     fn a_process_that_does_not_exist_has_no_name() {
         assert_eq!(exe_name(u32::MAX - 3), None);
+    }
+
+    #[test]
+    fn the_path_of_a_running_exe_is_its_whole_path() -> Result<(), String> {
+        let own = std::env::current_exe().describe()?;
+        assert_eq!(exe_path(std::process::id()), Some(own));
+        assert_eq!(exe_path(u32::MAX - 3), None);
+        Ok(())
     }
 
     #[test]

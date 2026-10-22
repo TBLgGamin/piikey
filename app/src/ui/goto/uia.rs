@@ -19,6 +19,7 @@
 
 use std::{
     cell::{Cell, RefCell},
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -38,12 +39,14 @@ use uiautomation::{
 
 use super::{
     Outcome, Target,
+    editors::Editor,
     needles::{self, Needle},
-    office,
+    office, start,
     titles::{self, Before, Names, Window},
 };
 use crate::{
     highlight::{Mark, Overlay, Rect},
+    process,
     proxy::Purpose,
     uia_text::{Control, Found},
 };
@@ -75,6 +78,8 @@ const MAX_CONTROLS: usize = 40;
 
 /// What a search is for.
 pub(super) struct Job {
+    /// The file, for an editor that is told where to go in it.
+    pub(super) file: PathBuf,
     pub(super) names: Names,
     pub(super) needles: Vec<Needle>,
     /// Where the format says the value is.
@@ -91,6 +96,7 @@ impl Job {
             return None;
         }
         Some(Self {
+            file: target.file.clone(),
             names: Names::of(&target.file)?,
             needles,
             place: target.place.clone(),
@@ -227,9 +233,14 @@ fn search(job: &Job, report: &Reporter, cancel: &AtomicBool) -> Outcome {
             let Some(frame) = listing.frames.get(at) else {
                 continue;
             };
-            if look(&desk, frame, job, report, cancel, None) == Outcome::Marked {
-                bring_forward(frame);
-                return Outcome::Marked;
+            match look(&desk, frame, job, report, cancel, None) {
+                Outcome::Marked => {
+                    bring_forward(frame);
+                    return Outcome::Marked;
+                }
+                // An editor that was told the place goes there, and comes forward, by itself.
+                Outcome::Placed => return Outcome::Placed,
+                Outcome::Opened => {}
             }
         }
     }
@@ -269,6 +280,9 @@ fn look(
     cancel: &AtomicBool,
     until: Option<Instant>,
 ) -> Outcome {
+    if let Some(outcome) = goto_in_editor(frame, job) {
+        return outcome;
+    }
     let started = Instant::now();
     // The window has a text control: PowerPoint and Excel have their own ways to wait.
     let mut text_seen = matches!(frame.class.as_str(), office::POWERPOINT | office::EXCEL);
@@ -298,6 +312,21 @@ fn look(
     }
 }
 
+/// When `frame` is a window of an editor that takes a place on its command line (VS Code, Notepad++,
+/// Sublime Text) and the value has a line: the editor is started again with the place, which its
+/// running window takes, and the file is shown there at the value. Its text is not readable to UI
+/// Automation (VS Code shows it only to screen readers), so this is the way to it. This also covers
+/// an editor that Windows starts for the file through a packaged app, whose exe the registry
+/// does not name.
+fn goto_in_editor(frame: &Frame, job: &Job) -> Option<Outcome> {
+    let Some(Location::Line { line, column }) = job.place else {
+        return None;
+    };
+    let exe = process::exe_path(frame.process?)?;
+    let arguments = Editor::of(&exe)?.arguments(&job.file, line, column);
+    start(&exe, &arguments).then_some(Outcome::Placed)
+}
+
 /// Asks a window that had the file open already for the focus, which brings it to the front. The
 /// app may take its time, and may refuse: the outline is up by now.
 fn bring_forward(frame: &Frame) {
@@ -320,10 +349,11 @@ pub(super) struct Desk {
     pub(super) awake: RefCell<Vec<Vec<i32>>>,
 }
 
-/// A top-level window of another program: the element and its class.
+/// A top-level window of another program: the element, its class and its process.
 pub(super) struct Frame {
     pub(super) element: UIElement,
     pub(super) class: String,
+    pub(super) process: Option<u32>,
 }
 
 /// The top-level windows of the other programs, from the top of the stack: the elements, and what
@@ -391,7 +421,14 @@ impl Desk {
                     shown: cached_flag(&element, UIProperty::IsOffscreen) == Some(false),
                 };
                 let class = element.get_cached_classname().unwrap_or_default();
-                Some((Frame { element, class }, window))
+                Some((
+                    Frame {
+                        element,
+                        class,
+                        process,
+                    },
+                    window,
+                ))
             })
             .unzip();
         Some(Listing { frames, windows })

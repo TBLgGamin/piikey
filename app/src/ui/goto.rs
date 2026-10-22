@@ -1,9 +1,12 @@
 //! "Open at this place": opens a file where a value was found in it, as far as the app that opens
 //! it allows. What was done is an [`Outcome`], best first:
 //!
-//! 1. **Placed.** The app Windows opens the file with is an editor that takes a line and column on
-//!    its command line: VS Code (and Insiders), Notepad++ and Sublime Text. The exe is read from
-//!    the registry (`default_app`), and started with the place (`editors`).
+//! 1. **Placed.** The app that shows the file is an editor that takes a line and column on its
+//!    command line: VS Code (and Insiders), Notepad++ and Sublime Text. It is known by the exe the
+//!    registry names for the file type (`default_app`), or, when the registry names none (an app
+//!    Windows starts through a package, as the Store VS Code), by the process of the window that
+//!    has or gets the file open; it is started with the place (`editors`), and its running window
+//!    goes there.
 //! 2. **Marked.** Any other app. When a window already has the file open (its title names it), the
 //!    value is looked for there and the file is not opened again. Otherwise Explorer hands the
 //!    file to the app, as a double click would, and `uia` waits for its window. Either way it finds
@@ -144,11 +147,13 @@ fn open_and_mark(target: &Target, purpose: &Arc<Purpose>) -> Res<Outcome> {
     }
     let deadline = Instant::now() + BUDGET;
     let mut search = Job::of(target, purpose).and_then(Search::start);
-    if let Some(search) = &mut search
-        && search.first(LOOK_WAIT) == Outcome::Marked
-    {
-        // The file is open and the value is pointed at: opening it again would only open it twice.
-        return Ok(Outcome::Marked);
+    if let Some(search) = &mut search {
+        let outcome = search.first(LOOK_WAIT);
+        if outcome != Outcome::Opened {
+            // The file is open and the value is pointed at, or its editor was told where to go:
+            // opening it again would only open it twice.
+            return Ok(outcome);
+        }
     }
     // Dropping the search, when this fails, tells its thread to stop.
     open_file(&target.file)?;
