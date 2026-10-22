@@ -11,7 +11,8 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-# Each entry needs the advisory id and why it is accepted.
+# Each entry needs the advisory id and why it is accepted. osv-scanner.toml (read by the Scorecard
+# Vulnerabilities check) carries the same entries plus the non-Windows ones: change both together.
 ignore = [
   { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained but sound, and a proc macro: it runs while compiling and is not in the binaries. It comes in through tokenizers 0.23.2, the newest stable release, which has no replacement yet." },
 ]

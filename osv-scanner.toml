@@ -1,0 +1,16 @@
+# OSV-Scanner (and the OpenSSF Scorecard "Vulnerabilities" check, which runs it over Cargo.lock).
+# Cargo.lock lists the crates of every platform; piikey is built for Windows only. cargo-deny
+# (deny.toml) judges the Windows graph and keeps the paste entry below in step with this file.
+# Each entry needs the advisory id and why it does not affect piikey.
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0436"
+reason = "paste is unmaintained but sound, and a proc macro: it runs while compiling and is not in the binaries. It comes in through tokenizers 0.23.2, the newest stable release, which has no replacement yet. Also accepted in deny.toml."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2022-0013"
+reason = "regex 0.2.11 comes in only as a build dependency of handlebars 0.29 under interfaces 0.0.8, which sysproxy 0.3.0 uses on macOS and Linux. It is never built for Windows, the only target (cargo tree --target x86_64-pc-windows-msvc -i interfaces prints nothing)."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2022-0006"
+reason = "thread_local 0.3.6 comes in only through regex 0.2.11 (see RUSTSEC-2022-0013): a macOS/Linux build dependency of sysproxy 0.3.0, never built for Windows."
