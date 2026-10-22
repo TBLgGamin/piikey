@@ -9,11 +9,15 @@ use std::{
     os::windows::process::CommandExt,
     path::{Component, Path, PathBuf},
     process::{Command, Output, Stdio},
-    sync::atomic::{AtomicU32, Ordering},
+    sync::{
+        LazyLock,
+        atomic::{AtomicU32, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
 
+use windows::ApplicationModel::Package;
 use windows_dpapi::{Scope, decrypt_data, encrypt_data};
 use zeroize::Zeroizing;
 
@@ -22,18 +26,69 @@ use crate::{Error, Result};
 /// `CREATE_NO_WINDOW`: console tools run from the GUI must not flash a window.
 pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+/// The folder under `%LOCALAPPDATA%` where Windows puts the execution alias of every app that is
+/// installed from an MSIX package.
+pub const ALIAS_DIR: &str = r"Microsoft\WindowsApps";
+
+/// `%LOCALAPPDATA%`.
+fn local_app_data() -> Result<PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .filter(|base| !base.is_empty())
+        .map(PathBuf::from)
+        .ok_or(Error::VaultPathUnavailable)
+}
+
 /// `%LOCALAPPDATA%\piikey` (created): the vault, the settings, the certificate, the model and the
-/// inventory live here.
+/// inventory live here. The Microsoft Store build keeps the folder out of its package (see
+/// `packaging/windows/msix/AppxManifest.xml`), so `piikey-cli.exe` from the zip or the installer
+/// shares it, and it is still there when the package is removed.
 ///
 /// # Errors
 /// `VaultPathUnavailable` when `LOCALAPPDATA` is unset; `Io` when the folder cannot be created.
 pub fn data_dir() -> Result<PathBuf> {
-    let base = std::env::var_os("LOCALAPPDATA")
-        .filter(|base| !base.is_empty())
-        .ok_or(Error::VaultPathUnavailable)?;
-    let dir = PathBuf::from(base).join("piikey");
+    let dir = local_app_data()?.join("piikey");
     fs::create_dir_all(&dir).map_err(|e| io_context(&e, "create", &dir))?;
     Ok(dir)
+}
+
+/// Whether this process runs from an MSIX package (the Microsoft Store build): Windows gives it a
+/// package identity. The portable zip and the installer have none. A program that a packaged
+/// process starts from outside its package (such as `cmd.exe`) has none either.
+#[must_use]
+pub fn is_packaged() -> bool {
+    // A process with no identity gets `APPMODEL_ERROR_NO_PACKAGE` from the call.
+    static PACKAGED: LazyLock<bool> = LazyLock::new(|| Package::Current().is_ok());
+    *PACKAGED
+}
+
+/// The path other programs use to start this exe: the Explorer menu and the sign-in clean-up
+/// put it in the registry.
+///
+/// An unpackaged exe is started by its own path. A packaged one runs only through its package:
+/// the folder under `C:\Program Files\WindowsApps` carries the version number, so it changes
+/// with every update, and Windows keeps it closed to other programs. The execution alias in
+/// [`ALIAS_DIR`], named like the exe, always starts the version that is installed.
+///
+/// # Errors
+/// `Io` when Windows does not say where this exe is; `VaultPathUnavailable` when a packaged
+/// process has no `LOCALAPPDATA`.
+pub fn launch_path() -> Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    if !is_packaged() {
+        return Ok(exe);
+    }
+    alias_in(&local_app_data()?, &exe).ok_or_else(|| {
+        Error::Io(io::Error::other(format!(
+            "{} has no file name",
+            exe.display()
+        )))
+    })
+}
+
+/// Where Windows puts the execution alias of the packaged exe `exe`, for the user whose
+/// `%LOCALAPPDATA%` is `local_app_data`.
+fn alias_in(local_app_data: &Path, exe: &Path) -> Option<PathBuf> {
+    Some(local_app_data.join(ALIAS_DIR).join(exe.file_name()?))
 }
 
 /// Writes `bytes` to a temp file beside `path`, syncs it and renames it over `path`, so readers
@@ -285,16 +340,22 @@ pub fn same_component(a: Component<'_>, b: Component<'_>) -> bool {
         })
 }
 
+/// `%SystemRoot%\System32`, where the tools that ship with Windows are.
+#[must_use]
+pub fn system_dir() -> PathBuf {
+    std::env::var_os("SystemRoot")
+        .filter(|root| !root.is_empty())
+        .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from)
+        .join("System32")
+}
+
 /// A command for `tool` (e.g. `curl.exe`) from `%SystemRoot%\System32` with no console window
 /// and stdin closed; the caller adds arguments and pipes.
 ///
 /// # Errors
 /// `Tool` when the tool is not in System32.
 pub fn system_command(tool: &str) -> Result<Command> {
-    let root = std::env::var_os("SystemRoot")
-        .filter(|root| !root.is_empty())
-        .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
-    let path = root.join("System32").join(tool);
+    let path = system_dir().join(tool);
     if !path.is_file() {
         return Err(Error::Tool(format!("{tool} was not found in System32")));
     }
@@ -336,6 +397,33 @@ mod tests {
             }
             Err(e) => return Err(e),
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_packaged_exe_is_started_through_its_alias() {
+        let exe = Path::new(
+            r"C:\Program Files\WindowsApps\piikey.dev_0.2.0.0_x64__g5sb5sk1g0qc0\piikey.exe",
+        );
+        assert_eq!(
+            alias_in(Path::new(r"C:\Users\jan\AppData\Local"), exe),
+            Some(PathBuf::from(
+                r"C:\Users\jan\AppData\Local\Microsoft\WindowsApps\piikey.exe"
+            ))
+        );
+        assert_eq!(
+            alias_in(Path::new(r"C:\Users\jan\AppData\Local"), Path::new(r"C:\")),
+            None,
+            "a path with no file name has no alias"
+        );
+    }
+
+    #[test]
+    fn an_unpackaged_process_starts_its_exe_by_the_exe_path() -> Result<()> {
+        // The test program has no package identity, and neither has a test run from a packaged
+        // terminal: what a packaged process starts from outside its package has none.
+        assert!(!is_packaged());
+        assert_eq!(launch_path()?, std::env::current_exe()?);
         Ok(())
     }
 

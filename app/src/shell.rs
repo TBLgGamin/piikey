@@ -2,8 +2,9 @@
 //!
 //! Per-user registration under `HKCU\Software\Classes`, so it needs no administrator rights and
 //! leaves other users alone. The verb runs `piikey.exe --scan <path>`, once for each item that is
-//! selected. On Windows 11 the classic verbs sit under "Show more options"; the top-level menu
-//! needs a signed package and a COM DLL.
+//! selected. In the Microsoft Store build that is the package's execution alias, see
+//! [`piikey::sys::launch_path`]. On Windows 11 the classic verbs sit under "Show more options";
+//! the top-level menu needs a signed package and a COM DLL.
 
 use std::{
     ffi::OsString,
@@ -31,13 +32,13 @@ const TARGETS: [(&str, &str); 3] = [
     (r"Directory\Background\shell", r"%V\."),
 ];
 
-/// Adds the verb for files, folders and folder backgrounds, pointing at `exe`. Safe to repeat: it
-/// refreshes the path, which a moved portable install needs.
+/// Adds the verb for files, folders and folder backgrounds, running `launcher` and showing the
+/// icon of `icon`. Safe to repeat: it refreshes the paths, which a moved portable install needs.
 ///
 /// # Errors
 /// A message when a registry key cannot be written.
-pub fn register(exe: &Path) -> Res<()> {
-    register_in(CLASSES, exe)
+pub fn register(launcher: &Path, icon: &Path) -> Res<()> {
+    register_in(CLASSES, launcher, icon)
 }
 
 /// Removes the verb. A verb that is not there is fine.
@@ -55,8 +56,8 @@ pub fn scan_paths(args: impl Iterator<Item = OsString>) -> Vec<PathBuf> {
         .collect()
 }
 
-fn register_in(classes: &str, exe: &Path) -> Res<()> {
-    let exe = exe.display();
+fn register_in(classes: &str, launcher: &Path, icon: &Path) -> Res<()> {
+    let (launcher, icon) = (launcher.display(), icon.display());
     let root = RegKey::predef(HKEY_CURRENT_USER);
     for (shell, argument) in TARGETS {
         let verb = format!(r"{classes}\{shell}\{VERB}");
@@ -67,7 +68,7 @@ fn register_in(classes: &str, exe: &Path) -> Res<()> {
             .create_subkey(&verb)
             .map_err(|e| format!("could not create HKCU\\{verb}: {e}"))?;
         write("MUIVerb", key.set_value("MUIVerb", &LABEL))?;
-        write("Icon", key.set_value("Icon", &format!("\"{exe}\",0")))?;
+        write("Icon", key.set_value("Icon", &format!("\"{icon}\",0")))?;
         write(
             "MultiSelectModel",
             key.set_value("MultiSelectModel", &"Player"),
@@ -77,7 +78,7 @@ fn register_in(classes: &str, exe: &Path) -> Res<()> {
             .map_err(|e| format!("could not create HKCU\\{verb}\\command: {e}"))?;
         write(
             "command",
-            command.set_value("", &format!("\"{exe}\" {SCAN_FLAG} \"{argument}\"")),
+            command.set_value("", &format!("\"{launcher}\" {SCAN_FLAG} \"{argument}\"")),
         )?;
     }
     Ok(())
@@ -201,7 +202,7 @@ mod tests {
             root.create_subkey(format!(r"{}\{shell}\other", sandbox.classes))
                 .describe()?;
         }
-        register_in(&sandbox.classes, exe)?;
+        register_in(&sandbox.classes, exe, exe)?;
         for (shell, _) in TARGETS {
             let verb = format!(r"{shell}\piikey.scan");
             assert!(
@@ -223,7 +224,8 @@ mod tests {
         }
 
         // Registering again points the verbs at the exe where it is now.
-        register_in(&sandbox.classes, Path::new(r"D:\Moved\piikey.exe"))?;
+        let moved = Path::new(r"D:\Moved\piikey.exe");
+        register_in(&sandbox.classes, moved, moved)?;
         assert!(
             sandbox
                 .value(r"*\shell\piikey.scan\command", "")?
@@ -240,9 +242,34 @@ mod tests {
     }
 
     #[test]
+    fn the_verb_runs_the_launcher_and_shows_the_icon_file() -> Res<()> {
+        // The Microsoft Store build: the execution alias runs the app, and the icon file the tray
+        // uses shows it, because Explorer cannot read an icon out of an alias.
+        let sandbox = Sandbox::new("icon");
+        let alias = Path::new(r"C:\Users\jan\AppData\Local\Microsoft\WindowsApps\piikey.exe");
+        let icon = Path::new(r"C:\Users\jan\AppData\Local\piikey\piikey.ico");
+        register_in(&sandbox.classes, alias, icon)?;
+        for (shell, _) in TARGETS {
+            let verb = format!(r"{shell}\piikey.scan");
+            assert_eq!(
+                sandbox.value(&verb, "Icon")?,
+                format!("\"{}\",0", icon.display()),
+                "{shell}"
+            );
+            assert!(
+                sandbox
+                    .value(&format!(r"{verb}\command"), "")?
+                    .starts_with(&format!("\"{}\" {SCAN_FLAG} ", alias.display())),
+                "{shell}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn every_verb_hands_over_the_path_it_was_asked_about() -> Res<()> {
         let sandbox = Sandbox::new("paths");
-        register_in(&sandbox.classes, Path::new(EXE))?;
+        register_in(&sandbox.classes, Path::new(EXE), Path::new(EXE))?;
         for (shell, placeholder, path) in [
             (r"*\shell", "%1", r"C:\Users\jan jansen\Documents\a b.docx"),
             (r"Directory\shell", "%1", r"C:\Users\jan jansen\Documents"),

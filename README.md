@@ -367,10 +367,12 @@ The first build downloads the Windows App SDK runtime and ONNX Runtime, so it ne
 access. The runtime DLLs and resource folders are placed next to the executables, and the app
 needs them there. To make the release zip and installer yourself, you need
 [cargo-about](https://github.com/EmbarkStudios/cargo-about) (`cargo install cargo-about --locked --features cli`)
-and [Inno Setup 6](https://jrsoftware.org/isinfo.php):
+and [Inno Setup 6](https://jrsoftware.org/isinfo.php). The script also packs the MSIX package for
+the Microsoft Store (unsigned, with a test identity); that step needs the Windows SDK, and
+`-SkipMsix` leaves it out:
 
 ```powershell
-./packaging/windows/package.ps1 -Version 0.1.0   # dist\piikey-0.1.0-windows-x64.zip, -setup-x64.exe, SHA256SUMS.txt
+./packaging/windows/package.ps1 -Version 0.1.0   # dist\piikey-0.1.0-windows-x64.zip, -setup-x64.exe, SHA256SUMS.txt, piikey-0.1.0-x64.msix
 ```
 
 Checks: `cargo fmt-check`, `cargo lint`, and `cargo test --all-targets`.

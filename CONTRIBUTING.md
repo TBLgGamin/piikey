@@ -83,6 +83,28 @@ by CI) and commitlint enforce this. They fail a commit that changes a version
 or `CHANGELOG.md`, and a push that creates a tag, unless it is the release
 pull request.
 
+### Microsoft Store package
+
+`release-assets.yml` also builds the MSIX package for the Microsoft Store from the
+same build, installs a copy signed with a throwaway certificate on the runner to
+test it (`packaging/windows/smoke-msix.ps1`), and uploads the unsigned package as
+a workflow artifact. It is not a release asset, and a failure there never keeps
+the zip, the installer or the winget submission from going out. A run without a
+tag (`gh workflow run release-assets.yml --ref <branch>`) builds and tests the
+same package and uploads nothing to a release.
+
+With the repository variables `STORE_IDENTITY_NAME`, `STORE_PUBLISHER` and
+`STORE_PUBLISHER_DISPLAY_NAME` set (Partner Center: Product management, Product
+identity) the package has the identity of the Store listing and is the file to
+upload to Partner Center; without them it has a test identity (`piikey.dev`). The
+package version is the release version with its first number raised by one (0.2.1
+becomes 1.2.1.0), because the Store takes no package whose first number is 0;
+everything else, `piikey-cli --version` included, keeps the release version.
+[`packaging/windows/msix/CERTIFICATION.md`](packaging/windows/msix/CERTIFICATION.md)
+holds what to paste into the submission. To build it by hand you need the Windows
+SDK: `pwsh packaging/windows/package-msix.ps1 -Version X.Y.Z` after
+`cargo build --release --workspace --locked` and `package.ps1`.
+
 ## Test data
 
 Never commit real personal data, in tests, fixtures or docs. Use made-up

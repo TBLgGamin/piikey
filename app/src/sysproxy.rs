@@ -11,7 +11,10 @@
 //!
 //! While the settings point at the app, a `RunOnce` entry also runs the
 //! app with `--restore-proxy` at the next sign-in, for a session ended by
-//! a shutdown or sign-out that the app could not clean up after.
+//! a shutdown or sign-out that the app could not clean up after. Removing
+//! the Microsoft Store package gives the app no such chance either, and then
+//! there is no app to run: that package's entry switches the proxy off itself
+//! (see [`packaged_command`]).
 //!
 //! The previous values are read as raw registry values: the `sysproxy` crate
 //! can only read a bare `ip:port`, so it would lose a proxy given by host
@@ -27,7 +30,7 @@ use std::{
 };
 
 use ::sysproxy::Sysproxy;
-use piikey::sys::{data_dir, write_atomic};
+use piikey::sys::{ALIAS_DIR, data_dir, is_packaged, launch_path, system_dir, write_atomic};
 use winreg::{
     RegKey,
     enums::{HKEY_CURRENT_USER, KEY_SET_VALUE, REG_DWORD, REG_EXPAND_SZ, REG_SZ, RegType},
@@ -138,9 +141,40 @@ pub fn disable() -> Res<()> {
 /// Has Windows run the app with [`crate::ui::RESTORE_FLAG`] at the next
 /// sign-in. Windows deletes the entry before it runs it.
 fn arm_sign_in_restore() -> Res<()> {
-    let exe = std::env::current_exe().map_err(|e| format!("cannot locate the piikey exe: {e}"))?;
-    let command = format!("\"{}\" {}", exe.display(), crate::ui::RESTORE_FLAG);
+    let launcher = launch_path().map_err(|e| format!("cannot locate the piikey exe: {e}"))?;
+    let command = if is_packaged() {
+        packaged_command(&launcher, &system_dir(), SETTINGS_KEY)
+    } else {
+        plain_command(&launcher)
+    };
     arm_in(RUN_ONCE_KEY, &command)
+}
+
+/// The `RunOnce` value of an exe that Windows starts by its path.
+fn plain_command(exe: &Path) -> String {
+    format!("\"{}\" {}", exe.display(), crate::ui::RESTORE_FLAG)
+}
+
+/// The `RunOnce` value of the Microsoft Store build: one command line for `cmd.exe` that starts
+/// the app's execution alias (`launcher`, of which only the file name is used) with the restore
+/// flag and, when Windows cannot start it, switches the proxy off. The alias is gone when the
+/// package was removed, which runs nothing of the package, so a proxy that was on stays on and
+/// points at a port nobody listens on, until this entry takes it off at the next sign-in. The
+/// Windows proxy then reads as off, not as the settings the user had: they are kept in
+/// `proxy.prev`, which only the app reads.
+///
+/// The alias is spelled `%LOCALAPPDATA%\..`, which `cmd.exe` fills in: Windows runs at most 260
+/// characters of a `RunOnce` value, and a long user name would not fit in what this leaves.
+fn packaged_command(launcher: &Path, system32: &Path, settings_key: &str) -> String {
+    let name = launcher
+        .file_name()
+        .map_or_else(|| "piikey.exe".into(), |name| name.to_string_lossy());
+    format!(
+        r#""{cmd}" /d /s /c ""%LOCALAPPDATA%\{ALIAS_DIR}\{name}" {flag}||"{reg}" add "HKCU\{settings_key}" /v ProxyEnable /t REG_DWORD /d 0 /f""#,
+        cmd = system32.join("cmd.exe").display(),
+        reg = system32.join("reg.exe").display(),
+        flag = crate::ui::RESTORE_FLAG,
+    )
 }
 
 fn arm_in(path: &str, command: &str) -> Res<()> {
@@ -375,7 +409,14 @@ impl Saved {
 
 #[cfg(test)]
 mod tests {
+    use std::{os::windows::process::CommandExt, process::Command};
+
+    use piikey::sys::CREATE_NO_WINDOW;
+
     use super::*;
+
+    /// The longest command line Windows takes as the value of a `RunOnce` entry.
+    const RUN_ONCE_MAX: usize = 260;
 
     const OURS: &str = "127.0.0.1:7979";
 
@@ -530,6 +571,87 @@ mod tests {
             .delete_subkey_all(sandbox.parent())
             .describe()?;
         disarm_in(&sandbox.0)?;
+        Ok(())
+    }
+
+    #[test]
+    fn the_sign_in_command_of_an_unpackaged_exe_runs_the_exe() {
+        assert_eq!(
+            plain_command(Path::new(r"C:\Apps\piikey\piikey.exe")),
+            r#""C:\Apps\piikey\piikey.exe" --restore-proxy"#
+        );
+    }
+
+    #[test]
+    fn the_sign_in_command_of_the_store_build_names_the_alias_and_fits_a_run_once_value() {
+        let alias = Path::new(r"C:\Users\jan\AppData\Local\Microsoft\WindowsApps\piikey.exe");
+        let command = packaged_command(alias, Path::new(r"C:\Windows\System32"), SETTINGS_KEY);
+        let length = command.chars().count();
+        assert!(
+            command.starts_with(
+                r#""C:\Windows\System32\cmd.exe" /d /s /c ""%LOCALAPPDATA%\Microsoft\WindowsApps\piikey.exe" --restore-proxy||"#
+            ),
+            "{command}"
+        );
+        assert!(
+            command.contains(&format!(r#"add "HKCU\{SETTINGS_KEY}" /v ProxyEnable"#)),
+            "{command}"
+        );
+        // The user name is not in it: a long one must not push it over the limit.
+        assert!(!command.contains("jan"), "{command}");
+        assert!(length <= RUN_ONCE_MAX, "{length} characters: {command}");
+    }
+
+    /// Runs `command` as Windows runs a `RunOnce` value, with `local` as `%LOCALAPPDATA%`.
+    fn run_sign_in(command: &str, local: &Path) -> Res<()> {
+        let (program, line) = command
+            .strip_prefix('"')
+            .and_then(|rest| rest.split_once('"'))
+            .ok_or_else(|| format!("no quoted program in {command}"))?;
+        Command::new(program)
+            .raw_arg(line.trim_start())
+            .env("LOCALAPPDATA", local)
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .describe()?;
+        Ok(())
+    }
+
+    #[test]
+    fn without_the_alias_the_sign_in_command_switches_the_proxy_off() -> Res<()> {
+        let sandbox = Sandbox::new("signin-gone");
+        let key = sandbox.key()?;
+        key.set_value("ProxyEnable", &1u32).describe()?;
+        // The alias of a package that was removed: no such file under this `%LOCALAPPDATA%`.
+        let alias = Path::new(r"C:\Apps\piikey-test-gone.exe");
+        let command = packaged_command(alias, &system_dir(), &sandbox.0);
+        run_sign_in(&command, &std::env::temp_dir())?;
+        assert_eq!(key.get_value::<u32, _>("ProxyEnable").describe()?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn with_the_alias_the_sign_in_command_runs_it_and_leaves_the_proxy_alone() -> Res<()> {
+        let sandbox = Sandbox::new("signin-here");
+        let key = sandbox.key()?;
+        key.set_value("ProxyEnable", &1u32).describe()?;
+        // A stand-in for the alias: a batch file that writes down how it was called.
+        let local = std::env::temp_dir().join(format!("piikey-signin-{}", std::process::id()));
+        let aliases = local.join(ALIAS_DIR);
+        fs::create_dir_all(&aliases).describe()?;
+        fs::write(
+            aliases.join("piikey-test-here.cmd"),
+            "@echo off\r\necho %*>\"%~dp0called.txt\"\r\nexit /b 0\r\n",
+        )
+        .describe()?;
+        let alias = Path::new(r"C:\Apps\piikey-test-here.cmd");
+        let command = packaged_command(alias, &system_dir(), &sandbox.0);
+        let ran = run_sign_in(&command, &local);
+        let called = fs::read_to_string(aliases.join("called.txt"));
+        let _ = fs::remove_dir_all(&local);
+        ran?;
+        assert_eq!(called.describe()?.trim(), crate::ui::RESTORE_FLAG);
+        assert_eq!(key.get_value::<u32, _>("ProxyEnable").describe()?, 1);
         Ok(())
     }
 

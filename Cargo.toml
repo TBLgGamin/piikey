@@ -80,8 +80,10 @@ chacha20poly1305 = { version = "0.11.0", features = ["zeroize"] }
 getrandom = "0.4.3"
 zeroize.workspace = true
 windows-dpapi.workspace = true
-# WinRT OCR + PDF rendering, shipped with Windows.
+# WinRT OCR + PDF rendering, and whether the process runs from an MSIX package (`sys::is_packaged`),
+# all shipped with Windows.
 windows = { version = "0.62.2", features = [
+    "ApplicationModel",
     "Media_Ocr",
     "Graphics_Imaging",
     "Storage_Streams",
