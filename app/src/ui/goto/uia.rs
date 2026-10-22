@@ -67,6 +67,11 @@ const RETRY: Duration = Duration::from_millis(60);
 const NO_TEXT: Duration = Duration::from_millis(1_200);
 /// How long the outline of the value stays.
 const FLASH: Duration = Duration::from_secs(2);
+/// How long the caret of an editor that was sent to the value is waited for (Chromium builds the
+/// text of an Electron app only after it was asked for it, and the editor takes the place a moment
+/// after it was started), and how often it is looked at.
+const CARET_WAIT: Duration = Duration::from_millis(2_500);
+const CARET_POLL: Duration = Duration::from_millis(150);
 /// How long finding the rectangles of a text may take.
 const MEASURE: Duration = Duration::from_millis(700);
 /// How long a text that was scrolled to is waited for to be laid out (Word lays out a page when it
@@ -80,6 +85,9 @@ const MAX_CONTROLS: usize = 40;
 pub(super) struct Job {
     /// The file, for an editor that is told where to go in it.
     pub(super) file: PathBuf,
+    /// The editor of the file was started at the place by the caller: the window it shows is only
+    /// looked at, not sent there again.
+    pub(super) placed: bool,
     pub(super) names: Names,
     pub(super) needles: Vec<Needle>,
     /// Where the format says the value is.
@@ -97,6 +105,7 @@ impl Job {
         }
         Some(Self {
             file: target.file.clone(),
+            placed: false,
             names: Names::of(&target.file)?,
             needles,
             place: target.place.clone(),
@@ -280,7 +289,10 @@ fn look(
     cancel: &AtomicBool,
     until: Option<Instant>,
 ) -> Outcome {
-    if let Some(outcome) = goto_in_editor(frame, job) {
+    // A window that was just opened by an editor that was started at the place is not sent there
+    // again.
+    let send = !(until.is_some() && job.placed);
+    if let Some(outcome) = goto_in_editor(desk, frame, job, report, cancel, send) {
         return outcome;
     }
     let started = Instant::now();
@@ -314,17 +326,46 @@ fn look(
 
 /// When `frame` is a window of an editor that takes a place on its command line (VS Code, Notepad++,
 /// Sublime Text) and the value has a line: the editor is started again with the place, which its
-/// running window takes, and the file is shown there at the value. Its text is not readable to UI
-/// Automation (VS Code shows it only to screen readers), so this is the way to it. This also covers
-/// an editor that Windows starts for the file through a packaged app, whose exe the registry
-/// does not name.
-fn goto_in_editor(frame: &Frame, job: &Job) -> Option<Outcome> {
+/// running window takes, and the file is shown there with the caret at the value. This also covers
+/// an editor that Windows starts for the file through a packaged app, whose exe the registry does
+/// not name.
+///
+/// Then the value is outlined where the caret is, when the editor shows its text to UI Automation:
+/// VS Code does when its screen reader support is on (`editor.accessibilitySupport`), and builds
+/// that text only once a client has asked, a moment after. Without it the caret is at the value,
+/// and nothing is outlined.
+fn goto_in_editor(
+    desk: &Desk,
+    frame: &Frame,
+    job: &Job,
+    report: &Reporter,
+    cancel: &AtomicBool,
+    send: bool,
+) -> Option<Outcome> {
     let Some(Location::Line { line, column }) = job.place else {
         return None;
     };
     let exe = process::exe_path(frame.process?)?;
     let arguments = Editor::of(&exe)?.arguments(&job.file, line, column);
-    start(&exe, &arguments).then_some(Outcome::Placed)
+    if send && !start(&exe, &arguments) {
+        return None;
+    }
+    let end = Instant::now() + CARET_WAIT;
+    while Instant::now() < end && !cancel.load(Ordering::Relaxed) {
+        let controls = text_controls(desk, &frame.element);
+        for needle in &job.needles {
+            for control in &controls {
+                if let Some(found) = control.at_caret(&needle.text, needle.ignore_case)
+                    && outline(&measure(control, &found), &job.purpose)
+                {
+                    report.done(Outcome::Marked);
+                    return Some(Outcome::Marked);
+                }
+            }
+        }
+        thread::sleep(CARET_POLL);
+    }
+    Some(Outcome::Placed)
 }
 
 /// Asks a window that had the file open already for the focus, which brings it to the front. The

@@ -152,3 +152,10 @@ strip = "symbols"
 # stepped into; piikey's own crates keep full debug info. Line tables still give backtraces.
 [profile.dev.package."*"]
 debug = "line-tables-only"
+
+# uiautomation 0.25.1 plus one safe method, `UITextRange::get_bounding_rectangles`: the exact
+# rectangle of each line of a text range (the call behind it is `unsafe`, so it must come from the
+# wrapper). The highlight outline and "Open at this place" box the text with it. Drop this once
+# a release of uiautomation has the method.
+[patch.crates-io]
+uiautomation = { git = "https://github.com/TBLgGamin/uiautomation-rs", rev = "95863e59cd284b0218d4a3756162e3be023ec610" }

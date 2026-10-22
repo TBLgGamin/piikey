@@ -3714,7 +3714,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.5",
  "windows-sys 0.61.2",
@@ -4091,8 +4091,7 @@ checksum = "abd2fc5d32b590614af8b0a20d837f32eca055edd0bbead59a9cfe80858be003"
 [[package]]
 name = "uiautomation"
 version = "0.25.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa2eacf9390a8491bc949b04230f40c12520c6423a2962a6087eea1ef14373af"
+source = "git+https://github.com/TBLgGamin/uiautomation-rs?rev=95863e59cd284b0218d4a3756162e3be023ec610#95863e59cd284b0218d4a3756162e3be023ec610"
 dependencies = [
  "chrono",
  "uiautomation_derive",
@@ -4103,8 +4102,7 @@ dependencies = [
 [[package]]
 name = "uiautomation_derive"
 version = "0.7.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c893ec96e05c3c81ba46f838f3190549ec185ef377d582ab3d44202b2dfacbd"
+source = "git+https://github.com/TBLgGamin/uiautomation-rs?rev=95863e59cd284b0218d4a3756162e3be023ec610#95863e59cd284b0218d4a3756162e3be023ec610"
 dependencies = [
  "proc-macro2",
  "quote",

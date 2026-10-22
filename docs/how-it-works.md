@@ -50,17 +50,22 @@ protected HTTPS traffic is created for your Windows user only; Windows asks once
 
 With highlight on, the same UI Automation reader that feeds the proxy also checks the field you are
 typing in, in any app. When it holds personal data, four thin bars in the theme's purple draw an
-outline around the field. They are topmost windows that take no clicks and no focus. The mode is
-`Off`, `Always` or `Hotkey`: with `Hotkey`, Ctrl+Alt+P checks the field once, and a field without
-personal data gets a short green flash. In `Always`, Ctrl+Alt+P pauses and resumes the outline. The
-check runs on your PC with the same detector as masking, even when protection is off, and nothing is
-stored. Password fields are never read.
+outline around each value, at the rectangle the app itself reports for that text
+(`GetBoundingRectangles`); a field whose app cannot say where its text is gets an outline around
+the field. The bars are topmost windows that take no clicks and no focus, and keep their place and
+size when they move to a monitor of another scale. The mode is `Off`, `Always` or `Hotkey`: with
+`Hotkey`, Ctrl+Alt+P checks the field once, and a field without personal data gets a short green
+flash. In `Always`, Ctrl+Alt+P pauses and resumes the outline. The check runs on your PC with the
+same detector as masking, even when protection is off, and nothing is stored. Password fields are
+never read.
 
 "Open at this place" in the findings view (see Inventory and Explorer) uses the same outline: when
 the app that opens a file has a UI Automation text pattern, piikey selects the value in its window
-and four bars outline it for about two seconds. It never sends a key or a click, never takes the
-focus and never reads a password field, and it runs on a thread of its own, so a hung app cannot
-hold the window.
+and four bars outline it for about two seconds. VS Code, Notepad++ and Sublime Text are sent to the
+line and column instead (also an editor installed from the Store, known by its window); VS Code's
+value is then outlined at the caret when its screen reader support is on, which is the only time it
+shows its text to UI Automation. It never sends a key or a click, never takes the focus and never
+reads a password field, and it runs on a thread of its own, so a hung app cannot hold the window.
 
 ## Inventory and Explorer
 

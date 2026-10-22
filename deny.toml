@@ -50,5 +50,9 @@ allow-wildcard-paths = true
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# windows-reactor and windows-reactor-setup (app/Cargo.toml) are git dependencies on windows-rs.
-allow-git = ["https://github.com/microsoft/windows-rs"]
+# windows-reactor and windows-reactor-setup (app/Cargo.toml) are git dependencies on windows-rs;
+# uiautomation is patched to a fork with one added method (root Cargo.toml, [patch.crates-io]).
+allow-git = [
+  "https://github.com/microsoft/windows-rs",
+  "https://github.com/TBLgGamin/uiautomation-rs",
+]

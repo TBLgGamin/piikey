@@ -6,9 +6,11 @@
 //! A [`Control`] is an element with a text pattern that is no password field (a password field is
 //! never read, its text, its value or its place; one that cannot say what it is counts as one).
 //! [`Control::find`] looks for a text in it and gives a [`Found`], which can be selected, scrolled
-//! into view and boxed: [`Found::rects`] gives a rectangle around each line of it, as close to the
-//! glyphs as the control lets it be (see [`rects`]: UI Automation's call for the rectangles of a
-//! range is `unsafe`, so they are found by asking the control what text is at a point).
+//! into view and boxed: [`Found::rects`] gives a rectangle around each line of it, exactly where the
+//! control draws it ([`UITextRange::get_bounding_rectangles`], from the patched `uiautomation`; see
+//! the root `Cargo.toml`). A control that cannot report them is measured by asking it what text is
+//! at a point ([`rects`]). [`Control::at_caret`] gives the text at the caret, for an editor that was
+//! sent to the value.
 //!
 //! What the controls of the programs do, as far as it was measured (Edge, Notepad, Word,
 //! `PowerPoint`):
@@ -111,6 +113,39 @@ impl Control {
             chars: text.chars().count(),
         })
     }
+
+    /// `text` where the caret of the control is, when it starts there: what an editor that was
+    /// sent to the place of the value (VS Code's `--goto`) shows. `None` when the control has no
+    /// caret, or the text after it is another.
+    pub(crate) fn at_caret(&self, text: &str, ignore_case: bool) -> Option<Found> {
+        let range = self.pattern.get_selection().ok()?.into_iter().next()?;
+        let start = TextPatternRangeEndpoint::Start;
+        // The caret, not a selection that starts somewhere else.
+        if range
+            .compare_endpoints(start, &range, TextPatternRangeEndpoint::End)
+            .ok()?
+            != 0
+        {
+            return None;
+        }
+        let chars = text.chars().count();
+        range
+            .move_endpoint_by_unit(
+                TextPatternRangeEndpoint::End,
+                uiautomation::types::TextUnit::Character,
+                i32::try_from(chars).ok()?,
+            )
+            .ok()?;
+        let read = range
+            .get_text(i32::try_from(text.encode_utf16().count()).ok()?)
+            .ok()?;
+        let same = if ignore_case {
+            read.to_lowercase() == text.to_lowercase()
+        } else {
+            read == text
+        };
+        same.then_some(Found { range, chars })
+    }
 }
 
 /// Chromium's `FindText` over a page returns a range that starts `k` characters after the text
@@ -192,8 +227,14 @@ impl Found {
     /// A rectangle around each line of it that is in view, in reading order, found within `within`;
     /// `Some` and empty when none of it is in view. `None` when the control cannot say, or is too
     /// slow to ask.
+    ///
+    /// The control is asked for them ([`UITextRange::get_bounding_rectangles`]): that is exact, and
+    /// one call. Only a control that cannot answer is found out by hit tests ([`rects`]).
     pub(crate) fn rects(&self, control: &Control, within: Duration) -> Option<Vec<Rect>> {
         let area = self.area(control)?;
+        if let Some(lines) = self.reported(area) {
+            return Some(lines);
+        }
         if control.chromium && self.around_is_big() {
             return None;
         }
@@ -206,9 +247,34 @@ impl Found {
         )
     }
 
+    /// The rectangles the control reports for the range, a line each, cut to `area`; `None` when
+    /// it cannot report them.
+    fn reported(&self, area: Rect) -> Option<Vec<Rect>> {
+        let rects = self.range.get_bounding_rectangles().ok()?;
+        Some(lines(
+            rects
+                .iter()
+                .filter_map(|rect| {
+                    Rect::text(
+                        rect.get_left(),
+                        rect.get_top(),
+                        rect.get_right(),
+                        rect.get_bottom(),
+                    )
+                })
+                .filter_map(|rect| text_in(rect, area))
+                .collect(),
+        ))
+    }
+
     /// Whether it is still at `rect`, where [`Found::rects`] said it was: the text may have
     /// scrolled or moved since.
     pub(crate) fn is_at(&self, control: &Control, rect: Rect) -> bool {
+        if let Ok(now) = self.range.get_bounding_rectangles() {
+            return now.first().is_some_and(|first| {
+                near(first.get_left(), rect.left) && near(first.get_top(), rect.top)
+            });
+        }
         // A point a little in from the start of the rectangle: a text of one character has no more
         // of it before the middle.
         let x = rect.left + rect.width() / 4;
@@ -326,6 +392,49 @@ fn intersection(one: Rect, other: Rect) -> Option<Rect> {
     )
 }
 
+/// The part of the text rectangle `rect` that lies in `area`; `None` when none does (a line
+/// scrolled out of the control).
+fn text_in(rect: Rect, area: Rect) -> Option<Rect> {
+    Rect::text(
+        rect.left.max(area.left),
+        rect.top.max(area.top),
+        rect.right.min(area.right),
+        rect.bottom.min(area.bottom),
+    )
+}
+
+/// One rectangle per line: a control may report a line in pieces (Chromium reports each run of
+/// text), which are joined when they share most of their height.
+fn lines(rects: Vec<Rect>) -> Vec<Rect> {
+    let mut joined: Vec<Rect> = Vec::new();
+    for rect in rects {
+        match joined.last_mut() {
+            Some(line) if same_line(*line, rect) => {
+                *line = Rect {
+                    left: line.left.min(rect.left),
+                    top: line.top.min(rect.top),
+                    right: line.right.max(rect.right),
+                    bottom: line.bottom.max(rect.bottom),
+                };
+            }
+            _ => joined.push(rect),
+        }
+    }
+    joined
+}
+
+/// Whether two rectangles of text are on one line: they share more than half of the smaller one's
+/// height.
+fn same_line(one: Rect, other: Rect) -> bool {
+    let shared = one.bottom.min(other.bottom) - one.top.max(other.top);
+    shared * 2 > one.height().min(other.height())
+}
+
+/// Whether two coordinates are the same place, give or take a pixel or two of rounding.
+fn near(one: i32, other: i32) -> bool {
+    (one - other).abs() <= 2
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,5 +457,33 @@ mod tests {
         // Next to each other, or only a sliver in common: nothing.
         assert_eq!(intersection(pane, rect(1600, 100, 1800, 900)), None);
         assert_eq!(intersection(pane, rect(0, 1195, 1600, 1400)), None);
+    }
+
+    #[test]
+    fn the_pieces_a_control_reports_of_a_line_are_one_rectangle_and_lines_stay_apart() {
+        // Chromium reports "jan.jansen" and "@example.nl" as two runs of one line, then a wrapped
+        // second line.
+        let reported = vec![
+            rect(100, 200, 180, 218),
+            rect(180, 201, 260, 219),
+            rect(20, 220, 90, 238),
+        ];
+        assert_eq!(
+            lines(reported),
+            [rect(100, 200, 260, 219), rect(20, 220, 90, 238)]
+        );
+        assert!(lines(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn a_line_is_cut_to_the_control_and_a_line_outside_it_is_left_out() {
+        let area = rect(0, 100, 500, 400);
+        // Half scrolled out at the top: the part in view.
+        assert_eq!(
+            text_in(rect(50, 90, 200, 110), area),
+            Some(rect(50, 100, 200, 110))
+        );
+        // Scrolled out entirely.
+        assert_eq!(text_in(rect(50, 20, 200, 40), area), None);
     }
 }

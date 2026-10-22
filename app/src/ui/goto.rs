@@ -103,21 +103,18 @@ pub enum Outcome {
 /// # Errors
 /// The file is no longer there, or Explorer cannot be started. The message is for the user.
 pub fn open_at(target: &Target, purpose: &Arc<Purpose>) -> Res<Outcome> {
-    if let Some(outcome) = place(target) {
-        return Ok(outcome);
-    }
     open_and_mark(target, purpose)
 }
 
-/// Starts the app that opens the file by default at the line of the target, when it is an editor
-/// that takes a place: `Some(Placed)` then, `None` for any other app or when it will not start.
-fn place(target: &Target) -> Option<Outcome> {
+/// How the default app of the file is started at the line of the target, when it is an editor
+/// that takes a place: its exe and the arguments. `None` for any other app.
+fn placing(target: &Target) -> Option<(PathBuf, Vec<OsString>)> {
     let Some(Location::Line { line, column }) = target.place else {
         return None;
     };
     let exe = default_exe(&target.file)?;
     let arguments = Editor::of(&exe)?.arguments(&target.file, line, column);
-    start(&exe, &arguments).then_some(Outcome::Placed)
+    Some((exe, arguments))
 }
 
 /// Starts `exe` with `arguments` and leaves it running, without a console window. Whether it
@@ -146,7 +143,13 @@ fn open_and_mark(target: &Target, purpose: &Arc<Purpose>) -> Res<Outcome> {
         ));
     }
     let deadline = Instant::now() + BUDGET;
-    let mut search = Job::of(target, purpose).and_then(Search::start);
+    let placing = placing(target);
+    let job = Job::of(target, purpose).map(|mut job| {
+        // The editor is started at the place: the window it shows is not sent there again.
+        job.placed = placing.is_some();
+        job
+    });
+    let mut search = job.and_then(Search::start);
     if let Some(search) = &mut search {
         let outcome = search.first(LOOK_WAIT);
         if outcome != Outcome::Opened {
@@ -156,8 +159,19 @@ fn open_and_mark(target: &Target, purpose: &Arc<Purpose>) -> Res<Outcome> {
         }
     }
     // Dropping the search, when this fails, tells its thread to stop.
-    open_file(&target.file)?;
-    Ok(search.map_or(Outcome::Opened, |mut search| search.finish(deadline)))
+    let fallback = match placing {
+        Some((exe, arguments)) if start(&exe, &arguments) => Outcome::Placed,
+        _ => {
+            open_file(&target.file)?;
+            Outcome::Opened
+        }
+    };
+    Ok(
+        search.map_or(fallback, |mut search| match search.finish(deadline) {
+            Outcome::Opened => fallback,
+            outcome => outcome,
+        }),
+    )
 }
 
 /// Opens `file` in the app that Windows opens it with: Explorer hands it over, as a double click

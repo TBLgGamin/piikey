@@ -434,16 +434,35 @@ impl ApplicationHandler<Cmd> for Bars {
     }
 
     fn window_event(&mut self, _: &ActiveEventLoop, window: WindowId, event: WindowEvent) {
-        // Windows asks a window to draw itself again when it was covered or moved.
-        if event == WindowEvent::RedrawRequested
-            && let Some(windows) = &mut self.windows
-            && let Some(bar) = windows
+        let Some(bar) = self.windows.as_mut().and_then(|windows| {
+            windows
                 .bars
                 .iter_mut()
                 .find(|bar| bar.window.id() == window)
-            && let Some(color) = bar.color
-        {
-            bar.paint(color);
+        }) else {
+            return;
+        };
+        match event {
+            // Windows asks a window to draw itself again when it was covered or moved.
+            WindowEvent::RedrawRequested => {
+                if let Some(color) = bar.color {
+                    bar.paint(color);
+                }
+            }
+            // A bar put on a monitor of another scale than the one it was on is resized by Windows
+            // to the new scale, and moved by winit to keep it on that monitor: it keeps the size and
+            // the place it was given, which are in physical pixels already.
+            WindowEvent::ScaleFactorChanged {
+                mut inner_size_writer,
+                ..
+            } => {
+                if let Some(place) = bar.place {
+                    let _ = inner_size_writer
+                        .request_inner_size(PhysicalSize::new(place.width, place.height));
+                }
+            }
+            WindowEvent::Moved(at) => bar.keep_place(at),
+            _ => {}
         }
     }
 
@@ -489,7 +508,8 @@ impl Bars {
             drawn += 1;
         }
         // The outlines that are no more go away.
-        for bar in windows.bars.iter().skip(drawn * BARS) {
+        for bar in windows.bars.iter_mut().skip(drawn * BARS) {
+            bar.place = None;
             bar.window.set_visible(false);
         }
         self.shown = Some(Shown {
@@ -500,7 +520,7 @@ impl Bars {
     }
 
     fn hide(&mut self) {
-        if let Some(windows) = &self.windows {
+        if let Some(windows) = &mut self.windows {
             windows.hide();
         }
         self.shown = None;
@@ -665,8 +685,9 @@ impl Windows {
     }
 
     /// Hides every bar.
-    fn hide(&self) {
-        for bar in &self.bars {
+    fn hide(&mut self) {
+        for bar in &mut self.bars {
+            bar.place = None;
             bar.window.set_visible(false);
         }
     }
@@ -690,6 +711,11 @@ struct Bar {
     surface: Surface<OwnedDisplayHandle, Rc<Window>>,
     /// What it was last filled with.
     color: Option<u32>,
+    /// Where it was put, while it is shown.
+    place: Option<Place>,
+    /// How often it was put back since it was put there: a window Windows will not leave there is
+    /// left alone after a few tries.
+    corrected: u8,
 }
 
 impl Bar {
@@ -726,6 +752,8 @@ impl Bar {
             window,
             surface,
             color: None,
+            place: None,
+            corrected: 0,
         };
         // A window that takes no clicks is layered, and a layered window draws nothing that was
         // not shown first: make it click-through once it is on screen and has been filled.
@@ -741,6 +769,8 @@ impl Bar {
 
     /// Moves the bar to `place`, fills it with `color` and shows it.
     fn put(&mut self, place: Place, color: u32) {
+        self.place = Some(place);
+        self.corrected = 0;
         self.window
             .set_outer_position(PhysicalPosition::new(place.x, place.y));
         let _ = self
@@ -748,6 +778,24 @@ impl Bar {
             .request_inner_size(PhysicalSize::new(place.width, place.height));
         self.paint(color);
         self.window.set_visible(true);
+    }
+
+    /// The bar was moved to `at`: back to its place if that is not where it was put, and its size
+    /// as well (a move onto a monitor of another scale changes both).
+    fn keep_place(&mut self, at: PhysicalPosition<i32>) {
+        const MOST: u8 = 3;
+        let Some(place) = self.place else {
+            return;
+        };
+        if (at.x, at.y) == (place.x, place.y) || self.corrected >= MOST {
+            return;
+        }
+        self.corrected += 1;
+        self.window
+            .set_outer_position(PhysicalPosition::new(place.x, place.y));
+        let _ = self
+            .window
+            .request_inner_size(PhysicalSize::new(place.width, place.height));
     }
 
     fn paint(&mut self, color: u32) {
