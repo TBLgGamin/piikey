@@ -1,6 +1,12 @@
-//! The work queue of the scan thread: the scans somebody asked for come first, in the order they
-//! were asked, and then what the watch has seen change in its folders. Nothing is scanned that
-//! nobody asked for, and nothing on a timer.
+//! The work queue of the scan thread. First what a removed folder leaves behind is forgotten,
+//! then the scans somebody asked for run in the order they were asked, and then what the watch
+//! has seen change in its folders. Nothing is scanned that nobody asked for, and nothing on a
+//! timer.
+//!
+//! Removing a folder ([`Scanner::withdraw`]) breaks off at once: what waits under it is dropped,
+//! the scan that runs under it stops within the file it is in and goes on without that folder,
+//! and forgetting what the folder held waits until that scan has saved, so nothing it found
+//! comes back.
 //!
 //! The thread itself belongs to the controller, which has the engine, the stores and the state
 //! that shows progress; this is only the queue and its rules, so they are tested without a thread.
@@ -8,14 +14,16 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     mem,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicBool, Ordering},
     },
 };
 
-use piikey::inventory::Touched;
+use piikey::{inventory::Touched, sys};
+
+use super::controller::Store;
 
 /// A scan somebody asked for: Explorer's "Scan for personal data", the Scan button, the API.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +71,11 @@ impl Changes {
         self.touched.keys()
     }
 
+    /// Drops what was reported under `folder`.
+    fn drop_under(&mut self, folder: &Path) {
+        self.touched.retain(|path, _| !sys::is_under(path, folder));
+    }
+
     /// Adds `other`. A path reported twice is fresh when either said so; with everything to be
     /// looked at, single paths say nothing more.
     pub fn merge(&mut self, other: Self) {
@@ -87,13 +100,47 @@ impl Changes {
     }
 }
 
-/// What a [`Job`] scans.
+/// What a [`Job`] does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Kind {
     /// What a [`Request`] names, into the inventory.
     Asked(Request),
     /// What the watch saw change, into the watch's inventory.
     Watch(Changes),
+    /// `folder` was removed from `store`'s folders: forget what the store holds under it.
+    Forget { store: Store, folder: PathBuf },
+}
+
+impl Kind {
+    /// What is left to do of this once `folder` of `store` is gone, and whether that is less
+    /// than before.
+    fn without(&self, store: Store, folder: &Path) -> (Self, bool) {
+        match (self, store) {
+            (Self::Asked(request), Store::Inventory) => {
+                let mut rest = request.clone();
+                rest.paths.retain(|path| !sys::is_under(path, folder));
+                let less = rest.paths.len() != request.paths.len();
+                (Self::Asked(rest), less)
+            }
+            (Self::Watch(changes), Store::Watch) => {
+                let mut rest = changes.clone();
+                rest.drop_under(folder);
+                // A scan of everything reads the folders when it starts: it has to start again.
+                let less = changes.everything || rest.touched.len() != changes.touched.len();
+                (Self::Watch(rest), less)
+            }
+            _ => (self.clone(), false),
+        }
+    }
+
+    /// Whether nothing is left to do.
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Asked(request) => request.paths.is_empty(),
+            Self::Watch(changes) => changes.is_empty(),
+            Self::Forget { .. } => false,
+        }
+    }
 }
 
 /// One scan for the thread to run. Setting `cancel` stops it within the file it is in.
@@ -112,6 +159,8 @@ impl Job {
 
 #[derive(Default)]
 struct Jobs {
+    /// Folders to forget, before any scan: see [`Scanner::withdraw`].
+    forget: VecDeque<(Store, PathBuf)>,
     asked: VecDeque<Request>,
     /// What the watch has seen that no scan took yet.
     watch: Changes,
@@ -132,11 +181,12 @@ enum Thread {
 
 struct Running {
     cancel: Arc<AtomicBool>,
-    /// It is a scan of what the watch saw.
-    watch: bool,
-    /// What the scan did not get to is looked at again when it was stopped: it stopped for a
-    /// request, which came first. Not when the watch was switched off.
-    requeue: bool,
+    /// What it does.
+    kind: Kind,
+    /// What runs instead of the rest once it is stopped: it was stopped for a request, which
+    /// comes first (a scan of what the watch saw starts again), or because a folder was removed
+    /// (it goes on without that folder). `None`: nothing, as when the watch was switched off.
+    rest: Option<Kind>,
 }
 
 enum Pick {
@@ -151,6 +201,9 @@ impl Jobs {
         if self.thread == Thread::Stopped {
             return Pick::Stop;
         }
+        if let Some((store, folder)) = self.forget.pop_front() {
+            return Pick::Run(self.begin(Kind::Forget { store, folder }));
+        }
         if let Some(request) = self.asked.pop_front() {
             return Pick::Run(self.begin(Kind::Asked(request)));
         }
@@ -163,32 +216,71 @@ impl Jobs {
 
     fn begin(&mut self, kind: Kind) -> Job {
         let cancel = Arc::new(AtomicBool::new(false));
+        let rest = matches!(kind, Kind::Watch(_)).then(|| kind.clone());
         self.running = Some(Running {
             cancel: Arc::clone(&cancel),
-            watch: matches!(kind, Kind::Watch(_)),
-            requeue: true,
+            kind: kind.clone(),
+            rest,
         });
         Job { kind, cancel }
     }
 
-    /// The scan `job` is over, to the end or cancelled. A scan of what the watch saw that was
-    /// stopped for a request saved what it did: the rest waits for its turn.
-    fn finish(&mut self, job: &Job) {
+    /// The scan `job` is over, to the end or cancelled. What a cancelled scan was to go on with
+    /// waits for its turn: a request goes first in line again. Returns whether there was such a
+    /// rest.
+    fn finish(&mut self, job: &Job) -> bool {
         let running = self.running.take();
-        if let Kind::Watch(changes) = &job.kind
-            && job.cancelled()
-            && self.thread != Thread::Stopped
-            && running.is_some_and(|running| running.requeue)
-        {
-            self.watch.merge(changes.clone());
+        if !job.cancelled() || self.thread == Thread::Stopped {
+            return false;
+        }
+        match running.and_then(|running| running.rest) {
+            Some(rest) if rest.is_empty() => false,
+            Some(Kind::Asked(request)) => {
+                self.asked.push_front(request);
+                true
+            }
+            Some(Kind::Watch(changes)) => {
+                self.watch.merge(changes);
+                true
+            }
+            Some(Kind::Forget { .. }) | None => false,
         }
     }
 
-    /// Stops the scan of what the watch saw if that is what runs.
+    /// Stops the scan of what the watch saw if that is what runs; it starts again later.
     fn interrupt(&self) {
-        if let Some(running) = self.running.as_ref().filter(|running| running.watch) {
+        if let Some(running) = self
+            .running
+            .as_ref()
+            .filter(|running| matches!(running.kind, Kind::Watch(_)))
+        {
             running.cancel.store(true, Ordering::Relaxed);
         }
+    }
+
+    /// See [`Scanner::withdraw`]. Returns the reveals of the requests that are dropped whole.
+    fn withdraw(&mut self, store: Store, folder: &Path) -> Vec<u64> {
+        let mut dropped = Vec::new();
+        match store {
+            Store::Inventory => self.asked.retain_mut(|request| {
+                request.paths.retain(|path| !sys::is_under(path, folder));
+                let keep = !request.paths.is_empty();
+                if !keep {
+                    dropped.extend(request.reveal);
+                }
+                keep
+            }),
+            Store::Watch => self.watch.drop_under(folder),
+        }
+        if let Some(running) = self.running.as_mut() {
+            let (rest, less) = running.kind.without(store, folder);
+            if less {
+                running.rest = Some(rest);
+                running.cancel.store(true, Ordering::Relaxed);
+            }
+        }
+        self.forget.push_back((store, folder.to_path_buf()));
+        dropped
     }
 }
 
@@ -245,13 +337,29 @@ impl Scanner {
         self.wake.notify_all();
     }
 
+    /// `folder` is no longer one of `store`'s folders. Nothing under it is scanned any more:
+    /// queued scans lose it (a request with nothing else is dropped), the scan that runs under it
+    /// stops and goes on without it, and then what the store holds under it is forgotten.
+    /// Returns the reveals of the requests that were dropped whole: nobody will scan them.
+    pub fn withdraw(&self, store: Store, folder: &Path) -> Vec<u64> {
+        let mut jobs = self.lock();
+        let dropped = jobs.withdraw(store, folder);
+        drop(jobs);
+        self.wake.notify_all();
+        dropped
+    }
+
     /// The watch was switched off: what it saw is not scanned, and the scan of it that runs is
     /// stopped and not started again.
     pub fn stop_watch(&self) {
         let mut jobs = self.lock();
         jobs.watch = Changes::default();
-        if let Some(running) = jobs.running.as_mut().filter(|running| running.watch) {
-            running.requeue = false;
+        if let Some(running) = jobs
+            .running
+            .as_mut()
+            .filter(|running| matches!(running.kind, Kind::Watch(_)))
+        {
+            running.rest = None;
             running.cancel.store(true, Ordering::Relaxed);
         }
     }
@@ -270,9 +378,10 @@ impl Scanner {
         }
     }
 
-    /// The scan `next` returned is over, to the end or [cancelled](Job::cancelled).
-    pub fn done(&self, job: &Job) {
-        self.lock().finish(job);
+    /// The scan `next` returned is over, to the end or [cancelled](Job::cancelled). Returns
+    /// whether the rest of a cancelled scan waits to run: then it is not over for its user.
+    pub fn done(&self, job: &Job) -> bool {
+        self.lock().finish(job)
     }
 
     /// Ends the thread, and stops the scan that runs.
@@ -289,7 +398,10 @@ impl Scanner {
     /// Nothing runs and nothing waits to run.
     pub fn idle(&self) -> bool {
         let jobs = self.lock();
-        jobs.asked.is_empty() && jobs.watch.is_empty() && jobs.running.is_none()
+        jobs.forget.is_empty()
+            && jobs.asked.is_empty()
+            && jobs.watch.is_empty()
+            && jobs.running.is_none()
     }
 }
 
@@ -498,6 +610,101 @@ mod tests {
         let job = scanner.next().ok_or("the watch saw something")?;
         scanner.done(&job);
         assert!(scanner.idle());
+        Ok(())
+    }
+
+    fn asked(paths: &[&str], reveal: Option<u64>) -> Request {
+        Request {
+            paths: paths.iter().map(PathBuf::from).collect(),
+            reveal,
+        }
+    }
+
+    #[test]
+    fn removing_a_location_breaks_off_its_scan_which_goes_on_without_it_after_the_forget()
+    -> Result<(), String> {
+        let scanner = Scanner::default();
+        scanner.ask(asked(&[r"C:\a", r"C:\b"], Some(1)));
+        let running = run(&mut scanner.lock())?;
+        assert!(
+            scanner
+                .withdraw(Store::Inventory, Path::new(r"C:\a"))
+                .is_empty()
+        );
+        assert!(running.cancelled(), "the scan under it stops at once");
+        assert!(scanner.done(&running), "and the rest of it waits to run");
+        let mut jobs = scanner.lock();
+        assert_eq!(
+            run(&mut jobs)?.kind,
+            Kind::Forget {
+                store: Store::Inventory,
+                folder: PathBuf::from(r"C:\a")
+            },
+            "first what it held is forgotten, after the stopped scan saved"
+        );
+        assert_eq!(
+            run(&mut jobs)?.kind,
+            Kind::Asked(asked(&[r"C:\b"], Some(1)))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn queued_scans_lose_a_removed_location_and_one_with_nothing_left_is_dropped()
+    -> Result<(), String> {
+        let scanner = Scanner::default();
+        scanner.ask(asked(&[r"C:\a\file.txt"], Some(7)));
+        scanner.ask(asked(&[r"C:\A", r"C:\c"], None));
+        assert_eq!(
+            scanner.withdraw(Store::Inventory, Path::new(r"C:\a")),
+            [7],
+            "its dialog is told nobody will scan it"
+        );
+        let mut jobs = scanner.lock();
+        assert!(matches!(run(&mut jobs)?.kind, Kind::Forget { .. }));
+        assert_eq!(run(&mut jobs)?.kind, Kind::Asked(asked(&[r"C:\c"], None)));
+        assert!(matches!(jobs.pick(), Pick::Wait), "nothing else is left");
+        Ok(())
+    }
+
+    #[test]
+    fn removing_a_watched_folder_breaks_off_the_watch_scan_and_keeps_the_rest() -> Result<(), String>
+    {
+        let scanner = Scanner::default();
+        scanner.changed(changes(&[(r"C:\w\a.txt", false), (r"C:\v\b.txt", true)]));
+        let running = run(&mut scanner.lock())?;
+        scanner.changed(changes(&[(r"C:\w\later.txt", false)]));
+        scanner.withdraw(Store::Watch, Path::new(r"C:\w"));
+        assert!(running.cancelled());
+        assert!(scanner.done(&running));
+        let mut jobs = scanner.lock();
+        assert!(matches!(
+            run(&mut jobs)?.kind,
+            Kind::Forget {
+                store: Store::Watch,
+                ..
+            }
+        ));
+        assert_eq!(
+            run(&mut jobs)?.kind,
+            Kind::Watch(changes(&[(r"C:\v\b.txt", true)])),
+            "nothing under the removed folder is scanned any more"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn removing_a_folder_leaves_scans_elsewhere_alone() -> Result<(), String> {
+        let scanner = Scanner::default();
+        scanner.ask(asked(&[r"C:\c"], None));
+        let running = run(&mut scanner.lock())?;
+        scanner.withdraw(Store::Inventory, Path::new(r"C:\a"));
+        scanner.withdraw(Store::Watch, Path::new(r"C:\c"));
+        assert!(
+            !running.cancelled(),
+            "another folder, or the other store's folder"
+        );
+        assert!(!scanner.done(&running));
         Ok(())
     }
 

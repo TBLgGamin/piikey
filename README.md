@@ -165,8 +165,8 @@ keeps are described in [docs/how-it-works.md](docs/how-it-works.md).
   Inventory, Watch, Vault, Detection; each opens its page), then the five latest swaps.
 - **Protection** holds the highlighting mode, the protected sites and the protected apps. The
   certificate is installed from Overview.
-- **Inventory** is where you scan. It lists your locations (Documents, Desktop and Downloads until
-  you choose others) with what each holds and a Remove button; the Scan button looks through them,
+- **Inventory** is where you scan. It lists your locations (none until you add one) with what each
+  holds and a Remove button, which also breaks off a scan of it; the Scan button looks through them,
   the box below scans one more folder or file,
   and you can drop files and folders from Explorer onto the page. The dashboard shows a tree of
   folders and files with bars by type, the types found, a treemap of the files, and the details of

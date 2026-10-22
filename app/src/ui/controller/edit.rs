@@ -35,9 +35,8 @@ pub enum Edit {
     /// quits piikey.
     Background(bool),
     /// A folder the inventory scans when asked (one of its locations); `on` adds it, `off`
-    /// takes it off. A path that is no folder is refused. While no location was chosen the
-    /// usual folders are the locations: the first change makes them a choice, so that one of
-    /// them can be taken off.
+    /// takes it off. A path that is no folder is refused. There is no location until the user
+    /// adds one.
     InventoryRoot {
         path: PathBuf,
         on: bool,
@@ -91,14 +90,7 @@ pub fn apply_edit(policy: &mut Policy, edit: &Edit) -> Res<bool> {
         Edit::Highlight(mode) => Ok(set(&mut policy.highlight, *mode)),
         Edit::ExplorerMenu(on) => Ok(set(&mut policy.explorer_menu, *on)),
         Edit::Background(on) => Ok(set(&mut policy.background, *on)),
-        Edit::InventoryRoot { path, on } => {
-            let mut locations = policy.inventory_roots_or_default();
-            let changed = folder_edit(&mut locations, path, *on)?;
-            if changed {
-                policy.inventory_roots = locations;
-            }
-            Ok(changed)
-        }
+        Edit::InventoryRoot { path, on } => folder_edit(&mut policy.inventory_roots, path, *on),
         Edit::Watch(on) => Ok(set(&mut policy.watch, *on)),
         Edit::WatchFolder { path, on } => folder_edit(&mut policy.watch_folders, path, *on),
         Edit::HttpApi(on) => Ok(set(&mut policy.http_api, *on)),

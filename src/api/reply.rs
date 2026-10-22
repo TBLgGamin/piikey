@@ -120,8 +120,7 @@ pub struct Progress {
 /// `inventory_status`: the inventory in numbers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InventoryStatus {
-    /// The folders it scans when asked: the user's locations, or the usual ones when there are
-    /// none.
+    /// The folders it scans when asked: the user's locations, none until one is added.
     pub roots: Vec<String>,
     pub files: u64,
     pub files_with_pii: u64,

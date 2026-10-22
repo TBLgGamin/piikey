@@ -30,7 +30,7 @@ use piikey::{
     sys,
 };
 
-use super::{Controller, Notice, Running};
+use super::{Controller, Notice, Running, Store};
 use crate::ui::scanner::Changes;
 
 /// How long a path must be quiet before it is scanned: a file that is being written is scanned
@@ -278,9 +278,12 @@ impl Controller {
     /// or no folder to watch), and everything is caught up on, because what happened while
     /// nothing watched is unknown.
     pub(super) fn sync_watch(self: &Arc<Self>, old: &Policy, new: &Policy) {
-        // What runs for the folders as they were ends before what they held is forgotten.
-        self.stop_watch_scan();
-        self.forget_unwatched(&old.watch_folders, &new.watch_folders);
+        // What runs for folders that went is broken off, and what they held is forgotten once
+        // that scan saved; with the watch off nothing it saw is scanned any more.
+        self.withdraw_removed(Store::Watch, &old.watch_folders, &new.watch_folders);
+        if !new.watch {
+            self.stop_watch_scan();
+        }
         self.stop_watching();
         if !new.watch || new.watch_folders.is_empty() {
             let totals = self.watch_store.totals();
@@ -347,22 +350,6 @@ impl Controller {
         if let Some(running) = self.update(|state| state.watch.running.take()) {
             running.stop();
         }
-    }
-
-    /// Forgets what the watch's inventory holds of the folders that `now` no longer lists.
-    fn forget_unwatched(&self, before: &[PathBuf], now: &[PathBuf]) {
-        for folder in before
-            .iter()
-            .filter(|folder| !now.iter().any(|kept| sys::same_path(kept, folder)))
-        {
-            if let Err(error) = self.watch_store.forget_under(folder) {
-                self.notify(Notice::error(format!(
-                    "Could not update what the watch found: {error}"
-                )));
-            }
-        }
-        let totals = self.watch_store.totals();
-        self.update(|state| state.watch.totals = totals);
     }
 
     /// The watch saw `changes` settle: they go to the scan thread, and the folders they are

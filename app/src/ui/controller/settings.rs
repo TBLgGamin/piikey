@@ -2,11 +2,17 @@
 //! depends on it (the engine's kinds, the Explorer menu, the local API, the watch, the highlight
 //! and the detection model) is brought in line.
 
-use std::sync::{Arc, PoisonError};
+use std::{
+    path::PathBuf,
+    sync::{Arc, PoisonError},
+};
 
-use piikey::policy::{Highlight, Policy, SettingsPatch};
+use piikey::{
+    policy::{Highlight, Policy, SettingsPatch},
+    sys,
+};
 
-use super::{Controller, Edit, Notice, apply_edit};
+use super::{Controller, Edit, Notice, Store, apply_edit};
 
 /// Whether the watch has something to keep an eye on.
 fn watching(policy: &Policy) -> bool {
@@ -71,6 +77,7 @@ impl Controller {
         if (new.http_api, new.http_port) != (old.http_api, old.http_port) {
             self.sync_http();
         }
+        self.withdraw_removed(Store::Inventory, &old.inventory_roots, &new.inventory_roots);
         if (new.watch, &new.watch_folders) != (old.watch, &old.watch_folders) {
             self.sync_watch(old, new);
         }
@@ -81,6 +88,30 @@ impl Controller {
             self.sync_model();
         }
         self.update(|_| {});
+    }
+
+    /// Breaks off whatever scans the folders of `store` that `now` no longer lists, and forgets
+    /// what they held once that scan has saved (see [`Scanner::withdraw`]).
+    ///
+    /// [`Scanner::withdraw`]: crate::ui::scanner::Scanner::withdraw
+    pub(super) fn withdraw_removed(
+        self: &Arc<Self>,
+        store: Store,
+        before: &[PathBuf],
+        now: &[PathBuf],
+    ) {
+        let mut any = false;
+        for folder in before
+            .iter()
+            .filter(|folder| !now.iter().any(|kept| sys::same_path(kept, folder)))
+        {
+            let dropped = self.scanner.withdraw(store, folder);
+            self.reveals_stopped(&dropped);
+            any = true;
+        }
+        if any {
+            self.ensure_scanner();
+        }
     }
 
     /// Starts what the saved settings ask for, as if the user had just switched each on.

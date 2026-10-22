@@ -3,8 +3,7 @@
 //! not change is not read. What it finds lives in a store of its own, apart from the inventory, and
 //! is shown by the same dashboard as the inventory.
 
-use piikey::policy::default_inventory_roots;
-use windows_reactor::{Button, StackPanel, View};
+use windows_reactor::View;
 
 use super::{
     dashboard::{self, dashboard, room},
@@ -63,17 +62,7 @@ const fn tone(status: &FolderStatus) -> Tone {
 fn folders(window: &MainWindow, context: Context<'_>) -> (View, f64) {
     let watch = &window.snap.watch;
     if watch.folders.is_empty() {
-        let usual = Button::new()
-            .content(format!("Watch {}", usual_names(&default_inventory_roots())))
-            .on_click(context.message(Msg::WatchUsual));
-        return (
-            card(StackPanel::new().spacing(10.0).children((
-                caption("No folders yet. Add one below, or start with the usual ones."),
-                usual,
-            )))
-            .into(),
-            90.0,
-        );
+        return (card(caption("No folders yet. Add one below.")).into(), 60.0);
     }
     places_card(
         watch
@@ -91,20 +80,6 @@ fn folders(window: &MainWindow, context: Context<'_>) -> (View, f64) {
             })
             .collect(),
     )
-}
-
-/// `Documents, Desktop and Downloads`: the folders' names.
-fn usual_names(paths: &[std::path::PathBuf]) -> String {
-    let names: Vec<String> = paths
-        .iter()
-        .filter_map(|path| path.file_name())
-        .map(|name| name.to_string_lossy().into_owned())
-        .collect();
-    match names.as_slice() {
-        [] => "the usual folders".to_owned(),
-        [only] => only.clone(),
-        [head @ .., last] => format!("{} and {last}", head.join(", ")),
-    }
 }
 
 /// What stands under the box that adds a folder: how far the watch is, or what it holds.
@@ -226,16 +201,5 @@ mod tests {
             ),
             "Not available: the drive is gone"
         );
-    }
-
-    #[test]
-    fn the_usual_folders_are_named_in_a_list() {
-        let paths: Vec<PathBuf> = [r"C:\u\Documents", r"C:\u\Desktop", r"C:\u\Downloads"]
-            .iter()
-            .map(PathBuf::from)
-            .collect();
-        assert_eq!(usual_names(&paths), "Documents, Desktop and Downloads");
-        assert_eq!(usual_names(&paths[..1]), "Documents");
-        assert_eq!(usual_names(&[]), "the usual folders");
     }
 }

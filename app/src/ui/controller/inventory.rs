@@ -17,7 +17,10 @@ use std::{
     time::Duration,
 };
 
-use piikey::inventory::{self, Entry, Finding, Inventory, Node, Progress, Tiles, TypeTotal};
+use piikey::{
+    inventory::{self, Entry, Finding, Inventory, Node, Progress, Tiles, TypeTotal},
+    sys,
+};
 
 use super::{Controller, Edit, Notice, PROGRESS_EVERY, ScanSummary, State};
 use crate::{
@@ -105,7 +108,7 @@ impl Controller {
     fn roots(&self, store: Store) -> Vec<PathBuf> {
         let policy = self.policy();
         match store {
-            Store::Inventory => policy.inventory_roots_or_default(),
+            Store::Inventory => policy.inventory_roots,
             Store::Watch => policy.watch_folders,
         }
     }
@@ -276,10 +279,10 @@ impl Controller {
         })
     }
 
-    /// Scans the inventory's folders now, whether or not anything changed in them; only files
+    /// Scans the inventory's locations now, whether or not anything changed in them; only files
     /// that did are read.
     pub(super) fn scan_all(self: &Arc<Self>) {
-        let roots = self.policy().inventory_roots_or_default();
+        let roots = self.policy().inventory_roots;
         if roots.is_empty() {
             self.notify(Notice::warning(
                 "There is no folder to scan yet. Add one first.",
@@ -301,13 +304,58 @@ impl Controller {
         }
     }
 
-    /// Runs one scan, on the scan thread. A scan that was asked to be shown leaves its result in
-    /// the [`Reveal`]; either way the inventory is saved.
+    /// Runs one job, on the scan thread. A scan that was asked to be shown leaves its result in
+    /// the [`Reveal`]; either way the store is saved.
     pub(super) fn run_scan(&self, job: &Job) {
         match &job.kind {
             Kind::Asked(request) => self.run_asked(job, request),
             Kind::Watch(changes) => self.run_watch(job, changes),
+            Kind::Forget { store, folder } => self.run_forget(*store, folder),
         }
+    }
+
+    /// A cancelled job whose rest is not run: a scan that was to be shown says it was stopped.
+    pub(super) fn scan_stopped(&self, job: &Job) {
+        if let Kind::Asked(Request {
+            reveal: Some(seq), ..
+        }) = &job.kind
+        {
+            self.reveals_stopped(&[*seq]);
+        }
+    }
+
+    /// The scans shown as `seqs` will not run (to the end): their dialogs say so.
+    pub(super) fn reveals_stopped(&self, seqs: &[u64]) {
+        self.update(|state| {
+            for &seq in seqs {
+                set_reveal(
+                    state,
+                    seq,
+                    RevealState::Failed("The scan was stopped.".to_owned()),
+                );
+            }
+        });
+    }
+
+    /// `folder` was removed from `store`'s folders: what the store holds under it goes, unless
+    /// a folder that is still listed holds it.
+    fn run_forget(&self, store: Store, folder: &Path) {
+        let still = self
+            .roots(store)
+            .iter()
+            .any(|root| sys::is_under(folder, root));
+        let target = self.store(store);
+        if !still && let Err(error) = target.forget_under(folder) {
+            self.notify(Notice::error(format!(
+                "Could not forget what was found in {}: {error}",
+                folder.display()
+            )));
+        }
+        let totals = target.totals();
+        self.update(|state| match store {
+            Store::Inventory => state.inventory_totals = totals,
+            Store::Watch => state.watch.totals = totals,
+        });
     }
 
     /// Scans what `request` names into the inventory.
@@ -338,9 +386,10 @@ impl Controller {
                 .scan_paths(&engine, &request.paths, &progress, &job.cancel)
         });
         let totals = self.inventory.totals();
-        let outcome = request.reveal.map(|seq| {
+        // A scan that was stopped either goes on later (its dialog keeps waiting) or is told so
+        // by `scan_stopped`.
+        let outcome = request.reveal.filter(|_| !job.cancelled()).map(|seq| {
             let state = match &result {
-                _ if job.cancelled() => RevealState::Failed("The scan was stopped.".to_owned()),
                 Err(error) => RevealState::Failed(format!("Could not save the inventory: {error}")),
                 Ok(()) => RevealState::Done(self.inventory.summary(&request.paths)),
             };
@@ -472,7 +521,10 @@ fn scan_loop(controller: &Weak<Controller>, scanner: &Scanner) {
             return;
         };
         controller.run_scan(&job);
-        scanner.done(&job);
+        let goes_on = scanner.done(&job);
+        if job.cancelled() && !goes_on {
+            controller.scan_stopped(&job);
+        }
         // Whoever waits for the scans to be over looks again.
         controller.update(|_| {});
     }

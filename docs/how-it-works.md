@@ -59,11 +59,17 @@ stored. Password fields are never read.
 ## Inventory and Explorer
 
 The inventory records which files hold personal data. It scans only when somebody asks: the Scan
-button on the Inventory page (which looks through your locations, the Documents, Desktop and
-Downloads folders until you choose others), the box that adds one more folder or file, files and
+button on the Inventory page (which looks through your locations: there are none until you add
+one, and removing all of them leaves none), the box that adds one more folder or file, files and
 folders dropped on the page, Explorer's menu, `explorer_scan`, `scan_files` and `inventory_rescan`
 through the API and the CLI. Nothing scans on a timer. Scans run on one scan thread in a
 half-sized thread pool, and a scan you asked for goes before whatever the watch has queued.
+
+Removing a location or a watched folder breaks off at once. Queued scans lose that folder (one
+with nothing else left is dropped, and its dialog says it was stopped), the scan that runs under
+it stops within the file it is in and goes on later without it, and then what the store held
+under the folder is forgotten, after that scan saved, so nothing it found comes back. What
+another listed folder still covers stays.
 
 For each file, `inventory.jsonl` keeps its size, write time, a BLAKE3 fingerprint of its contents
 and how many values of each type it holds, never the values. A scan is incremental. A file whose
@@ -156,8 +162,8 @@ under it that is a button to Overview.
   dashboard described under Inventory and Explorer above. Files and folders dropped on the page are
   scanned.
 - **Watch**: its switch, the folder list with each folder's state and a Remove button, the box that
-  adds a folder (or "Watch Documents, Desktop and Downloads" when the list is empty), a status line
-  and the same dashboard over the watch's store.
+  adds a folder (nothing is watched until you add one), a status line and the same dashboard over
+  the watch's store.
 - **Vault**: an activity feed of every value in the vault next to its stand-in, the most recently
   sent first (including values first stored long ago), then the ones never sent. Search matches
   values, stand-ins, sites and apps; filters narrow it to a type, a site (subdomains included) or a

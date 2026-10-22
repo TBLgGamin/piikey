@@ -37,7 +37,6 @@
 //! matcher misbehave.
 
 use std::{
-    ffi::OsStr,
     fs,
     path::{Path, PathBuf},
 };
@@ -153,8 +152,8 @@ pub struct Policy {
     /// Whether closing the window leaves piikey running in the tray, with protection, the
     /// highlight, the watch and the API still working. Off: closing the window quits piikey.
     pub background: bool,
-    /// Absolute folders the inventory scans when asked (its locations); empty means
-    /// [`default_inventory_roots`].
+    /// Absolute folders the inventory scans when asked (its locations). None until the user
+    /// adds one.
     pub inventory_roots: Vec<PathBuf>,
     /// Whether the watch keeps an eye on [`Self::watch_folders`]: every change in them is
     /// scanned as it happens, into a store of its own.
@@ -389,17 +388,6 @@ impl Policy {
             .iter()
             .fold(KindSet::ALL, |set, &kind| set.without(kind))
     }
-
-    /// The folders the inventory scans when asked: the saved ones, or
-    /// [`default_inventory_roots`] when none were saved.
-    #[must_use]
-    pub fn inventory_roots_or_default(&self) -> Vec<PathBuf> {
-        if self.inventory_roots.is_empty() {
-            default_inventory_roots()
-        } else {
-            self.inventory_roots.clone()
-        }
-    }
 }
 
 /// A partial update of the [`Policy`], as the API's `settings_set` carries it: every field
@@ -550,38 +538,6 @@ fn deserialize_kinds<'de, D: Deserializer<'de>>(
                 .ok_or_else(|| D::Error::custom(format!("not a kind of personal data: {name}")))
         })
         .collect()
-}
-
-/// The folders the inventory scans when the user has picked none: the documents, the desktop
-/// (both also where `OneDrive` keeps them) and the downloads that exist, without duplicates.
-#[must_use]
-pub fn default_inventory_roots() -> Vec<PathBuf> {
-    default_roots_in(
-        std::env::var_os("OneDrive").as_deref(),
-        std::env::var_os("USERPROFILE").as_deref(),
-    )
-}
-
-/// [`default_inventory_roots`] for the given `OneDrive` and user profile folders.
-fn default_roots_in(onedrive: Option<&OsStr>, profile: Option<&OsStr>) -> Vec<PathBuf> {
-    let candidates = [
-        (onedrive, "Documents"),
-        (onedrive, "Desktop"),
-        (profile, "Documents"),
-        (profile, "Desktop"),
-        (profile, "Downloads"),
-    ];
-    let mut roots: Vec<PathBuf> = Vec::new();
-    for (base, name) in candidates {
-        let Some(base) = base.filter(|base| !base.is_empty()) else {
-            continue;
-        };
-        let path = Path::new(base).join(name);
-        if path.is_dir() && !roots.iter().any(|root| same_path(root, &path)) {
-            roots.push(path);
-        }
-    }
-    roots
 }
 
 fn push_unique(list: &mut Vec<String>, value: Option<String>) {
@@ -1059,18 +1015,6 @@ mod tests {
     }
 
     #[test]
-    fn saved_folders_win_and_none_saved_means_the_usual_ones() {
-        assert_eq!(
-            Policy::default().inventory_roots_or_default(),
-            default_inventory_roots()
-        );
-        assert_eq!(
-            policy().inventory_roots_or_default(),
-            policy().inventory_roots
-        );
-    }
-
-    #[test]
     fn inventory_and_watch_folders_are_normalized_and_deduplicated() {
         let p = Policy::parse(
             "inventory_root=C:\\Users\\jan\\Documents\n\
@@ -1142,42 +1086,6 @@ mod tests {
                  inventory_root=C:\\ok\nwatch_folder=C:\\ok\\watched\n"
             )
         );
-    }
-
-    #[test]
-    fn default_roots_are_the_existing_folders_without_duplicates() -> Result<()> {
-        let dir = temp_dir("roots");
-        let onedrive = dir.join("OneDrive");
-        let profile = dir.join("profile");
-        for folder in [
-            onedrive.join("Documents"),
-            onedrive.join("Desktop"),
-            profile.join("Documents"),
-            profile.join("Downloads"),
-        ] {
-            fs::create_dir_all(folder)?;
-        }
-        // A file is not a folder.
-        fs::write(profile.join("Desktop"), b"")?;
-        assert_eq!(
-            default_roots_in(Some(onedrive.as_os_str()), Some(profile.as_os_str())),
-            [
-                onedrive.join("Documents"),
-                onedrive.join("Desktop"),
-                profile.join("Documents"),
-                profile.join("Downloads"),
-            ]
-        );
-        // The same folder under another spelling is listed once, in the spelling it was met in.
-        let shouted = PathBuf::from(profile.to_string_lossy().to_uppercase());
-        assert_eq!(
-            default_roots_in(Some(shouted.as_os_str()), Some(profile.as_os_str())),
-            [shouted.join("Documents"), profile.join("Downloads")]
-        );
-        assert!(default_roots_in(None, None).is_empty());
-        assert!(default_roots_in(Some(OsStr::new("")), Some(OsStr::new(""))).is_empty());
-        fs::remove_dir_all(&dir)?;
-        Ok(())
     }
 
     #[test]

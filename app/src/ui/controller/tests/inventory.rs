@@ -81,9 +81,8 @@ fn an_explorer_scan_fills_the_inventory_and_the_dialog_gets_its_result() -> Test
         .inventory_view(Store::Inventory, Path::new(""), None);
     assert_eq!(top.nodes.len(), 1);
     assert!(top.nodes[0].path.as_os_str().is_empty());
-    // No folder chosen: the view groups by the usual ones, which is what the Scan button
-    // scans and what the breadcrumb must collapse.
-    assert_eq!(top.roots, quiet().inventory_roots_or_default());
+    // No location chosen: nothing to group by.
+    assert!(top.roots.is_empty());
     let level = rig
         .controller
         .inventory_view(Store::Inventory, &folder, Some(&file));
@@ -264,6 +263,36 @@ fn a_scan_nobody_asked_to_see_leaves_the_window_alone_and_nothing_scans_by_itsel
     rig.run(Command::ScanAll)?;
     assert!(rig.controller.wait_scans(Duration::from_secs(20)));
     assert_eq!(rig.controller.snapshot().inventory_totals, (2, 2));
+    Ok(())
+}
+
+#[test]
+fn removing_a_location_forgets_what_it_held_and_nothing_comes_back() -> Test {
+    let dir = TempDir::new()?;
+    let folder = docs(&dir)?;
+    let rig = rig(
+        true,
+        Policy {
+            inventory_roots: vec![folder.clone()],
+            ..quiet()
+        },
+    )?;
+    rig.run(Command::ScanAll)?;
+    assert!(rig.controller.wait_scans(Duration::from_secs(20)));
+    assert_eq!(rig.controller.snapshot().inventory_totals, (1, 1));
+
+    rig.run(Command::Edit(Edit::InventoryRoot {
+        path: folder,
+        on: false,
+    }))?;
+    assert!(rig.controller.wait_scans(Duration::from_secs(20)));
+    let snapshot = rig.controller.snapshot();
+    assert!(
+        snapshot.policy.inventory_roots.is_empty(),
+        "no folder in its place"
+    );
+    assert_eq!(snapshot.inventory_totals, (0, 0));
+    assert_eq!(rig.controller.inventory().totals().files, 0);
     Ok(())
 }
 
@@ -469,6 +498,11 @@ fn a_scan_that_is_stopped_before_it_ends_says_so_to_the_dialog() -> Test {
         cancel: Arc::new(AtomicBool::new(true)),
     };
     rig.controller.run_scan(&job);
+    // A stopped scan may go on later without a removed folder: its dialog keeps waiting.
+    let reveal = rig.controller.snapshot().reveal.ok_or("no dialog")?;
+    assert_eq!(reveal.state, RevealState::Scanning);
+    // Nothing of it goes on: the scan thread says so.
+    rig.controller.scan_stopped(&job);
     let reveal = rig.controller.snapshot().reveal.ok_or("no dialog")?;
     assert_eq!(
         reveal.state,

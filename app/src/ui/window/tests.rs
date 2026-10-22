@@ -413,7 +413,7 @@ fn pages() -> [(Page, &'static [&'static str]); 5] {
             &[
                 "Watch",
                 "Keeps an eye on folders and checks a file again when it changes.",
-                "No folders yet. Add one below, or start with the usual ones.",
+                "No folders yet. Add one below.",
                 "Add folder",
                 "Watch is off.",
                 "Watched folders",
@@ -1322,10 +1322,17 @@ fn inventory_lists_its_locations_like_watch_lists_its_folders() -> Test {
         ("a.txt", "mail jan.jansen@acme.nl and piet@acme.nl"),
         ("b.txt", "call jan.jansen@acme.nl"),
     ])?;
-    let before = ui.send(Msg::Nav(Page::Inventory))?;
-    // A row for each location, with what the inventory holds of it before the load says more.
+    // No location until one is added: the page says what to do, and nothing comes by itself.
+    let empty = ui.send(Msg::Nav(Page::Inventory))?;
+    expect_drawn(
+        "no locations",
+        &empty,
+        &["No locations yet. Add a folder or file below, or drop one on this page."],
+    )?;
+    expect_not_drawn("no location rows", &empty, &["Remove"])?;
+    let before = ui.poll()?;
+    // A row for the location, with what the inventory holds of it before the load says more.
     expect_drawn("locations", &before, &["Remove", "Nothing found yet"])?;
-    expect_not_drawn("no flyout", &before, &["Locations (3)"])?;
     let drawn = ui.loaded(Store::Inventory, Path::new(""))?;
     let path = folder.display().to_string();
     expect_drawn(

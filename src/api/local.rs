@@ -234,7 +234,7 @@ impl Local {
         all_absolute(paths)?;
         let roots;
         let paths = if paths.is_empty() {
-            roots = self.policy()?.inventory_roots_or_default();
+            roots = self.policy()?.inventory_roots;
             roots.as_slice()
         } else {
             paths
@@ -307,7 +307,7 @@ impl Local {
         let totals = self.inventory.totals();
         Ok(reply::InventoryStatus {
             roots: policy
-                .inventory_roots_or_default()
+                .inventory_roots
                 .iter()
                 .map(|root| lossy(root))
                 .collect(),
@@ -344,13 +344,13 @@ impl Local {
 
     fn inventory_tree(&self, under: Option<&Path>) -> Result<Value, ApiError> {
         under.map(require_absolute).transpose()?;
-        let roots = self.policy()?.inventory_roots_or_default();
+        let roots = self.policy()?.inventory_roots;
         let nodes = self.inventory.children(under, &roots);
         to_json(&reply::Nodes { nodes })
     }
 
     fn inventory_rescan(&self) -> Result<Value, ApiError> {
-        let roots = self.policy()?.inventory_roots_or_default();
+        let roots = self.policy()?.inventory_roots;
         let _lock = self.inventory.lock_scan()?;
         let _running = Running::start(&self.rescanning);
         self.inventory.scan_paths(

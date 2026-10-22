@@ -98,7 +98,7 @@ fn status_line(window: &MainWindow) -> View {
     }
     let (files, hits) = snap.inventory_totals;
     let text = if hits > 0 {
-        found_text(hits, files, snap.policy.inventory_roots_or_default().len())
+        found_text(hits, files, snap.policy.inventory_roots.len())
     } else {
         "Nothing found yet.".to_owned()
     };
@@ -122,18 +122,26 @@ fn location_state(top: &[Node], location: &Path) -> (String, Tone) {
 }
 
 /// The locations the Scan button looks through, one row each like the folders of Watch: with what
-/// was found in it and the button that takes it off. Also the room the card takes.
+/// was found in it and the button that takes it off; or, with none, what to do. Also the room
+/// the card takes.
 fn locations(window: &MainWindow, context: Context<'_>) -> (View, f64) {
+    let roots = &window.snap.policy.inventory_roots;
+    if roots.is_empty() {
+        return (
+            card(caption(
+                "No locations yet. Add a folder or file below, or drop one on this page.",
+            ))
+            .into(),
+            60.0,
+        );
+    }
     let top: &[Node] = window
         .inventory
         .loaded
         .as_ref()
         .map_or(&[], |loaded| &loaded.top);
     places_card(
-        window
-            .snap
-            .policy
-            .inventory_roots_or_default()
+        roots
             .iter()
             .map(|location| {
                 let (state, tone) = location_state(top, location);

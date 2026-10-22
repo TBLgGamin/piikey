@@ -67,36 +67,23 @@ fn feature_edits_report_whether_they_changed_anything() -> Test {
 }
 
 #[test]
-fn the_usual_folders_are_the_locations_until_the_first_change_makes_them_a_choice() -> Test {
-    let usual = quiet().inventory_roots_or_default();
+fn there_is_no_location_until_one_is_added_and_removing_all_leaves_none() -> Test {
     let dir = TempDir::new()?;
+    let other = TempDir::new()?;
     let root = |path: &Path, on| Edit::InventoryRoot {
         path: path.to_path_buf(),
         on,
     };
-
-    // Adding a folder keeps the usual ones next to it, and saves them as the user's.
-    let mut added = quiet();
-    assert!(apply_edit(&mut added, &root(&dir.0, true))?);
-    let mut expected = usual.clone();
-    expected.push(dir.0.clone());
-    assert_eq!(added.inventory_roots, expected);
-
-    // One of the usual ones can be taken off, which it could not be before it was a choice.
-    if let Some(first) = usual.first() {
-        let mut removed = quiet();
-        assert!(apply_edit(&mut removed, &root(first, false))?);
-        assert_eq!(removed.inventory_roots, usual[1..]);
-    }
-
-    // A folder that is not among them changes nothing, and neither does one that already is.
-    let mut same = quiet();
-    assert!(!apply_edit(&mut same, &root(&dir.0, false))?);
-    assert!(same.inventory_roots.is_empty(), "still the usual ones");
-    if let Some(first) = usual.first() {
-        assert!(!apply_edit(&mut same, &root(first, true))?);
-        assert!(same.inventory_roots.is_empty());
-    }
+    let mut policy = quiet();
+    assert!(policy.inventory_roots.is_empty());
+    assert!(apply_edit(&mut policy, &root(&dir.0, true))?);
+    assert!(apply_edit(&mut policy, &root(&other.0, true))?);
+    assert!(apply_edit(&mut policy, &root(&dir.0, false))?);
+    assert!(apply_edit(&mut policy, &root(&other.0, false))?);
+    // Nothing comes back in their place.
+    assert!(policy.inventory_roots.is_empty());
+    // Taking off what is not there changes nothing.
+    assert!(!apply_edit(&mut policy, &root(&dir.0, false))?);
     Ok(())
 }
 

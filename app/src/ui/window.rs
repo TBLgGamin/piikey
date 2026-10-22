@@ -230,8 +230,6 @@ pub enum Msg {
     AddWatch,
     /// A folder taken off the Watch list.
     RemoveWatch(PathBuf),
-    /// Watch Documents, Desktop and Downloads.
-    WatchUsual,
     /// Something was dropped on the window: the paths of the files and folders.
     Dropped(Vec<String>),
     /// Something a dashboard's controls ask for; the store says which dashboard.
@@ -628,12 +626,6 @@ impl MainWindow {
             Msg::RemoveWatch(path) => {
                 let _ = self.edit(Edit::WatchFolder { path, on: false });
             }
-            Msg::WatchUsual => {
-                // A folder that is not there is left out; the others are watched.
-                for path in piikey::policy::default_inventory_roots() {
-                    let _ = self.edit(Edit::WatchFolder { path, on: true });
-                }
-            }
             _ => {}
         }
     }
@@ -907,8 +899,7 @@ impl Component for MainWindow {
             | Msg::RemoveLocation(_)
             | Msg::WatchDraft(_)
             | Msg::AddWatch
-            | Msg::RemoveWatch(_)
-            | Msg::WatchUsual => self.update_lists(message, context),
+            | Msg::RemoveWatch(_) => self.update_lists(message, context),
             Msg::Highlight(_)
             | Msg::Kind(..)
             | Msg::ExplorerMenu(_)
