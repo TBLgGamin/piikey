@@ -74,7 +74,9 @@ pull request titled `chore: release vX.Y.Z` open. `feat` bumps the minor
 version (also before 1.0) and `fix` and `perf` bump the patch version. When the
 maintainer merges that pull request, release-plz tags `vX.Y.Z`, publishes the
 GitHub Release, and the same workflow run builds the portable zip and the
-installer, `SHA256SUMS.txt` and a build-provenance attestation.
+installer, `SHA256SUMS.txt` and a build-provenance attestation. Its last job
+submits the new installer to winget (`TBLgGamin.piikey`) as a pull request to
+`microsoft/winget-pkgs`, using the `WINGET_TOKEN` secret.
 
 `scripts/release-guard.mjs` (run by the `pre-commit` and `pre-push` hooks and
 by CI) and commitlint enforce this. They fail a commit that changes a version

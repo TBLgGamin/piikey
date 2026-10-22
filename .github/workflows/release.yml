@@ -1,7 +1,8 @@
 name: release
 
 # release-plz keeps one "chore: release vX.Y.Z" pull request open. Merging it tags vX.Y.Z, publishes
-# the GitHub Release and builds its assets (release-assets.yml). See CONTRIBUTING.md#releases.
+# the GitHub Release, builds its assets (release-assets.yml) and submits the installer to winget.
+# See CONTRIBUTING.md#releases.
 on:
   push:
     branches: [main]
@@ -71,3 +72,37 @@ jobs:
       contents: write
       id-token: write
       attestations: write
+
+  # A pull request to microsoft/winget-pkgs with the new installer, made by Komac from the version
+  # already there. Needs the secret WINGET_TOKEN: a classic PAT of TBLgGamin with `public_repo`
+  # (the PR comes from the fork TBLgGamin/winget-pkgs). Without it the release still goes out.
+  winget:
+    needs: [release, assets]
+    if: needs.release.outputs.tag != ''
+    runs-on: ubuntu-latest
+    permissions: {}
+    env:
+      # Komac is a single binary; pinned by version and SHA-256 (its release's SHA256SUMS).
+      KOMAC_VERSION: 2.17.1
+      KOMAC_SHA256: e694e79cd451afabf47bead66ed34586fef4814f7b94e4b61a098f419978d5d7
+    steps:
+      - name: Submit the installer to winget
+        env:
+          TAG: ${{ needs.release.outputs.tag }}
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          if [ -z "$WINGET_TOKEN" ]; then
+            echo "::warning::WINGET_TOKEN is not set: $TAG was not submitted to winget"
+            exit 0
+          fi
+          archive="komac-$KOMAC_VERSION-x86_64-unknown-linux-gnu.tar.gz"
+          curl -fsSL -o "$archive" "https://github.com/russellbanks/Komac/releases/download/v$KOMAC_VERSION/$archive"
+          echo "$KOMAC_SHA256  $archive" | sha256sum -c -
+          tar -xzf "$archive" komac
+          version="${TAG#v}"
+          ./komac update TBLgGamin.piikey \
+            --version "$version" \
+            --urls "https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/piikey-$version-setup-x64.exe" \
+            --release-notes-url "https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG" \
+            --submit \
+            --token "$WINGET_TOKEN"
