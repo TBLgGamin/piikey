@@ -88,7 +88,7 @@ impl View {
             Request::ApiToken { .. } => Self::Token,
             Request::Status => Self::Status,
             Request::Protection { .. } => Self::Protection,
-            Request::ExplorerScan { .. } => Self::Json,
+            Request::ExplorerScan { .. } | Request::ShowWindow => Self::Json,
         }
     }
 }

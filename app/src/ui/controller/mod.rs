@@ -1,4 +1,4 @@
-//! App state behind the UI: start and stop, certificate, settings, keyed values, the PII inventory
+//! App state behind the UI: start and stop, certificate, settings, the vault's values, the inventory
 //! and the scans that fill it.
 //!
 //! Everything that can block (`certutil`, CA files, binding the proxy, `WinINET`, settings and vault
@@ -13,7 +13,7 @@
 //! - [`settings`]: following the settings with what runs because of them.
 //! - [`model`]: the detection model's download, load and release.
 //! - [`keyed`]: the vault's values, where they went, and the activity feed.
-//! - [`inventory`]: the PII inventory, its scans and the scan thread.
+//! - [`inventory`]: the inventory, its scans and the scan thread.
 //! - [`edit`]: the edits of the settings, applied to a [`Policy`].
 //!
 //! Lock order: nothing else is locked while a `Shared` lock is held, and `Shared` is never locked
@@ -53,10 +53,12 @@ use crate::{
     proxy::{Event, Shared},
 };
 
+#[cfg(test)]
+pub use self::keyed::RECENT;
 pub use self::{
     edit::{Edit, apply_edit},
     inventory::{InventoryView, Reveal},
-    keyed::{Keyed, KeyedPage, KeyedQuery, Period, RECENT, Sent},
+    keyed::{Keyed, KeyedPage, KeyedQuery, Period, Sent},
     model::Model,
 };
 
@@ -88,7 +90,7 @@ pub trait Backend: Send + Sync + 'static {
     fn save_policy(&self, policy: &Policy) -> Res<()>;
     /// Opens the engine over the vault.
     fn open_engine(&self) -> Res<Engine>;
-    /// Opens the PII inventory: which files hold personal data, never the values.
+    /// Opens the inventory: which files hold personal data, never the values.
     fn open_inventory(&self) -> Res<Inventory>;
     /// The saved activity feed; empty when there is none or it cannot be read.
     fn load_activity(&self) -> Activity;
@@ -107,7 +109,7 @@ pub trait Backend: Send + Sync + 'static {
     fn token(&self, rotate: bool) -> Res<String>;
     /// Starts the local HTTP API on `127.0.0.1:port`, asking for `token`.
     fn start_http(&self, port: u16, token: String) -> Res<Box<dyn Running>>;
-    /// Adds or removes "Scan for PII" in Explorer's right-click menu.
+    /// Adds or removes "Scan for personal data" in Explorer's right-click menu.
     fn set_explorer_menu(&self, on: bool) -> Res<()>;
     /// Registers (`on`) or gives back the shortcut of the highlight, Ctrl+Alt+P. The error says
     /// why not, in words for the user: another program may have the shortcut.
@@ -180,7 +182,7 @@ pub struct Snapshot {
     /// Proxies issued so far: vault records.
     pub issued: u64,
     pub policy: Policy,
-    /// The [`RECENT`] most recently sent values, filled up with the newest records.
+    /// The `RECENT` most recently sent values, filled up with the newest records.
     pub recent: Vec<Keyed>,
     /// The latest masking or restoring this session.
     pub last_activity: Option<Sent>,
@@ -196,6 +198,9 @@ pub struct Snapshot {
     pub http: bool,
     /// The highlight is paused: in Always mode its shortcut pauses and resumes it.
     pub highlight_paused: bool,
+    /// How many times something asked for the window to come forward (a second start of the
+    /// app, `piikey-cli open`), 0 before the first: see [`Controller::request_window`].
+    pub show: u64,
 }
 
 /// What the application thread watches while no window is open: what the tray icon shows, and
@@ -209,6 +214,8 @@ pub struct Tray {
     pub highlight_paused: bool,
     /// The number of the latest request to show a scan, 0 before the first: [`Reveal::seq`].
     pub reveal: u64,
+    /// How many times something asked for the window to come forward: [`Snapshot::show`].
+    pub show: u64,
 }
 
 /// Work for the worker thread.
@@ -236,7 +243,7 @@ pub enum Command {
     Settings(SettingsPatch),
     /// Scan the watched folders again now.
     Rescan,
-    /// Scan these files and folders into the inventory, as Explorer's "Scan for PII" does. With
+    /// Scan these files and folders into the inventory, as Explorer's "Scan for personal data" does. With
     /// `reveal` the window comes forward with the result.
     ScanFiles {
         paths: Vec<PathBuf>,
@@ -281,6 +288,8 @@ struct State {
     scan: Option<Arc<Progress>>,
     /// See [`Snapshot::reveal`].
     reveal: Option<Reveal>,
+    /// See [`Snapshot::show`].
+    show: u64,
     inventory_totals: Totals,
 }
 
@@ -356,7 +365,7 @@ impl Controller {
                 backend
                     .open_inventory()
                     .map(|inventory| (engine, inventory))
-                    .map_err(|error| format!("could not open the PII inventory: {error}"))
+                    .map_err(|error| format!("could not open the inventory: {error}"))
             });
         let (engine, inventory) = match opened {
             Ok(opened) => opened,
@@ -446,6 +455,7 @@ impl Controller {
                 fetch: Fetch::default(),
                 scan: None,
                 reveal: None,
+                show: 0,
                 inventory_totals,
             }),
             changed: Condvar::new(),
@@ -504,6 +514,7 @@ impl Controller {
                 )
             }),
             reveal: state.reveal.clone(),
+            show: state.show,
             inventory_totals: (
                 state.inventory_totals.files_with_pii,
                 state.inventory_totals.hits,
@@ -576,6 +587,12 @@ impl Controller {
         self.update(|state| state.notice = Some(notice));
     }
 
+    /// Asks for the window to come forward, opening it if it is closed: what a second start of
+    /// the app asks of the one that runs. The app thread sees [`Tray::show`] grow.
+    pub fn request_window(&self) {
+        self.update(|state| state.show += 1);
+    }
+
     /// Whether the highlight is paused: in Always mode its shortcut pauses and resumes it.
     pub fn highlight_paused(&self) -> bool {
         self.shared.purpose.paused()
@@ -589,6 +606,7 @@ impl Controller {
             on: state.enabled || state.busy == Some(Busy::Starting),
             highlight_paused: paused,
             reveal: state.reveal.as_ref().map_or(0, |reveal| reveal.seq),
+            show: state.show,
         }
     }
 

@@ -34,7 +34,7 @@ piikey is a personal-data manager that runs in the background on your PC. It fin
 phone numbers, IBANs, card numbers, addresses and other personal data and puts you in charge of it,
 in four ways:
 
-- **Mask what you send.** For the sites and programs you choose (chatbots, webmail, forms, anything
+- **Mask what you send.** For the sites and apps you choose (chatbots, webmail, forms, anything
   that goes through the Windows proxy), piikey swaps each value for a believable stand-in of the same
   shape before the message leaves your PC, and puts your real values back into the answer.
 - **Flag what you type.** The field you are typing in gets a purple outline when it holds personal
@@ -51,8 +51,8 @@ back into your values by `piikey-cli deanonymize --tolerant`: the full names, th
 "Kevin" and the phone number all come back as yours.
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/home-dark.png">
-  <img alt="piikey's Home page: protection switch, key numbers, and a treemap of the folders and files that hold personal data" src="docs/assets/screenshots/home-light.png" width="900">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/overview-dark.png">
+  <img alt="piikey's Overview page: protection is on, with one switch, what piikey is doing (masking, highlighting, inventory, vault, detection) and the latest swaps" src="docs/assets/screenshots/overview-light.png" width="900">
 </picture>
 
 ## Features
@@ -60,7 +60,7 @@ back into your values by `piikey-cli deanonymize --tolerant`: the full names, th
 <table>
   <tr>
     <td width="48"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/icons/dark/mask.svg"><img src="docs/assets/icons/light/mask.svg" width="28" height="28" alt=""></picture></td>
-    <td><b>Masking for sites and programs</b><br>Replaces what you type or paste into the sites and programs you protect with format-preserving stand-ins, restores them in the (streamed) answer, and forgives typos and lone first names.</td>
+    <td><b>Masking for sites and apps</b><br>Replaces what you type or paste into the sites and apps you protect with format-preserving stand-ins, restores them in the (streamed) answer, and forgives typos and lone first names.</td>
   </tr>
   <tr>
     <td><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/icons/dark/highlight.svg"><img src="docs/assets/icons/light/highlight.svg" width="28" height="28" alt=""></picture></td>
@@ -68,11 +68,11 @@ back into your values by `piikey-cli deanonymize --tolerant`: the full names, th
   </tr>
   <tr>
     <td><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/icons/dark/explorer.svg"><img src="docs/assets/icons/light/explorer.svg" width="28" height="28" alt=""></picture></td>
-    <td><b>"Scan for PII" in Explorer</b><br>Right-click a file or folder to see what personal data it holds.</td>
+    <td><b>"Scan for personal data" in Explorer</b><br>Right-click a file or folder to see what personal data it holds.</td>
   </tr>
   <tr>
     <td><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/icons/dark/inventory.svg"><img src="docs/assets/icons/light/inventory.svg" width="28" height="28" alt=""></picture></td>
-    <td><b>PII inventory</b><br>A treemap of your folders sized by the personal data in them, with actions per file: open, show in Explorer, rescan, make a masked copy, exclude, export a report.</td>
+    <td><b>Inventory</b><br>A treemap of your folders sized by the personal data in them, with actions per file: open, show in Explorer, rescan, make a masked copy, exclude, export a report.</td>
   </tr>
   <tr>
     <td><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/icons/dark/subject.svg"><img src="docs/assets/icons/light/subject.svg" width="28" height="28" alt=""></picture></td>
@@ -129,10 +129,10 @@ flowchart LR
     subgraph tray ["piikey.exe, in the tray"]
         capture["capture: focused field and clipboard"] --> overlay["highlight overlay"]
         capture --> typed["typed-value store"] --> proxy["proxy: mask and restore"]
-        loop["inventory loop"] --> inv[("inventory.jsonl")] --> home["Home treemap"]
+        loop["inventory loop"] --> inv[("inventory.jsonl")] --> map["Inventory map"]
         api["API"]
     end
-    explorer["Explorer: Scan for PII"] -->|pipe| api
+    explorer["Explorer: Scan for personal data"] -->|pipe| api
     cli["piikey-cli"] -->|pipe| api
     scripts["scripts and CI"] -->|"HTTP and token"| api
     api --> core["engine and vault"]
@@ -141,31 +141,72 @@ flowchart LR
 ```
 
 piikey sets itself as the Windows proxy while protection is on. It only opens the traffic of sites
-and programs you protect; everything else passes through untouched. If the app crashes, a watchdog
+and apps you protect; everything else passes through untouched. If the app crashes, a watchdog
 gives Windows its previous proxy settings back. The highlight, the inventory and the API run in the
 same app and need no proxy. Detection, the proxy, the app's pages and the files piikey keeps are
 described in [docs/how-it-works.md](docs/how-it-works.md).
 
-## Screenshots
+## The app
+
+`piikey.exe` is one window with five pages, and a tray icon.
+
+- **Overview** says in one sentence whether protection is on, and has the one Turn on / Turn off
+  button. When something needs you, such as a certificate that is not installed, one message shows
+  with its fix button. Below it, five rows say what piikey is doing (Masking, Highlighting,
+  Inventory, Vault, Detection; each opens its page), then the five latest swaps.
+- **Protection** holds the master switch, the certificate, the protected sites, the protected apps
+  and the highlighting mode.
+- **Inventory** has its own switch, the treemap of where personal data is stored, the watched
+  folders, what is left out, and the "Scan for personal data" entry for Explorer's menu.
+- **Vault** lists every value next to its stand-in, newest first, with search and filters by type,
+  site and time, and Forget per value. Export and the two-click Wipe sit under Manage.
+- **Settings** is one scrolling page: General (Start piikey when I sign in), Detection (the model
+  and where it runs), Types of personal data, Developer access (the local HTTP API, token and
+  pipe), Privacy & data and About.
+
+The tray icon shows the same status as Overview (the key in grey while protection is off, the app
+icon while it is on, with an amber dot when it needs you). Its menu has Open piikey, Turn protection
+on or off, and Quit piikey. Closing the window leaves piikey running in the tray while protection,
+highlighting, the inventory or the API is on. Starting piikey again while it runs brings the window
+forward instead of starting a second copy (`piikey-cli open` does the same). With "Start piikey when
+I sign in" on, piikey starts in the tray at sign-in without a window.
 
 <table>
   <tr>
     <td width="50%">
       <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/keyed-dark.png">
-        <img alt="Keyed values: every value in the vault next to its stand-in, with where and when it was sent" src="docs/assets/screenshots/keyed-light.png">
+        <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/protection-dark.png">
+        <img alt="Protection page: the master switch, the certificate, the protected sites and apps, and highlighting" src="docs/assets/screenshots/protection-light.png">
+      </picture>
+    </td>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/inventory-dark.png">
+        <img alt="Inventory page: a treemap of the folders and files that hold personal data, with the watched folders and the Explorer menu entry" src="docs/assets/screenshots/inventory-light.png">
+      </picture>
+    </td>
+  </tr>
+  <tr>
+    <td><b>Protection</b>: what piikey masks and highlights. The certificate, the sites and apps you protect, and the highlighting mode.</td>
+    <td><b>Inventory</b>: where personal data is stored on this PC, as a treemap sized by the number of values, with the folders piikey watches.</td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/vault-dark.png">
+        <img alt="Vault page: every value next to its stand-in, with where and when it was sent, and search and filters" src="docs/assets/screenshots/vault-light.png">
       </picture>
     </td>
     <td width="50%">
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/settings-dark.png">
-        <img alt="Settings, General tab: a card for every feature with its switch, and tabs for masking, detection, the inventory, the API and the vault" src="docs/assets/screenshots/settings-light.png">
+        <img alt="Settings page: start at sign-in, the detection model, the types of personal data, developer access, privacy and data, and about" src="docs/assets/screenshots/settings-light.png">
       </picture>
     </td>
   </tr>
   <tr>
-    <td><b>Keyed values</b>: every value in the vault next to its stand-in, most recently sent first, with search and filters by kind, site and time.</td>
-    <td><b>Settings</b>: seven tabs. General has a switch for each feature; Masking holds the certificate and the sites and programs to protect; Detection has a switch for every kind of personal data; Inventory the folders to scan; API the pipe, the HTTP address and the token; Vault export and wipe; About the version.</td>
+    <td><b>Vault</b>: every value next to its stand-in, most recently swapped first, with search and filters by type, site and time.</td>
+    <td><b>Settings</b>: start at sign-in, the detection model and the types of personal data piikey looks for, the local HTTP API, and where your data is kept.</td>
   </tr>
 </table>
 
@@ -178,8 +219,8 @@ Download from the [latest release](https://github.com/TBLgGamin/piikey/releases/
 - **Portable** (`piikey-<version>-windows-x64.zip`): unzip it anywhere and run `piikey\piikey.exe`.
 
 On first start, piikey downloads its detection model (about 343 MB, checked with SHA-256) to
-`%LOCALAPPDATA%\piikey\models`. Turn protection on, pick your sites, and accept the certificate
-prompt once.
+`%LOCALAPPDATA%\piikey\models`. On the Protection page install the certificate (Windows asks once),
+tick your sites, then turn protection on at Overview.
 
 The builds are not code-signed yet, so Windows SmartScreen asks once: choose **More info**, then
 **Run anyway**.
@@ -198,16 +239,16 @@ gh attestation verify piikey-0.1.0-setup-x64.exe --repo TBLgGamin/piikey
 ```
 
 **Uninstall** (Settings > Apps, or the Start menu). The uninstaller stops piikey, gives Windows its
-proxy settings back, and removes the local certificate. It then asks before it deletes your data
-in `%LOCALAPPDATA%\piikey`. Keep that data if you still want earlier stand-ins to come back as
-your values.
+proxy settings back, removes the start-at-sign-in entry and the local certificate. It then asks
+before it deletes your data in `%LOCALAPPDATA%\piikey`. Keep that data if you still want earlier
+stand-ins to come back as your values.
 
 ## Accuracy and speed
 
 From the benchmark in [`eval/`](eval/README.md): regex pass plus model, on the CPU of an AMD Ryzen 5
 9600X.
 
-| Corpus | Overlap F1 | PII characters leaked | Docs/s (batches of 32) |
+| Corpus | Overlap F1 | Personal-data characters leaked | Docs/s (batches of 32) |
 |---|---:|---:|---:|
 | Hand-made NL/EN/DE chatbot prompts | 0.945 | 5.4% | 188 |
 | gretel_en (synthetic English) | 0.889 | 3.5% | 68 |
@@ -220,9 +261,10 @@ the failure modes and how these numbers compare with published ones.
 ## API
 
 Everything piikey does is one JSON API. The app serves it on a named pipe, and on an HTTP port at
-127.0.0.1 if you switch that on in Settings > General. `piikey-cli` is a client of the same API, so
-each operation below is also a subcommand. Without the app, `piikey-cli` runs the same operations in
-its own process (`--local`), except `protection` and `explorer_scan`, which answer `app_required`.
+127.0.0.1 if you switch that on in Settings > Developer access. `piikey-cli` is a client of the same
+API, so each operation below is also a subcommand. Without the app, `piikey-cli` runs the same
+operations in its own process (`--local`), except `protection`, `explorer_scan` and `show_window`,
+which answer `app_required`.
 
 | Operation (`op`) | Does | CLI |
 |---|---|---|
@@ -231,7 +273,7 @@ its own process (`--local`), except `protection` and `explorer_scan`, which answ
 | `scan_files` | Scans files and folders, and records the result in the inventory unless `record` is false. | `scan PATH...` |
 | `anonymize_files`, `deanonymize_files` | Rewrites files into `out`. | `anonymize --out DIR PATH...`, `deanonymize ...` |
 | `subject_search` | Finds the files that mention the given `values` (no `paths`: the inventory folders). | `subject --value V` |
-| `vault_list` | Lists the vault, newest first, filtered by `query` and `kind`, paged by `limit` and `offset`. | `vault list` |
+| `vault_list` | Lists the vault, newest first, filtered by `query` and `kind` (the type), paged by `limit` and `offset`. | `vault list` |
 | `vault_forget` | Forgets the records whose value or stand-in is one of `values`. | `vault forget VALUE...` |
 | `vault_export` | Writes the vault to a new file as JSON or CSV. | `vault export --out FILE` |
 | `vault_wipe` | Deletes every record. Needs `"confirm": true`. | `vault wipe --yes` |
@@ -239,12 +281,13 @@ its own process (`--local`), except `protection` and `explorer_scan`, which answ
 | `inventory_list`, `inventory_tree` | The files with personal data, or the treemap's nodes under a path. | `inventory list`, `inventory tree` |
 | `inventory_rescan`, `inventory_report` | Scans the inventory folders now; writes a JSON or CSV report. | `inventory rescan`, `inventory report` |
 | `settings_get`, `settings_set` | Reads or changes the settings (the `guard.cfg` keys). | `settings get`, `settings set KEY=VALUE...` |
-| `kinds` | The kinds of personal data, their groups, and whether each is on. | `kinds` |
+| `kinds` | The types of personal data (the `kind` field), their groups, and whether each is on. | `kinds` |
 | `model_status`, `model_download` | The detection model's state; downloads it. | `model status`, `model download` |
 | `api_token` | The HTTP token; `rotate` makes a new one. | `token [--rotate]` |
 | `status` | Whether the app runs, protection, version, vault size, model and feature switches. | `status` |
 | `protection` | Turns masking on or off. App only. | `protection on\|off` |
-| `explorer_scan` | Scans paths and shows them on Home. App only; the Explorer menu uses it. | none |
+| `explorer_scan` | Scans paths and shows them on the Inventory page. App only; the Explorer menu uses it. | none |
+| `show_window` | Brings the app's window forward. App only; a second start of `piikey.exe` uses it. | `open` |
 
 **Replies** share one envelope: `{"ok": true, "result": ...}`, or `{"ok": false, "error": {"code":
 "...", "message": "..."}}`. The codes are `bad_request`, `app_required`, `not_found`, `busy`, `io`,
@@ -257,7 +300,7 @@ bytes `P`, `2`, `0`, `0`, a `u32` little-endian length, then the request JSON, f
 three zero bytes, a `u32` little-endian length and the envelope. Version 1 (binary) is no longer
 accepted.
 
-**HTTP.** Turn on "Local HTTP API" in Settings > General (default port 7980, loopback only). Send
+**HTTP.** Turn on "Local HTTP API" in Settings > Developer access (default port 7980, loopback only). Send
 `POST /v1/<op>` with the request's fields as the JSON body (without `op`; `GET /v1/status` also
 works) and a bearer token from `piikey-cli token`. Requests with an `Origin` header are refused, so
 web pages cannot call it. Replies use the envelope, with the HTTP status 200, 400, 401, 403, 404,
@@ -300,6 +343,7 @@ piikey-cli vault wipe --yes
 piikey-cli inventory status | list [--under PATH] [--limit N] [--offset N] | tree [--under PATH] | rescan | report --out FILE [--format json|csv]
 piikey-cli settings get | settings set KEY=VALUE...      keys = guard.cfg keys; list keys repeat (site=a site=b)
 piikey-cli kinds | model status | model download | token [--rotate] | status | protection on|off
+piikey-cli open      brings the running app's window forward (needs the app)
 piikey-cli serve [--http [--port N]] [--pipe NAME]
 global: --json  --local  --vault PATH  -h/--help  -V/--version
 ```
@@ -318,14 +362,14 @@ global: --json  --local  --vault PATH  -h/--help  -V/--version
   created it can read; `--vault PATH` does the same on the vault at PATH. `serve` serves the API
   from the terminal when the app is not running.
 - The CLI uses the detection model once it is downloaded (`model download`, or the app does it),
-  and finds patterns only until then. Kinds switched off in Settings > Detection are off here too.
+  and finds patterns only until then. Types switched off in Settings > Types of personal data are off here too.
 
 **Exit codes:** 0 success; 1 personal data found under `--fail-on`; 2 usage error; 3 any API error.
 
 ### Use it as a pre-commit / CI gate
 
 `scan --fail-on any` exits 1 when a file holds personal data, and `--fail-on email,iban` limits it
-to those kinds (see `piikey-cli kinds`). `--no-record` keeps the scan out of the inventory.
+to those types (see `piikey-cli kinds`). `--no-record` keeps the scan out of the inventory.
 
 `.git/hooks/pre-commit`:
 
@@ -350,7 +394,7 @@ only (emails, phone numbers, IBANs, cards and so on):
   run: git ls-files -z | xargs -0 "$RUNNER_TEMP/piikey/piikey-cli.exe" scan --local --no-record --fail-on any
 ```
 
-To find names, places and the other kinds that only the detection model sees, add a step that runs
+To find names, places and the other types that only the detection model sees, add a step that runs
 `piikey-cli.exe model download` first (about 340 MB, so cache the model folder between runs).
 
 ## Build from source
@@ -381,9 +425,9 @@ Checks: `cargo fmt-check`, `cargo lint`, and `cargo test --all-targets`.
 
 - Everything runs locally. piikey makes one network call of its own: the model download from
   Hugging Face, which is checked with SHA-256.
-- Your values exist in one place only, the encrypted vault in `%LOCALAPPDATA%\piikey`. The activity
-  feed keeps stand-ins, sites and counts. The PII inventory keeps paths and counts per kind, never
-  values.
+- Your values exist in one place only, the encrypted vault in `%LOCALAPPDATA%\piikey`. The list of
+  swaps on the Vault page keeps stand-ins, sites and times. The inventory keeps paths and counts per
+  type, never values.
 - Masking and the highlight read the focused field only, never a password field, and the highlight
   stores nothing.
 - The HTTP API is off by default. When on, it listens on loopback only, needs a token and refuses

@@ -400,6 +400,10 @@ fn a_command_that_cannot_be_done_exits_three_with_the_reason() -> TestResult {
     assert_eq!(got.code, Some(3), "{}", got.err);
     let error: Value = serde_json::from_str(&got.out)?;
     assert_eq!(error["code"], "app_required");
+    let got = sandbox.run(&["--json", "open"], "")?;
+    assert_eq!(got.code, Some(3), "{}", got.err);
+    let error: Value = serde_json::from_str(&got.out)?;
+    assert_eq!(error["code"], "app_required");
     // Text that is no text.
     let mut child = sandbox
         .cli()

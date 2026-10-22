@@ -48,8 +48,8 @@ const LIST_DEFAULT: usize = 100;
 const LIST_MAX: usize = 10_000;
 
 /// Answers every request in this process, on the engine, the inventory and the saved settings
-/// it was given. Only what needs the app is refused: `protection` and `explorer_scan` answer
-/// `app_required`.
+/// it was given. Only what needs the app is refused: `protection`, `explorer_scan` and
+/// `show_window` answer `app_required`.
 ///
 /// The settings and the token are read from and written to the data folder
 /// (`%LOCALAPPDATA%\piikey`), so they are the user's, like the app's. The kinds of personal data
@@ -511,6 +511,7 @@ impl Handler for Local {
             Request::Status => to_json(&self.status()?),
             Request::Protection { .. } => Err(app_required("protection")),
             Request::ExplorerScan { .. } => Err(app_required("explorer_scan")),
+            Request::ShowWindow => Err(app_required("show_window")),
         }
     }
 }
@@ -1090,6 +1091,7 @@ mod tests {
             Request::ExplorerScan {
                 paths: vec![fx.dir.file("x")],
             },
+            Request::ShowWindow,
         ] {
             let error = fx.ask(request).err().ok_or("answered without the app")?;
             assert_eq!(error.code(), "app_required");

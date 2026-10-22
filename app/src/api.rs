@@ -150,6 +150,12 @@ impl AppApi {
         Ok(json!({}))
     }
 
+    /// Asks the app thread to bring the window forward.
+    fn show_window(&self) -> Result<Value, ApiError> {
+        self.controller()?.request_window();
+        Ok(json!({}))
+    }
+
     /// What [`Local`] says of the inventory, with the progress of the scan the controller runs:
     /// the app's scans are its own, not [`Local`]'s.
     fn inventory_status(&self) -> Result<Value, ApiError> {
@@ -246,6 +252,7 @@ impl Handler for AppApi {
             Request::Status => self.status(),
             Request::SettingsSet { settings } => self.settings_set(&settings),
             Request::ExplorerScan { paths } => self.explorer_scan(paths),
+            Request::ShowWindow => self.show_window(),
             Request::InventoryStatus => self.inventory_status(),
             Request::InventoryRescan => self.inventory_rescan(),
             Request::ModelStatus => self.model_status(),
@@ -407,6 +414,18 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         };
         assert_eq!(reveal.select, Some(file));
+        Ok(())
+    }
+
+    #[test]
+    fn show_window_asks_the_application_thread_for_the_window() -> Test {
+        let dir = TempDir::new()?;
+        let (api, controller) = api(&dir)?;
+        assert_eq!(controller.tray().show, 0);
+        assert_eq!(ask(&api, Request::ShowWindow)?, json!({}));
+        assert_eq!(ask(&api, Request::ShowWindow)?, json!({}));
+        assert_eq!(controller.tray().show, 2);
+        assert_eq!(controller.snapshot().show, 2);
         Ok(())
     }
 

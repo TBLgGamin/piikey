@@ -1,12 +1,12 @@
 //! The first-run screen, shown instead of the pages while the detection model downloads.
 
 use windows_reactor::{
-    Button, ButtonStyle, FontWeight, HorizontalAlignment, Image, InfoBarSeverity, Orientation,
-    ProgressBar, RichText, RichTextBlock, RichTextInline, RichTextRun, StackPanel, Stretch,
-    TextBlock, TextWrapping, VerticalAlignment, View,
+    Button, ButtonStyle, HorizontalAlignment, Image, InfoBarSeverity, Orientation, ProgressBar,
+    RichText, RichTextBlock, RichTextInline, RichTextRun, StackPanel, Stretch, TextAlignment,
+    TextWrapping, VerticalAlignment, View,
 };
 
-use super::{Context, caption, info};
+use super::kit::{Context, body, caption, info, subtitle};
 use crate::ui::{
     assets,
     controller::Model,
@@ -42,11 +42,12 @@ pub fn screen(window: &MainWindow, context: Context<'_>) -> StackPanel {
             .stretch(Stretch::Uniform)
             .height(120.0)
             .into(),
-        TextBlock::new()
-            .text("Getting piikey ready")
-            .font_size(24.0)
-            .font_weight(FontWeight::SEMI_BOLD)
+        subtitle("Getting piikey ready")
             .horizontal_alignment(HorizontalAlignment::Center)
+            .into(),
+        body("piikey downloads the detection model once. It finds names and addresses on this PC, and nothing about you leaves it.")
+            .text_alignment(TextAlignment::Center)
+            .opacity(0.72)
             .into(),
     ];
     match &window.snap.model {

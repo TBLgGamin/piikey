@@ -192,11 +192,14 @@ pub enum Request {
     /// Scans files and folders as Explorer's "Scan for PII" does and shows the result in the
     /// app. Needs the app. Result: `{}`.
     ExplorerScan { paths: Vec<PathBuf> },
+    /// Brings the app's window forward, opening it when it is closed. What a second start of
+    /// `piikey.exe` asks of the app that runs. Needs the app. Result: `{}`.
+    ShowWindow,
 }
 
 impl Request {
     /// The names of all ops, as they are spelled in `op` and in HTTP paths.
-    pub const OPS: [&'static str; 25] = [
+    pub const OPS: [&'static str; 26] = [
         "scan_text",
         "anonymize",
         "deanonymize",
@@ -222,6 +225,7 @@ impl Request {
         "status",
         "protection",
         "explorer_scan",
+        "show_window",
     ];
 
     /// This request's op, one of [`Request::OPS`].
@@ -253,6 +257,7 @@ impl Request {
             Self::Status => "status",
             Self::Protection { .. } => "protection",
             Self::ExplorerScan { .. } => "explorer_scan",
+            Self::ShowWindow => "show_window",
         }
     }
 }
@@ -626,6 +631,7 @@ mod tests {
             Request::ExplorerScan {
                 paths: vec![path()],
             },
+            Request::ShowWindow,
         ]
     }
 

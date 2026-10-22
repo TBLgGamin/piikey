@@ -36,7 +36,8 @@ fn an_explorer_scan_fills_the_inventory_and_asks_the_window_to_show_it() -> Test
         Tray {
             on: false,
             highlight_paused: false,
-            reveal: 1
+            reveal: 1,
+            show: 0
         }
     );
     // A scan writes nothing to the vault.

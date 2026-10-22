@@ -17,7 +17,7 @@ use super::map::MAX_TILES;
 use crate::ui::{
     activity,
     controller::InventoryView,
-    pages::{counted, thousands},
+    pages::kit::{counted, thousands},
     window::Selection,
 };
 
@@ -171,7 +171,7 @@ fn entry_summary(entry: &Entry) -> String {
     match &entry.status {
         Status::Ok if entry.hits() == 0 => "No personal data found.".to_owned(),
         Status::Ok => found_text(entry.hits(), 1),
-        Status::Unsupported => "piikey cannot read this kind of file.".to_owned(),
+        Status::Unsupported => "piikey cannot read this type of file.".to_owned(),
         Status::TooLarge => format!(
             "Too large to scan: piikey skips files over {} MB.",
             MAX_FILE >> 20
@@ -288,7 +288,7 @@ pub(super) fn panel<'a>(
     }
 }
 
-/// "Last scanned 14:05": when a scan looked at the file, told the way the feed of Keyed values
+/// "Last scanned 14:05": when a scan looked at the file, told the way the vault's list
 /// tells times.
 pub(super) fn scanned_text(scanned: u64) -> String {
     let secs = i64::try_from(scanned).unwrap_or(i64::MAX);

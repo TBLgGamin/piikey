@@ -523,6 +523,8 @@ fn small_commands() {
     assert!(usage_error(&["protection"]));
     assert!(usage_error(&["protection", "maybe"]));
     assert!(usage_error(&["protection", "on", "off"]));
+    same(&request(&["open"]), &Request::ShowWindow);
+    assert!(usage_error(&["open", "now"]));
     assert!(usage_error(&["model"]));
     assert!(usage_error(&["model", "remove"]));
     assert!(usage_error(&["kinds", "email"]));
@@ -622,7 +624,7 @@ fn an_empty_path_is_a_mistake() {
 
 #[test]
 fn every_operation_but_the_explorer_one_has_a_command() {
-    let lines: [&[&str]; 25] = [
+    let lines: [&[&str]; 26] = [
         &["scan"],
         &["anonymize"],
         &["deanonymize"],
@@ -647,6 +649,7 @@ fn every_operation_but_the_explorer_one_has_a_command() {
         &["token"],
         &["status"],
         &["protection", "on"],
+        &["open"],
         &["serve"],
     ];
     let mut ops = BTreeSet::new();

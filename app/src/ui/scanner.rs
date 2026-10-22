@@ -18,7 +18,7 @@ use std::{
 /// How long the watched folders go without a scan.
 pub const EVERY: Duration = Duration::from_hours(1);
 
-/// A scan somebody asked for: Explorer's "Scan for PII", a rescan, the API.
+/// A scan somebody asked for: Explorer's "Scan for personal data", a rescan, the API.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
     pub paths: Vec<PathBuf>,

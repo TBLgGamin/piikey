@@ -29,7 +29,7 @@ pub enum Edit {
     },
     /// When the field in focus is outlined if it holds personal data.
     Highlight(Highlight),
-    /// Whether Explorer's right-click menu offers "Scan for PII".
+    /// Whether Explorer's right-click menu offers "Scan for personal data".
     ExplorerMenu(bool),
     /// Whether the inventory scans the watched folders in the background. Switching it on with
     /// no folder chosen watches the usual ones.
@@ -68,7 +68,7 @@ pub fn apply_edit(policy: &mut Policy, edit: &Edit) -> Res<bool> {
         Edit::Program { exe, on: true } => {
             let parsed = Policy::parse_program(exe).ok_or_else(|| {
                 format!(
-                    "\"{}\" is not a program name. Use a name such as chrome.exe.",
+                    "\"{}\" is not an app name. Use a name such as chrome.exe.",
                     exe.trim()
                 )
             })?;

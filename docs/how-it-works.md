@@ -6,9 +6,9 @@ with stand-ins in it, piikey swaps the originals back in.
 
 ## Detection
 
-piikey first looks for PII with validated regexes, which use checksums and context keywords. An
-on-device detection model then finds what patterns cannot: a token classifier on the CPU, with the
-GPU joining in through DirectML for large batches.
+piikey first looks for personal data with validated regexes, which use checksums and context
+keywords. An on-device detection model then finds what patterns cannot: a token classifier on the
+CPU, with the GPU joining in through DirectML for large batches.
 
 Regex: emails, phone numbers (international/NANP/NL/EU), IBAN (mod-97),
 credit cards (Luhn), IPv4/IPv6, MAC, US SSN, NL BSN (11-proof), URL
@@ -24,17 +24,17 @@ political opinion, religion, sexual orientation, trade union, criminal record).
 `%LOCALAPPDATA%\piikey\models` on first start; the CLI uses it once it is
 there and masks patterns only until then.
 
-Each value is replaced with a believable format-preserving stand-in (the pattern kinds carry an
+Each value is replaced with a believable format-preserving stand-in (the pattern types carry an
 invisible keyed watermark). The original↔stand-in mapping is kept in an encrypted vault whose key is
 protected by Windows DPAPI. Deanonymize swaps issued stand-ins back to their originals.
 
 ## Proxy and capture
 
-`piikey.exe` puts piikey in front of the sites and programs you pick, for example chatbots. A local
+`piikey.exe` puts piikey in front of the sites and apps you pick, for example chatbots. A local
 proxy anonymizes what they receive and restores what they send back, including streamed replies, a
 typo'd stand-in and a partial name mention.
 
-While protection is on, piikey masks only what you type or paste into those sites and programs
+While protection is on, piikey masks only what you type or paste into those sites and apps
 (plus the files you upload there). It reads the focused text field through Windows UI Automation,
 the interface screen readers use, and the clipboard when you paste, finds the personal data in that
 text, and replaces exactly those values in what the page sends, so scripts, ids and telemetry are
@@ -42,7 +42,7 @@ left alone. Password fields are never read, nothing needs installing in the brow
 switch their accessibility support on when something asks for it, which costs them a little extra
 work. If UI Automation is not available, piikey says so and checks whole requests instead.
 
-Sites and programs that are not protected are tunnelled untouched. Programs must follow the Windows
+Sites and apps that are not protected are tunnelled untouched. Apps must follow the Windows
 proxy settings: browsers, Electron, .NET and curl do. The local certificate piikey uses to read
 protected HTTPS traffic is created for your Windows user only; Windows asks once before trusting it.
 
@@ -61,17 +61,17 @@ stored. Password fields are never read.
 The inventory records which files hold personal data. A background loop scans your folders (the
 Documents, Desktop and Downloads folders unless you choose others) on a half-sized thread pool and
 skips files that did not change since the last scan. For each file, `inventory.jsonl` keeps how many
-values of each kind it holds, never the values, and the scan treats a file piikey masked as clean.
-Home shows the result as a treemap: one tile per folder or file, sized by the number of values, and
-clicking a folder opens it. A tile's side panel can open the file, show it in Explorer, rescan it,
-make a masked copy (beside the file; it never replaces an existing file) or exclude it. A folder
-excluded while a scan runs is dropped from the inventory when that scan ends.
+values of each type it holds, never the values, and the scan treats a file piikey masked as clean.
+The Inventory page shows the result as a treemap: one tile per folder or file, sized by the number
+of values, and clicking a folder opens it. A tile's side panel can open the file, show it in
+Explorer, rescan it, make a masked copy (beside the file; it never replaces an existing file) or
+exclude it. A folder excluded while a scan runs is dropped from the inventory when that scan ends.
 
-"Scan for PII" in Explorer's right-click menu (under "Show more options" on Windows 11) starts
-`piikey.exe --scan <path>`. It hands the paths to the running app, which scans them and, when the
-scan ends, brings its window forward on Home at the scanned path, also when the app was only a
-tray icon (a timer on the application thread looks four times a second); if the app is not
-running, the command starts it.
+"Scan for personal data" in Explorer's right-click menu (under "Show more options" on Windows 11)
+starts `piikey.exe --scan <path>`. It hands the paths to the running app, which scans them and,
+when the scan ends, brings its window forward on the Inventory page at the scanned path, also when
+the app was only a tray icon (a timer on the application thread looks four times a second); if the
+app is not running, the command starts it.
 
 ## API
 
@@ -92,35 +92,83 @@ process notices the new id and reloads.
 
 ## The app
 
-- **Home**: the on/off switch, key numbers (values keyed, files with personal data, values found in
-  files, protected sites and programs), the inventory treemap and recent activity: the values most
-  recently sent, with where and when. The treemap is described under Inventory and Explorer above.
-- **Keyed values**: an activity feed of every value in the vault next to its stand-in, the most
-  recently sent first (including values first keyed long ago), then the ones never sent. Search
-  matches values, stand-ins, sites and programs; filters narrow it to a kind, a site (subdomains
-  included) or a time (today, last 7 days, last 30 days). The feed persists in
-  `%LOCALAPPDATA%\piikey\activity.cfg`, which holds stand-ins, sites, programs and times only;
-  the values themselves stay in the encrypted vault. Forgetting a value or wiping the vault also
-  removes its lines from the feed.
-- **Settings**: seven tabs, picked in a bar under the title. The app opens on General and remembers
-  the tab you chose until the window closes.
-  - **General** has a card for each feature with its own control: masking (a switch; it stays off
-    until the certificate is installed, and the card says so), the highlight (off, always, or when
-    you press Ctrl+Alt+P), the Explorer menu, the inventory and the local HTTP API. A feature
-    with more settings links to its tab.
-  - **Masking**: the certificate, the sites and the programs to protect.
-  - **Detection**: which kinds of personal data piikey looks for (every kind has its own switch,
-    all on by default; a value masked earlier still comes back after its kind is switched off).
-    It applies to masking, the highlight, scans and the inventory.
-  - **Inventory**: the folders to scan, what is left out and Rescan now.
-  - **API**: the pipe name, the HTTP address with whether it listens, and the token (copy it or
-    make a new one).
-  - **Vault**: where the vault file is, how many records it holds, Export (CSV in Downloads) and
-    Wipe, which takes two clicks.
-  - **About**: the version and the state of the local proxy.
+One window with a navigation pane and five pages, a tray icon, and a controller behind both. The
+pane has Overview, Protection, Inventory and Vault, Settings at its foot, and a status chip under
+it that is a button to Overview.
 
-Closing the window while the app is on leaves it running in the tray; Exit (tray) turns it off and
-gives Windows its previous proxy settings back.
+- **Overview**: the status hero (a title, one sentence, and the one Turn on / Turn off button, which
+  says why when it is unavailable), at most one attention block with its single fix button, five
+  clickable rows (Masking, Highlighting, Inventory, Vault, Detection, each with its own state and
+  no switches) and the five most recent swaps with a link to the Vault.
+- **Protection**: the master switch, the certificate, the protected sites, the protected apps and
+  the highlighting mode. The masking switch stays off until the certificate is installed, and the
+  page says so.
+- **Inventory**: the inventory switch and a status line, the treemap (described under Inventory
+  and Explorer above) with Export report and Rescan, the watched folders, what is left out, and the
+  Explorer menu switch.
+- **Vault**: an activity feed of every value in the vault next to its stand-in, the most recently
+  sent first (including values first stored long ago), then the ones never sent. Search matches
+  values, stand-ins, sites and apps; filters narrow it to a type, a site (subdomains included) or a
+  time (today, last 7 days, last 30 days). The feed persists in
+  `%LOCALAPPDATA%\piikey\activity.cfg`, which holds stand-ins, sites, apps and times only; the
+  values themselves stay in the encrypted vault. Forgetting a value or wiping the vault also removes
+  its lines from the feed. Under Manage: where the vault file is, how many records it holds, Export
+  (CSV in Downloads) and Wipe, which takes two clicks and names the number of records.
+- **Settings**: one scrolling page with six sections. General has Start piikey when I sign in.
+  Detection shows the model's state and where it runs (CPU, or CPU and GPU), with a button to
+  download it after a skip or to try again after a failure. Types of personal data has a switch for every type,
+  all on by default; a value masked earlier still comes back after its type is switched off, and
+  the setting applies to masking, the highlight, scans and the inventory. Developer access has the
+  local HTTP API switch, its address and whether it listens, the token (copy it or make a new one),
+  the pipe name and a note about the CLI. Privacy & data shows the data folder, with Open folder.
+  About has the version, the state of the local proxy and links to the source, the issue tracker
+  and the license.
+
+### Status
+
+What protection is doing is one status, derived from the controller's snapshot (and the window's
+optimistic wish while a command runs) in `app/src/ui/status.rs`. The hero, the chip under the pane,
+the tray's tooltip, the header of the tray menu and the tray icon all render it, so they cannot
+disagree:
+
+| Status | Title | When |
+|---|---|---|
+| Off | Protection is off | Nothing runs; the sentence says so, and the hero's button says why it is unavailable while the certificate is missing |
+| Busy | Starting / Stopping protection, Installing the certificate | A command is running |
+| On | Protection is on | Masking runs, with the number of protected sites and apps and the latest swap |
+| Needs attention | Protection is on, but needs attention / Protection needs attention | The certificate is missing, the model failed to download or an action failed |
+| Downloading | Downloading the detection model | The first-run download is running |
+
+The certificate is the one cause that a single click fixes, so it wins over an error it may be
+behind.
+
+### Tray and lifecycle
+
+The tray icon is the key in grey while protection is off or the model downloads, the app icon while
+it is on, and the app icon with an amber dot when it needs you. Its tooltip is the status in a
+line, and its menu is the status as a header, Open piikey, Turn protection on or off, and Quit
+piikey.
+
+Closing the window while protection is on, or while the highlight, the inventory or the local API
+is, leaves the app running in the tray; with all of them off, closing the window ends the app. Quit
+piikey (tray) ends it either way, and gives Windows its previous proxy settings back.
+
+Only one copy runs per Windows user. A second start of `piikey.exe` finds the running app over its
+named pipe and asks it (`show_window`) to bring its window forward, then ends quietly;
+`piikey-cli open` asks the same. If the first app is still opening its pipe, the second start asks
+again for up to five seconds.
+
+**Start at sign-in** is the General setting "Start piikey when I sign in". The zip and the
+installer keep a value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` that starts
+`piikey.exe --background`; the setting counts as on only while that value starts this exe and
+Windows has not been told (Settings > Apps > Startup) to skip it. The Microsoft Store build cannot
+use the registry, so its manifest declares a startup task (`piikeyStartup`, off at install) that
+the setting asks Windows to switch on; Windows refuses when the user turned it off in Settings >
+Apps > Startup or a policy forbids it, and the setting says so. A startup task passes no
+arguments, so the app tells such a start from the user's by the way Windows activated it. A
+background start shows no window, only the tray icon (it shows the window anyway when there is no
+tray icon to open it from), and when an app already runs, a background start leaves its window
+alone. The uninstaller removes the `Run` and its skip entry.
 
 ## Model and devices
 
@@ -164,9 +212,9 @@ Everything piikey keeps is in `%LOCALAPPDATA%\piikey`, readable only by your Win
 |---|---|
 | `vault.pkv` | the encrypted original↔stand-in pairs (XChaCha20-Poly1305, key wrapped with DPAPI) |
 | `models\` | the downloaded detection model and `device.cfg` |
-| `guard.cfg` | protected sites and programs, kinds switched off, on/off, the highlight mode, the Explorer menu, inventory folders and the HTTP API |
+| `guard.cfg` | protected sites and apps, types switched off, on/off, the highlight mode, the Explorer menu, inventory folders and the HTTP API |
 | `activity.cfg` | the activity feed (stand-ins only) |
-| `inventory.jsonl` | per file: size, change time and how many values of each kind it holds, never the values |
+| `inventory.jsonl` | per file: size, change time and how many values of each type it holds, never the values |
 | `api.token` | the token the local HTTP API asks for |
 | `ca.crt`, `ca.key` | the local certificate; the key is wrapped with DPAPI |
 | `proxy.prev` | the previous Windows proxy settings, only while piikey has them changed |

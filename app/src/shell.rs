@@ -1,4 +1,4 @@
-//! The Explorer right-click verb "Scan for PII".
+//! The Explorer right-click verb "Scan for personal data".
 //!
 //! Per-user registration under `HKCU\Software\Classes`, so it needs no administrator rights and
 //! leaves other users alone. The verb runs `piikey.exe --scan <path>`, once for each item that is
@@ -21,7 +21,7 @@ const CLASSES: &str = r"Software\Classes";
 /// The verb's key name under each `shell` key.
 const VERB: &str = "piikey.scan";
 /// The menu text.
-const LABEL: &str = "Scan for PII";
+const LABEL: &str = "Scan for personal data";
 /// What Explorer is told to open: files, folders, and the background of an open folder. The
 /// background verb gets its folder as `%V\.`, not `%V`: the path of a drive's root, `C:\`, would
 /// end the quoted argument in `\"`, which Windows reads as a quote and not as the end of the path.

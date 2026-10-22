@@ -1,4 +1,4 @@
-//! The PII inventory as the controller serves it: the treemap's levels, the scans that fill it and
+//! The inventory as the controller serves it: the treemap's levels, the scans that fill it and
 //! the thread that runs them, and the files written from it.
 
 use std::{
@@ -29,7 +29,7 @@ use crate::{
 /// How long a quitting app waits for the scan it cancelled to save what it did.
 const SCAN_STOP_WAIT: Duration = Duration::from_secs(2);
 
-/// A request to show the result of a scan: the window comes forward, on Home, at `at`.
+/// A request to show the result of a scan: the window comes forward, on Inventory, at `at`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reveal {
     /// Grows with every request, so the window can tell a new one from one it handled.
@@ -52,7 +52,7 @@ pub struct InventoryView {
 }
 
 impl Controller {
-    /// The PII inventory: which files hold personal data.
+    /// The inventory: which files hold personal data.
     pub fn inventory(&self) -> Arc<Inventory> {
         Arc::clone(&self.inventory)
     }
@@ -156,7 +156,7 @@ impl Controller {
         for path in now.iter().filter(|path| !before.contains(path)) {
             if let Err(error) = self.inventory.forget_under(path) {
                 self.notify(Notice::error(format!(
-                    "Could not update the PII inventory: {error}"
+                    "Could not update the inventory: {error}"
                 )));
             }
         }

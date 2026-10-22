@@ -323,6 +323,7 @@ impl Flags {
             "token" => self.token(rest)?,
             "status" => self.plain("status", Request::Status, rest)?,
             "protection" => self.protection(rest)?,
+            "open" => self.plain("open", Request::ShowWindow, rest)?,
             "serve" => self.serve(rest)?,
             other => return Err(usage(format!("unknown command '{other}'"))),
         };
