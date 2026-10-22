@@ -169,7 +169,7 @@ keeps are described in [docs/how-it-works.md](docs/how-it-works.md).
   holds and a Remove button, which also breaks off a scan of it; the Scan button looks through them,
   the box below scans one more folder or file,
   and you can drop files and folders from Explorer onto the page. The dashboard shows a tree of
-  your real folders, from the drive down (This PC, `C:`, Users, ...), with bars by type, the types
+  your real folders, from the drive down (This PC, `C:`, Users, ...) in Explorer's order, with bars by type, the types
   found, a treemap of the files, and the details of what you select. A scan that you start from the
   page, the box, a drop or Explorer ends in a result dialog. The inventory keeps counts, never the
   values; "Show what was found" reads the files again and lists every value with search, type and

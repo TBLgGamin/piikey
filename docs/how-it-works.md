@@ -95,8 +95,11 @@ The Inventory page shows the result as a dashboard, like a disk-usage viewer. A 
 files has a bar by type on each row and follows the computer's real folders: its top is the drives
 (and network shares) that hold scanned files, such as `C:`, and below a drive come its real
 folders down to the files, however they came to be scanned (the locations only say what the Scan
-button looks through; they group nothing). The breadcrumb above it is the same path (This PC,
-`C:`, Users, ...) and each step goes back to that folder. A legend lists the types found (a chip
+button looks through; they group nothing). Rows come in Explorer's order, not by what they hold:
+the drives by letter and then the shares, and in a folder its folders and then its files, each by
+name; opening a folder only adds its contents under it, so nothing else moves. The breadcrumb above
+it is the same path (This PC, `C:`, Users, ...) and each step goes back to that folder. A legend
+lists the types found (a chip
 row in a narrow window, a list in a wide one) and picking one shows only that type; a treemap has a
 tile for every file, nested by folder and coloured by type (up to 400 tiles, the rest one "+N
 files" tile); and a details pane describes what is selected. Selecting a tile opens the tree along

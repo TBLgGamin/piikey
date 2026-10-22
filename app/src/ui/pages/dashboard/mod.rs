@@ -18,19 +18,19 @@ mod report;
 mod tree;
 mod types;
 
-use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use piikey::detect::EntityKind;
 use windows_reactor::{
-    Border, Button, ButtonStyle, Color, DataItem, FontIcon, FontWeight, Grid, GridLength,
-    HyperlinkButton, KeyedView, ListView, ListViewSelectionMode, Orientation, StackPanel,
+    Border, Button, ButtonStyle, Callback, Color, FontIcon, FontWeight, Grid, GridLength,
+    HorizontalAlignment, HyperlinkButton, ItemsRepeater, Orientation, ScrollViewer, StackPanel,
     TextBlock, TextTrimming, TextWrapping, ThemeBrush, Thickness, TooltipExt, VerticalAlignment,
-    View,
+    View, VirtualSource,
 };
 
 use self::{
     crumbs::{crumbs, top_label},
-    tree::{Line, Row, lines, position, segments},
+    tree::{Line, Row, lines, segments},
 };
 pub(in crate::ui) use self::{findings::panel as findings_panel, report::dialog};
 use super::kit::{Context, caption, card, counted, glyph, thousands};
@@ -194,7 +194,7 @@ fn crumb_bar(dash: &Dashboard, store: Store, context: Context<'_>) -> View {
 
 /// The bar of a row: as long as the row's share of its folder, in the colours of the types it
 /// holds.
-fn bar(row: &Row<'_>, kind: Option<EntityKind>) -> View {
+fn bar(row: &Row, kind: Option<EntityKind>) -> View {
     let full = (row.share * BAR).clamp(2.0, BAR);
     let parts = segments(&row.node.counts, kind, full);
     let mut columns: Vec<GridLength> = Vec::new();
@@ -220,7 +220,7 @@ fn bar(row: &Row<'_>, kind: Option<EntityKind>) -> View {
 }
 
 /// What stands under a row's name: the files and the types for a folder, the types for a file.
-fn row_caption(row: &Row<'_>, kind: Option<EntityKind>) -> String {
+fn row_caption(row: &Row, kind: Option<EntityKind>) -> String {
     let held: Vec<(EntityKind, u32)> = row
         .node
         .counts
@@ -239,25 +239,37 @@ fn row_caption(row: &Row<'_>, kind: Option<EntityKind>) -> String {
     }
 }
 
-/// One row of the tree: how deep it is, a button to open it when it is a folder, its name over a
-/// bar and the types it holds, and what it holds.
-fn row_view(row: &Row<'_>, kind: Option<EntityKind>, store: Store, context: Context<'_>) -> View {
-    let node = row.node;
+/// The fill behind the selected row of the tree, light enough for both themes.
+const SELECTED_FILL: Color = Color::argb(0x1f, 0x80, 0x80, 0x80);
+
+/// One row of the tree: how deep it is, a button to open it when it is a folder, and the row
+/// itself, a button that selects it, with its name over a bar and the types it holds, and what it
+/// holds. The two buttons lie side by side, so each has its own pointer, focus and keys.
+fn row_view(
+    row: &Row,
+    kind: Option<EntityKind>,
+    store: Store,
+    selected: bool,
+    send: &Callback<Msg>,
+) -> View {
+    let node = &row.node;
     let chevron: View = if node.is_dir {
+        let send = send.clone();
+        let folder = node.path.clone();
         Button::new()
             .style(ButtonStyle::Subtle)
-            .grid_column(1)
+            .grid_column(2)
             .vertical_alignment(VerticalAlignment::Center)
             .automation_name(format!(
                 "{} {}",
                 if row.open { "Close" } else { "Open" },
                 node.name
             ))
-            .on_click(context.message(Msg::Dash(store, Dash::Toggle(node.path.clone()))))
+            .on_click(move || send.call(Msg::Dash(store, Dash::Toggle(folder.clone()))))
             .content(glyph(if row.open { "\u{E70D}" } else { "\u{E76C}" }, 10.0))
             .into()
     } else {
-        Border::new().grid_column(1).into()
+        Border::new().width(32.0).grid_column(2).into()
     };
     let name = Grid::new()
         .columns([GridLength::Auto, GridLength::STAR])
@@ -281,33 +293,66 @@ fn row_view(row: &Row<'_>, kind: Option<EntityKind>, store: Store, context: Cont
                 .text_trimming(TextTrimming::CharacterEllipsis)
                 .grid_column(1),
         ));
-    let shown = node.path.display().to_string();
-    Grid::new()
+    let pick = {
+        let send = send.clone();
+        let path = node.path.clone();
+        Button::new()
+            .style(ButtonStyle::Subtle)
+            .horizontal_alignment(HorizontalAlignment::Stretch)
+            .horizontal_content_alignment(HorizontalAlignment::Stretch)
+            .grid_column(3)
+            .automation_name(node.name.as_str())
+            .on_click(move || send.call(Msg::Dash(store, Dash::Select(path.clone(), Origin::Tree))))
+            .content(
+                Grid::new()
+                    .columns([GridLength::STAR, GridLength::Auto])
+                    .children((
+                        StackPanel::new()
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .children((name, under)),
+                        TextBlock::new()
+                            .text(thousands(row.found))
+                            .font_weight(FontWeight::SEMI_BOLD)
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .margin(Thickness::new(10.0, 0.0, 0.0, 0.0))
+                            .grid_column(1),
+                    )),
+            )
+            .tooltip(node.path.display().to_string())
+    };
+    let mark: View = if selected {
+        Border::new()
+            .width(3.0)
+            .height(16.0)
+            .corner_radius(1.5)
+            .background(ThemeBrush::Accent)
+            .vertical_alignment(VerticalAlignment::Center)
+            .into()
+    } else {
+        Border::new().width(3.0).into()
+    };
+    let line = Grid::new()
         .columns([
+            GridLength::Auto,
             GridLength::Pixel(INDENT * f64::from(u32::try_from(row.depth).unwrap_or(0))),
             GridLength::Auto,
             GridLength::STAR,
-            GridLength::Auto,
         ])
-        .children((
-            Border::new().grid_column(0),
-            chevron,
-            StackPanel::new()
-                .grid_column(2)
-                .vertical_alignment(VerticalAlignment::Center)
-                .children((name, under)),
-            TextBlock::new()
-                .text(thousands(row.found))
-                .font_weight(FontWeight::SEMI_BOLD)
-                .vertical_alignment(VerticalAlignment::Center)
-                .margin(Thickness::new(10.0, 0.0, 0.0, 0.0))
-                .grid_column(3),
-        ))
-        .tooltip(shown)
+        .children((mark, Border::new().grid_column(1), chevron, pick));
+    Border::new()
+        .margin(Thickness::new(4.0, 1.0, 4.0, 1.0))
+        .corner_radius(4.0)
+        .background(if selected {
+            SELECTED_FILL
+        } else {
+            Color::transparent()
+        })
+        .content(line)
+        .into()
 }
 
 /// The line that stands for rows the tree leaves out.
-fn leftover(line: &Line<'_>) -> Option<String> {
+fn leftover(line: &Line) -> Option<String> {
     match line {
         Line::Row(_) => None,
         Line::More { count, found, .. } => Some(format!(
@@ -319,58 +364,39 @@ fn leftover(line: &Line<'_>) -> Option<String> {
     }
 }
 
-/// The tree in a card: a line over it that says how it is sorted, and the rows. A row picked is
-/// the selection.
+/// The tree in a card: a line over it that names its columns, and the rows, in Explorer's order.
+/// The rows are made as they scroll into view, each kept by its path: a folder opened adds its
+/// contents under it and the rest stays where it is (a `ListView` reused the containers of its
+/// rows and drew rows in the places of others).
 fn tree_card(dash: &Dashboard, loaded: &Loaded, store: Store, context: Context<'_>) -> Border {
-    let pin = dash.selected.as_deref().filter(|_| dash.pinned);
-    let all = lines(&loaded.levels, &dash.at, &dash.open, pin, dash.kind);
-    let paths: Vec<Option<PathBuf>> = all
-        .iter()
-        .map(|line| line.path().map(Path::to_path_buf))
-        .collect();
-    let selected = dash
-        .selected
-        .as_deref()
-        .and_then(|path| position(&all, path));
-    // A row is a folder or file of the real tree, which lists each once: its path is its key.
-    let keys: Vec<String> = all
-        .iter()
-        .enumerate()
-        .map(|(i, line)| match line {
-            Line::Row(row) => format!("row:{}", row.node.path.display()),
-            Line::More { .. } | Line::Cut => format!("more:{i}"),
-        })
-        .collect();
-    // Rows that change places make a new list: moving the rows of a list with a selection makes
-    // WinUI fail fast, as picking a second tile of the map did when it listed another folder first.
-    let epoch = dash.tree_list(keys.clone());
-    let items: Vec<DataItem> =
-        all.iter()
-            .zip(keys)
-            .map(|(line, key)| match line {
-                Line::Row(row) => DataItem::new(key, &row.node.name)
-                    .content(row_view(row, dash.kind, store, context)),
-                other => DataItem::new(key, "more").content(
-                    caption(leftover(other).unwrap_or_default())
-                        .margin(Thickness::new(INDENT, 8.0, 8.0, 8.0)),
-                ),
-            })
-            .collect();
-    let list = ListView::new()
-        .selection_mode(ListViewSelectionMode::Single)
-        .selected_index(selected)
-        .items(items)
-        .on_selection_changed(context.callback(move |index: Option<usize>| {
-            // The list reports nothing chosen while it is made again: that is not a choice.
-            index
-                .and_then(|i| paths.get(i).cloned().flatten())
-                .map_or(Msg::Noop, |path| {
-                    Msg::Dash(store, Dash::Select(path, Origin::Tree))
-                })
-        }));
-    let list = Grid::new()
+    let all = Rc::new(lines(&loaded.levels, &dash.at, &dash.open, dash.kind));
+    let keys: Rc<Vec<String>> = Rc::new(all.iter().map(Line::key).collect());
+    let revision = dash.tree_revision(&keys);
+    let selected = dash.selected.clone();
+    let kind = dash.kind;
+    let send = context.forward();
+    let shown = Rc::clone(&all);
+    let source = VirtualSource::new(
+        revision,
+        all.len(),
+        move |index| keys.get(index).cloned().unwrap_or_default(),
+        move |index| -> View {
+            match shown.get(index) {
+                Some(Line::Row(row)) => {
+                    let picked = selected.as_deref() == Some(row.node.path.as_path());
+                    row_view(row, kind, store, picked, &send)
+                }
+                Some(other) => caption(leftover(other).unwrap_or_default())
+                    .text_wrapping(TextWrapping::Wrap)
+                    .margin(Thickness::new(INDENT, 8.0, 8.0, 8.0))
+                    .into(),
+                None => Border::new().into(),
+            }
+        },
+    );
+    let list = ScrollViewer::new()
         .grid_row(1)
-        .keyed_children([KeyedView::new(format!("tree-{epoch}"), list)]);
+        .content(ItemsRepeater::new().virtual_source(source));
     Border::new()
         .background(ThemeBrush::CardBackground)
         .border_brush(ThemeBrush::CardStroke)
@@ -382,11 +408,8 @@ fn tree_card(dash: &Dashboard, loaded: &Loaded, store: Store, context: Context<'
                 .children((
                     Grid::new()
                         .columns([GridLength::STAR, GridLength::Auto])
-                        .margin(Thickness::new(14.0, 8.0, 16.0, 4.0))
-                        .children((
-                            caption("The most personal data first"),
-                            caption("Found").grid_column(1),
-                        )),
+                        .margin(Thickness::new(14.0, 8.0, 26.0, 4.0))
+                        .children((caption("Name"), caption("Found").grid_column(1))),
                     list,
                 )),
         )

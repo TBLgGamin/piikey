@@ -94,8 +94,6 @@ pub struct Dashboard {
     pub(in crate::ui) at: PathBuf,
     /// The folder or file the details describe.
     pub(in crate::ui) selected: Option<PathBuf>,
-    /// The way to the selection is listed first in the tree: it was picked in the map.
-    pub(in crate::ui) pinned: bool,
     /// The folders opened in the tree.
     pub(in crate::ui) open: HashSet<PathBuf>,
     /// The only type on show, or all.
@@ -107,11 +105,10 @@ pub struct Dashboard {
     /// The number of the load that `loaded` came from: one that is older than that, or was made
     /// for another folder, is not shown.
     shown: u64,
-    /// The keys of the tree's rows as they were last drawn, the folder on show then, and the number
-    /// of the list they were drawn in: see [`Dashboard::tree_list`].
+    /// The keys of the tree's rows as they were last drawn, and the revision of the tree's list:
+    /// see [`Dashboard::tree_revision`].
     tree_keys: RefCell<Vec<String>>,
-    tree_at: RefCell<PathBuf>,
-    tree_epoch: Cell<u64>,
+    tree_revision: Cell<u64>,
 }
 
 impl Dashboard {
@@ -120,34 +117,26 @@ impl Dashboard {
         Self {
             at: PathBuf::new(),
             selected: None,
-            pinned: false,
             open: HashSet::new(),
             kind: None,
             loaded: None,
             seq: 0,
             shown: 0,
             tree_keys: RefCell::new(Vec::new()),
-            tree_at: RefCell::new(PathBuf::new()),
-            tree_epoch: Cell::new(0),
+            tree_revision: Cell::new(0),
         }
     }
 
     /// Tells the dashboard the tree is about to be drawn with rows keyed `keys`, and returns the
-    /// number of the list to draw it in. Rows that come or go keep the list; rows that change places
-    /// make it a new one, because moving the rows of a list that has a selection makes `WinUI` fail
-    /// fast (`0xC000027B`): the old list is dropped and the new one made, which also starts it at the
-    /// top, where the way to the selection is listed first. So does a new folder on show: `WinUI`
-    /// showed stale rows, without their content, in a list that had all its rows replaced twice,
-    /// which is what going into a folder and back out does, so each folder gets a list of its own.
-    pub(in crate::ui) fn tree_list(&self, keys: Vec<String>) -> u64 {
+    /// revision of its rows: a new one whenever rows came, went or the folder on show changed, so
+    /// the list takes the new keys; the same while only what the rows say changed.
+    pub(in crate::ui) fn tree_revision(&self, keys: &[String]) -> u64 {
         let mut last = self.tree_keys.borrow_mut();
-        let mut at = self.tree_at.borrow_mut();
-        if *at != self.at || !keeps_order(&last, &keys) {
-            self.tree_epoch.set(self.tree_epoch.get() + 1);
-            at.clone_from(&self.at);
+        if last.as_slice() != keys {
+            self.tree_revision.set(self.tree_revision.get() + 1);
+            *last = keys.to_vec();
         }
-        *last = keys;
-        self.tree_epoch.get()
+        self.tree_revision.get()
     }
 
     /// Whether `path` is a folder, as far as the last load knows: the folder on show, or a folder
@@ -176,8 +165,7 @@ impl Dashboard {
         if self.selected.as_deref() == Some(path.as_path()) {
             return false;
         }
-        self.pinned = origin == Origin::Map;
-        if self.pinned {
+        if origin == Origin::Map {
             let way = ancestors(&path, &self.at);
             self.open.extend(way);
         }
@@ -199,10 +187,9 @@ impl Dashboard {
         self.open.retain(|folder| is_under(folder, &at));
         self.at = at;
         self.selected = None;
-        self.pinned = false;
     }
 
-    /// Shows the folder `at` with `select` chosen in it, the way to it open and listed first.
+    /// Shows the folder `at` with `select` chosen in it and the way to it open.
     pub(in crate::ui) fn reveal(&mut self, at: PathBuf, select: Option<PathBuf>) {
         self.enter(at);
         if let Some(file) = select {
@@ -225,15 +212,6 @@ impl Dashboard {
     fn show_type(&mut self, kind: Option<EntityKind>) {
         self.kind = kind;
     }
-}
-
-/// Whether the rows that are in both lists come in the same order in both: nothing has to move.
-fn keeps_order(old: &[String], new: &[String]) -> bool {
-    let in_new: HashSet<&str> = new.iter().map(String::as_str).collect();
-    let in_old: HashSet<&str> = old.iter().map(String::as_str).collect();
-    old.iter()
-        .filter(|key| in_new.contains(key.as_str()))
-        .eq(new.iter().filter(|key| in_old.contains(key.as_str())))
 }
 
 /// The folders that have to be open for the row of `path` to show, from the outermost in: the ones
@@ -423,7 +401,7 @@ mod tests {
     }
 
     #[test]
-    fn rows_that_come_or_go_keep_the_list_and_rows_that_move_make_a_new_one() {
+    fn the_tree_revision_moves_only_when_its_rows_do() {
         let keys = |names: &[&str]| {
             names
                 .iter()
@@ -431,44 +409,12 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let dash = Dashboard::new();
-        let first = dash.tree_list(keys(&["a", "b", "c"]));
-        // A folder opened: rows come in between.
-        assert_eq!(dash.tree_list(keys(&["a", "a1", "a2", "b", "c"])), first);
-        // A folder closed, and the same drawn again.
-        assert_eq!(dash.tree_list(keys(&["a", "b", "c"])), first);
-        assert_eq!(dash.tree_list(keys(&["a", "b", "c"])), first);
-        // The way to a tile's file listed first: rows move.
-        let moved = dash.tree_list(keys(&["c", "a", "b"]));
-        assert_ne!(moved, first);
-        assert_eq!(dash.tree_list(keys(&["c", "a", "b", "d"])), moved);
-        // Rows that are all new need no move either, but a new order of the old ones does.
-        assert_eq!(dash.tree_list(keys(&["x", "y"])), moved);
-        assert_ne!(dash.tree_list(keys(&["y", "x"])), moved);
-    }
-
-    #[test]
-    fn each_folder_on_show_gets_a_list_of_its_own() {
-        let keys = |names: &[&str]| {
-            names
-                .iter()
-                .map(|name| (*name).to_owned())
-                .collect::<Vec<_>>()
-        };
-        let mut dash = Dashboard::new();
-        let top = dash.tree_list(keys(&["c:", "d:"]));
-        assert_eq!(dash.tree_list(keys(&["c:", "c:/users", "d:"])), top);
-        // Another folder shown, whatever its rows are: a list of its own, and the rows that come
-        // after (the load that was asked for) go into it.
-        dash.enter(PathBuf::from(r"C:\Users"));
-        let users = dash.tree_list(keys(&[]));
-        assert_ne!(users, top);
-        assert_eq!(dash.tree_list(keys(&["me"])), users);
-        // And back to the top: another list again, not the one the top had.
-        dash.enter(PathBuf::new());
-        let back = dash.tree_list(keys(&["c:", "d:"]));
-        assert_ne!(back, users);
-        assert_ne!(back, top);
-        assert_eq!(dash.tree_list(keys(&["c:", "d:"])), back);
+        let first = dash.tree_revision(&keys(&["a", "b"]));
+        assert_eq!(dash.tree_revision(&keys(&["a", "b"])), first);
+        let opened = dash.tree_revision(&keys(&["a", "a1", "b"]));
+        assert_ne!(opened, first);
+        assert_eq!(dash.tree_revision(&keys(&["a", "a1", "b"])), opened);
+        assert_ne!(dash.tree_revision(&keys(&["a", "b"])), opened);
     }
 
     #[test]
@@ -483,7 +429,6 @@ mod tests {
     fn a_tile_opens_the_way_to_its_file_and_a_row_does_not() {
         let mut dash = dashboard();
         assert!(dash.select(PathBuf::from(r"C:\Docs\Taxes\2023.pdf"), Origin::Map));
-        assert!(dash.pinned);
         assert!(
             dash.open.contains(Path::new(r"C:\")),
             "the way starts at the drive"
@@ -493,7 +438,6 @@ mod tests {
 
         let mut dash = dashboard();
         assert!(dash.select(PathBuf::from(r"C:\Docs\Taxes\2023.pdf"), Origin::Tree));
-        assert!(!dash.pinned);
         assert!(
             dash.open.is_empty(),
             "a row is where the user already looks"
@@ -501,15 +445,11 @@ mod tests {
     }
 
     #[test]
-    fn the_row_the_tree_reports_after_a_tile_was_picked_changes_nothing() {
+    fn a_row_picked_again_changes_nothing() {
         let mut dash = dashboard();
         let file = PathBuf::from(r"C:\Docs\a.pdf");
         assert!(dash.select(file.clone(), Origin::Map));
-        assert!(
-            !dash.select(file, Origin::Tree),
-            "the echo of the selection must not unpin it"
-        );
-        assert!(dash.pinned);
+        assert!(!dash.select(file, Origin::Tree));
     }
 
     #[test]
@@ -547,7 +487,6 @@ mod tests {
             dash.selected,
             Some(PathBuf::from(r"C:\Docs\Taxes\2023.pdf"))
         );
-        assert!(dash.pinned);
         // A folder is shown without a choice.
         dash.reveal(PathBuf::from(r"C:\Docs"), None);
         assert!(dash.selected.is_none());

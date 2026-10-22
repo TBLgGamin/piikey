@@ -1,13 +1,16 @@
-//! The tree of a dashboard: the folders and files that hold personal data, the ones that hold most
-//! first, and the folders the user opened. This decides which rows there are; the widgets in
-//! [`super`] draw them.
+//! The tree of a dashboard: the folders and files that hold personal data, in the order Explorer
+//! lists them (folders first, then files, each by name; the drives `C:`, `D:`, ... and then the
+//! shares), and the folders the user opened. This decides which rows there are; the widgets in
+//! [`super`] draw them. A row's place never changes but by rows coming or going above it, so a
+//! folder opened only adds its contents under it.
 
 use std::{
+    cmp::Ordering,
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
-use piikey::{detect::EntityKind, inventory::Node, sys::is_under};
+use piikey::{detect::EntityKind, inventory::Node};
 
 use super::map::weigh;
 
@@ -18,8 +21,8 @@ pub(super) const MAX_ROWS: usize = 1_000;
 
 /// One row of the tree: a folder or a file.
 #[derive(Debug, Clone, PartialEq)]
-pub(super) struct Row<'a> {
-    pub(super) node: &'a Node,
+pub(super) struct Row {
+    pub(super) node: Node,
     /// How many folders lie between it and the top of the tree.
     pub(super) depth: usize,
     /// It is a folder and its contents are listed below it.
@@ -32,8 +35,8 @@ pub(super) struct Row<'a> {
 
 /// One line of the tree.
 #[derive(Debug, Clone, PartialEq)]
-pub(super) enum Line<'a> {
-    Row(Row<'a>),
+pub(super) enum Line {
+    Row(Row),
     /// The folders and files of a folder beyond [`MAX_SIBLINGS`], as one line.
     More {
         /// Of the folder `depth` levels down.
@@ -43,18 +46,20 @@ pub(super) enum Line<'a> {
         /// What they hold together.
         found: u64,
         /// The folder they are in.
-        folder: &'a Path,
+        folder: PathBuf,
     },
     /// The tree stops here: [`MAX_ROWS`].
     Cut,
 }
 
-impl Line<'_> {
-    /// The path the line selects, if it is a row.
-    pub(super) fn path(&self) -> Option<&Path> {
+impl Line {
+    /// What tells the line apart from the others of the tree, whatever its place: the path of a
+    /// row, the folder of a line of more.
+    pub(super) fn key(&self) -> String {
         match self {
-            Self::Row(row) => Some(&row.node.path),
-            Self::More { .. } | Self::Cut => None,
+            Self::Row(row) => format!("row:{}", row.node.path.display()),
+            Self::More { folder, .. } => format!("more:{}", folder.display()),
+            Self::Cut => "cut".to_owned(),
         }
     }
 }
@@ -72,42 +77,41 @@ fn share(part: u64, whole: u64) -> f64 {
     }
 }
 
-/// The nodes of one level that hold something, as `(node, found)`, the ones that hold most first.
-/// With a `pin` the folder it lies in, and the file, come before the others.
-fn level<'a>(
-    nodes: &'a [Node],
-    kind: Option<EntityKind>,
-    pin: Option<&Path>,
-) -> Vec<(&'a Node, u64)> {
+/// Explorer's order: folders before files, each by name without regard to letter case; at the top
+/// the drives before the network shares (`\\server\share`).
+fn explorer_order(a: &Node, b: &Node) -> Ordering {
+    let share = |node: &Node| node.name.starts_with(r"\\");
+    b.is_dir
+        .cmp(&a.is_dir)
+        .then_with(|| share(a).cmp(&share(b)))
+        .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        .then_with(|| a.name.cmp(&b.name))
+}
+
+/// The nodes of one level that hold something, as `(node, found)`, in [`explorer_order`].
+fn level(nodes: &[Node], kind: Option<EntityKind>) -> Vec<(&Node, u64)> {
     let mut held: Vec<(&Node, u64)> = nodes
         .iter()
         .map(|node| (node, weigh(&node.counts, node.hits, kind)))
         .filter(|&(_, found)| found > 0)
         .collect();
-    let pinned = |node: &Node| pin.is_some_and(|pin| is_under(pin, &node.path));
-    held.sort_by(|a, b| {
-        pinned(b.0)
-            .cmp(&pinned(a.0))
-            .then(b.1.cmp(&a.1))
-            .then_with(|| a.0.name.to_lowercase().cmp(&b.0.name.to_lowercase()))
-    });
+    held.sort_by(|a, b| explorer_order(a.0, b.0));
     held
 }
 
 /// Adds the rows of the folder `folder`, and of the folders open in it, to `out`.
-fn list<'a>(
-    folder: &'a Path,
+fn list(
+    folder: &Path,
     depth: usize,
-    levels: &'a HashMap<PathBuf, Vec<Node>>,
+    levels: &HashMap<PathBuf, Vec<Node>>,
     open: &HashSet<PathBuf>,
-    pin: Option<&Path>,
     kind: Option<EntityKind>,
-    out: &mut Vec<Line<'a>>,
+    out: &mut Vec<Line>,
 ) {
     let Some(nodes) = levels.get(folder) else {
         return;
     };
-    let held = level(nodes, kind, pin);
+    let held = level(nodes, kind);
     let whole: u64 = held.iter().map(|&(_, found)| found).sum();
     for (i, &(node, found)) in held.iter().enumerate() {
         if out.len() >= MAX_ROWS {
@@ -122,37 +126,35 @@ fn list<'a>(
                 depth,
                 count: rest.len(),
                 found: rest.iter().map(|&(_, found)| found).sum(),
-                folder,
+                folder: folder.to_path_buf(),
             });
             return;
         }
-        let row = Row {
-            node,
+        let inner = node.is_dir && open.contains(&node.path) && levels.contains_key(&node.path);
+        out.push(Line::Row(Row {
+            node: node.clone(),
             depth,
-            open: open.contains(&node.path) && levels.contains_key(&node.path),
+            open: inner,
             found,
             share: share(found, whole),
-        };
-        let inner = row.open && node.is_dir;
-        out.push(Line::Row(row));
+        }));
         if inner {
-            list(&node.path, depth + 1, levels, open, pin, kind, out);
+            list(&node.path, depth + 1, levels, open, kind, out);
         }
     }
 }
 
 /// The lines of the tree under `at` (the top level when it is empty), given the `levels` loaded
 /// (a folder's path leads to the nodes in it) and the folders `open`. With a `kind` only what is
-/// of that type counts; with a `pin` the way to that path is listed first at each level.
-pub(super) fn lines<'a>(
-    levels: &'a HashMap<PathBuf, Vec<Node>>,
-    at: &'a Path,
+/// of that type counts.
+pub(super) fn lines(
+    levels: &HashMap<PathBuf, Vec<Node>>,
+    at: &Path,
     open: &HashSet<PathBuf>,
-    pin: Option<&Path>,
     kind: Option<EntityKind>,
-) -> Vec<Line<'a>> {
+) -> Vec<Line> {
     let mut out = Vec::new();
-    list(at, 0, levels, open, pin, kind, &mut out);
+    list(at, 0, levels, open, kind, &mut out);
     out
 }
 
@@ -189,13 +191,6 @@ pub(super) fn segments(
         out.push((None, width * rest / total));
     }
     out
-}
-
-/// The index of the row of `path` among `lines`.
-pub(super) fn position(lines: &[Line<'_>], path: &Path) -> Option<usize> {
-    lines
-        .iter()
-        .position(|line| line.path().is_some_and(|row| row == path))
 }
 
 #[cfg(test)]
@@ -258,7 +253,7 @@ mod tests {
         levels
     }
 
-    fn names<'a>(lines: &[Line<'a>]) -> Vec<&'a str> {
+    fn names(lines: &[Line]) -> Vec<&str> {
         lines
             .iter()
             .map(|line| match line {
@@ -274,17 +269,62 @@ mod tests {
     }
 
     #[test]
-    fn the_top_level_lists_the_drives_that_hold_most_first() {
+    fn the_top_level_lists_the_drives_by_letter_and_then_the_shares() {
+        let mut levels = HashMap::new();
+        levels.insert(
+            PathBuf::new(),
+            vec![
+                node(r"\\nas\team", true, &[(EntityKind::Email, 90)]),
+                node(r"X:\", true, &[(EntityKind::Email, 1)]),
+                node(r"C:\", true, &[(EntityKind::Email, 2)]),
+                node(r"D:\", true, &[(EntityKind::Email, 50)]),
+            ],
+        );
+        // The name of a share is its whole `\\server\share`.
+        if let Some(share) = levels.get_mut(&PathBuf::new()).and_then(|v| v.first_mut()) {
+            share.name = r"\\nas\team".to_owned();
+        }
+        let lines = lines(&levels, Path::new(""), &HashSet::new(), None);
+        assert_eq!(names(&lines), ["C:", "D:", "X:", r"\\nas\team"]);
+    }
+
+    #[test]
+    fn folders_come_before_files_each_by_name_whatever_they_hold() {
+        let mut levels = HashMap::new();
+        levels.insert(
+            PathBuf::new(),
+            vec![
+                node(r"C:\b.txt", false, &[(EntityKind::Email, 1)]),
+                node(r"C:\Zeta", true, &[(EntityKind::Email, 1)]),
+                node(r"C:\A.txt", false, &[(EntityKind::Email, 99)]),
+                node(r"C:\alpha", true, &[(EntityKind::Email, 40)]),
+            ],
+        );
+        let lines = lines(&levels, Path::new(""), &HashSet::new(), None);
+        assert_eq!(names(&lines), ["alpha", "Zeta", "A.txt", "b.txt"]);
+    }
+
+    #[test]
+    fn opening_a_folder_only_adds_its_contents_under_it() {
         let levels = levels();
-        let lines = lines(&levels, Path::new(""), &HashSet::new(), None, None);
-        assert_eq!(names(&lines), ["C:", "D:"]);
+        let keys = |lines: &[Line]| lines.iter().map(Line::key).collect::<Vec<_>>();
+        let closed = keys(&lines(&levels, Path::new(""), &open(&[r"C:\"]), None));
+        let opened = keys(&lines(
+            &levels,
+            Path::new(""),
+            &open(&[r"C:\", r"C:\Docs"]),
+            None,
+        ));
+        let kept: Vec<&String> = opened.iter().filter(|key| closed.contains(key)).collect();
+        assert_eq!(kept, closed.iter().collect::<Vec<_>>());
+        assert_eq!(opened.len(), closed.len() + 2);
     }
 
     #[test]
     fn an_open_folder_lists_its_contents_under_it_indented() {
         let levels = levels();
         let open = open(&[r"C:\", r"C:\Docs"]);
-        let lines = lines(&levels, Path::new(""), &open, None, None);
+        let lines = lines(&levels, Path::new(""), &open, None);
         assert_eq!(
             names(&lines),
             ["C:", "Docs", "Taxes", "a.pdf", "Mail", "D:"]
@@ -305,7 +345,7 @@ mod tests {
     #[test]
     fn a_folder_that_is_open_but_not_loaded_has_nothing_under_it_yet() {
         let levels = levels();
-        let lines = lines(&levels, Path::new(""), &open(&[r"D:\"]), None, None);
+        let lines = lines(&levels, Path::new(""), &open(&[r"D:\"]), None);
         assert_eq!(names(&lines), ["C:", "D:"]);
         assert!(matches!(&lines[1], Line::Row(row) if !row.open));
     }
@@ -313,7 +353,7 @@ mod tests {
     #[test]
     fn a_folder_on_show_is_the_top_of_the_tree_and_not_a_row() {
         let levels = levels();
-        let lines = lines(&levels, Path::new(r"C:\"), &open(&[r"C:\Docs"]), None, None);
+        let lines = lines(&levels, Path::new(r"C:\"), &open(&[r"C:\Docs"]), None);
         assert_eq!(names(&lines), ["Docs", "Taxes", "a.pdf", "Mail"]);
         assert!(matches!(&lines[0], Line::Row(row) if row.depth == 0));
     }
@@ -325,7 +365,6 @@ mod tests {
             &levels,
             Path::new(""),
             &HashSet::new(),
-            None,
             Some(EntityKind::Person),
         );
         assert_eq!(names(&lines), ["C:"]);
@@ -339,7 +378,7 @@ mod tests {
     #[test]
     fn a_share_is_of_what_the_folder_holds() {
         let levels = levels();
-        let lines = lines(&levels, Path::new(""), &HashSet::new(), None, None);
+        let lines = lines(&levels, Path::new(""), &HashSet::new(), None);
         let shares: Vec<f64> = lines
             .iter()
             .filter_map(|line| match line {
@@ -349,42 +388,6 @@ mod tests {
             .collect();
         assert!((shares[0] - 55.0 / 57.0).abs() < 1e-9);
         assert!((shares.iter().sum::<f64>() - 1.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn the_way_to_the_pinned_path_comes_first_at_each_level() {
-        let levels = levels();
-        // The small file is pinned: its folder is listed first anyway, and the file before the
-        // folder next to it that holds more.
-        let lines = lines(
-            &levels,
-            Path::new(""),
-            &open(&[r"C:\", r"C:\Docs"]),
-            Some(Path::new(r"C:\Docs\a.pdf")),
-            None,
-        );
-        assert_eq!(
-            names(&lines),
-            ["C:", "Docs", "a.pdf", "Taxes", "Mail", "D:"]
-        );
-        // A pin on the mail puts Mail ahead of Docs.
-        let lines = super::lines(
-            &levels,
-            Path::new(""),
-            &open(&[r"C:\"]),
-            Some(Path::new(r"C:\Mail")),
-            None,
-        );
-        assert_eq!(names(&lines), ["C:", "Mail", "Docs", "D:"]);
-        // A pin on a file of the smaller drive puts that drive first.
-        let lines = super::lines(
-            &levels,
-            Path::new(""),
-            &HashSet::new(),
-            Some(Path::new(r"D:\Backup\a.txt")),
-            None,
-        );
-        assert_eq!(names(&lines), ["D:", "C:"]);
     }
 
     #[test]
@@ -400,7 +403,7 @@ mod tests {
             .collect();
         let mut levels = HashMap::new();
         levels.insert(PathBuf::new(), many);
-        let lines = lines(&levels, Path::new(""), &HashSet::new(), None, None);
+        let lines = lines(&levels, Path::new(""), &HashSet::new(), None);
         assert_eq!(lines.len(), MAX_SIBLINGS + 1);
         assert!(matches!(
             lines.last(),
@@ -433,7 +436,7 @@ mod tests {
             levels.insert(top.path.clone(), inner);
         }
         levels.insert(PathBuf::new(), tops);
-        let lines = lines(&levels, Path::new(""), &open, None, None);
+        let lines = lines(&levels, Path::new(""), &open, None);
         assert!(lines.len() <= MAX_ROWS + 1, "{} lines", lines.len());
         assert!(matches!(lines.last(), Some(Line::Cut)));
     }
@@ -473,14 +476,5 @@ mod tests {
         assert!(segments(&counts, Some(EntityKind::Mac), 80.0).is_empty());
         assert!(segments(&[], None, 80.0).is_empty());
         assert!(segments(&counts, None, 0.0).is_empty());
-    }
-
-    #[test]
-    fn a_row_is_found_again_by_its_path() {
-        let levels = levels();
-        let open = open(&[r"C:\", r"C:\Docs"]);
-        let lines = lines(&levels, Path::new(""), &open, None, None);
-        assert_eq!(position(&lines, Path::new(r"C:\Docs\a.pdf")), Some(3));
-        assert_eq!(position(&lines, Path::new(r"C:\Gone")), None);
     }
 }

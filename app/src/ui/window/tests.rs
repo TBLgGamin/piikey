@@ -1159,25 +1159,32 @@ fn the_inventory_dashboard_lists_what_was_scanned_in_the_tree_the_legend_the_map
         &drawn,
         &[
             "This PC",
-            drive.as_str(),
             "All types",
             "Email",
-            "The most personal data first",
+            "Name",
             "Found",
             "a.txt",
             "3 found in 2 files",
         ],
     )?;
-    expect_not_drawn("no grouping of its own", &drawn, &["Other scans"])?;
+    expect_not_drawn(
+        "no grouping and no order by amount",
+        &drawn,
+        &["Other scans", "The most personal data first"],
+    )?;
+    // The rows are made as they come into view: the drive first.
+    let rows = ui.realize(1)?;
+    expect_drawn("the drive", &rows, &[drive.as_str()])?;
     // The drive opens onto its real folders: the first one on the way to what was scanned.
     let ways = below_the_drive(&folder);
     ui.send(Msg::Dash(Store::Inventory, Dash::Toggle(root.clone())))?;
-    let opened = ui.loaded_with(
+    ui.loaded_with(
         Store::Inventory,
         Path::new(""),
         std::slice::from_ref(&root),
         None,
     )?;
+    let opened = ui.realize(2)?;
     expect_drawn("the drive opened", &opened, &[ways[0].as_str()])?;
 
     // The folder the files lie in on show: the way back is there at once, from This PC through
@@ -1188,7 +1195,8 @@ fn the_inventory_dashboard_lists_what_was_scanned_in_the_tree_the_legend_the_map
     way.extend(below_the_drive(&parent));
     let way: Vec<&str> = way.iter().map(String::as_str).collect();
     expect_drawn("the way back", &entered, &way)?;
-    let inside = ui.loaded(Store::Inventory, &parent)?;
+    ui.loaded(Store::Inventory, &parent)?;
+    let inside = ui.realize(1)?;
     expect_drawn("the folder on show", &inside, &["scanned"])?;
     // A folder row selected: the details offer what applies to a folder.
     let folder_row = ui.send(Msg::Dash(
@@ -1243,12 +1251,7 @@ fn a_wide_window_lists_the_types_in_a_column_next_to_the_map() -> Test {
     expect_drawn(
         "the wide dashboard",
         &drawn,
-        &[
-            "All types",
-            "Email",
-            "1 file",
-            "The most personal data first",
-        ],
+        &["All types", "Email", "1 file", "Name"],
     )
 }
 
@@ -1861,9 +1864,9 @@ fn inventory_lists_its_locations_like_watch_lists_its_folders() -> Test {
 }
 
 #[test]
-fn picking_a_tile_of_another_folder_makes_a_new_tree_and_never_moves_the_rows_of_one() -> Test {
-    // WinUI fails fast (0xC000027B) when the rows of a list that has a selection change places,
-    // which is what listing the way to the second tile's folder first did.
+fn opening_folders_and_picking_tiles_keep_the_tree_list() -> Test {
+    // A `ListView` reused the containers of its rows and drew rows in the places of others when
+    // a folder opened in the middle; the tree is one list made as it scrolls, kept by row.
     let mut ui = Headless::open(stub_controller)?;
     let docs = ui.dir.0.join("docs");
     let mail = ui.dir.0.join("mail");
@@ -1885,56 +1888,28 @@ fn picking_a_tile_of_another_folder_makes_a_new_tree_and_never_moves_the_rows_of
     if !ui.controller.wait_idle(WAIT) || !ui.controller.wait_scans(WAIT) {
         return Err("the scan did not finish".to_owned());
     }
-    // The folder the two lie in is on show, so its rows are the two folders.
     let top = ui.dir.0.clone();
     ui.send(Msg::Nav(Page::Inventory))?;
     ui.send(Msg::Dash(Store::Inventory, Dash::Enter(top.clone())))?;
     ui.loaded(Store::Inventory, &top)?;
-    // The folder that holds more is listed first; a tile of the other one is picked, so its way
-    // comes first: the rows would have to change places.
-    let first = mail.join("a.txt");
-    let second = docs.join("a.txt");
-    ui.send(Msg::Dash(
-        Store::Inventory,
-        Dash::Select(first, Origin::Map),
-    ))?;
-    ui.loaded_with(Store::Inventory, &top, std::slice::from_ref(&mail), None)?;
-    let before = ui.host.adapter().batches().len();
-    ui.send(Msg::Dash(
-        Store::Inventory,
-        Dash::Select(second, Origin::Map),
-    ))?;
-    let made = created(&ui.host.adapter().batches()[before..], ObjectType::ListView);
-    assert_eq!(made, 1, "the rows changed places in a list that stayed");
-    // The same rows again keep their list.
-    let before = ui.host.adapter().batches().len();
-    ui.loaded_with(Store::Inventory, &top, &[mail, docs], None)?;
-    let made = created(&ui.host.adapter().batches()[before..], ObjectType::ListView);
-    assert_eq!(made, 0, "rows that only came made a new list");
-    Ok(())
-}
-
-#[test]
-fn each_folder_on_show_gets_a_tree_list_of_its_own() -> Test {
-    // A list whose rows were all replaced twice showed stale rows, so going into a folder and back
-    // out makes a list each time, and the load that fills it goes into it.
-    let (mut ui, folder) = scanned_window(&[("a.txt", "mail jan.jansen@acme.nl")])?;
-    ui.send(Msg::Nav(Page::Inventory))?;
-    ui.loaded(Store::Inventory, Path::new(""))?;
+    // By name, whatever they hold: docs before mail, which holds more.
+    let rows = ui.realize(2)?;
+    let at = |name: &str| rows.iter().position(|text| text == name);
+    assert!(at("docs") < at("mail"), "{rows:?}");
     let lists = |ui: &Headless, from: usize| {
-        created(&ui.host.adapter().batches()[from..], ObjectType::ListView)
+        created(
+            &ui.host.adapter().batches()[from..],
+            ObjectType::ItemsRepeater,
+        )
     };
     let before = ui.host.adapter().batches().len();
-    ui.send(Msg::Dash(Store::Inventory, Dash::Enter(folder.clone())))?;
-    ui.loaded(Store::Inventory, &folder)?;
-    assert_eq!(lists(&ui, before), 1, "into a folder");
-    let before = ui.host.adapter().batches().len();
-    ui.send(Msg::Dash(Store::Inventory, Dash::Enter(PathBuf::new())))?;
-    ui.loaded(Store::Inventory, Path::new(""))?;
-    assert_eq!(lists(&ui, before), 1, "back to the top");
-    // The same folder read again (a folder opened, a scan that ended) keeps its list.
-    let before = ui.host.adapter().batches().len();
-    ui.loaded(Store::Inventory, Path::new(""))?;
-    assert_eq!(lists(&ui, before), 0, "the same folder again");
+    ui.send(Msg::Dash(Store::Inventory, Dash::Toggle(docs.clone())))?;
+    ui.loaded_with(Store::Inventory, &top, std::slice::from_ref(&docs), None)?;
+    ui.send(Msg::Dash(
+        Store::Inventory,
+        Dash::Select(mail.join("a.txt"), Origin::Map),
+    ))?;
+    ui.loaded_with(Store::Inventory, &top, &[docs, mail], None)?;
+    assert_eq!(lists(&ui, before), 0, "the tree made a new list");
     Ok(())
 }
