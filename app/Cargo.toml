@@ -39,10 +39,11 @@ zeroize.workspace = true
 # thread while no window is open (`ui/mod.rs`, `Ticker`): `Application` has no cross-thread
 # handle and no timer, and the reactor's own dispatcher is private. The feature only adds test
 # hooks next to it (a recording adapter, more event payloads); the real adapter is unchanged.
-# From the fork TBLgGamin/windows-rs: microsoft/windows-rs at 20f6de7 plus one fix (closing a
-# window with a dialog open panicked in the adapter's drop and aborted the process). Back to
-# microsoft/windows-rs once it has the fix.
-windows-reactor = { git = "https://github.com/TBLgGamin/windows-rs", rev = "5fe8f5decadf4f64bcad485005d47769e9067b5a", features = ["test"] }
+# From the fork TBLgGamin/windows-rs: microsoft/windows-rs at 20f6de7 plus two fixes (closing a
+# window with a dialog open panicked in the adapter's drop; a list's selection was set before the
+# items the same update adds, which WinUI refused, and the app ended). Back to microsoft/windows-rs
+# once it has them.
+windows-reactor = { git = "https://github.com/TBLgGamin/windows-rs", rev = "3830b01a36955806328716783f1ff23daeee65b5", features = ["test"] }
 serde_json.workspace = true
 # Reads the Windows light/dark app setting (HKCU Personalize) with a safe registry API.
 winreg = "0.56.0"
@@ -84,7 +85,7 @@ rfd = { version = "0.17.2", default-features = false }
 # Embeds assets/piikey.ico as the exe icon resource (icon only: the manifest comes from windows-reactor-setup).
 embed-resource.workspace = true
 # Stages a private Windows App SDK runtime so no runtime install is needed.
-windows-reactor-setup = { git = "https://github.com/TBLgGamin/windows-rs", rev = "5fe8f5decadf4f64bcad485005d47769e9067b5a" }
+windows-reactor-setup = { git = "https://github.com/TBLgGamin/windows-rs", rev = "3830b01a36955806328716783f1ff23daeee65b5" }
 
 [lints]
 workspace = true

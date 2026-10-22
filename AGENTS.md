@@ -15,10 +15,12 @@ watermarked proxies, DPAPI-protected vault, reversible deanonymization.
   `uiautomation` (UI Automation, wrapped safely: raw `windows` UIA calls are `unsafe`), `clipboard-win`,
   `notify` (file-system change notifications for the watch: `ReadDirectoryChangesW` is `unsafe`, so the crate wraps it),
   `rfd` (the Windows folder and file pickers of the Browse buttons: `IFileOpenDialog` is COM and `unsafe`).
-  `windows-reactor` is pinned to a windows-rs git revision because the tray/`Application` API
-  (`App::run_application`, `NotifyIcon`) is not in a crates.io release. Read its source under
-  `~/.cargo/git/checkouts/windows-rs-*/<rev>/crates/libs/reactor` and the samples in
-  `crates/samples/reactor`; the docs.rs pages describe the older release.
+  `windows-reactor` is pinned to a git revision because the tray/`Application` API
+  (`App::run_application`, `NotifyIcon`) is not in a crates.io release; the revision is on the fork
+  `TBLgGamin/windows-rs` (microsoft/windows-rs at 20f6de7 plus two fixes: hiding a window's open
+  dialogs in the adapter's drop, and a list's selection set after the items its update adds).
+  Read its source under `~/.cargo/git/checkouts/windows-rs-*/<rev>/crates/libs/reactor` and the
+  samples in `crates/samples/reactor`; the docs.rs pages describe the older release.
 
 ## Rules
 
