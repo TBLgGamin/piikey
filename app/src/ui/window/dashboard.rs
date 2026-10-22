@@ -8,7 +8,6 @@
 //! (folder, selection, open folders, type) lives in [`Dashboard`] and survives a load.
 
 use std::{
-    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
@@ -105,10 +104,6 @@ pub struct Dashboard {
     /// The number of the load that `loaded` came from: one that is older than that, or was made
     /// for another folder, is not shown.
     shown: u64,
-    /// The keys of the tree's rows as they were last drawn, and the revision of the tree's list:
-    /// see [`Dashboard::tree_revision`].
-    tree_keys: RefCell<Vec<String>>,
-    tree_revision: Cell<u64>,
 }
 
 impl Dashboard {
@@ -122,21 +117,7 @@ impl Dashboard {
             loaded: None,
             seq: 0,
             shown: 0,
-            tree_keys: RefCell::new(Vec::new()),
-            tree_revision: Cell::new(0),
         }
-    }
-
-    /// Tells the dashboard the tree is about to be drawn with rows keyed `keys`, and returns the
-    /// revision of its rows: a new one whenever rows came, went or the folder on show changed, so
-    /// the list takes the new keys; the same while only what the rows say changed.
-    pub(in crate::ui) fn tree_revision(&self, keys: &[String]) -> u64 {
-        let mut last = self.tree_keys.borrow_mut();
-        if last.as_slice() != keys {
-            self.tree_revision.set(self.tree_revision.get() + 1);
-            *last = keys.to_vec();
-        }
-        self.tree_revision.get()
     }
 
     /// Whether `path` is a folder, as far as the last load knows: the folder on show, or a folder
@@ -398,23 +379,6 @@ mod tests {
             (r"C:\Docs", &[node(r"C:\Docs\a.pdf", false)]),
         ]));
         dash
-    }
-
-    #[test]
-    fn the_tree_revision_moves_only_when_its_rows_do() {
-        let keys = |names: &[&str]| {
-            names
-                .iter()
-                .map(|name| (*name).to_owned())
-                .collect::<Vec<_>>()
-        };
-        let dash = Dashboard::new();
-        let first = dash.tree_revision(&keys(&["a", "b"]));
-        assert_eq!(dash.tree_revision(&keys(&["a", "b"])), first);
-        let opened = dash.tree_revision(&keys(&["a", "a1", "b"]));
-        assert_ne!(opened, first);
-        assert_eq!(dash.tree_revision(&keys(&["a", "a1", "b"])), opened);
-        assert_ne!(dash.tree_revision(&keys(&["a", "b"])), opened);
     }
 
     #[test]

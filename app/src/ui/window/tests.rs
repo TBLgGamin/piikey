@@ -1172,19 +1172,16 @@ fn the_inventory_dashboard_lists_what_was_scanned_in_the_tree_the_legend_the_map
         &drawn,
         &["Other scans", "The most personal data first"],
     )?;
-    // The rows are made as they come into view: the drive first.
-    let rows = ui.realize(1)?;
-    expect_drawn("the drive", &rows, &[drive.as_str()])?;
+    expect_drawn("the drive", &drawn, &[drive.as_str()])?;
     // The drive opens onto its real folders: the first one on the way to what was scanned.
     let ways = below_the_drive(&folder);
     ui.send(Msg::Dash(Store::Inventory, Dash::Toggle(root.clone())))?;
-    ui.loaded_with(
+    let opened = ui.loaded_with(
         Store::Inventory,
         Path::new(""),
         std::slice::from_ref(&root),
         None,
     )?;
-    let opened = ui.realize(2)?;
     expect_drawn("the drive opened", &opened, &[ways[0].as_str()])?;
 
     // The folder the files lie in on show: the way back is there at once, from This PC through
@@ -1195,8 +1192,7 @@ fn the_inventory_dashboard_lists_what_was_scanned_in_the_tree_the_legend_the_map
     way.extend(below_the_drive(&parent));
     let way: Vec<&str> = way.iter().map(String::as_str).collect();
     expect_drawn("the way back", &entered, &way)?;
-    ui.loaded(Store::Inventory, &parent)?;
-    let inside = ui.realize(1)?;
+    let inside = ui.loaded(Store::Inventory, &parent)?;
     expect_drawn("the folder on show", &inside, &["scanned"])?;
     // A folder row selected: the details offer what applies to a folder.
     let folder_row = ui.send(Msg::Dash(
@@ -1864,9 +1860,10 @@ fn inventory_lists_its_locations_like_watch_lists_its_folders() -> Test {
 }
 
 #[test]
-fn opening_folders_and_picking_tiles_keep_the_tree_list() -> Test {
-    // A `ListView` reused the containers of its rows and drew rows in the places of others when
-    // a folder opened in the middle; the tree is one list made as it scrolls, kept by row.
+fn opening_folders_and_picking_tiles_keep_the_tree_and_its_scroll_bar() -> Test {
+    // A `ListView` reused the containers of its rows and drew rows in the places of others, and an
+    // `ItemsRepeater` emptied itself and went back to the top on every folder opened: the tree is
+    // one panel of rows kept by path, in one scroller that stays.
     let mut ui = Headless::open(stub_controller)?;
     let docs = ui.dir.0.join("docs");
     let mail = ui.dir.0.join("mail");
@@ -1891,25 +1888,30 @@ fn opening_folders_and_picking_tiles_keep_the_tree_list() -> Test {
     let top = ui.dir.0.clone();
     ui.send(Msg::Nav(Page::Inventory))?;
     ui.send(Msg::Dash(Store::Inventory, Dash::Enter(top.clone())))?;
-    ui.loaded(Store::Inventory, &top)?;
+    let rows = ui.loaded(Store::Inventory, &top)?;
     // By name, whatever they hold: docs before mail, which holds more.
-    let rows = ui.realize(2)?;
     let at = |name: &str| rows.iter().position(|text| text == name);
     assert!(at("docs") < at("mail"), "{rows:?}");
-    let lists = |ui: &Headless, from: usize| {
-        created(
-            &ui.host.adapter().batches()[from..],
-            ObjectType::ItemsRepeater,
-        )
-    };
+    let made =
+        |ui: &Headless, from: usize, kind| created(&ui.host.adapter().batches()[from..], kind);
     let before = ui.host.adapter().batches().len();
     ui.send(Msg::Dash(Store::Inventory, Dash::Toggle(docs.clone())))?;
-    ui.loaded_with(Store::Inventory, &top, std::slice::from_ref(&docs), None)?;
+    let opened = ui.loaded_with(Store::Inventory, &top, std::slice::from_ref(&docs), None)?;
     ui.send(Msg::Dash(
         Store::Inventory,
         Dash::Select(mail.join("a.txt"), Origin::Map),
     ))?;
     ui.loaded_with(Store::Inventory, &top, &[docs, mail], None)?;
-    assert_eq!(lists(&ui, before), 0, "the tree made a new list");
+    assert_eq!(
+        made(&ui, before, ObjectType::ScrollViewer),
+        0,
+        "the tree's scroller was made again"
+    );
+    // Only the row that came is drawn: the rows that were there stay as they are.
+    assert!(opened.iter().any(|text| text == "a.txt"), "{opened:?}");
+    assert!(
+        !opened.iter().any(|text| text == "mail" || text == "docs"),
+        "{opened:?}"
+    );
     Ok(())
 }

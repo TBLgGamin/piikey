@@ -18,14 +18,12 @@ mod report;
 mod tree;
 mod types;
 
-use std::rc::Rc;
-
 use piikey::detect::EntityKind;
 use windows_reactor::{
     Border, Button, ButtonStyle, Callback, Color, FontIcon, FontWeight, Grid, GridLength,
-    HorizontalAlignment, HyperlinkButton, ItemsRepeater, Orientation, ScrollViewer, StackPanel,
+    HorizontalAlignment, HyperlinkButton, KeyedView, Orientation, ScrollViewer, StackPanel,
     TextBlock, TextTrimming, TextWrapping, ThemeBrush, Thickness, TooltipExt, VerticalAlignment,
-    View, VirtualSource,
+    View,
 };
 
 use self::{
@@ -365,38 +363,31 @@ fn leftover(line: &Line) -> Option<String> {
 }
 
 /// The tree in a card: a line over it that names its columns, and the rows, in Explorer's order.
-/// The rows are made as they scroll into view, each kept by its path: a folder opened adds its
-/// contents under it and the rest stays where it is (a `ListView` reused the containers of its
-/// rows and drew rows in the places of others).
+/// Every row is made, each kept by its path in one panel that stays: a folder opened inserts its
+/// contents under it, and the rest, the scroll bar with it, stays where it is. (A `ListView`
+/// reused the containers of its rows and drew rows in the places of others; an `ItemsRepeater`
+/// gets its rows a moment after it measures them, so a new folder emptied the list and scrolled
+/// it to the top, and the end of the list jittered as rows grew under the scroll bar.)
 fn tree_card(dash: &Dashboard, loaded: &Loaded, store: Store, context: Context<'_>) -> Border {
-    let all = Rc::new(lines(&loaded.levels, &dash.at, &dash.open, dash.kind));
-    let keys: Rc<Vec<String>> = Rc::new(all.iter().map(Line::key).collect());
-    let revision = dash.tree_revision(&keys);
-    let selected = dash.selected.clone();
-    let kind = dash.kind;
     let send = context.forward();
-    let shown = Rc::clone(&all);
-    let source = VirtualSource::new(
-        revision,
-        all.len(),
-        move |index| keys.get(index).cloned().unwrap_or_default(),
-        move |index| -> View {
-            match shown.get(index) {
-                Some(Line::Row(row)) => {
-                    let picked = selected.as_deref() == Some(row.node.path.as_path());
-                    row_view(row, kind, store, picked, &send)
+    let rows = lines(&loaded.levels, &dash.at, &dash.open, dash.kind)
+        .into_iter()
+        .map(|line| {
+            let view: View = match &line {
+                Line::Row(row) => {
+                    let picked = dash.selected.as_deref() == Some(row.node.path.as_path());
+                    row_view(row, dash.kind, store, picked, &send)
                 }
-                Some(other) => caption(leftover(other).unwrap_or_default())
+                other => caption(leftover(other).unwrap_or_default())
                     .text_wrapping(TextWrapping::Wrap)
                     .margin(Thickness::new(INDENT, 8.0, 8.0, 8.0))
                     .into(),
-                None => Border::new().into(),
-            }
-        },
-    );
+            };
+            KeyedView::new(line.key(), view)
+        });
     let list = ScrollViewer::new()
         .grid_row(1)
-        .content(ItemsRepeater::new().virtual_source(source));
+        .content(StackPanel::new().keyed_children(rows));
     Border::new()
         .background(ThemeBrush::CardBackground)
         .border_brush(ThemeBrush::CardStroke)
