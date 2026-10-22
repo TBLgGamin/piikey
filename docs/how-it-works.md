@@ -149,6 +149,13 @@ values you never had are removed again. If a shutdown or sign-out ends both, a `
 does it at the next sign-in. With piikey saved as on, the next start resumes it. Only one copy runs
 per Windows user.
 
+Windows runs nothing of the Microsoft Store (MSIX) build when it removes the package, so a proxy
+that was on would stay pointed at a port nobody listens on. In that build the `RunOnce` entry is a
+`cmd.exe` line that starts piikey through its execution alias, as the entry of the other builds
+starts the exe, and switches the proxy off itself when the alias is gone. The Explorer menu starts
+piikey through the alias too: the folder of the package changes with every version and Windows
+keeps it closed to other programs.
+
 ## Files
 
 Everything piikey keeps is in `%LOCALAPPDATA%\piikey`, readable only by your Windows user:
@@ -163,3 +170,10 @@ Everything piikey keeps is in `%LOCALAPPDATA%\piikey`, readable only by your Win
 | `api.token` | the token the local HTTP API asks for |
 | `ca.crt`, `ca.key` | the local certificate; the key is wrapped with DPAPI |
 | `proxy.prev` | the previous Windows proxy settings, only while piikey has them changed |
+
+The Microsoft Store build keeps all of this in the same folder, so `piikey-cli` from the zip or the
+installer sees the same vault: the package declares the folder, and the registry keys and the
+certificate store piikey changes on purpose (the Windows proxy, the sign-in entry, the certificate
+and the Explorer menu), as ones Windows leaves out of the package's private copy. Removing the
+package leaves the folder, the certificate and the Explorer menu behind:
+[what an uninstall leaves](../packaging/windows/msix/CERTIFICATION.md#what-an-uninstall-leaves).

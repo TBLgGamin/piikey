@@ -1,24 +1,41 @@
 <#
 .SYNOPSIS
-  Packages a release build into dist\: the portable zip, the per-user installer and SHA256SUMS.txt.
+  Packages a release build into dist\: the portable zip, the per-user installer, SHA256SUMS.txt and the MSIX package for the Microsoft Store.
 
 .DESCRIPTION
   Build first:  cargo build --release --workspace --locked
-  Needs:        cargo-about (cargo install cargo-about --locked --features cli) and Inno Setup 6.
+  Needs:        cargo-about (cargo install cargo-about --locked --features cli), Inno Setup 6 and, for the
+                MSIX, the Windows SDK (makeappx.exe).
   CI runs it from .github/workflows/release-assets.yml.
 
   Output:       dist\piikey\                           the release folder (what the zip and installer hold)
                 dist\piikey-<Version>-windows-x64.zip  portable: unzip anywhere, run piikey.exe
                 dist\piikey-<Version>-setup-x64.exe    installer
                 dist\SHA256SUMS.txt                    SHA-256 of the zip and the installer
+                dist\piikey-<Version>-x64.msix         the Microsoft Store package (package-msix.ps1), not in SHA256SUMS.txt
 
 .PARAMETER Version
   The version of the build in target\release, as in Cargo.toml (for example 0.1.0).
 
+.PARAMETER SkipMsix
+  Leave out the MSIX package. CI does, and runs package-msix.ps1 in a step of its own.
+
+.PARAMETER MsixIdentityName
+.PARAMETER MsixPublisher
+.PARAMETER MsixPublisherDisplayName
+  The identity of the MSIX package, as package-msix.ps1 takes it (IdentityName, Publisher,
+  PublisherDisplayName). Without them it is the identity of a test build, piikey.dev.
+
 .EXAMPLE
   pwsh packaging/windows/package.ps1 -Version 0.1.0
 #>
-param([Parameter(Mandatory)][string]$Version)
+param(
+    [Parameter(Mandatory)][string]$Version,
+    [switch]$SkipMsix,
+    [string]$MsixIdentityName,
+    [string]$MsixPublisher,
+    [string]$MsixPublisherDisplayName
+)
 
 $ErrorActionPreference = 'Stop'
 
@@ -117,5 +134,15 @@ $lines = foreach ($file in $zip, $setup) {
     '{0}  {1}' -f (Get-FileHash -Algorithm SHA256 -LiteralPath $file).Hash.ToLowerInvariant(), (Split-Path $file -Leaf)
 }
 [System.IO.File]::WriteAllText($sums, (($lines -join "`n") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+
+# 9. The MSIX package for the Microsoft Store. It is not in SHA256SUMS.txt: the Store, not a release,
+# is where it is distributed.
+if (-not $SkipMsix) {
+    $identity = @{}
+    if ($MsixIdentityName) { $identity.IdentityName = $MsixIdentityName }
+    if ($MsixPublisher) { $identity.Publisher = $MsixPublisher }
+    if ($MsixPublisherDisplayName) { $identity.PublisherDisplayName = $MsixPublisherDisplayName }
+    & (Join-Path $PSScriptRoot 'package-msix.ps1') -Version $Version -StageDir $stage @identity
+}
 
 Get-ChildItem -LiteralPath $dist -File | Select-Object Name, Length | Format-Table -AutoSize

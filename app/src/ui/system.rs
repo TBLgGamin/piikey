@@ -17,11 +17,12 @@ use piikey::{
     inventory::Inventory,
     policy::Policy,
     service::Server,
-    sys::{data_dir, write_atomic},
+    sys::{data_dir, is_packaged, launch_path, write_atomic},
 };
 
 use super::{
     activity::Activity,
+    assets,
     controller::{Backend, Running},
 };
 use crate::{
@@ -124,13 +125,19 @@ impl Backend for System {
     }
 
     fn set_explorer_menu(&self, on: bool) -> Res<()> {
-        if on {
-            let exe = std::env::current_exe()
-                .map_err(|error| format!("could not find piikey.exe: {error}"))?;
-            shell::register(&exe)
-        } else {
-            shell::unregister()
+        if !on {
+            return shell::unregister();
         }
+        let launcher =
+            launch_path().map_err(|error| format!("could not find piikey.exe: {error}"))?;
+        // Explorer cannot read an icon out of the execution alias of a packaged app: the icon
+        // file that the tray icon uses stands in for it.
+        let icon = if is_packaged() {
+            assets::icon_file(&self.vault)?
+        } else {
+            launcher.clone()
+        };
+        shell::register(&launcher, &icon)
     }
 
     fn set_hotkey(&self, shared: &Shared, on: bool) -> Res<()> {

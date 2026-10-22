@@ -1,8 +1,10 @@
 name: release-assets
 
 # Builds the portable zip, the per-user installer and SHA256SUMS.txt from source, tests them, and
-# uploads them to a release. release.yml calls it right after release-plz tags a release (a tag made
-# with GITHUB_TOKEN starts no other workflow). By hand:
+# uploads them to a release. From the same build it also packs the MSIX package for the Microsoft
+# Store and installs a signed copy on the runner to test it; the unsigned MSIX is a workflow
+# artifact, never a release asset. release.yml calls it right after release-plz tags a release (a
+# tag made with GITHUB_TOKEN starts no other workflow). By hand:
 #   gh workflow run release-assets.yml --ref main            dry run: build and test, upload nothing
 #   gh workflow run release-assets.yml -f tag=v0.1.0         rebuild a release's assets and replace them
 on:
@@ -67,7 +69,7 @@ jobs:
       - name: Package
         env:
           VERSION: ${{ steps.version.outputs.version }}
-        run: ./packaging/windows/package.ps1 -Version $env:VERSION
+        run: ./packaging/windows/package.ps1 -Version $env:VERSION -SkipMsix
       - name: Smoke test the zip, the installer and the uninstaller
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -97,3 +99,59 @@ jobs:
         run: |
           $files = "dist/piikey-$env:VERSION-windows-x64.zip", "dist/piikey-$env:VERSION-setup-x64.exe", 'dist/SHA256SUMS.txt'
           gh release upload $env:TAG @files --clobber --repo $env:GITHUB_REPOSITORY
+      # The MSIX is for the Microsoft Store, not for the release: the three steps below come last, after
+      # everything that goes to the release has been uploaded.
+      - name: Package the MSIX
+        id: msix
+        # A broken Store package fails a dry run; a release run only marks the step, so the assets and winget go on.
+        continue-on-error: ${{ inputs.tag != '' }}
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          # Repository variables, from Partner Center (Product identity): all three or none.
+          STORE_IDENTITY_NAME: ${{ vars.STORE_IDENTITY_NAME }}
+          STORE_PUBLISHER: ${{ vars.STORE_PUBLISHER }}
+          STORE_PUBLISHER_DISPLAY_NAME: ${{ vars.STORE_PUBLISHER_DISPLAY_NAME }}
+        run: |
+          $names = 'STORE_IDENTITY_NAME', 'STORE_PUBLISHER', 'STORE_PUBLISHER_DISPLAY_NAME'
+          $set = @($names | Where-Object { -not [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_)) })
+          $store = @{}
+          if ($set.Count -eq $names.Count) {
+            $store = @{
+              IdentityName = $env:STORE_IDENTITY_NAME
+              Publisher = $env:STORE_PUBLISHER
+              PublisherDisplayName = $env:STORE_PUBLISHER_DISPLAY_NAME
+            }
+          }
+          elseif ($set.Count -gt 0) {
+            $empty = $names | Where-Object { $set -notcontains $_ }
+            throw "set all three repository variables (STORE_IDENTITY_NAME, STORE_PUBLISHER, STORE_PUBLISHER_DISPLAY_NAME) or none; empty: $($empty -join ', ')"
+          }
+          ./packaging/windows/package-msix.ps1 -Version $env:VERSION @store
+          $file = "piikey-$env:VERSION-x64.msix"
+          if ($store.Count -gt 0) {
+            "MSIX ${file}: Store identity $($store.IdentityName) by $($store.Publisher). This is the file for Partner Center." >> $env:GITHUB_STEP_SUMMARY
+          }
+          else {
+            "MSIX ${file}: test identity. Set the repository variables STORE_IDENTITY_NAME, STORE_PUBLISHER and STORE_PUBLISHER_DISPLAY_NAME to build the Store package." >> $env:GITHUB_STEP_SUMMARY
+          }
+      - name: Smoke test the MSIX
+        if: steps.msix.outcome == 'success'
+        # As above: a broken Store package only fails a dry run.
+        continue-on-error: ${{ inputs.tag != '' }}
+        # Installs a package and starts the app: a hang must not hold up the winget submission for hours.
+        timeout-minutes: 20
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: ./packaging/windows/smoke-msix.ps1 -Version $env:VERSION
+      # Unsigned, as the Store signs it: when the STORE_* variables are set, this is the file to upload to
+      # Partner Center. It is kept when the smoke test failed, to look at.
+      - name: Upload the MSIX
+        if: ${{ !cancelled() && steps.msix.outcome == 'success' }}
+        # As above: a failure here only fails a dry run.
+        continue-on-error: ${{ inputs.tag != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: piikey-${{ steps.version.outputs.version }}-msix
+          path: dist/piikey-${{ steps.version.outputs.version }}-x64.msix
+          if-no-files-found: error
+          retention-days: 14
