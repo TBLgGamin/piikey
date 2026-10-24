@@ -102,7 +102,7 @@ impl Controller {
     }
 
     /// Loads the detection model while something needs it, and frees its memory when nothing
-    /// does: protection, the highlight, the watch, a scan, the findings of a file.
+    /// does: protection, the highlight, monitoring, a scan, the findings of a file.
     pub(super) fn sync_model(&self) {
         self.sync_model_with(false);
     }
@@ -185,7 +185,7 @@ impl Controller {
             starting
                 || state.enabled
                 || policy.highlight != Highlight::Off
-                || (policy.watch && !policy.watch_folders.is_empty())
+                || !policy.monitored_roots.is_empty()
                 || state.scan.is_some()
                 || state.watch.scan.is_some()
                 || state.findings > 0,

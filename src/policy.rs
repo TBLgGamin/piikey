@@ -8,7 +8,6 @@
 //! highlight=hotkey
 //! explorer_menu=true
 //! background=true
-//! watch=false
 //! http_api=false
 //! http_port=7980
 //! site=chat.openai.com
@@ -16,7 +15,7 @@
 //! program=chrome.exe
 //! disabled_kind=email
 //! inventory_root=C:\Users\jan\Documents
-//! watch_folder=C:\Users\jan\Downloads
+//! monitor_root=C:\Users\jan\Documents
 //! ```
 //!
 //! `disabled_kind=<kind>` lines (the `EntityKind::as_str` name) list the kinds
@@ -24,13 +23,15 @@
 //! an old file means. An unknown kind name is skipped like any unknown key.
 //!
 //! `highlight` is `off`, `always` or `hotkey`. `explorer_menu` and `background` are on unless
-//! they say `false`; `watch`, `http_api` and `enabled` are off unless they say `true`.
+//! they say `false`; `http_api` and `enabled` are off unless they say `true`.
 //! `http_port` is a port from 1 to 65535. `program` is an exe name; a path stands for its file
-//! name. `inventory_root` (the folders the inventory scans when asked) and `watch_folder` (the
-//! folders the watch keeps an eye on) repeat, one absolute folder each. A file from an older
+//! name. `inventory_root` (the folders the inventory scans when asked) and `monitor_root` (a
+//! location whose changes are scanned as they happen; it must also be an `inventory_root`, and
+//! one that is not is dropped) repeat, one absolute folder each. A file from an older
 //! version lacks the newer keys and gets their defaults; the keys of features that are gone
 //! (`inventory`, `inventory_exclude`) are skipped like any unknown key, and the next save leaves
-//! them out.
+//! them out. The retired `watch` and `watch_folder` keys are migrated: an older file's
+//! `watch_folder` folders become locations, monitored when its `watch` was `true`.
 //!
 //! Blank lines and `#` comments are ignored, unknown keys are skipped, and
 //! every value is normalized on load, so a hand-edited file cannot make the
@@ -67,19 +68,18 @@ const FILE_NAME: &str = "guard.cfg";
 
 /// The keys of `guard.cfg`, in the order the file lists them. `settings set` takes all but
 /// `enabled`: protection is switched on and off by itself.
-pub const KEYS: [&str; 12] = [
+pub const KEYS: [&str; 11] = [
     "enabled",
     "highlight",
     "explorer_menu",
     "background",
-    "watch",
     "http_api",
     "http_port",
     "site",
     "program",
     "disabled_kind",
     "inventory_root",
-    "watch_folder",
+    "monitor_root",
 ];
 
 /// The port of the local HTTP API unless `http_port` says otherwise.
@@ -150,17 +150,14 @@ pub struct Policy {
     /// Whether Explorer's right-click menu offers "Scan for personal data".
     pub explorer_menu: bool,
     /// Whether closing the window leaves piikey running in the tray, with protection, the
-    /// highlight, the watch and the API still working. Off: closing the window quits piikey.
+    /// highlight, monitoring and the API still working. Off: closing the window quits piikey.
     pub background: bool,
     /// Absolute folders the inventory scans when asked (its locations). None until the user
     /// adds one.
     pub inventory_roots: Vec<PathBuf>,
-    /// Whether the watch keeps an eye on [`Self::watch_folders`]: every change in them is
-    /// scanned as it happens, into a store of its own.
-    pub watch: bool,
-    /// Absolute folders the watch keeps an eye on, below them too. Empty until the user picks
-    /// some: nothing is watched by default.
-    pub watch_folders: Vec<PathBuf>,
+    /// Locations (each one of `inventory_roots`) whose file changes are scanned as they happen.
+    /// None by default.
+    pub monitored_roots: Vec<PathBuf>,
     /// Whether the app serves the local HTTP API on `127.0.0.1`.
     pub http_api: bool,
     /// The port of the local HTTP API, 1 to 65535.
@@ -180,8 +177,7 @@ impl Default for Policy {
             explorer_menu: true,
             background: true,
             inventory_roots: Vec::new(),
-            watch: false,
-            watch_folders: Vec::new(),
+            monitored_roots: Vec::new(),
             http_api: false,
             http_port: DEFAULT_HTTP_PORT,
         }
@@ -271,6 +267,13 @@ impl Policy {
         normalize_folder(s).map(PathBuf::from)
     }
 
+    /// Drops every monitored root that is not one of the locations.
+    pub fn prune_monitored(&mut self) {
+        let roots = &self.inventory_roots;
+        self.monitored_roots
+            .retain(|m| roots.iter().any(|r| same_path(r, m)));
+    }
+
     /// Whether traffic to `host` from program `exe` is intercepted: the app
     /// is on and the host matches a site or the program is selected.
     #[must_use]
@@ -295,6 +298,10 @@ impl Policy {
 
     fn parse(text: &str) -> Self {
         let mut policy = Self::default();
+        // The retired `watch` and `watch_folder` keys: the folders become locations, monitored
+        // when the watch was on.
+        let mut legacy_watch = false;
+        let mut legacy_folders: Vec<Option<PathBuf>> = Vec::new();
         for line in text.strip_prefix('\u{feff}').unwrap_or(text).lines() {
             let line = line.trim();
             if line.starts_with('#') {
@@ -309,7 +316,6 @@ impl Policy {
                 "highlight" => policy.highlight = Highlight::parse(value).unwrap_or_default(),
                 "explorer_menu" => policy.explorer_menu = !value.eq_ignore_ascii_case("false"),
                 "background" => policy.background = !value.eq_ignore_ascii_case("false"),
-                "watch" => policy.watch = value.eq_ignore_ascii_case("true"),
                 "http_api" => policy.http_api = value.eq_ignore_ascii_case("true"),
                 "http_port" => {
                     policy.http_port = value
@@ -330,12 +336,28 @@ impl Policy {
                 "inventory_root" => {
                     push_unique_folder(&mut policy.inventory_roots, Self::parse_folder(value));
                 }
-                "watch_folder" => {
-                    push_unique_folder(&mut policy.watch_folders, Self::parse_folder(value));
+                "monitor_root" => {
+                    push_unique_folder(&mut policy.monitored_roots, Self::parse_folder(value));
                 }
+                "watch" => legacy_watch = value.eq_ignore_ascii_case("true"),
+                "watch_folder" => legacy_folders.push(Self::parse_folder(value)),
                 _ => {}
             }
         }
+        for folder in legacy_folders.into_iter().flatten() {
+            push_unique_folder(&mut policy.inventory_roots, Some(folder.clone()));
+            if legacy_watch
+                // Spelled as the location is, whichever of them was typed first.
+                && let Some(location) = policy
+                    .inventory_roots
+                    .iter()
+                    .find(|root| same_path(root, &folder))
+            {
+                let location = location.clone();
+                push_unique_folder(&mut policy.monitored_roots, Some(location));
+            }
+        }
+        policy.prune_monitored();
         policy
     }
 
@@ -356,7 +378,6 @@ impl Policy {
             vec![self.highlight.as_str().to_owned()],
             vec![self.explorer_menu.to_string()],
             vec![self.background.to_string()],
-            vec![self.watch.to_string()],
             vec![self.http_api.to_string()],
             vec![self.http_port.to_string()],
             sites.collect(),
@@ -367,7 +388,7 @@ impl Policy {
                 .map(|kind| kind.as_str().to_owned())
                 .collect(),
             folders(&self.inventory_roots),
-            folders(&self.watch_folders),
+            folders(&self.monitored_roots),
         ];
         let mut out = String::new();
         for (key, values) in KEYS.into_iter().zip(values) {
@@ -418,12 +439,9 @@ pub struct SettingsPatch {
     /// Replaces [`Policy::inventory_roots`]; each entry goes through [`Policy::parse_folder`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inventory_roots: Option<Vec<PathBuf>>,
-    /// Replaces [`Policy::watch`].
+    /// Replaces [`Policy::monitored_roots`]; each must be one of the locations after this patch.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub watch: Option<bool>,
-    /// Replaces [`Policy::watch_folders`]; each entry goes through [`Policy::parse_folder`].
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub watch_folders: Option<Vec<PathBuf>>,
+    pub monitored_roots: Option<Vec<PathBuf>>,
     /// Replaces [`Policy::http_api`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub http_api: Option<bool>,
@@ -463,12 +481,20 @@ impl SettingsPatch {
         if let Some(folders) = &self.inventory_roots {
             next.inventory_roots = checked_folders(folders, "inventory folder")?;
         }
-        if let Some(value) = self.watch {
-            next.watch = value;
+        if let Some(folders) = &self.monitored_roots {
+            let monitored = checked_folders(folders, "monitored folder")?;
+            if let Some(stray) = monitored
+                .iter()
+                .find(|m| !next.inventory_roots.iter().any(|r| same_path(r, m)))
+            {
+                return Err(Error::BadRequest(format!(
+                    "Not a location: {} (a monitored folder must be one of the inventory's locations)",
+                    stray.display()
+                )));
+            }
+            next.monitored_roots = monitored;
         }
-        if let Some(folders) = &self.watch_folders {
-            next.watch_folders = checked_folders(folders, "watch folder")?;
-        }
+        next.prune_monitored();
         if let Some(value) = self.http_api {
             next.http_api = value;
         }
@@ -609,7 +635,7 @@ mod tests {
     use super::*;
 
     /// The new switches at their defaults, as `to_text` writes them after `enabled`.
-    const DEFAULT_SWITCHES: &str = "highlight=hotkey\nexplorer_menu=true\nbackground=true\nwatch=false\n\
+    const DEFAULT_SWITCHES: &str = "highlight=hotkey\nexplorer_menu=true\nbackground=true\n\
                                     http_api=false\nhttp_port=7980\n";
 
     fn policy() -> Policy {
@@ -625,8 +651,7 @@ mod tests {
                 PathBuf::from(r"C:\Users\jan\Documents"),
                 PathBuf::from(r"D:\Archive"),
             ],
-            watch: true,
-            watch_folders: vec![PathBuf::from(r"C:\Users\jan\Downloads")],
+            monitored_roots: vec![PathBuf::from(r"C:\Users\jan\Documents")],
             http_api: true,
             http_port: 8123,
         }
@@ -652,9 +677,9 @@ mod tests {
                 r#"{"sites":["HTTPS://Chat.OpenAI.com/x","*.example.org","chat.openai.com"],
                 "programs":["Firefox"],
                 "disabled_kinds":["phone","email","phone"],
-                "highlight":"always","explorer_menu":false,"background":true,"watch":false,
+                "highlight":"always","explorer_menu":false,"background":true,
                 "inventory_roots":["\"C:\\Users\\jan\\Documents\"","C:\\Users\\jan\\documents\\"],
-                "watch_folders":["C:\\Users\\jan\\Pictures"],
+                "monitored_roots":["C:\\Users\\jan\\Documents"],
                 "http_api":true,"http_port":8123}"#,
             )
             .apply(&mut p)
@@ -664,12 +689,15 @@ mod tests {
         assert_eq!(p.programs, ["firefox.exe"]);
         assert_eq!(p.disabled_kinds, [EntityKind::Email, EntityKind::Phone]);
         assert_eq!(p.highlight, Highlight::Always);
-        assert!(!p.explorer_menu && p.background && !p.watch && p.http_api);
+        assert!(!p.explorer_menu && p.background && p.http_api);
         assert_eq!(
             p.inventory_roots,
             [PathBuf::from(r"C:\Users\jan\Documents")]
         );
-        assert_eq!(p.watch_folders, [PathBuf::from(r"C:\Users\jan\Pictures")]);
+        assert_eq!(
+            p.monitored_roots,
+            [PathBuf::from(r"C:\Users\jan\Documents")]
+        );
         assert_eq!(p.http_port, 8123);
         assert_eq!(p.enabled, before.enabled);
 
@@ -685,7 +713,7 @@ mod tests {
             r#"{"background":true,"programs":["a|b.exe"]}"#,
             r#"{"background":true,"disabled_kinds":["nonsense"]}"#,
             r#"{"background":true,"inventory_roots":["relative\\folder"]}"#,
-            r#"{"background":true,"watch_folders":[""]}"#,
+            r#"{"background":true,"monitored_roots":[""]}"#,
             r#"{"background":true,"http_port":0}"#,
         ] {
             let mut p = policy();
@@ -711,6 +739,32 @@ mod tests {
         // refused, not silently half applied.
         assert!(serde_json::from_str::<SettingsPatch>(r#"{"inventory":true}"#).is_err());
         assert!(serde_json::from_str::<SettingsPatch>(r#"{"inventory_exclude":[]}"#).is_err());
+        // Nor does the watch that monitoring replaced.
+        assert!(serde_json::from_str::<SettingsPatch>(r#"{"watch":true}"#).is_err());
+        assert!(serde_json::from_str::<SettingsPatch>(r#"{"watch_folders":[]}"#).is_err());
+    }
+
+    #[test]
+    fn a_monitored_root_must_be_a_location() {
+        let mut p = Policy::default();
+        let before = p.clone();
+        let Err(error) = patch(r#"{"monitored_roots":["C:\\X"]}"#).apply(&mut p) else {
+            panic!("a folder that is no location cannot be monitored");
+        };
+        assert!(matches!(error, Error::BadRequest(_)), "{error:?}");
+        assert!(error.to_string().contains("Not a location"), "{error}");
+        assert_eq!(p, before);
+
+        assert!(
+            patch(r#"{"inventory_roots":["C:\\X"],"monitored_roots":["C:\\X"]}"#)
+                .apply(&mut p)
+                .is_ok()
+        );
+        assert_eq!(p.monitored_roots, [PathBuf::from(r"C:\X")]);
+
+        // Taking the location away ends its monitoring.
+        assert!(patch(r#"{"inventory_roots":[]}"#).apply(&mut p).is_ok());
+        assert!(p.inventory_roots.is_empty() && p.monitored_roots.is_empty());
     }
 
     #[test]
@@ -728,7 +782,7 @@ mod tests {
             sites: vec!["chatgpt.com".into()],
             disabled_kinds: vec![EntityKind::CreditCard, EntityKind::Email],
             inventory_roots: vec![PathBuf::from(r"C:\Docs")],
-            watch_folders: vec![PathBuf::from(r"D:\Inbox")],
+            monitored_roots: vec![PathBuf::from(r"D:\Inbox")],
             ..Policy::default()
         };
         let Ok(json) = serde_json::to_value(&p) else {
@@ -745,8 +799,7 @@ mod tests {
                 "explorer_menu": true,
                 "background": true,
                 "inventory_roots": ["C:\\Docs"],
-                "watch": false,
-                "watch_folders": ["D:\\Inbox"],
+                "monitored_roots": ["D:\\Inbox"],
                 "http_api": false,
                 "http_port": 7980,
             })
@@ -759,11 +812,11 @@ mod tests {
         assert_eq!(Policy::parse(&p.to_text()), p);
         assert_eq!(
             p.to_text(),
-            "enabled=true\nhighlight=always\nexplorer_menu=false\nbackground=false\nwatch=true\n\
+            "enabled=true\nhighlight=always\nexplorer_menu=false\nbackground=false\n\
              http_api=true\nhttp_port=8123\nsite=chatgpt.com\nsite=*.anthropic.com\n\
              program=chrome.exe\ndisabled_kind=email\ndisabled_kind=person\n\
              inventory_root=C:\\Users\\jan\\Documents\ninventory_root=D:\\Archive\n\
-             watch_folder=C:\\Users\\jan\\Downloads\n"
+             monitor_root=C:\\Users\\jan\\Documents\n"
         );
     }
 
@@ -887,9 +940,9 @@ mod tests {
         assert_eq!(p.highlight, Highlight::Hotkey);
         assert!(p.explorer_menu);
         assert!(p.background, "closing the window keeps piikey in the tray");
-        assert!(!p.watch && !p.http_api);
+        assert!(!p.http_api);
         assert_eq!(p.http_port, 7980);
-        assert!(p.inventory_roots.is_empty() && p.watch_folders.is_empty());
+        assert!(p.inventory_roots.is_empty() && p.monitored_roots.is_empty());
     }
 
     #[test]
@@ -908,7 +961,7 @@ mod tests {
             p.inventory_roots,
             [PathBuf::from(r"C:\Users\jan\Documents")]
         );
-        assert!(p.background && !p.watch && p.watch_folders.is_empty());
+        assert!(p.background && p.monitored_roots.is_empty());
         // The next save leaves them out.
         let saved = p.to_text();
         assert!(!saved.contains("inventory=") && !saved.contains("inventory_exclude"));
@@ -957,9 +1010,7 @@ mod tests {
         assert!(read("background=\n").background);
         assert!(read("").background);
         // Off by default: only the word `true` turns them on.
-        assert!(read("watch=true\n").watch);
         assert!(read("http_api=TRUE\n").http_api);
-        assert!(!read("watch=yes\n").watch);
         assert!(!read("http_api=1\n").http_api);
     }
 
@@ -978,14 +1029,20 @@ mod tests {
     fn parse_reads_every_key() {
         for key in KEYS {
             let sample = match key {
-                "enabled" | "watch" | "http_api" => "true",
+                "enabled" | "http_api" => "true",
                 "highlight" => "off",
                 "explorer_menu" | "background" => "false",
                 "http_port" => "1",
                 "site" => "a.com",
                 "program" => "a.exe",
                 "disabled_kind" => "email",
-                "inventory_root" | "watch_folder" => r"C:\a",
+                "inventory_root" => r"C:\a",
+                "monitor_root" => {
+                    // Only a location can be monitored: it is read together with its location.
+                    let p = Policy::parse("inventory_root=C:\\a\nmonitor_root=C:\\a\n");
+                    assert_eq!(p.monitored_roots, [PathBuf::from(r"C:\a")]);
+                    continue;
+                }
                 other => panic!("{other} needs a sample"),
             };
             assert_ne!(
@@ -1015,7 +1072,7 @@ mod tests {
     }
 
     #[test]
-    fn inventory_and_watch_folders_are_normalized_and_deduplicated() {
+    fn locations_and_monitored_roots_are_normalized_and_deduplicated() {
         let p = Policy::parse(
             "inventory_root=C:\\Users\\jan\\Documents\n\
              inventory_root=\"C:\\Users\\jan\\Desktop\"\n\
@@ -1026,18 +1083,43 @@ mod tests {
              inventory_root=\n\
              inventory_root=\"\"\n\
              inventory_root=C:\\a\u{1}b\n\
-             watch_folder=D:\\Inbox\n\
-             watch_folder = d:\\inbox\\\n\
-             watch_folder=Inbox\n",
+             inventory_root=D:\\Inbox\n\
+             monitor_root=D:\\Inbox\n\
+             monitor_root = d:\\inbox\\\n\
+             monitor_root=Inbox\n\
+             monitor_root=E:\\NotALocation\n",
         );
         assert_eq!(
             p.inventory_roots,
             [
                 PathBuf::from(r"C:\Users\jan\Documents"),
                 PathBuf::from(r"C:\Users\jan\Desktop"),
+                PathBuf::from(r"D:\Inbox"),
             ]
         );
-        assert_eq!(p.watch_folders, [PathBuf::from(r"D:\Inbox")]);
+        assert_eq!(p.monitored_roots, [PathBuf::from(r"D:\Inbox")]);
+    }
+
+    #[test]
+    fn an_older_watch_becomes_monitored_locations() {
+        let old = "inventory_root=C:\\A\nwatch=true\nwatch_folder=C:\\B\nwatch_folder=c:\\a\\\n\
+                   monitor_root=C:\\Z\n";
+        let p = Policy::parse(old);
+        assert_eq!(
+            p.inventory_roots,
+            [PathBuf::from(r"C:\A"), PathBuf::from(r"C:\B")]
+        );
+        assert_eq!(
+            p.monitored_roots,
+            [PathBuf::from(r"C:\B"), PathBuf::from(r"C:\A")],
+            "in the order of the watch_folder lines, spelled as the location is; C:\\Z is none"
+        );
+        assert!(!p.to_text().contains("watch"));
+        assert_eq!(Policy::parse(&p.to_text()), p);
+
+        let off = Policy::parse(&old.replace("watch=true", "watch=false"));
+        assert_eq!(off.inventory_roots, p.inventory_roots);
+        assert!(off.monitored_roots.is_empty());
     }
 
     #[test]
@@ -1076,14 +1158,14 @@ mod tests {
                 PathBuf::from("relative"),
                 not_unicode,
             ],
-            watch_folders: vec![PathBuf::from(r"C:\ok\watched")],
+            monitored_roots: vec![PathBuf::from(r"C:\ok")],
             ..Policy::default()
         };
         assert_eq!(
             p.to_text(),
             format!(
                 "enabled=false\n{DEFAULT_SWITCHES}\
-                 inventory_root=C:\\ok\nwatch_folder=C:\\ok\\watched\n"
+                 inventory_root=C:\\ok\nmonitor_root=C:\\ok\n"
             )
         );
     }

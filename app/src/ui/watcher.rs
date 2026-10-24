@@ -1,5 +1,5 @@
-//! The system's side of the watch: file-system change notifications for the folders the user
-//! asked to be watched, as [`Change`]s for the controller (see `controller/watch.rs`, which
+//! The system's side of monitoring: file-system change notifications for the locations the user
+//! switched Monitor on for, as [`Change`]s for the controller (see `controller/watch.rs`, which
 //! lets them settle and scans what they name). The Windows API behind it is wrapped by the
 //! `notify` crate, because calling it takes `unsafe`.
 

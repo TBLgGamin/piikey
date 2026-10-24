@@ -431,9 +431,9 @@ fn the_settings_are_kept_and_decide_what_is_looked_for() -> TestResult {
             "settings",
             "set",
             "highlight=always",
-            "watch=true",
             "background=false",
-            &format!("watch_folder={inbox}"),
+            &format!("inventory_root={inbox}"),
+            &format!("monitor_root={inbox}"),
             "site=chatgpt.com",
             "site=*.openai.com",
             "http_port=7999",
@@ -442,15 +442,20 @@ fn the_settings_are_kept_and_decide_what_is_looked_for() -> TestResult {
     )?;
     assert_eq!(set["highlight"], "always");
     let got = sandbox.json(&["settings", "get"], "")?;
-    assert_eq!(got["watch"], true);
+    assert!(got.get("watch").is_none() && got.get("watch_folders").is_none());
     assert_eq!(got["background"], false);
-    assert_eq!(got["watch_folders"][0], inbox);
+    assert_eq!(got["monitored_roots"][0], inbox);
     assert!(got.get("inventory").is_none(), "{got}");
     assert!(got.get("inventory_exclude").is_none(), "{got}");
     assert_eq!(got["http_port"], 7999);
     assert_eq!(got["sites"][1], "*.openai.com");
-    // The inventory's switch and its exclusions are gone.
-    for gone in ["inventory=true", r"inventory_exclude=C:\Private"] {
+    // The inventory's switch and its exclusions are gone, and so is the watch.
+    for gone in [
+        "inventory=true",
+        r"inventory_exclude=C:\Private",
+        "watch=true",
+        r"watch_folder=C:\Inbox",
+    ] {
         let refused = sandbox.run(&["settings", "set", "--local", gone], "")?;
         assert_eq!(refused.code, Some(2), "{gone}: {}", refused.err);
     }

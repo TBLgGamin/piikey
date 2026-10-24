@@ -133,10 +133,6 @@ impl Backend for Stub {
         Inventory::open(&self.vault.with_file_name("inventory.jsonl")).describe()
     }
 
-    fn open_watch(&self) -> Res<Inventory> {
-        Inventory::open(&self.vault.with_file_name("watch.jsonl")).describe()
-    }
-
     fn load_activity(&self) -> Activity {
         Activity::default()
     }
@@ -198,19 +194,10 @@ pub fn stub_controller_with(dir: &TempDir, certificate: bool) -> Result<Arc<Cont
         certificate,
     };
     let inventory = stub.open_inventory()?;
-    let watch = stub.open_watch()?;
     let policy = Policy {
         highlight: Highlight::Off,
         explorer_menu: false,
         ..Policy::default()
     };
-    Controller::new(
-        Box::new(stub),
-        vault,
-        policy,
-        engine,
-        inventory,
-        watch,
-        None,
-    )
+    Controller::new(Box::new(stub), vault, policy, engine, inventory, None)
 }

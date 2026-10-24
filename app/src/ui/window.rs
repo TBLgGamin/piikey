@@ -4,8 +4,8 @@
 //! poll; every user action becomes a message, then a [`Command`] for the controller. Edits to the
 //! lists and the feature switches are applied to the copy at once so the controls follow the
 //! click; the next snapshot is the truth and puts a rejected edit back. Work that waits on the
-//! disk, the registry or the clipboard (exports, the API token, masked copies, the dashboards'
-//! views, starting at sign-in) runs in the background, and its errors reach the user as the
+//! disk, the registry or the clipboard (exports, the API token, masked copies, the dashboard's
+//! view, starting at sign-in) runs in the background, and its errors reach the user as the
 //! controller's notice.
 
 use std::{
@@ -30,7 +30,7 @@ use super::{
     assets,
     controller::{
         Command, Controller, Edit, FindingFiles, KeyedPage, KeyedQuery, Model, Notice, Period,
-        Snapshot, Store, apply_edit,
+        Snapshot, apply_edit,
     },
     explorer, goto, pages,
     status::Status,
@@ -66,38 +66,35 @@ const OPENS_AT: WindowSize = WindowSize {
 };
 
 /// How coarsely the window's size is followed, in DIPs: a smaller change leaves the layout of the
-/// dashboards alone, so dragging an edge builds them anew once in a while, not at every pixel.
+/// dashboard alone, so dragging an edge builds it anew once in a while, not at every pixel.
 const SIZE_STEP: f64 = 8.0;
 
 /// Rows the Vault page lists at most; the search narrows the rest down.
 pub const VAULT_LIMIT: usize = 500;
 
-/// The pages of the navigation pane: five in its menu, and Settings at its foot.
+/// The pages of the navigation pane: four in its menu, and Settings at its foot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
     Overview,
     Protection,
     Inventory,
-    Watch,
     Vault,
     Settings,
 }
 
 impl Page {
     /// The pages of the pane's menu, in order. Settings is the pane's footer item.
-    const MENU: [Self; 5] = [
+    const MENU: [Self; 4] = [
         Self::Overview,
         Self::Protection,
         Self::Inventory,
-        Self::Watch,
         Self::Vault,
     ];
 
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 5] = [
         Self::Overview,
         Self::Protection,
         Self::Inventory,
-        Self::Watch,
         Self::Vault,
         Self::Settings,
     ];
@@ -107,7 +104,6 @@ impl Page {
             Self::Overview => "overview",
             Self::Protection => "protection",
             Self::Inventory => "inventory",
-            Self::Watch => "watch",
             Self::Vault => "vault",
             Self::Settings => "settings",
         }
@@ -123,19 +119,17 @@ impl Page {
             Self::Overview => "Overview",
             Self::Protection => "Protection",
             Self::Inventory => "Inventory",
-            Self::Watch => "Watch",
             Self::Vault => "Vault",
             Self::Settings => "Settings",
         }
     }
 
-    /// A Segoe Fluent Icons glyph: home, shield, folder, eye, lock, gear.
+    /// A Segoe Fluent Icons glyph: home, shield, folder, lock, gear.
     const fn glyph(self) -> &'static str {
         match self {
             Self::Overview => "\u{E80F}",
             Self::Protection => "\u{EA18}",
             Self::Inventory => "\u{E8B7}",
-            Self::Watch => "\u{E890}",
             Self::Vault => "\u{E72E}",
             Self::Settings => "\u{E713}",
         }
@@ -183,8 +177,6 @@ pub enum Browse {
     Location,
     /// A file for the inventory: it is scanned.
     File,
-    /// A folder for the watch.
-    Watch,
 }
 
 impl Browse {
@@ -193,7 +185,6 @@ impl Browse {
         match self {
             Self::Location => "Choose a folder to scan",
             Self::File => "Choose a file to scan",
-            Self::Watch => "Choose a folder to watch",
         }
     }
 }
@@ -246,21 +237,16 @@ pub enum Msg {
     RemoveLocation(PathBuf),
     /// The Scan button: the inventory scans all its locations now.
     ScanAll,
-    /// The Watch switch.
-    Watch(bool),
-    /// The "add a folder to watch" box.
-    WatchDraft(String),
-    AddWatch,
-    /// A folder taken off the Watch list.
-    RemoveWatch(PathBuf),
+    /// A location's Monitor switch: its file changes are scanned as they happen, or not.
+    Monitor(PathBuf, bool),
     /// A Browse button: open the Windows picker for it.
     Browse(Browse),
     /// The picker of a Browse button gave this path: it goes where the box's text would.
     Browsed(Browse, PathBuf),
     /// Something was dropped on the window: the paths of the files and folders.
     Dropped(Vec<String>),
-    /// Something a dashboard's controls ask for; the store says which dashboard.
-    Dash(Store, Dash),
+    /// Something the dashboard's controls ask for.
+    Dash(Dash),
     /// The files the findings view will read.
     FindingsListed(u64, FindingFiles),
     /// What a batch of those files held, or why one could not be read; the number says which
@@ -357,8 +343,6 @@ pub struct MainWindow {
     pub(super) app_draft: String,
     /// The folder or file being typed in Inventory.
     pub(super) root_draft: String,
-    /// The folder being typed in Watch.
-    pub(super) watch_draft: String,
     /// Why the last "Add" was refused.
     pub(super) form_error: Option<String>,
     /// What Developer access says about the last token action; changing the page clears it.
@@ -377,8 +361,6 @@ pub struct MainWindow {
     vault_search: u64,
     /// What the Inventory page shows and what the user chose in it.
     pub(super) inventory: Dashboard,
-    /// The same for the Watch page.
-    pub(super) watch: Dashboard,
     /// The findings view while it is open: the values of the files of a result and how the list is
     /// narrowed down. Never kept past the view.
     pub(super) findings: Option<FindingsView>,
@@ -412,7 +394,6 @@ impl MainWindow {
             site_draft: String::new(),
             app_draft: String::new(),
             root_draft: String::new(),
-            watch_draft: String::new(),
             form_error: None,
             token_note: None,
             startup: None,
@@ -422,7 +403,6 @@ impl MainWindow {
             forget_asked: false,
             vault_search: 0,
             inventory: Dashboard::new(),
-            watch: Dashboard::new(),
             findings: None,
             findings_seq: 0,
             dismissed,
@@ -490,10 +470,10 @@ impl MainWindow {
             || self.snap.reveal != snapshot.reveal
             || self.snap.show != snapshot.show;
         let vault_changed = self.snap.issued != snapshot.issued;
-        // The dashboards follow what the scans find, while they run and once one has ended.
+        // The dashboard follows what the scans find, while they run and once one has ended: the
+        // ones that were asked for and the ones of what monitoring saw change.
         let inventory_changed = self.snap.inventory_totals != snapshot.inventory_totals
-            || (self.snap.scan.is_some() && snapshot.scan.is_none());
-        let watch_changed = self.snap.watch.totals != snapshot.watch.totals
+            || (self.snap.scan.is_some() && snapshot.scan.is_none())
             || (self.snap.watch.scanning.is_some() && snapshot.watch.scanning.is_none());
         self.snap = snapshot;
         if self.snap.busy.is_none() && self.snap.pending == 0 {
@@ -506,10 +486,7 @@ impl MainWindow {
             self.search(context);
         }
         if inventory_changed && self.page == Page::Inventory {
-            self.load_dashboard(Store::Inventory, context);
-        }
-        if watch_changed && self.page == Page::Watch {
-            self.load_dashboard(Store::Watch, context);
+            self.load_dashboard(context);
         }
     }
 
@@ -537,8 +514,7 @@ impl MainWindow {
                 self.input.controller.submit(Command::Refresh);
                 self.watch_apps(context);
             }
-            Page::Inventory => self.load_dashboard(Store::Inventory, context),
-            Page::Watch => self.load_dashboard(Store::Watch, context),
+            Page::Inventory => self.load_dashboard(context),
             Page::Vault => self.search(context),
             Page::Settings => self.load_settings(context),
         }
@@ -602,8 +578,8 @@ impl MainWindow {
         }
     }
 
-    /// The lists of Protection, Inventory and Watch: sites, apps, and the folders the inventory
-    /// scans and the watch looks at. [`Component::update`] routes the messages of these here.
+    /// The lists of Protection and Inventory: sites, apps, and the locations the inventory scans
+    /// and monitors. [`Component::update`] routes the messages of these here.
     fn update_lists(&mut self, message: Msg, context: &ComponentContext<Self>) {
         match message {
             Msg::SiteDraft(text) => {
@@ -651,10 +627,6 @@ impl MainWindow {
                 self.root_draft = path.display().to_string();
                 self.add_root(context);
             }
-            Msg::Browsed(Browse::Watch, path) => {
-                self.watch_draft = path.display().to_string();
-                self.add_watch();
-            }
             Msg::RootAdded => {
                 self.root_draft.clear();
                 self.form_error = None;
@@ -663,27 +635,11 @@ impl MainWindow {
             Msg::RemoveLocation(path) => {
                 let _ = self.edit(Edit::InventoryRoot { path, on: false });
             }
-            Msg::WatchDraft(text) => {
-                self.watch_draft = text;
-                self.form_error = None;
-            }
-            Msg::AddWatch => self.add_watch(),
-            Msg::RemoveWatch(path) => {
-                let _ = self.edit(Edit::WatchFolder { path, on: false });
-            }
+            Msg::Monitor(path, on) => match self.edit(Edit::Monitor { path, on }) {
+                Ok(()) => self.form_error = None,
+                Err(error) => self.form_error = Some(error),
+            },
             _ => {}
-        }
-    }
-
-    /// The Watch box: its folder is watched, or the box says why not.
-    fn add_watch(&mut self) {
-        let path = PathBuf::from(self.watch_draft.trim());
-        match self.edit(Edit::WatchFolder { path, on: true }) {
-            Ok(()) => {
-                self.watch_draft.clear();
-                self.form_error = None;
-            }
-            Err(error) => self.form_error = Some(error),
         }
     }
 
@@ -694,7 +650,7 @@ impl MainWindow {
             let dialog = rfd::FileDialog::new().set_title(browse.title());
             let picked = match browse {
                 Browse::File => dialog.pick_file(),
-                Browse::Location | Browse::Watch => dialog.pick_folder(),
+                Browse::Location => dialog.pick_folder(),
             };
             picked.map_or(Msg::Noop, |path| Msg::Browsed(browse, path))
         });
@@ -745,9 +701,6 @@ impl MainWindow {
             }
             Msg::HttpApi(on) => {
                 let _ = self.edit(Edit::HttpApi(*on));
-            }
-            Msg::Watch(on) => {
-                let _ = self.edit(Edit::Watch(*on));
             }
             Msg::ScanAll => self.input.controller.submit(Command::ScanAll),
             Msg::Dropped(paths) => {
@@ -953,7 +906,7 @@ impl Component for MainWindow {
             Msg::RetryModel => self.input.controller.submit(Command::FetchModel),
             Msg::SkipModel => self.input.controller.submit(Command::SkipModel),
             Msg::Noop => {}
-            Msg::Dash(store, message) => self.update_dashboard(store, message, context),
+            Msg::Dash(message) => self.update_dashboard(message, context),
             Msg::SiteDraft(_)
             | Msg::AddSite
             | Msg::Site(..)
@@ -965,9 +918,7 @@ impl Component for MainWindow {
             | Msg::RootAdded
             | Msg::RootRefused(_)
             | Msg::RemoveLocation(_)
-            | Msg::WatchDraft(_)
-            | Msg::AddWatch
-            | Msg::RemoveWatch(_)
+            | Msg::Monitor(..)
             | Msg::Browse(_)
             | Msg::Browsed(..) => self.update_lists(message, context),
             Msg::Highlight(_)
@@ -975,7 +926,6 @@ impl Component for MainWindow {
             | Msg::ExplorerMenu(_)
             | Msg::Background(_)
             | Msg::HttpApi(_)
-            | Msg::Watch(_)
             | Msg::ScanAll
             | Msg::Dropped(_)
             | Msg::CopyToken

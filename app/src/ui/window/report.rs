@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use windows_reactor::ComponentContext;
 
 use super::{MainWindow, Msg};
-use crate::ui::controller::{Command, Reveal, RevealState, Store};
+use crate::ui::controller::{Command, Reveal, RevealState};
 
 impl MainWindow {
     /// The newest scan that was asked to be shown and whose result the user has not put away.
@@ -56,7 +56,7 @@ impl MainWindow {
                 self.put_away_reveal();
                 // A scan goes into the main inventory, which knows which files of a folder hold what.
                 if let Some(roots) = roots {
-                    self.open_findings(roots, Store::Inventory, context);
+                    self.open_findings(roots, context);
                 }
             }
             _ => {}

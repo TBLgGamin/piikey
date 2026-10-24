@@ -167,14 +167,12 @@ fn the_feed_is_loaded_at_start_filtered_by_time_and_saved_at_shutdown() -> Test 
         ..Fake::default()
     });
     let inventory = fake.open_inventory()?;
-    let watch = fake.open_watch()?;
     let controller = Controller::new(
         Box::new(Arc::clone(&fake)),
         vault,
         quiet(),
         engine,
         inventory,
-        watch,
         None,
     )?;
     let period = |period: Period| KeyedQuery {

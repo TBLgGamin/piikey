@@ -1,16 +1,16 @@
-//! The watch: an eye on the folders the user picked, and what the controller does with what it
-//! sees.
+//! Monitoring: an eye on the locations the user switched Monitor on for, and what the controller
+//! does with what it sees.
 //!
 //! The system reports a change per file and per write ([`Backend::start_watch`]): saving one
 //! document is a dozen reports, copying a folder in is thousands. They go to a thread of their
 //! own, through a [`Debouncer`], which lets a path settle before it is looked at and merges
 //! what it sees into one batch; the batch goes to the scan thread, which scans only what it
-//! names, into the watch's own inventory (see [`Inventory::refresh`]). When the system may have
-//! lost reports (a burst, or it says so), the batch is everything, scanned the way the
-//! inventory's scans are: only what changed is read.
+//! names, into the inventory (see [`Inventory::refresh`]). When the system may have lost reports
+//! (a burst, or it says so), the batch is everything, scanned the way the inventory's scans are:
+//! only what changed is read.
 //!
-//! Switching the watch on, adding a folder and starting the app catch up the same way, with
-//! everything, because a folder is not watched while the app is not running.
+//! Turning Monitor on, adding or removing a monitored location and starting the app catch up the
+//! same way, with everything, because a location is not watched while the app is not running.
 
 use std::{
     collections::HashMap,
@@ -25,12 +25,12 @@ use std::{
 };
 
 use piikey::{
-    inventory::{Progress, Totals, Touched},
+    inventory::{Progress, Touched},
     policy::Policy,
     sys,
 };
 
-use super::{Controller, Notice, Running, Store};
+use super::{Controller, Notice, Running};
 use crate::ui::scanner::Changes;
 
 /// How long a path must be quiet before it is scanned: a file that is being written is scanned
@@ -44,7 +44,7 @@ const CAP: Duration = Duration::from_secs(30);
 /// changed, and walking a folder costs far less than reading its files.
 const BURST: usize = 64;
 
-/// One report of the system: something changed in a watched folder.
+/// One report of the system: something changed in a monitored location.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change {
     /// A file or folder at this path was written, created, renamed or removed. `fresh`: it was
@@ -62,18 +62,16 @@ pub struct Started {
     pub failed: Vec<(PathBuf, String)>,
 }
 
-/// How a watched folder stands.
+/// How a monitored location stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FolderStatus {
-    /// The watch is switched off.
-    Off,
     /// Changes in it are seen as they happen.
     Watching,
     /// It cannot be watched: the message says why (the folder is gone, or not allowed).
     Unavailable(String),
 }
 
-/// One of the folders the watch is asked to keep an eye on.
+/// One of the locations that are monitored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchedFolder {
     pub path: PathBuf,
@@ -83,29 +81,27 @@ pub struct WatchedFolder {
     pub last_change: Option<u64>,
 }
 
-/// How the watch stands, for the window.
+/// How monitoring stands, for the window.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Watch {
-    /// The folders it is asked to watch, in the order of the settings.
+    /// The monitored locations, in the order of the settings.
     pub folders: Vec<WatchedFolder>,
-    /// Files scanned and files to scan, while the watch scans: catching up, or handling changes.
+    /// Files scanned and files to scan, while monitoring scans: catching up, or handling changes.
+    /// What it finds goes into the inventory.
     pub scanning: Option<(u64, u64)>,
-    /// Files in the watch's inventory that hold personal data, and the values found in them.
-    pub totals: (u64, u64),
 }
 
-/// What the controller keeps of the watch.
+/// What the controller keeps of monitoring.
 #[derive(Default)]
 pub(super) struct WatchState {
-    /// The system's watcher while the watch runs.
+    /// The system's watcher while monitoring runs.
     pub running: Option<Box<dyn Running>>,
-    /// How each folder it started for stands; a folder that is not here is not watched.
+    /// How each location it started for stands; a location that is not here is not watched.
     pub statuses: Vec<(PathBuf, FolderStatus)>,
     /// How far the scan that runs now has got.
     pub scan: Option<Arc<Progress>>,
-    /// When a change was last seen under each folder (as the settings spell it).
+    /// When a change was last seen under each location (as the settings spell it).
     pub last_change: HashMap<PathBuf, u64>,
-    pub totals: Totals,
 }
 
 impl WatchState {
@@ -125,15 +121,11 @@ impl WatchState {
         };
         Watch {
             folders: policy
-                .watch_folders
+                .monitored_roots
                 .iter()
                 .map(|path| WatchedFolder {
                     path: path.clone(),
-                    status: if policy.watch {
-                        find(path).unwrap_or(FolderStatus::Watching)
-                    } else {
-                        FolderStatus::Off
-                    },
+                    status: find(path).unwrap_or(FolderStatus::Watching),
                     last_change: last(path),
                 })
                 .collect(),
@@ -143,7 +135,6 @@ impl WatchState {
                     progress.total.load(Ordering::Relaxed),
                 )
             }),
-            totals: (self.totals.files_with_pii, self.totals.hits),
         }
     }
 }
@@ -273,35 +264,28 @@ impl Debouncer {
 }
 
 impl Controller {
-    /// Brings the watch in line with the settings: what is no longer watched is forgotten, the
-    /// system's watcher starts again over the folders there are now (or ends, with the watch off
-    /// or no folder to watch), and everything is caught up on, because what happened while
-    /// nothing watched is unknown.
-    pub(super) fn sync_watch(self: &Arc<Self>, old: &Policy, new: &Policy) {
-        // What runs for folders that went is broken off, and what they held is forgotten once
-        // that scan saved; with the watch off nothing it saw is scanned any more.
-        self.withdraw_removed(Store::Watch, &old.watch_folders, &new.watch_folders);
-        if !new.watch {
-            self.stop_watch_scan();
-        }
+    /// Brings monitoring in line with the settings: what was queued or running for the old set of
+    /// locations is dropped (the catch-up below looks at every monitored location again, and
+    /// reads only what changed), the system's watcher starts again over the locations there are
+    /// now (or ends, with none), and everything is caught up on, because what happened while
+    /// nothing watched is unknown. What a removed location held is forgotten when the location
+    /// is withdrawn, which happens before this.
+    pub(super) fn sync_watch(self: &Arc<Self>, new: &Policy) {
+        self.stop_watch_scan();
         self.stop_watching();
-        if !new.watch || new.watch_folders.is_empty() {
-            let totals = self.watch_store.totals();
-            self.update(|state| {
-                state.watch.statuses.clear();
-                state.watch.totals = totals;
-            });
+        if new.monitored_roots.is_empty() {
+            self.update(|state| state.watch.statuses.clear());
             return;
         }
         let (sender, receiver) = mpsc::channel();
-        let started = match self.backend.start_watch(&new.watch_folders, sender) {
+        let started = match self.backend.start_watch(&new.monitored_roots, sender) {
             Ok(started) => started,
             Err(error) => {
                 self.notify(Notice::error(format!(
-                    "Could not watch your folders: {error}"
+                    "Could not monitor your locations: {error}"
                 )));
                 let statuses = new
-                    .watch_folders
+                    .monitored_roots
                     .iter()
                     .map(|folder| (folder.clone(), FolderStatus::Unavailable(error.clone())))
                     .collect();
@@ -310,7 +294,7 @@ impl Controller {
             }
         };
         let statuses: Vec<(PathBuf, FolderStatus)> = new
-            .watch_folders
+            .monitored_roots
             .iter()
             .map(|folder| {
                 let failed = started
@@ -332,7 +316,9 @@ impl Controller {
             .spawn(move || watch_loop(&controller, &receiver));
         if let Err(error) = spawned {
             started.running.stop();
-            self.notify(Notice::error(format!("Could not start watching: {error}")));
+            self.notify(Notice::error(format!(
+                "Could not start monitoring: {error}"
+            )));
             return;
         }
         self.update(|state| {
@@ -352,10 +338,10 @@ impl Controller {
         }
     }
 
-    /// The watch saw `changes` settle: they go to the scan thread, and the folders they are
+    /// Monitoring saw `changes` settle: they go to the scan thread, and the locations they are
     /// under have a change to show.
     fn watch_saw(self: &Arc<Self>, changes: Changes) {
-        let roots = self.policy().watch_folders;
+        let roots = self.policy().monitored_roots;
         let now = unix_now();
         self.update(|state| {
             for path in changes.paths() {

@@ -224,10 +224,6 @@ impl Backend for Arc<Fake> {
         Inventory::open(&self.vault.with_file_name("inventory.jsonl")).describe()
     }
 
-    fn open_watch(&self) -> Res<Inventory> {
-        Inventory::open(&self.vault.with_file_name("watch.jsonl")).describe()
-    }
-
     fn token(&self, _rotate: bool) -> Res<String> {
         Ok("test-token".to_owned())
     }
@@ -340,14 +336,12 @@ fn rig(installed: bool, policy: Policy) -> Result<Rig, String> {
     });
     let engine = Engine::open(&vault).describe()?;
     let inventory = fake.open_inventory()?;
-    let watch = fake.open_watch()?;
     let controller = Controller::new(
         Box::new(Arc::clone(&fake)),
         vault,
         policy,
         engine,
         inventory,
-        watch,
         None,
     )?;
     Ok(Rig {

@@ -1,5 +1,5 @@
 //! Following the settings: an edit or the API's patch is saved, becomes the live policy, and what
-//! depends on it (the engine's kinds, the Explorer menu, the local API, the watch, the highlight
+//! depends on it (the engine's kinds, the Explorer menu, the local API, monitoring, the highlight
 //! and the detection model) is brought in line.
 
 use std::{
@@ -12,11 +12,11 @@ use piikey::{
     sys,
 };
 
-use super::{Controller, Edit, Notice, Store, apply_edit};
+use super::{Controller, Edit, Notice, apply_edit};
 
-/// Whether the watch has something to keep an eye on.
-fn watching(policy: &Policy) -> bool {
-    policy.watch && !policy.watch_folders.is_empty()
+/// Whether any location is monitored: something has to keep an eye on files.
+fn monitoring(policy: &Policy) -> bool {
+    !policy.monitored_roots.is_empty()
 }
 
 impl Controller {
@@ -62,7 +62,7 @@ impl Controller {
     }
 
     /// Makes `new` the live settings and brings in line what depends on them, for what changed
-    /// from `old`: the engine's kinds, the Explorer menu, the local API, the watch, the
+    /// from `old`: the engine's kinds, the Explorer menu, the local API, monitoring, the
     /// highlight and the detection model.
     fn adopt_policy(self: &Arc<Self>, old: &Policy, new: &Policy) {
         self.engine().set_enabled(new.enabled_kinds());
@@ -77,35 +77,30 @@ impl Controller {
         if (new.http_api, new.http_port) != (old.http_api, old.http_port) {
             self.sync_http();
         }
-        self.withdraw_removed(Store::Inventory, &old.inventory_roots, &new.inventory_roots);
-        if (new.watch, &new.watch_folders) != (old.watch, &old.watch_folders) {
-            self.sync_watch(old, new);
+        self.withdraw_removed(&old.inventory_roots, &new.inventory_roots);
+        if new.monitored_roots != old.monitored_roots {
+            self.sync_watch(new);
         }
         if new.highlight != old.highlight {
             self.sync_highlight(new.highlight);
         }
-        if new.highlight != old.highlight || watching(new) != watching(old) {
+        if new.highlight != old.highlight || monitoring(new) != monitoring(old) {
             self.sync_model();
         }
         self.update(|_| {});
     }
 
-    /// Breaks off whatever scans the folders of `store` that `now` no longer lists, and forgets
-    /// what they held once that scan has saved (see [`Scanner::withdraw`]).
+    /// Breaks off whatever scans the locations that `now` no longer lists, and forgets what they
+    /// held once that scan has saved (see [`Scanner::withdraw`]).
     ///
     /// [`Scanner::withdraw`]: crate::ui::scanner::Scanner::withdraw
-    pub(super) fn withdraw_removed(
-        self: &Arc<Self>,
-        store: Store,
-        before: &[PathBuf],
-        now: &[PathBuf],
-    ) {
+    fn withdraw_removed(self: &Arc<Self>, before: &[PathBuf], now: &[PathBuf]) {
         let mut any = false;
         for folder in before
             .iter()
             .filter(|folder| !now.iter().any(|kept| sys::same_path(kept, folder)))
         {
-            let dropped = self.scanner.withdraw(store, folder);
+            let dropped = self.scanner.withdraw(folder);
             self.reveals_stopped(&dropped);
             any = true;
         }
@@ -114,13 +109,15 @@ impl Controller {
         }
     }
 
-    /// Starts what the saved settings ask for, as if the user had just switched each on.
+    /// Starts what the saved settings ask for, as if the user had just switched each on, and lets
+    /// the inventory hold only what lies in the locations (an older piikey kept every scan).
     pub(super) fn startup(self: &Arc<Self>) {
+        self.keep_to_locations();
         let policy = self.policy();
         let off = Policy {
             highlight: Highlight::Off,
             explorer_menu: false,
-            watch: false,
+            monitored_roots: Vec::new(),
             http_api: false,
             ..policy.clone()
         };

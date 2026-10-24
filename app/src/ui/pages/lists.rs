@@ -1,15 +1,16 @@
 //! The small widgets of the pages that edit a list: a list of check boxes, a row with a Remove
-//! button, a box to add an entry. Protection (sites and apps), Inventory (its locations), Watch
-//! (its folders) and Settings (the types of personal data) are built from them.
+//! button, a box to add an entry. Protection (sites and apps), Inventory (its locations) and
+//! Settings (the types of personal data) are built from them.
 
 use std::{path::Path, rc::Rc};
 
 use windows_reactor::{
     Button, ButtonStyle, CheckBox, DataItem, Grid, GridLength, ListView, ListViewSelectionMode,
-    ScrollViewer, StackPanel, TextBlock, TextBox, TextTrimming, Thickness, VerticalAlignment, View,
+    ScrollBarVisibility, ScrollViewer, StackPanel, TextBlock, TextBox, TextTrimming, Thickness,
+    ToggleSwitch, VerticalAlignment, View,
 };
 
-use super::kit::{Context, caption, card, toned_glyph};
+use super::kit::{Context, caption, card, place_glyph, toned_glyph};
 use crate::ui::{
     status::Tone,
     window::{Browse, Msg},
@@ -133,55 +134,93 @@ pub(super) fn add_row_with(
         .into()
 }
 
-/// One place a page looks through (a location of the inventory, a folder of Watch): its folder
-/// icon in the colour of `tone`, its path, what it is doing, and the button that takes it off.
+/// One place a page looks through (a location of the inventory): its folder icon in the brand
+/// colour (in the caution colour when `tone` says something is wrong), its path, what it is doing,
+/// its Monitor switch (`monitored` says where it stands, and `monitor` turns a toggle into the
+/// message) and the button that takes it off.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each part of the row is its own input: what it says, its switch and its button"
+)]
 pub(super) fn place_row(
     path: &Path,
     state: &str,
     tone: Tone,
     dark: bool,
+    monitored: bool,
+    monitor: impl Fn(bool) -> Msg + 'static,
     remove: Msg,
     context: Context<'_>,
 ) -> View {
     Grid::new()
-        .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
+        .columns([
+            GridLength::Auto,
+            GridLength::STAR,
+            GridLength::Auto,
+            GridLength::Auto,
+        ])
         .column_spacing(12.0)
         .height(PLACE_ROW)
         .children((
-            toned_glyph("\u{E8B7}", 18.0, tone, dark).vertical_alignment(VerticalAlignment::Center),
+            if tone == Tone::Caution {
+                toned_glyph("\u{E8B7}", 18.0, tone, dark)
+            } else {
+                place_glyph(true, 18.0, dark)
+            }
+            .vertical_alignment(VerticalAlignment::Center),
             StackPanel::new()
                 .grid_column(1)
                 .vertical_alignment(VerticalAlignment::Center)
                 .children((
                     TextBlock::new()
                         .text(path.display().to_string())
-                        .text_trimming(TextTrimming::CharacterEllipsis),
+                        .text_trimming(TextTrimming::CharacterEllipsis)
+                        .is_text_selection_enabled(true),
                     caption(state),
                 )),
+            ToggleSwitch::new()
+                .is_on(monitored)
+                .on_content("Monitoring")
+                .off_content("Not monitored")
+                .automation_name(format!("Monitor {}", path.display()))
+                .grid_column(2)
+                .vertical_alignment(VerticalAlignment::Center)
+                .on_toggled(context.callback(monitor)),
             Button::new()
                 .content("Remove")
                 .style(ButtonStyle::Subtle)
                 .automation_name(format!("Remove {}", path.display()))
-                .grid_column(2)
+                .grid_column(3)
                 .vertical_alignment(VerticalAlignment::Center)
                 .on_click(context.message(remove)),
         ))
         .into()
 }
 
-/// The rows of places in a card that scrolls past [`PLACE_ROWS`]; also how much height the card
-/// and the gap under it take, for the page to leave room for.
+/// The rows of places in a card that scrolls past [`PLACE_ROWS`], so the card never grows past
+/// them. With more rows, half of the next one shows under them, and the scroll bar is in view: the
+/// list says it goes on (an idle scroll bar hides until the pointer comes near). Also how
+/// much height the card and the gap under it take, for the page to leave room for.
 pub(super) fn places_card(rows: Vec<View>) -> (View, f64) {
-    let shown = rows.len().min(PLACE_ROWS);
+    let more = rows.len() > PLACE_ROWS;
+    let bar = if more {
+        ScrollBarVisibility::Visible
+    } else {
+        ScrollBarVisibility::Auto
+    };
     // Row counts are tiny: the conversion is exact.
-    let height = PLACE_ROW * f64::from(u32::try_from(shown).unwrap_or(u32::MAX));
+    let shown = f64::from(u32::try_from(rows.len().min(PLACE_ROWS)).unwrap_or(u32::MAX));
+    let height = PLACE_ROW * if more { shown + 0.5 } else { shown };
     (
         card(
-            ScrollViewer::new().height(height).content(
-                StackPanel::new()
-                    .margin(Thickness::new(0.0, 0.0, 12.0, 0.0))
-                    .children(rows),
-            ),
+            ScrollViewer::new()
+                .height(height)
+                .vertical_scroll_bar_visibility(bar)
+                .content(
+                    StackPanel::new()
+                        .margin(Thickness::new(0.0, 0.0, 16.0, 0.0))
+                        .children(rows),
+                ),
         )
         .into(),
         height + PLACE_CARD,

@@ -1,10 +1,10 @@
 //! The inventory as the controller serves it: the scans that fill it and the thread that runs
-//! them, what the dialog of a scan shows, the views of both inventories (the user's own and the
-//! watch's), the findings of the files a result names, and the files written from it.
+//! them, what the dialog of a scan shows, the views of it, the findings of the files a result
+//! names, and the files written from it.
 //!
 //! The inventory is scanned when somebody asks: the Scan button, a folder or file the user
-//! points at, Explorer's menu, the API. Nothing is scanned on a timer. The watch fills an
-//! inventory of its own, see [`watch`](super::watch); both are read through the same views.
+//! points at, Explorer's menu, the API. Nothing is scanned on a timer. What changes in the
+//! monitored locations is scanned into it too, see [`watch`](super::watch).
 
 use std::{
     collections::{HashMap, HashSet},
@@ -52,15 +52,6 @@ pub enum FindingsEvent {
     Found(PathBuf, Vec<Finding>),
     /// The file is read, or could not be: the message says why, for the user.
     Done(PathBuf, Res<()>),
-}
-
-/// Which of the two inventories a view reads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Store {
-    /// What the user scanned: the Scan button, a folder or file pointed at, Explorer's menu.
-    Inventory,
-    /// What the watch found in the folders it keeps an eye on.
-    Watch,
 }
 
 /// A scan somebody asked to see the result of: the window comes forward, at once, and shows a
@@ -214,82 +205,85 @@ impl Controller {
         Arc::clone(&self.inventory)
     }
 
-    fn store(&self, store: Store) -> &Inventory {
-        match store {
-            Store::Inventory => &self.inventory,
-            Store::Watch => &self.watch_store,
-        }
-    }
-
-    /// The folders `store` looks through: the inventory's locations, or the watched folders.
-    fn roots(&self, store: Store) -> Vec<PathBuf> {
-        let policy = self.policy();
-        match store {
-            Store::Inventory => policy.inventory_roots,
-            Store::Watch => policy.watch_folders,
-        }
-    }
-
-    /// One level of the tree of `store`, the real folders of the computer: what lies directly
+    /// One level of the inventory's tree, the real folders of the computer: what lies directly
     /// under `at` or, for an empty `at`, one node for each drive or network share that holds
     /// findings. `selected` is a file whose entry is wanted.
-    pub fn inventory_view(
-        &self,
-        store: Store,
-        at: &Path,
-        selected: Option<&Path>,
-    ) -> InventoryView {
-        let inventory = self.store(store);
+    pub fn inventory_view(&self, at: &Path, selected: Option<&Path>) -> InventoryView {
         InventoryView {
-            nodes: inventory.children(under(at)),
-            entry: selected.and_then(|file| inventory.entry(file)),
+            nodes: self.inventory.children(under(at)),
+            entry: selected.and_then(|file| self.inventory.entry(file)),
         }
     }
 
-    /// What `store` found in each of the folders it looks through (the inventory's locations, the
-    /// watched folders), counted by path: one node for each that holds anything. Folders inside
-    /// one another each count what lies in them.
-    pub fn places(&self, store: Store) -> Vec<Node> {
-        let inventory = self.store(store);
-        self.roots(store)
+    /// What the inventory found in each of its locations, counted by path: one node for each
+    /// that holds anything. Locations inside one another each count what lies in them.
+    pub fn places(&self) -> Vec<Node> {
+        self.policy()
+            .inventory_roots
             .iter()
-            .filter_map(|root| inventory.node(root))
+            .filter_map(|root| self.inventory.node(root))
             .collect()
     }
 
-    /// Every file of `store` that holds personal data at and under `under` (all of it for an
-    /// empty path), as the treemap's tiles: the `limit` with the most values first, and the
+    /// Every file of the inventory that holds personal data at and under `under` (all of it for
+    /// an empty path), as the treemap's tiles: the `limit` with the most values first, and the
     /// others added up.
-    pub fn tiles(&self, store: Store, at: &Path, limit: usize) -> Tiles {
-        self.store(store).tiles(under(at), limit)
+    pub fn tiles(&self, at: &Path, limit: usize) -> Tiles {
+        self.inventory.tiles(under(at), limit)
     }
 
     /// How much there is of each kind at and under `under` (all of it for an empty path): the
     /// legend of the treemap.
-    pub fn type_totals(&self, store: Store, at: &Path) -> Vec<TypeTotal> {
-        self.store(store).type_totals(under(at))
+    pub fn type_totals(&self, at: &Path) -> Vec<TypeTotal> {
+        self.inventory.type_totals(under(at))
     }
 
     /// The files the findings view of `roots` reads: every file that was named, and for each folder
-    /// the files `store` found personal data in, the ones with the most first. A folder holds
-    /// thousands of files at worst, so the list stops at [`MOST_FILES`] and says how many it left
-    /// out. Waits on the disk (a root may be a folder or a file), so it is for the background.
-    pub fn finding_files(&self, store: Store, roots: &[PathBuf]) -> FindingFiles {
-        let inventory = self.store(store);
+    /// the files the inventory found personal data in (or, outside the locations, the last asked
+    /// scan found), the ones with the most first. A folder holds thousands of files at worst, so
+    /// the list stops at [`MOST_FILES`] and says how many it left out. Waits on the disk (a root
+    /// may be a folder or a file), so it is for the background.
+    pub fn finding_files(&self, roots: &[PathBuf]) -> FindingFiles {
+        let outside = self
+            .asked_outside
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         let mut named: Vec<(PathBuf, String)> = Vec::new();
         let mut held: Vec<(u64, PathBuf, String)> = Vec::new();
         for root in roots {
             if root.is_dir() {
-                for entry in inventory.entries(Some(root), 1) {
-                    let hits = entry.hits();
-                    let label = label_under(root, &entry.path);
-                    held.push((hits, entry.path, label));
+                let stored = self
+                    .inventory
+                    .entries(Some(root), 1)
+                    .into_iter()
+                    .map(|entry| (entry.hits(), entry.path));
+                let elsewhere = outside
+                    .iter()
+                    .filter(|(_, path)| sys::is_under(path, root))
+                    .cloned();
+                for (hits, path) in stored.chain(elsewhere) {
+                    let label = label_under(root, &path);
+                    held.push((hits, path, label));
                 }
             } else {
                 named.push((root.clone(), name_of(root)));
             }
         }
         pick_files(named, held, MOST_FILES)
+    }
+
+    /// Forgets what the inventory holds outside its locations, and shows the totals that leave:
+    /// the Inventory lists what lies in its locations and nothing else.
+    pub(super) fn keep_to_locations(&self) {
+        let roots = self.policy().inventory_roots;
+        if let Err(error) = self.inventory.forget_outside(&roots) {
+            self.notify(Notice::error(format!(
+                "Could not tidy the inventory: {error}"
+            )));
+        }
+        let totals = self.inventory.totals();
+        self.update(|state| state.inventory_totals = totals);
     }
 
     /// Reads what the detector finds in each of `files`, four at a time in the scan pool, and
@@ -393,7 +387,7 @@ impl Controller {
         }
     }
 
-    /// Blocks until every scan that was asked for is done and none runs, the watch's included;
+    /// Blocks until every scan that was asked for is done and none runs, monitoring's included;
     /// `false` on timeout.
     pub fn wait_scans(&self, timeout: Duration) -> bool {
         let state = self.lock();
@@ -419,9 +413,9 @@ impl Controller {
             .unwrap_or_else(PoisonError::into_inner);
     }
 
-    /// Stops the scan of what the watch saw, if one runs, drops what the watch had still to
-    /// look at, and gives the scan a moment to save what it did. What the watch found in
-    /// folders it no longer watches is forgotten after this, so the scan cannot add it again.
+    /// Stops the scan of what monitoring saw, if one runs, drops what it had still to look at,
+    /// and gives the scan a moment to save what it did. What a removed location held is
+    /// forgotten once that scan has saved, so the scan cannot add it again.
     pub(super) fn stop_watch_scan(&self) {
         self.scanner.stop_watch();
         let state = self.lock();
@@ -449,7 +443,7 @@ impl Controller {
         }
     }
 
-    /// Queues a scan of `paths` into the inventory: it runs before what the watch has to do.
+    /// Queues a scan of `paths` into the inventory: it runs before what monitoring has to do.
     /// With `reveal` the window is asked to come forward at once, with a dialog for it.
     pub(super) fn ask_scan(self: &Arc<Self>, paths: Vec<PathBuf>, reveal: bool) {
         let reveal = reveal.then(|| self.begin_reveal(&paths));
@@ -506,7 +500,7 @@ impl Controller {
         match &job.kind {
             Kind::Asked(request) => self.run_asked(job, request),
             Kind::Watch(changes) => self.run_watch(job, changes),
-            Kind::Forget { store, folder } => self.run_forget(*store, folder),
+            Kind::Forget { folder } => self.run_forget(folder),
         }
     }
 
@@ -542,28 +536,26 @@ impl Controller {
         }
     }
 
-    /// `folder` was removed from `store`'s folders: what the store holds under it goes, unless
-    /// a folder that is still listed holds it.
-    fn run_forget(&self, store: Store, folder: &Path) {
+    /// `folder` was removed from the locations: what the inventory holds under it goes, unless a
+    /// location that is still listed holds it.
+    fn run_forget(&self, folder: &Path) {
         let still = self
-            .roots(store)
+            .policy()
+            .inventory_roots
             .iter()
             .any(|root| sys::is_under(folder, root));
-        let target = self.store(store);
-        if !still && let Err(error) = target.forget_under(folder) {
+        if !still && let Err(error) = self.inventory.forget_under(folder) {
             self.notify(Notice::error(format!(
                 "Could not forget what was found in {}: {error}",
                 folder.display()
             )));
         }
-        let totals = target.totals();
-        self.update(|state| match store {
-            Store::Inventory => state.inventory_totals = totals,
-            Store::Watch => state.watch.totals = totals,
-        });
+        let totals = self.inventory.totals();
+        self.update(|state| state.inventory_totals = totals);
     }
 
-    /// Scans what `request` names into the inventory.
+    /// Scans what `request` names into the inventory. What it found outside the locations is
+    /// shown by its dialog and findings view, then forgotten by the inventory.
     fn run_asked(&self, job: &Job, request: &Request) {
         // A `piikey-cli` run on its own may be scanning the same inventory.
         let _lock = match self.inventory.lock_scan() {
@@ -590,7 +582,7 @@ impl Controller {
             self.inventory
                 .scan_paths(&engine, &request.paths, &progress, &job.cancel)
         });
-        let totals = self.inventory.totals();
+        // The result comes from the inventory before it forgets what lies outside the locations.
         // A scan that was stopped either goes on later (its dialog keeps waiting) or is told so
         // by `scan_stopped`.
         let outcome = request.reveal.filter(|_| !job.cancelled()).map(|seq| {
@@ -600,6 +592,20 @@ impl Controller {
             };
             (seq, state)
         });
+        let roots = self.policy().inventory_roots;
+        let outside: Vec<(u64, PathBuf)> = request
+            .paths
+            .iter()
+            .flat_map(|path| self.inventory.entries(Some(path), 1))
+            .filter(|entry| !roots.iter().any(|root| sys::is_under(&entry.path, root)))
+            .map(|entry| (entry.hits(), entry.path))
+            .collect();
+        *self
+            .asked_outside
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = outside;
+        let forgot = self.inventory.forget_outside(&roots);
+        let totals = self.inventory.totals();
         self.update(|state| {
             state.scan = None;
             state.inventory_totals = totals;
@@ -607,7 +613,7 @@ impl Controller {
                 set_reveal(state, seq, outcome);
             }
         });
-        if let Err(error) = result {
+        if let Err(error) = result.and(forgot.map(drop)) {
             self.notify(Notice::error(format!(
                 "Could not save the inventory: {error}"
             )));
@@ -615,18 +621,19 @@ impl Controller {
         self.sync_model_after_use();
     }
 
-    /// Scans what the watch saw change into the watch's inventory: everything, or the paths that
-    /// were reported.
+    /// Scans what monitoring saw change into the inventory: everything, or the paths that were
+    /// reported. Only the monitored locations are looked at.
     fn run_watch(&self, job: &Job, changes: &Changes) {
         let policy = self.policy();
-        if !policy.watch || policy.watch_folders.is_empty() {
+        if policy.monitored_roots.is_empty() {
             return;
         }
-        let _lock = match self.watch_store.lock_scan() {
+        // A `piikey-cli` run on its own may be scanning the same inventory.
+        let _lock = match self.inventory.lock_scan() {
             Ok(lock) => lock,
             Err(error) => {
                 self.notify(Notice::error(format!(
-                    "Could not scan what changed in the watched folders: {error}"
+                    "Could not scan what changed in your monitored locations: {error}"
                 )));
                 return;
             }
@@ -635,24 +642,24 @@ impl Controller {
         self.update(|state| state.watch.scan = Some(Arc::clone(&progress)));
         self.sync_model();
         let engine = self.engine();
-        let roots = policy.watch_folders;
+        let roots = policy.monitored_roots;
         let result = self.with_progress(|| {
             if changes.everything {
-                self.watch_store
+                self.inventory
                     .scan_paths(&engine, &roots, &progress, &job.cancel)
             } else {
-                self.watch_store
+                self.inventory
                     .refresh(&engine, &roots, &changes.list(), &progress, &job.cancel)
             }
         });
-        let totals = self.watch_store.totals();
+        let totals = self.inventory.totals();
         self.update(|state| {
             state.watch.scan = None;
-            state.watch.totals = totals;
+            state.inventory_totals = totals;
         });
         if let Err(error) = result {
             self.notify(Notice::error(format!(
-                "Could not save what the watch found: {error}"
+                "Could not save the inventory: {error}"
             )));
         }
         self.sync_model_after_use();

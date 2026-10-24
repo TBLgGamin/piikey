@@ -15,7 +15,7 @@ use piikey::{
         ner::{self, files},
     },
     engine::Engine,
-    inventory::Inventory,
+    inventory::{Inventory, remove_retired_files},
     policy::Policy,
     service::Server,
     sys::{data_dir, is_packaged, launch_path, write_atomic},
@@ -47,7 +47,7 @@ const MODEL_IDLE: Duration = Duration::from_mins(2);
 pub struct System {
     /// The vault the engine opens.
     pub vault: PathBuf,
-    /// The detection model; loaded while protection, the highlight, the watch or a scan needs it.
+    /// The detection model; loaded while protection, the highlight, monitoring or a scan needs it.
     pub ner: NerDetector,
     /// Where the model files live.
     pub model_dir: PathBuf,
@@ -96,12 +96,9 @@ impl Backend for System {
     }
 
     fn open_inventory(&self) -> Res<Inventory> {
+        // Best effort: a file an older piikey still holds goes at a later start.
+        let _ = data_dir().and_then(|dir| remove_retired_files(&dir));
         let path = Inventory::default_path().describe()?;
-        Inventory::open(&path).map_err(|error| format!("{}: {error}", path.display()))
-    }
-
-    fn open_watch(&self) -> Res<Inventory> {
-        let path = Inventory::watch_path().describe()?;
         Inventory::open(&path).map_err(|error| format!("{}: {error}", path.display()))
     }
 

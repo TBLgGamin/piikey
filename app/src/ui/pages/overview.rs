@@ -18,7 +18,7 @@ use super::{
     vault::swap_row,
 };
 use crate::ui::{
-    controller::{Model, Snapshot},
+    controller::Snapshot,
     status::{Action, Status, Work, protected, protected_text},
     window::{MainWindow, Msg, Page},
 };
@@ -106,27 +106,17 @@ fn doing(window: &MainWindow, status: &Status, context: Context<'_>) -> View {
                 .build(),
             Row::new("Inventory")
                 .icon("\u{E8B7}")
-                .description("Lists the files you scanned that hold personal data.")
-                .state(inventory_state(window))
+                .description(
+                    "Lists the files that hold personal data, and keeps the locations you monitor up to date.",
+                )
+                .state(inventory_state(snap))
                 .on_click(go(Page::Inventory))
-                .build(),
-            Row::new("Watch")
-                .icon("\u{E890}")
-                .description("Keeps an eye on folders and looks at files again when they change.")
-                .state(watch_state(snap))
-                .on_click(go(Page::Watch))
                 .build(),
             Row::new("Vault")
                 .icon("\u{E72E}")
                 .description("Remembers which stand-in replaced which value.")
                 .state(vault_state(snap.issued))
                 .on_click(go(Page::Vault))
-                .build(),
-            Row::new("Detection")
-                .icon("\u{E9D9}")
-                .description("Finds personal data for all of the above.")
-                .state(detection_state(&snap.model))
-                .on_click(go(Page::Settings))
                 .build(),
         ],
     )
@@ -153,10 +143,11 @@ fn highlighting_state(mode: Highlight, paused: bool) -> String {
     .to_owned()
 }
 
-/// `711 found in 51 files`, `Scanning… 3,412 of 20,100` or `Nothing scanned yet`.
-fn inventory_state(window: &MainWindow) -> String {
-    let snap = &window.snap;
-    if let Some((done, total)) = snap.scan {
+/// `711 found in 51 files · monitoring 2 locations`, `Scanning… 3,412 of 20,100` or `Nothing
+/// scanned yet`.
+fn inventory_state(snap: &Snapshot) -> String {
+    // A scan the user asked for, or the scan of what changed in a monitored location.
+    if let Some((done, total)) = snap.scan.or(snap.watch.scanning) {
         return if total == 0 {
             "Scanning\u{2026}".to_owned()
         } else {
@@ -168,7 +159,7 @@ fn inventory_state(window: &MainWindow) -> String {
         };
     }
     let (files, hits) = snap.inventory_totals;
-    if hits > 0 {
+    let base = if hits > 0 {
         format!(
             "{} found in {}",
             thousands(hits),
@@ -176,44 +167,13 @@ fn inventory_state(window: &MainWindow) -> String {
         )
     } else {
         "Nothing scanned yet".to_owned()
-    }
-}
-
-/// `Off`, `No folders yet`, `Scanning… 12 of 40`, `34 found in 5 files` or `Watching 2 folders`.
-fn watch_state(snap: &Snapshot) -> String {
-    if !snap.policy.watch {
-        return "Off".to_owned();
-    }
-    if snap.policy.watch_folders.is_empty() {
-        return "No folders yet".to_owned();
-    }
-    if let Some((done, total)) = snap.watch.scanning {
-        return if total == 0 {
-            "Scanning\u{2026}".to_owned()
-        } else {
-            format!(
-                "Scanning\u{2026} {} of {}",
-                thousands(done),
-                thousands(total)
-            )
-        };
-    }
-    let (files, hits) = snap.watch.totals;
-    if hits > 0 {
-        format!(
-            "{} found in {}",
-            thousands(hits),
-            counted(files, "file", "files")
-        )
-    } else {
-        format!(
-            "Watching {}",
-            counted(
-                u64::try_from(snap.policy.watch_folders.len()).unwrap_or(u64::MAX),
-                "folder",
-                "folders"
-            )
-        )
+    };
+    match u64::try_from(snap.policy.monitored_roots.len()).unwrap_or(u64::MAX) {
+        0 => base,
+        n => format!(
+            "{base} \u{b7} monitoring {}",
+            counted(n, "location", "locations")
+        ),
     }
 }
 
@@ -224,17 +184,6 @@ fn vault_state(issued: u64) -> String {
     } else {
         format!("{} remembered", counted(issued, "value", "values"))
     }
-}
-
-/// The detection model, in a few words.
-fn detection_state(model: &Model) -> String {
-    match model {
-        Model::Ready => "Model ready",
-        Model::Skipped => "Patterns only (model skipped)",
-        Model::Failed(_) => "Model failed",
-        Model::Downloading { .. } => "Downloading the model\u{2026}",
-    }
-    .to_owned()
 }
 
 /// The latest swaps, with the way to all of them, or an honest word about why there are none.
@@ -314,20 +263,29 @@ mod tests {
     }
 
     #[test]
-    fn the_watch_row_says_off_what_it_waits_for_and_what_it_found() -> Result<(), String> {
+    fn the_inventory_row_says_how_many_locations_it_monitors() -> Result<(), String> {
         let dir = TempDir::new()?;
         let mut snap = stub_controller(&dir)?.snapshot();
-        assert_eq!(watch_state(&snap), "Off");
-        snap.policy.watch = true;
-        assert_eq!(watch_state(&snap), "No folders yet");
-        snap.policy.watch_folders = vec![PathBuf::from(r"C:\Users\me\Downloads")];
-        assert_eq!(watch_state(&snap), "Watching 1 folder");
-        snap.watch.totals = (5, 34);
-        assert_eq!(watch_state(&snap), "34 found in 5 files");
+        assert_eq!(inventory_state(&snap), "Nothing scanned yet");
+        snap.inventory_totals = (5, 34);
+        assert_eq!(inventory_state(&snap), "34 found in 5 files");
+        snap.policy.monitored_roots = vec![
+            PathBuf::from(r"C:\Users\me\Downloads"),
+            PathBuf::from(r"C:\Users\me\Documents"),
+        ];
+        assert_eq!(
+            inventory_state(&snap),
+            "34 found in 5 files \u{b7} monitoring 2 locations"
+        );
+        snap.policy.monitored_roots.truncate(1);
+        assert_eq!(
+            inventory_state(&snap),
+            "34 found in 5 files \u{b7} monitoring 1 location"
+        );
         snap.watch.scanning = Some((12, 40));
-        assert_eq!(watch_state(&snap), "Scanning\u{2026} 12 of 40");
+        assert_eq!(inventory_state(&snap), "Scanning\u{2026} 12 of 40");
         snap.watch.scanning = Some((0, 0));
-        assert_eq!(watch_state(&snap), "Scanning\u{2026}");
+        assert_eq!(inventory_state(&snap), "Scanning\u{2026}");
         Ok(())
     }
 
@@ -336,18 +294,5 @@ mod tests {
         assert_eq!(vault_state(0), "Nothing remembered yet");
         assert_eq!(vault_state(1), "1 value remembered");
         assert_eq!(vault_state(22), "22 values remembered");
-    }
-
-    #[test]
-    fn the_detection_row_names_the_model() {
-        assert_eq!(detection_state(&Model::Ready), "Model ready");
-        assert_eq!(
-            detection_state(&Model::Skipped),
-            "Patterns only (model skipped)"
-        );
-        assert_eq!(
-            detection_state(&Model::Failed(String::new())),
-            "Model failed"
-        );
     }
 }

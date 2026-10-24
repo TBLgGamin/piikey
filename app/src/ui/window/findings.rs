@@ -22,7 +22,7 @@ use windows_reactor::{ComponentContext, ComponentTask};
 
 use super::{MainWindow, Msg};
 use crate::ui::{
-    controller::{FindingFiles, FindingsEvent, Notice, Store},
+    controller::{FindingFiles, FindingsEvent, Notice},
     goto,
 };
 
@@ -341,7 +341,6 @@ impl MainWindow {
     pub(in crate::ui) fn open_findings(
         &mut self,
         roots: Vec<PathBuf>,
-        store: Store,
         context: &ComponentContext<Self>,
     ) {
         self.close_findings();
@@ -351,7 +350,7 @@ impl MainWindow {
         let controller = Arc::clone(&self.input.controller.0);
         let sender = context.completion();
         view.task = Some(context.spawn_background(move |token| {
-            let listed = controller.finding_files(store, &roots);
+            let listed = controller.finding_files(&roots);
             let files: Vec<PathBuf> = listed.files.iter().map(|file| file.path.clone()).collect();
             if token.is_cancelled() || !sender.clone().complete(Msg::FindingsListed(seq, listed)) {
                 return Msg::Noop;

@@ -12,9 +12,8 @@
 //! again. A line without a `hash` (written before it existed) is as good as any other: that file
 //! is detected again the next time it changes, and gets one.
 //!
-//! The watch keeps a second inventory in `watch.jsonl`, in the same format, for the folders it
-//! keeps an eye on: it is another [`Inventory`] over another file, with its own locks, and
-//! shares nothing with the first.
+//! Monitoring is part of this inventory: the app scans what changes in the monitored locations
+//! into this same file through [`Inventory::refresh`].
 //!
 //! The detector reads what [`Engine::enabled`] says, and the inventory keeps what it found at the
 //! time: changing the kinds does not rescan files that did not change.
@@ -67,8 +66,6 @@ pub const MAX_FILE: u64 = 64 << 20;
 
 /// The inventory's file name in the data folder.
 const FILE_NAME: &str = "inventory.jsonl";
-/// The watch's inventory: the same format, another file.
-const WATCH_FILE_NAME: &str = "watch.jsonl";
 /// Files a scan hands to the thread pool at once; the scan can be stopped between two chunks.
 const CHUNK: usize = 64;
 /// A scan saves the inventory when this many entries are unsaved, but not more often than
@@ -452,6 +449,26 @@ impl fmt::Debug for Inventory {
     }
 }
 
+/// The files of the store the watch kept apart, before monitoring became part of the inventory.
+const RETIRED_FILES: [&str; 3] = ["watch.jsonl", "watch.lock", "watch.save.lock"];
+
+/// Deletes those files from `dir` (the data folder); one that is not there is fine.
+///
+/// # Errors
+/// `Io` when one exists and cannot be deleted.
+pub fn remove_retired_files(dir: &Path) -> Result<()> {
+    for name in RETIRED_FILES {
+        let path = dir.join(name);
+        match fs::remove_file(&path) {
+            Err(err) if err.kind() != io::ErrorKind::NotFound => {
+                return Err(io_context(&err, "delete", &path));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 impl Inventory {
     /// `%LOCALAPPDATA%\piikey\inventory.jsonl`.
     ///
@@ -459,15 +476,6 @@ impl Inventory {
     /// `VaultPathUnavailable` when `LOCALAPPDATA` is unset; `Io` when the folder cannot be made.
     pub fn default_path() -> Result<PathBuf> {
         Ok(sys::data_dir()?.join(FILE_NAME))
-    }
-
-    /// `%LOCALAPPDATA%\piikey\watch.jsonl`: the inventory of the watch, which is no part of the
-    /// one at [`Inventory::default_path`].
-    ///
-    /// # Errors
-    /// `VaultPathUnavailable` when `LOCALAPPDATA` is unset; `Io` when the folder cannot be made.
-    pub fn watch_path() -> Result<PathBuf> {
-        Ok(sys::data_dir()?.join(WATCH_FILE_NAME))
     }
 
     /// The inventory saved at `path`. A missing file is an empty inventory; a line that is not
@@ -636,7 +644,7 @@ impl Inventory {
     }
 
     /// Brings the inventory up to date with `touched`, the paths the file system said changed
-    /// below `roots` (the folders a watch keeps an eye on): what a crawl of `roots` would leave
+    /// below `roots` (the monitored locations): what a crawl of `roots` would leave
     /// out is left out here too. A path that is gone is forgotten, with what lay below it. A
     /// file is scanned the way [`Inventory::scan_paths`] scans one, so one that was only touched
     /// is not detected again. A folder is walked when it is [fresh](Touched::fresh), and
@@ -841,6 +849,27 @@ impl Inventory {
                     changed.insert(path.clone());
                 }
                 !forgotten
+            });
+            let removed = before - entries.len();
+            (removed, removed > 0)
+        })
+    }
+
+    /// Forgets every entry that lies under none of `keep` (all of them when `keep` is empty) and
+    /// saves; returns how many there were. The app keeps its inventory to its locations with it.
+    ///
+    /// # Errors
+    /// `Io` when the inventory cannot be read or saved; `Busy` as for [`Inventory::save`].
+    pub fn forget_outside(&self, keep: &[PathBuf]) -> Result<usize> {
+        self.update(SAVE_WAIT, |state| {
+            let State { entries, changed } = state;
+            let before = entries.len();
+            entries.retain(|path, _| {
+                let kept = keep.iter().any(|root| sys::is_under(path, root));
+                if !kept {
+                    changed.insert(path.clone());
+                }
+                kept
             });
             let removed = before - entries.len();
             (removed, removed > 0)
@@ -2233,6 +2262,16 @@ mod tests {
                 PathBuf::from(r"C:\r\subway\d.txt"),
             ]
         );
+
+        // Only what lies in the given folders stays: another letter case counts as the same
+        // folder, and a folder whose name only starts the same is another one.
+        assert_eq!(
+            inv.forget_outside(&[PathBuf::from(r"c:\R\a.txt"), PathBuf::from(r"C:\r\sub")])?,
+            2
+        );
+        assert_eq!(stored(&tmp.inventory()?), [PathBuf::from(r"C:\r\a.txt")]);
+        assert_eq!(inv.forget_outside(&[])?, 1);
+        assert!(stored(&tmp.inventory()?).is_empty());
         Ok(())
     }
 
@@ -2960,41 +2999,20 @@ mod tests {
     }
 
     #[test]
-    fn the_watch_keeps_an_inventory_of_its_own() -> Res {
-        assert_ne!(FILE_NAME, WATCH_FILE_NAME);
+    fn the_files_of_the_store_the_watch_kept_apart_are_deleted() -> Res {
         let tmp = TempDir::new()?;
-        let engine = tmp.engine()?;
-        let main = tmp.inventory()?;
-        let watch = Inventory::open(&tmp.0.join(WATCH_FILE_NAME))?;
-        let root = tmp.0.join("docs");
-        put(&root.join("a.txt"), EMAIL)?;
-
-        // Two scans at once: each inventory has its own scan lock, and its own file.
-        let (_main_scan, _watch_scan) = (main.lock_scan()?, watch.lock_scan()?);
-        scan(&watch, &engine, std::slice::from_ref(&root))?;
-        assert_eq!(watch.totals().files, 1);
-        assert_eq!(
-            main.totals().files,
-            0,
-            "the watch added nothing to the inventory"
-        );
-        assert!(tmp.0.join(WATCH_FILE_NAME).is_file());
-        assert!(!tmp.0.join(FILE_NAME).exists());
-
-        scan(&main, &engine, std::slice::from_ref(&root))?;
-        main.forget_under(&root)?;
-        assert_eq!(main.totals().files, 0);
-        assert_eq!(
-            watch.totals().files,
-            1,
-            "forgetting in the inventory leaves the watch"
-        );
-        assert_eq!(
-            Inventory::open(&tmp.0.join(WATCH_FILE_NAME))?
-                .totals()
-                .files,
-            1
-        );
+        // Nothing there is fine.
+        remove_retired_files(&tmp.0)?;
+        for name in RETIRED_FILES {
+            put(&tmp.0.join(name), "x")?;
+        }
+        let kept = tmp.0.join(FILE_NAME);
+        put(&kept, "{}")?;
+        remove_retired_files(&tmp.0)?;
+        for name in RETIRED_FILES {
+            assert!(!tmp.0.join(name).exists(), "{name}");
+        }
+        assert!(kept.is_file(), "the inventory itself stays");
         Ok(())
     }
 

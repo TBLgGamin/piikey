@@ -3,8 +3,9 @@
 //! widget, so the pages cannot drift apart.
 //!
 //! Colours come from the theme. The reactor offers no app-wide accent, so interactive controls
-//! follow the accent the user chose in Windows, and nothing here competes with it: the brand purple
-//! is for the logo only: the dashboards colour by type of personal data. Status is a glyph and words first, and a colour second.
+//! follow the accent the user chose in Windows, and nothing here competes with it. The brand purple
+//! is for the logo and the icons of folders and files; the dashboards colour by type of personal
+//! data. Status is a glyph and words first, and a colour second.
 
 use piikey::detect::EntityKind;
 use windows_reactor::{
@@ -46,12 +47,14 @@ const BUTTON_PAD: (f64, f64, f64) = (8.0, 5.0, 6.0);
 
 // ---- Type ----
 
-/// A page title: Title, 28 semibold.
+/// A page title: Title, 28 semibold. Like every text style here, it can be selected and copied;
+/// text inside a button must turn that off, or the text takes the button's clicks.
 pub(super) fn title(text: &str) -> TextBlock {
     TextBlock::new()
         .text(text)
         .font_size(28.0)
         .font_weight(FontWeight::SEMI_BOLD)
+        .is_text_selection_enabled(true)
 }
 
 /// The line that says what is on: Subtitle, 20 semibold.
@@ -61,6 +64,7 @@ pub(super) fn subtitle(text: &str) -> TextBlock {
         .font_size(20.0)
         .font_weight(FontWeight::SEMI_BOLD)
         .text_wrapping(TextWrapping::Wrap)
+        .is_text_selection_enabled(true)
 }
 
 /// A section header: Body Strong, 14 semibold.
@@ -69,6 +73,7 @@ pub(super) fn heading(text: &str) -> TextBlock {
         .text(text)
         .font_size(14.0)
         .font_weight(FontWeight::SEMI_BOLD)
+        .is_text_selection_enabled(true)
 }
 
 /// Running text: Body, 14.
@@ -76,6 +81,7 @@ pub(super) fn body(text: impl AsRef<str>) -> TextBlock {
     TextBlock::new()
         .text(text)
         .text_wrapping(TextWrapping::Wrap)
+        .is_text_selection_enabled(true)
 }
 
 /// Secondary text: Caption, 12, the theme's text colour dimmed.
@@ -85,6 +91,7 @@ pub(super) fn caption(text: impl AsRef<str>) -> TextBlock {
         .font_size(12.0)
         .text_wrapping(TextWrapping::Wrap)
         .opacity(0.72)
+        .is_text_selection_enabled(true)
 }
 
 // ---- Colour and glyphs ----
@@ -185,6 +192,24 @@ pub(super) fn toned_glyph(code: &str, size: f64, tone: Tone, dark: bool) -> Font
     } else {
         icon
     }
+}
+
+/// The brand colour for the theme, as the logo kit gives it: purple `#6f49b1` on light, lilac
+/// `#d6c9f9` on dark.
+pub(super) const fn brand(dark: bool) -> Color {
+    if dark {
+        Color::rgb(0xd6, 0xc9, 0xf9)
+    } else {
+        Color::rgb(0x6f, 0x49, 0xb1)
+    }
+}
+
+/// The icon of a folder (`is_dir`) or a file, in the brand colour.
+pub(super) fn place_glyph(is_dir: bool, size: f64, dark: bool) -> FontIcon {
+    FontIcon::new()
+        .glyph(if is_dir { "\u{E8B7}" } else { "\u{E7C3}" })
+        .font_size(size)
+        .foreground(Brush::Solid(brand(dark)))
 }
 
 // ---- Containers ----
@@ -308,7 +333,6 @@ pub(super) struct Row {
     icon: Option<&'static str>,
     title: String,
     description: Option<String>,
-    selectable: bool,
     state: Option<String>,
     control: Option<View>,
     click: Option<Callback<()>>,
@@ -320,7 +344,6 @@ impl Row {
             icon: None,
             title: title.into(),
             description: None,
-            selectable: false,
             state: None,
             control: None,
             click: None,
@@ -336,12 +359,6 @@ impl Row {
     /// What the row is about, in Caption under the title.
     pub(super) fn description(mut self, text: impl Into<String>) -> Self {
         self.description = Some(text.into());
-        self
-    }
-
-    /// Lets the user select the description, to copy it: a path, an address.
-    pub(super) fn selectable(mut self) -> Self {
-        self.selectable = true;
         self
     }
 
@@ -363,20 +380,19 @@ impl Row {
         self
     }
 
-    /// The row as a view.
+    /// The row as a view. The texts of a row that is no button can be selected and copied.
     pub(super) fn build(self) -> View {
         let Self {
             icon,
             title,
             description,
-            selectable,
             state,
             control,
             click,
         } = self;
         let layout = row_layout(
             icon,
-            row_texts(&title, description, selectable),
+            row_texts(&title, description, click.is_none()),
             row_trailing(state, control, click.is_some()),
         );
         match click {
@@ -409,12 +425,13 @@ impl Row {
     }
 }
 
-/// The title of a row, and under it what it says.
+/// The title of a row, and under it what it says; `selectable` when the row is no button.
 fn row_texts(title: &str, description: Option<String>, selectable: bool) -> Vec<View> {
     let mut texts: Vec<View> = vec![
         TextBlock::new()
             .text(title)
             .text_wrapping(TextWrapping::Wrap)
+            .is_text_selection_enabled(selectable)
             .into(),
     ];
     texts.extend(

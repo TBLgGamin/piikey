@@ -1,7 +1,6 @@
-//! The dashboard of the Inventory and Watch pages: a tree of the folders and files that hold
-//! personal data, the types found (the legend), a map with a tile for every file, and details of
-//! what is selected. The pages around it differ; this is the same for both, and takes the store it
-//! shows from the window.
+//! The dashboard of the Inventory page: a tree of the folders and files that hold personal data,
+//! the types found (the legend), a map with a tile for every file, and details of what is
+//! selected.
 //!
 //! Two shapes, by the room there is. Wide: the tree, the map, and a column with the legend and the
 //! details side by side. Narrow (the default window): the legend as one row of chips above the tree
@@ -27,13 +26,12 @@ use windows_reactor::{
 };
 
 use self::{
-    crumbs::{crumbs, top_label},
+    crumbs::{TOP, crumbs},
     tree::{Line, Row, lines, segments},
 };
 pub(in crate::ui) use self::{findings::panel as findings_panel, report::dialog};
-use super::kit::{Context, caption, card, counted, glyph, thousands};
+use super::kit::{Context, caption, card, counted, glyph, place_glyph, thousands};
 use crate::ui::{
-    controller::Store,
     treemap::Rect,
     window::{Dash, Dashboard, Loaded, Msg, Origin, PANE_WIDTH},
 };
@@ -151,8 +149,8 @@ pub(super) fn empty_card(text: &str) -> Border {
 }
 
 /// The way back up from the folder on show: every crumb but the last is a link.
-fn crumb_bar(dash: &Dashboard, store: Store, context: Context<'_>) -> View {
-    let trail = crumbs(&dash.at, top_label(store));
+fn crumb_bar(dash: &Dashboard, context: Context<'_>) -> View {
+    let trail = crumbs(&dash.at, TOP);
     let mut steps: Vec<View> = Vec::new();
     for (i, crumb) in trail.iter().enumerate() {
         if i > 0 {
@@ -178,7 +176,7 @@ fn crumb_bar(dash: &Dashboard, store: Store, context: Context<'_>) -> View {
             steps.push(
                 HyperlinkButton::new()
                     .content(crumb.label.as_str())
-                    .on_click(context.message(Msg::Dash(store, Dash::Enter(crumb.target.clone()))))
+                    .on_click(context.message(Msg::Dash(Dash::Enter(crumb.target.clone()))))
                     .into(),
             );
         }
@@ -246,8 +244,8 @@ const SELECTED_FILL: Color = Color::argb(0x1f, 0x80, 0x80, 0x80);
 fn row_view(
     row: &Row,
     kind: Option<EntityKind>,
-    store: Store,
     selected: bool,
+    dark: bool,
     send: &Callback<Msg>,
 ) -> View {
     let node = &row.node;
@@ -263,7 +261,7 @@ fn row_view(
                 if row.open { "Close" } else { "Open" },
                 node.name
             ))
-            .on_click(move || send.call(Msg::Dash(store, Dash::Toggle(folder.clone()))))
+            .on_click(move || send.call(Msg::Dash(Dash::Toggle(folder.clone()))))
             .content(glyph(if row.open { "\u{E70D}" } else { "\u{E76C}" }, 10.0))
             .into()
     } else {
@@ -273,9 +271,7 @@ fn row_view(
         .columns([GridLength::Auto, GridLength::STAR])
         .column_spacing(8.0)
         .children((
-            glyph(if node.is_dir { "\u{E8B7}" } else { "\u{E7C3}" }, 14.0)
-                .opacity(0.72)
-                .vertical_alignment(VerticalAlignment::Center),
+            place_glyph(node.is_dir, 14.0, dark).vertical_alignment(VerticalAlignment::Center),
             TextBlock::new()
                 .text(&node.name)
                 .text_trimming(TextTrimming::CharacterEllipsis)
@@ -286,7 +282,9 @@ fn row_view(
         .column_spacing(8.0)
         .children((
             bar(row, kind),
+            // The row is a button: selectable text would take its clicks.
             caption(row_caption(row, kind))
+                .is_text_selection_enabled(false)
                 .text_wrapping(TextWrapping::NoWrap)
                 .text_trimming(TextTrimming::CharacterEllipsis)
                 .grid_column(1),
@@ -300,7 +298,7 @@ fn row_view(
             .horizontal_content_alignment(HorizontalAlignment::Stretch)
             .grid_column(3)
             .automation_name(node.name.as_str())
-            .on_click(move || send.call(Msg::Dash(store, Dash::Select(path.clone(), Origin::Tree))))
+            .on_click(move || send.call(Msg::Dash(Dash::Select(path.clone(), Origin::Tree))))
             .content(
                 Grid::new()
                     .columns([GridLength::STAR, GridLength::Auto])
@@ -368,7 +366,7 @@ fn leftover(line: &Line) -> Option<String> {
 /// reused the containers of its rows and drew rows in the places of others; an `ItemsRepeater`
 /// gets its rows a moment after it measures them, so a new folder emptied the list and scrolled
 /// it to the top, and the end of the list jittered as rows grew under the scroll bar.)
-fn tree_card(dash: &Dashboard, loaded: &Loaded, store: Store, context: Context<'_>) -> Border {
+fn tree_card(dash: &Dashboard, loaded: &Loaded, dark: bool, context: Context<'_>) -> Border {
     let send = context.forward();
     let rows = lines(&loaded.levels, &dash.at, &dash.open, dash.kind)
         .into_iter()
@@ -376,7 +374,7 @@ fn tree_card(dash: &Dashboard, loaded: &Loaded, store: Store, context: Context<'
             let view: View = match &line {
                 Line::Row(row) => {
                     let picked = dash.selected.as_deref() == Some(row.node.path.as_path());
-                    row_view(row, dash.kind, store, picked, &send)
+                    row_view(row, dash.kind, picked, dark, &send)
                 }
                 other => caption(leftover(other).unwrap_or_default())
                     .text_wrapping(TextWrapping::Wrap)
@@ -426,20 +424,19 @@ pub(super) fn loading(space: Space) -> View {
         .into()
 }
 
-/// The dashboard of `store`, laid out for `space`. When the folder on show holds nothing,
+/// The dashboard, laid out for `space`. When the folder on show holds nothing,
 /// `nothing` says so under the way back up (it is told the folder is the top level or not).
 pub(super) fn dashboard(
     window: &crate::ui::window::MainWindow,
-    store: Store,
     space: Space,
     nothing: impl FnOnce(bool) -> View,
     context: Context<'_>,
 ) -> View {
-    let dash = window.dash(store);
+    let dash = &window.inventory;
     let Some(loaded) = dash.loaded.as_ref() else {
         return loading(space);
     };
-    let crumb_bar = crumb_bar(dash, store, context);
+    let crumb_bar = crumb_bar(dash, context);
     if is_empty(dash, loaded) {
         return StackPanel::new()
             .spacing(GAP)
@@ -460,23 +457,16 @@ pub(super) fn dashboard(
     );
     let selected = dash.selected.as_deref();
     let folder_selected = selected.is_some_and(|path| dash.is_folder(path));
-    let map = map::map(
-        &placed,
-        plan.canvas,
-        selected,
-        folder_selected,
-        store,
-        context,
-    );
-    let tree = tree_card(dash, loaded, store, context);
-    let details = details::details(dash, store, plan.details, context);
+    let map = map::map(&placed, plan.canvas, selected, folder_selected, context);
+    let tree = tree_card(dash, loaded, window.dark, context);
+    let details = details::details(dash, plan.details, window.dark, context);
     if plan.wide {
         let side = Grid::new()
             .rows([GridLength::Pixel(plan.legend), GridLength::STAR])
             .row_spacing(GAP)
             .grid_column(2)
             .children((
-                legend::list(&loaded.totals, dash.kind, plan.legend, store, context),
+                legend::list(&loaded.totals, dash.kind, plan.legend, context),
                 details.grid_row(1),
             ));
         let main = Grid::new()
@@ -507,15 +497,15 @@ pub(super) fn dashboard(
         .spacing(GAP)
         .children((
             crumb_bar,
-            legend::strip(&loaded.totals, dash.kind, store, context),
+            legend::strip(&loaded.totals, dash.kind, context),
             main,
         ))
         .into()
 }
 
-/// Whether the dashboard of `store` has been loaded and has something to show.
-pub(super) fn has_data(window: &crate::ui::window::MainWindow, store: Store) -> Option<bool> {
-    let dash = window.dash(store);
+/// Whether the dashboard has been loaded and has something to show.
+pub(super) fn has_data(window: &crate::ui::window::MainWindow) -> Option<bool> {
+    let dash = &window.inventory;
     let loaded = dash.loaded.as_ref()?;
     Some(!is_empty(dash, loaded))
 }

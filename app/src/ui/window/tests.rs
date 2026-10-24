@@ -57,7 +57,7 @@ fn a_page_is_found_again_by_the_tag_the_pane_reports() {
     assert_eq!(tags.len(), Page::ALL.len(), "two pages share a tag");
     assert_eq!(Page::from_tag("keyed"), None);
     assert_eq!(Page::from_tag(""), None);
-    // The pane lists the five feature pages; Settings is its footer.
+    // The pane lists the four feature pages; Settings is its footer.
     assert!(!Page::MENU.contains(&Page::Settings));
     assert_eq!(Page::MENU.len() + 1, Page::ALL.len());
 }
@@ -208,25 +208,24 @@ impl Headless {
         texts(self.host.adapter().batches())
     }
 
-    /// Gives the dashboard of `store` what its load would bring for the folder `at`, read from the
+    /// Gives the Inventory dashboard what its load would bring for the folder `at`, read from the
     /// controller as the window reads it, and returns what that drew.
-    fn loaded(&mut self, store: Store, at: &Path) -> Result<Vec<String>, String> {
+    fn loaded(&mut self, at: &Path) -> Result<Vec<String>, String> {
         self.loads += 1;
-        let loaded = Loaded::read(&self.controller, store, at, &[], None);
-        self.send(Msg::Dash(store, Dash::Loaded(self.loads, Box::new(loaded))))
+        let loaded = Loaded::read(&self.controller, at, &[], None);
+        self.send(Msg::Dash(Dash::Loaded(self.loads, Box::new(loaded))))
     }
 
     /// As [`Headless::loaded`], with the folders `open` read as well and the entry of `file`.
     fn loaded_with(
         &mut self,
-        store: Store,
         at: &Path,
         open: &[PathBuf],
         file: Option<&Path>,
     ) -> Result<Vec<String>, String> {
         self.loads += 1;
-        let loaded = Loaded::read(&self.controller, store, at, open, file);
-        self.send(Msg::Dash(store, Dash::Loaded(self.loads, Box::new(loaded))))
+        let loaded = Loaded::read(&self.controller, at, open, file);
+        self.send(Msg::Dash(Dash::Loaded(self.loads, Box::new(loaded))))
     }
 
     /// Opens `page` and gives it what the background work would bring: the dashboards' views and
@@ -234,8 +233,7 @@ impl Headless {
     fn go(&mut self, page: Page) -> Result<Vec<String>, String> {
         let mut drawn = self.send(Msg::Nav(page))?;
         match page {
-            Page::Inventory => drawn.extend(self.loaded(Store::Inventory, Path::new(""))?),
-            Page::Watch => drawn.extend(self.loaded(Store::Watch, Path::new(""))?),
+            Page::Inventory => drawn.extend(self.loaded(Path::new(""))?),
             Page::Vault => drawn.extend(self.send(Msg::VaultLoaded(1, KeyedPage::default()))?),
             Page::Overview | Page::Protection | Page::Settings => {}
         }
@@ -449,10 +447,10 @@ fn enabled(batches: &[Vec<Mutation>], text: &str) -> Option<bool> {
 const OFF: &str = "Nothing is read or changed, and your Windows proxy settings are your own.";
 
 /// What the Inventory dashboard says while nothing was scanned.
-const INVENTORY_EMPTY: &str = "Scan your locations to see which files hold personal data, or right-click a file or folder in Explorer and choose Scan for personal data.";
+const INVENTORY_EMPTY: &str = "Scan your locations to see which files hold personal data. Only what lies in your locations is listed here.";
 
 /// What each page other than Overview must say, with the controller of a fresh install.
-fn pages() -> [(Page, &'static [&'static str]); 5] {
+fn pages() -> [(Page, &'static [&'static str]); 4] {
     [
         (
             Page::Protection,
@@ -471,25 +469,13 @@ fn pages() -> [(Page, &'static [&'static str]); 5] {
             Page::Inventory,
             &[
                 "Inventory",
-                "Where personal data is stored on this PC. Only what you scan is listed.",
+                "Where personal data is stored on this PC: what you scan, kept up to date in the locations you monitor.",
                 "Scan",
                 "Export report",
                 "Add and scan",
                 "Nothing found yet.",
                 "This PC",
                 INVENTORY_EMPTY,
-            ],
-        ),
-        (
-            Page::Watch,
-            &[
-                "Watch",
-                "Keeps an eye on folders and checks a file again when it changes.",
-                "No folders yet. Add one below.",
-                "Add folder",
-                "Watch is off.",
-                "Watched folders",
-                "Add a folder above to start watching it.",
             ],
         ),
         (
@@ -543,10 +529,7 @@ fn overview_says_what_piikey_is_doing_in_one_hero_and_a_row_for_each_job() -> Te
             "Masking",
             "Highlighting",
             "Inventory",
-            "Watch",
             "Vault",
-            "Detection",
-            "Model ready",
             "Recent swaps",
             "View all",
             "Turn on protection to start masking.",
@@ -555,11 +538,19 @@ fn overview_says_what_piikey_is_doing_in_one_hero_and_a_row_for_each_job() -> Te
             "Protection off",
         ],
     )?;
-    // No tiles, no tabs, nothing of the old window.
+    // No tiles, no tabs, nothing of the old window, and no row for the detection model: it is
+    // Settings' business.
     expect_not_drawn(
         "Overview",
         &drawn,
-        &["values keyed, all time", "General", "Home", "Keyed values"],
+        &[
+            "values keyed, all time",
+            "General",
+            "Home",
+            "Keyed values",
+            "Detection",
+            "Model ready",
+        ],
     )
 }
 
@@ -652,7 +643,7 @@ fn the_window_says_everything_in_the_words_of_the_glossary() -> Test {
     }
     for text in ui.everything() {
         for banned in [
-            "PII", "Keyed", "keyed", "program", "Program", "kind", "Kind",
+            "PII", "Keyed", "keyed", "program", "Program", "kind", "Kind", "Watch", "watch",
         ] {
             assert!(!text.contains(banned), "{text:?} says {banned:?}");
         }
@@ -898,20 +889,16 @@ fn the_rows_of_overview_each_tell_their_own_state() -> Test {
         snap.issued = 22;
         snap.policy.highlight = Highlight::Always;
         snap.highlight_paused = true;
-        snap.model = Model::Skipped;
-        snap.policy.watch = true;
-        snap.policy.watch_folders = vec![PathBuf::from(r"C:\Users\me\Downloads")];
-        snap.watch.totals = (5, 34);
+        snap.policy.inventory_roots = vec![PathBuf::from(r"C:\Users\me\Downloads")];
+        snap.policy.monitored_roots = vec![PathBuf::from(r"C:\Users\me\Downloads")];
     })?;
     expect_drawn(
         "rows",
         &drawn,
         &[
-            "711 found in 51 files",
-            "34 found in 5 files",
+            "711 found in 51 files \u{b7} monitoring 1 location",
             "22 values remembered",
             "Paused",
-            "Patterns only (model skipped)",
         ],
     )?;
     let scanning = ui.poll_with(|snap| snap.scan = Some((3_412, 20_100)))?;
@@ -1040,11 +1027,13 @@ fn a_poll_that_brings_nothing_new_builds_nothing() -> Test {
         } else {
             ui.go(page)?;
         }
-        // A scan without files yet, and folders to watch: the busiest the pages get.
+        // A scan without files yet, and two locations, one of them monitored: the busiest the
+        // pages get.
         let mut snapshot = ui.controller.snapshot();
         snapshot.scan = Some((0, 0));
         snapshot.policy.inventory_roots =
             vec![PathBuf::from(r"C:\Docs"), PathBuf::from(r"C:\Mail")];
+        snapshot.policy.monitored_roots = vec![PathBuf::from(r"C:\Docs")];
         ui.send(Msg::Polled(Some(Box::new(snapshot.clone()))))?;
         let before = ui.host.adapter().batches().len();
         snapshot.version += 1;
@@ -1081,7 +1070,7 @@ fn rebuilt(batches: &[Vec<Mutation>]) -> Vec<String> {
         .collect()
 }
 
-/// Shows the window a scan at `scan` over two watched folders; what that rebuilt.
+/// Shows the window a scan at `scan` over two locations; what that rebuilt.
 fn scan_look(ui: &mut Headless, scan: (u64, u64)) -> Result<Vec<String>, String> {
     let before = ui.host.adapter().batches().len();
     ui.poll_with(|snap| {
@@ -1150,7 +1139,7 @@ fn the_inventory_dashboard_lists_what_was_scanned_in_the_tree_the_legend_the_map
         ("b.txt", "call jan.jansen@acme.nl"),
     ])?;
     ui.send(Msg::Nav(Page::Inventory))?;
-    let drawn = ui.loaded(Store::Inventory, Path::new(""))?;
+    let drawn = ui.loaded(Path::new(""))?;
     // The tree starts at the drive the files are on, as the computer does, with no grouping of
     // its own.
     let (drive, root) = drive_of(&folder);
@@ -1175,30 +1164,22 @@ fn the_inventory_dashboard_lists_what_was_scanned_in_the_tree_the_legend_the_map
     expect_drawn("the drive", &drawn, &[drive.as_str()])?;
     // The drive opens onto its real folders: the first one on the way to what was scanned.
     let ways = below_the_drive(&folder);
-    ui.send(Msg::Dash(Store::Inventory, Dash::Toggle(root.clone())))?;
-    let opened = ui.loaded_with(
-        Store::Inventory,
-        Path::new(""),
-        std::slice::from_ref(&root),
-        None,
-    )?;
+    ui.send(Msg::Dash(Dash::Toggle(root.clone())))?;
+    let opened = ui.loaded_with(Path::new(""), std::slice::from_ref(&root), None)?;
     expect_drawn("the drive opened", &opened, &[ways[0].as_str()])?;
 
     // The folder the files lie in on show: the way back is there at once, from This PC through
     // the drive and the real folders down to it, and its rows are what lies in it.
     let parent = ui.dir.0.clone();
-    let entered = ui.send(Msg::Dash(Store::Inventory, Dash::Enter(parent.clone())))?;
+    let entered = ui.send(Msg::Dash(Dash::Enter(parent.clone())))?;
     let mut way: Vec<String> = vec!["This PC".to_owned(), drive];
     way.extend(below_the_drive(&parent));
     let way: Vec<&str> = way.iter().map(String::as_str).collect();
     expect_drawn("the way back", &entered, &way)?;
-    let inside = ui.loaded(Store::Inventory, &parent)?;
+    let inside = ui.loaded(&parent)?;
     expect_drawn("the folder on show", &inside, &["scanned"])?;
     // A folder row selected: the details offer what applies to a folder.
-    let folder_row = ui.send(Msg::Dash(
-        Store::Inventory,
-        Dash::Select(folder.clone(), Origin::Tree),
-    ))?;
+    let folder_row = ui.send(Msg::Dash(Dash::Select(folder.clone(), Origin::Tree)))?;
     expect_drawn(
         "a folder",
         &folder_row,
@@ -1211,10 +1192,7 @@ fn the_inventory_dashboard_lists_what_was_scanned_in_the_tree_the_legend_the_map
     expect_not_drawn("nothing to scan again", &folder_row, &["Scan this"])?;
     // A tile of the map selected: the details offer what applies to a file.
     let file = folder.join("a.txt");
-    let picked = ui.send(Msg::Dash(
-        Store::Inventory,
-        Dash::Select(file.clone(), Origin::Map),
-    ))?;
+    let picked = ui.send(Msg::Dash(Dash::Select(file.clone(), Origin::Map)))?;
     expect_drawn(
         "a file",
         &picked,
@@ -1222,16 +1200,15 @@ fn the_inventory_dashboard_lists_what_was_scanned_in_the_tree_the_legend_the_map
     )?;
     expect_not_drawn("nothing to scan again", &picked, &["Scan this"])?;
     // The load that follows brings the entry of the file: when it was scanned, and how big.
-    let entry = ui.loaded_with(Store::Inventory, &parent, &[folder], Some(&file))?;
+    let entry = ui.loaded_with(&parent, &[folder], Some(&file))?;
     assert!(
         entry.iter().any(|text| text.starts_with("Last scanned ")),
         "{entry:?}"
     );
     // One type shown: its chip is the one that stays lit and the tree counts only it.
-    let email = ui.send(Msg::Dash(
-        Store::Inventory,
-        Dash::Type(Some(piikey::detect::EntityKind::Email)),
-    ))?;
+    let email = ui.send(Msg::Dash(Dash::Type(Some(
+        piikey::detect::EntityKind::Email,
+    ))))?;
     expect_not_drawn("a type", &email, &["Show what was found"])
 }
 
@@ -1243,7 +1220,7 @@ fn a_wide_window_lists_the_types_in_a_column_next_to_the_map() -> Test {
         height: 1_080.0,
     }))?;
     ui.send(Msg::Nav(Page::Inventory))?;
-    let drawn = ui.loaded(Store::Inventory, Path::new(""))?;
+    let drawn = ui.loaded(Path::new(""))?;
     expect_drawn(
         "the wide dashboard",
         &drawn,
@@ -1260,32 +1237,17 @@ fn the_browse_buttons_open_pickers_and_what_is_picked_goes_where_the_box_would()
         &inventory,
         &["Browse folder\u{2026}", "Browse file\u{2026}"],
     )?;
-    let watch = ui.go(Page::Watch)?;
-    expect_drawn("watch picker", &watch, &["Browse\u{2026}"])?;
-    // A folder picked for the watch is watched, as if it had been typed in the box.
-    let folder = ui.dir.0.join("picked");
-    fs::create_dir_all(&folder).describe()?;
-    ui.send(Msg::Browsed(Browse::Watch, folder.clone()))?;
-    assert!(ui.controller.wait_idle(WAIT));
-    assert!(
-        ui.controller
-            .snapshot()
-            .policy
-            .watch_folders
-            .iter()
-            .any(|path| path == &folder)
-    );
     Ok(())
 }
 
 #[test]
-fn the_watch_page_shows_its_folders_what_they_are_doing_and_what_was_found_there() -> Test {
+fn a_location_can_be_monitored_and_says_what_monitoring_is_doing() -> Test {
     let mut ui = Headless::open(stub_controller)?;
-    ui.go(Page::Watch)?;
+    ui.go(Page::Inventory)?;
     let folder = PathBuf::from(r"C:\Users\me\Downloads");
     let drawn = ui.poll_with(|snap| {
-        snap.policy.watch = true;
-        snap.policy.watch_folders = vec![folder.clone()];
+        snap.policy.inventory_roots = vec![folder.clone()];
+        snap.policy.monitored_roots = vec![folder.clone()];
         snap.watch = Watch {
             folders: vec![WatchedFolder {
                 path: folder.clone(),
@@ -1293,23 +1255,50 @@ fn the_watch_page_shows_its_folders_what_they_are_doing_and_what_was_found_there
                 last_change: None,
             }],
             scanning: Some((3, 10)),
-            totals: (0, 0),
         };
     })?;
     expect_drawn(
-        "watching",
+        "monitoring",
         &drawn,
         &[
             r"C:\Users\me\Downloads",
-            "Scanning 3 of 10",
+            "Nothing found yet \u{b7} Scanning 3 of 10",
+            "Monitoring",
             "Remove",
-            "Looking at 3 of 10 files\u{2026}",
+            "Scanned 3 of 10 files\u{2026}",
         ],
     )?;
-    // Switching it on asks the controller, which saves it.
-    ui.send(Msg::Watch(true))?;
+    // Only a location can be monitored: anything else is refused, and the page says so.
+    let refused = ui.send(Msg::Monitor(PathBuf::from(r"C:\Not\A\Location"), true))?;
+    expect_drawn(
+        "a path that is no location",
+        &refused,
+        &[r"Not a location: C:\Not\A\Location"],
+    )?;
+    // The switch of a real location asks the controller, which saves it; off, it is forgotten.
+    let location = ui.dir.0.join("monitored");
+    fs::create_dir_all(&location).describe()?;
+    ui.controller.submit(Command::Edit(Edit::InventoryRoot {
+        path: location.clone(),
+        on: true,
+    }));
     assert!(ui.controller.wait_idle(WAIT));
-    assert!(ui.controller.snapshot().policy.watch);
+    ui.poll()?;
+    let monitored = |ui: &Headless| {
+        ui.controller
+            .snapshot()
+            .policy
+            .monitored_roots
+            .iter()
+            .any(|root| root == &location)
+    };
+    assert!(!monitored(&ui));
+    ui.send(Msg::Monitor(location.clone(), true))?;
+    assert!(ui.controller.wait_idle(WAIT));
+    assert!(monitored(&ui));
+    ui.send(Msg::Monitor(location.clone(), false))?;
+    assert!(ui.controller.wait_idle(WAIT) && ui.controller.wait_scans(WAIT));
+    assert!(!monitored(&ui));
     Ok(())
 }
 
@@ -1392,7 +1381,12 @@ fn a_scan_that_was_asked_for_shows_its_progress_and_its_result_in_a_dialog() -> 
         select: None,
         state,
     };
-    let scanning = ui.poll_with(|snap| snap.reveal = Some(reveal(RevealState::Scanning)))?;
+    // The scanned folder is a location: its result can be shown in the Inventory.
+    let located = |snap: &mut Snapshot, state: RevealState| {
+        snap.policy.inventory_roots = vec![folder.clone()];
+        snap.reveal = Some(reveal(state));
+    };
+    let scanning = ui.poll_with(|snap| located(snap, RevealState::Scanning))?;
     expect_drawn(
         "scanning",
         &scanning,
@@ -1405,8 +1399,7 @@ fn a_scan_that_was_asked_for_shows_its_progress_and_its_result_in_a_dialog() -> 
         counts: vec![(piikey::detect::EntityKind::Email, 7)],
         unread: 0,
     };
-    let done =
-        ui.poll_with(|snap| snap.reveal = Some(reveal(RevealState::Done(summary.clone()))))?;
+    let done = ui.poll_with(|snap| located(snap, RevealState::Done(summary.clone())))?;
     expect_drawn(
         "done",
         &done,
@@ -1422,8 +1415,7 @@ fn a_scan_that_was_asked_for_shows_its_progress_and_its_result_in_a_dialog() -> 
     // "Show in Inventory" goes to the page and puts the result away: it is not shown again.
     let shown = ui.send(Msg::ReportShow)?;
     expect_drawn("show", &shown, &["Add and scan"])?;
-    let again =
-        ui.poll_with(|snap| snap.reveal = Some(reveal(RevealState::Done(summary.clone()))))?;
+    let again = ui.poll_with(|snap| located(snap, RevealState::Done(summary.clone())))?;
     expect_not_drawn("put away", &again, &["Scan result"])?;
     // A scan that found nothing has nothing to show in the inventory.
     let nothing = ScanSummary {
@@ -1443,7 +1435,18 @@ fn a_scan_that_was_asked_for_shows_its_progress_and_its_result_in_a_dialog() -> 
         "nothing",
         &none,
         &["Show in Inventory", "Show what was found"],
-    )
+    )?;
+    // What was found outside the locations is shown, and the Inventory, which keeps only what
+    // lies in its locations, is not offered.
+    let outside = ui.poll_with(|snap| {
+        snap.policy.inventory_roots = vec![PathBuf::from(r"C:\Elsewhere")];
+        snap.reveal = Some(Reveal {
+            seq: 3,
+            ..reveal(RevealState::Done(summary.clone()))
+        });
+    })?;
+    expect_drawn("outside", &outside, &["Show what was found"])?;
+    expect_not_drawn("outside", &outside, &["Show in Inventory"])
 }
 
 #[test]
@@ -1463,16 +1466,17 @@ fn a_window_that_opens_for_a_scan_shows_its_result_and_one_that_opens_for_the_us
         }
         Ok(controller)
     };
+    // The scanned folder is no location: the result offers what was found, not the Inventory.
     let ui = Headless::open_for(scan, Some(1))?;
     expect_drawn(
         "opened for the scan",
         &ui.everything(),
-        &[
-            "Scan result",
-            "1 found in 1 file",
-            "Show what was found",
-            "Show in Inventory",
-        ],
+        &["Scan result", "1 found in 1 file", "Show what was found"],
+    )?;
+    expect_not_drawn(
+        "opened for the scan",
+        &ui.everything(),
+        &["Show in Inventory"],
     )?;
     let ui = Headless::open_for(scan, None)?;
     expect_not_drawn("opened by the user", &ui.everything(), &["Scan result"])
@@ -1713,7 +1717,7 @@ fn the_search_a_type_and_a_file_narrow_the_list_and_back_closes_the_view() -> Te
     // Back: the page that was on show is there again, and the values are gone from the window.
     let back = ui.send(Msg::FindingsClose)?;
     expect_drawn("back", &back, &["What piikey is doing"])?;
-    let again = ui.send(Msg::Dash(Store::Inventory, Dash::Found(folder.clone())))?;
+    let again = ui.send(Msg::Dash(Dash::Found(folder.clone())))?;
     expect_drawn("again", &again, &["Looking for the files\u{2026}"])?;
     expect_not_drawn("again", &again, &["jan.jansen@acme.nl", "Jan Jansen"])?;
     // What an older reading brings is not taken in: the view that read it is gone.
@@ -1761,7 +1765,7 @@ const OPENED_ONLY: &str =
 fn a_file_that_cannot_be_read_and_a_folder_with_nothing_in_it_say_so_in_the_view() -> Test {
     let mut ui = Headless::open(stub_controller)?;
     let file = ui.dir.0.join("a.bin");
-    let asked = ui.send(Msg::Dash(Store::Inventory, Dash::Found(file.clone())))?;
+    let asked = ui.send(Msg::Dash(Dash::Found(file.clone())))?;
     expect_drawn("asked", &asked, &[&file.display().to_string()])?;
     let listed = FindingFiles {
         files: vec![FindingFile {
@@ -1785,7 +1789,7 @@ fn a_file_that_cannot_be_read_and_a_folder_with_nothing_in_it_say_so_in_the_view
     )?;
     // A folder none of whose files holds anything: the view is done at once and says so.
     let folder = ui.dir.0.join("empty");
-    ui.send(Msg::Dash(Store::Inventory, Dash::Found(folder)))?;
+    ui.send(Msg::Dash(Dash::Found(folder)))?;
     let listed = ui.send(Msg::FindingsListed(2, FindingFiles::default()))?;
     expect_drawn("empty", &listed, &["No personal data found."])
 }
@@ -1819,7 +1823,7 @@ fn protection_starts_with_highlighting_then_the_sites_and_the_apps() -> Test {
 }
 
 #[test]
-fn inventory_lists_its_locations_like_watch_lists_its_folders() -> Test {
+fn inventory_lists_its_locations() -> Test {
     let (mut ui, folder) = scanned_window(&[
         ("a.txt", "mail jan.jansen@acme.nl and piet@acme.nl"),
         ("b.txt", "call jan.jansen@acme.nl"),
@@ -1838,9 +1842,14 @@ fn inventory_lists_its_locations_like_watch_lists_its_folders() -> Test {
     expect_drawn(
         "locations",
         &before,
-        &[path.as_str(), "Remove", "Nothing found yet"],
+        &[
+            path.as_str(),
+            "Not monitored",
+            "Remove",
+            "Nothing found yet",
+        ],
     )?;
-    let drawn = ui.loaded(Store::Inventory, Path::new(""))?;
+    let drawn = ui.loaded(Path::new(""))?;
     expect_drawn("the scanned location", &drawn, &["3 found in 2 files"])?;
     // The row of the location counts what lies in its folder, by its path; the details of the
     // top say the same of everything: that makes two.
@@ -1887,21 +1896,18 @@ fn opening_folders_and_picking_tiles_keep_the_tree_and_its_scroll_bar() -> Test 
     }
     let top = ui.dir.0.clone();
     ui.send(Msg::Nav(Page::Inventory))?;
-    ui.send(Msg::Dash(Store::Inventory, Dash::Enter(top.clone())))?;
-    let rows = ui.loaded(Store::Inventory, &top)?;
+    ui.send(Msg::Dash(Dash::Enter(top.clone())))?;
+    let rows = ui.loaded(&top)?;
     // By name, whatever they hold: docs before mail, which holds more.
     let at = |name: &str| rows.iter().position(|text| text == name);
     assert!(at("docs") < at("mail"), "{rows:?}");
     let made =
         |ui: &Headless, from: usize, kind| created(&ui.host.adapter().batches()[from..], kind);
     let before = ui.host.adapter().batches().len();
-    ui.send(Msg::Dash(Store::Inventory, Dash::Toggle(docs.clone())))?;
-    let opened = ui.loaded_with(Store::Inventory, &top, std::slice::from_ref(&docs), None)?;
-    ui.send(Msg::Dash(
-        Store::Inventory,
-        Dash::Select(mail.join("a.txt"), Origin::Map),
-    ))?;
-    ui.loaded_with(Store::Inventory, &top, &[docs, mail], None)?;
+    ui.send(Msg::Dash(Dash::Toggle(docs.clone())))?;
+    let opened = ui.loaded_with(&top, std::slice::from_ref(&docs), None)?;
+    ui.send(Msg::Dash(Dash::Select(mail.join("a.txt"), Origin::Map)))?;
+    ui.loaded_with(&top, &[docs, mail], None)?;
     assert_eq!(
         made(&ui, before, ObjectType::ScrollViewer),
         0,

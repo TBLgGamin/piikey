@@ -24,7 +24,6 @@ use super::{
     types,
 };
 use crate::ui::{
-    controller::Store,
     pages::kit::{Context, counted, thousands},
     treemap::{Rect, squarify},
     window::{Dash, Msg, Origin},
@@ -350,7 +349,7 @@ pub(super) fn focus(of: &Of, selected: Option<&Path>, folder_selected: bool) -> 
 }
 
 /// One tile as a bordered box on the canvas. A click selects its file.
-fn tile_view(tile: &Placed, focus: Focus, store: Store, context: Context<'_>) -> View {
+fn tile_view(tile: &Placed, focus: Focus, context: Context<'_>) -> View {
     let ring = match focus {
         Focus::Chosen => tile.text,
         _ => Color::transparent(),
@@ -371,7 +370,7 @@ fn tile_view(tile: &Placed, focus: Focus, store: Store, context: Context<'_>) ->
     if let Of::File(path) = &tile.of {
         let path = path.clone();
         border = border.on_pointer_pressed(context.callback(move |_: PointerEventInfo| {
-            Msg::Dash(store, Dash::Select(path.clone(), Origin::Map))
+            Msg::Dash(Dash::Select(path.clone(), Origin::Map))
         }));
     }
     let (named, counted_too) = label_room(&tile.rect);
@@ -387,19 +386,11 @@ pub(super) fn map(
     canvas: (f64, f64),
     selected: Option<&Path>,
     folder_selected: bool,
-    store: Store,
     context: Context<'_>,
 ) -> Border {
     let tiles: Vec<View> = placed
         .iter()
-        .map(|tile| {
-            tile_view(
-                tile,
-                focus(&tile.of, selected, folder_selected),
-                store,
-                context,
-            )
-        })
+        .map(|tile| tile_view(tile, focus(&tile.of, selected, folder_selected), context))
         .collect();
     Border::new()
         .background(ThemeBrush::CardBackground)

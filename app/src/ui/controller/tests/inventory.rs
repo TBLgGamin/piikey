@@ -1,9 +1,6 @@
 use std::sync::mpsc;
 
-use piikey::{
-    inventory::{Inventory, Node},
-    sys::volume_len,
-};
+use piikey::{inventory::Node, sys::volume_len};
 
 use super::*;
 use crate::ui::controller::FindingsEvent;
@@ -44,7 +41,7 @@ fn summary_of(snapshot: &Snapshot) -> Result<ScanSummary, String> {
 }
 
 #[test]
-fn an_explorer_scan_fills_the_inventory_and_the_dialog_gets_its_result() -> Test {
+fn an_explorer_scan_outside_the_locations_shows_its_result_and_is_not_kept() -> Test {
     let rig = rig(true, quiet())?;
     let dir = TempDir::new()?;
     let folder = docs(&dir)?;
@@ -54,7 +51,9 @@ fn an_explorer_scan_fills_the_inventory_and_the_dialog_gets_its_result() -> Test
         reveal: true,
     })?;
     let snapshot = shown(&rig.controller)?;
-    assert_eq!(snapshot.inventory_totals, (1, 1));
+    // No location holds the folder: the Inventory keeps nothing of it.
+    assert_eq!(snapshot.inventory_totals, (0, 0));
+    assert_eq!(rig.controller.inventory().totals().files, 0);
     let reveal = snapshot.reveal.clone().ok_or("no dialog")?;
     assert_eq!(
         (reveal.seq, &reveal.paths, &reveal.at, &reveal.select),
@@ -85,26 +84,21 @@ fn an_explorer_scan_fills_the_inventory_and_the_dialog_gets_its_result() -> Test
     let engine = rig.controller.engine();
     let records = engine.vault().read().describe()?.record_count();
     assert_eq!(records, 0);
-    // The watch has seen nothing of it: it is the inventory's.
-    assert_eq!(rig.controller.snapshot().watch.totals, (0, 0));
-    assert_eq!(rig.controller.watch_store.totals().files, 0);
 
-    // The top of the tree is the drive the folder is on, a location or not.
-    let (drive, root) = drive_of(&folder);
-    let top = rig
-        .controller
-        .inventory_view(Store::Inventory, Path::new(""), None);
-    assert_eq!(top.nodes.len(), 1);
-    assert_eq!((&top.nodes[0].name, &top.nodes[0].path), (&drive, &root));
-    assert!(top.nodes[0].is_dir);
-    // No location chosen: nothing to count by place.
-    assert!(rig.controller.places(Store::Inventory).is_empty());
-    let level = rig
-        .controller
-        .inventory_view(Store::Inventory, &folder, Some(&file));
-    assert_eq!(level.nodes.len(), 1);
-    assert_eq!(level.nodes[0].name, "a.txt");
-    assert_eq!(level.entry.map(|entry| entry.hits()), Some(1));
+    // The tree, the places and the store hold nothing of it; its findings view still reads the
+    // file the scan found.
+    assert!(
+        rig.controller
+            .inventory_view(Path::new(""), None)
+            .nodes
+            .is_empty()
+    );
+    assert!(rig.controller.places().is_empty());
+    let listed = rig.controller.finding_files(std::slice::from_ref(&folder));
+    assert_eq!(
+        listed.files.iter().map(|f| &f.path).collect::<Vec<_>>(),
+        [&file]
+    );
 
     // The scan of one file shows its folder with the file selected, and its summary is the
     // file's.
@@ -141,7 +135,13 @@ fn the_dialog_is_there_from_the_moment_the_scan_is_queued_and_the_newest_request
     let other = dir.0.join("other");
     fs::create_dir(&other).describe()?;
     fs::write(other.join("b.txt"), "call +31 6 12345678").describe()?;
-    let rig = rig(true, quiet())?;
+    let rig = rig(
+        true,
+        Policy {
+            inventory_roots: vec![dir.0.clone()],
+            ..quiet()
+        },
+    )?;
 
     // The first scan stops where the model loads, so what the dialog says can be looked at.
     let (entered, in_scan) = mpsc::channel();
@@ -202,7 +202,13 @@ fn the_dialog_is_there_from_the_moment_the_scan_is_queued_and_the_newest_request
 fn a_scan_that_could_not_run_tells_the_dialog_why() -> Test {
     let dir = TempDir::new()?;
     let folder = docs(&dir)?;
-    let rig = rig(true, quiet())?;
+    let rig = rig(
+        true,
+        Policy {
+            inventory_roots: vec![folder.clone()],
+            ..quiet()
+        },
+    )?;
     // A `piikey-cli` run on its own holds the inventory.
     let held = rig.controller.inventory().lock_scan().describe()?;
     rig.run(Command::ScanFiles {
@@ -268,13 +274,11 @@ fn a_scan_nobody_asked_to_see_leaves_the_window_alone_and_nothing_scans_by_itsel
     );
     assert_eq!(rig.controller.tray().reveal, 0);
     let (drive, root) = drive_of(&folder);
-    let top = rig
-        .controller
-        .inventory_view(Store::Inventory, Path::new(""), None);
+    let top = rig.controller.inventory_view(Path::new(""), None);
     assert_eq!(top.nodes.len(), 1);
     assert_eq!((&top.nodes[0].name, &top.nodes[0].path), (&drive, &root));
     // The location counts what lies in its folder, wherever the folder is in the tree.
-    let places = rig.controller.places(Store::Inventory);
+    let places = rig.controller.places();
     assert_eq!(places.len(), 1);
     assert_eq!(places[0].path, folder);
     assert_eq!((places[0].hits, places[0].files), (1, 1));
@@ -438,11 +442,9 @@ fn the_findings_of_files_are_read_on_request_with_the_model_and_kept_nowhere() -
             .last()
             .is_some_and(|call| call == "release_model")
     })?;
-    // Nothing was stored: not in the inventory, not in the watch's, and not as a file.
+    // Nothing was stored: not in the inventory, and not as a file.
     assert_eq!(rig.controller.inventory().totals().files, 0);
-    assert_eq!(rig.controller.watch_store.totals().files, 0);
     assert!(!dir.0.join("inventory.jsonl").exists());
-    assert!(!dir.0.join("watch.jsonl").exists());
     assert_eq!(rig.controller.snapshot().inventory_totals, (0, 0));
     // Nothing to read: the model is not loaded for it.
     let calls = rig.calls().len();
@@ -540,9 +542,7 @@ fn a_folder_result_lists_the_files_with_personal_data_the_most_first_and_a_named
     })?;
     assert!(rig.controller.wait_scans(Duration::from_secs(20)));
 
-    let listed = rig
-        .controller
-        .finding_files(Store::Inventory, std::slice::from_ref(&folder));
+    let listed = rig.controller.finding_files(std::slice::from_ref(&folder));
     let labels: Vec<&str> = listed
         .files
         .iter()
@@ -556,93 +556,79 @@ fn a_folder_result_lists_the_files_with_personal_data_the_most_first_and_a_named
     // path that is no folder is a file: reading it says what is wrong with it.
     let clean = folder.join("b.txt");
     let gone = dir.0.join("gone.txt");
-    let named = rig
-        .controller
-        .finding_files(Store::Inventory, &[clean.clone(), gone.clone()]);
+    let named = rig.controller.finding_files(&[clean.clone(), gone.clone()]);
     let paths: Vec<&PathBuf> = named.files.iter().map(|file| &file.path).collect();
     assert_eq!(paths, [&clean, &gone]);
     assert_eq!(named.files[0].label, "b.txt");
-
-    // The watch's inventory knows nothing of what was scanned into the main one.
-    let watched = rig
-        .controller
-        .finding_files(Store::Watch, std::slice::from_ref(&folder));
-    assert!(watched.files.is_empty());
     Ok(())
 }
 
 #[test]
-fn the_views_read_the_inventory_they_are_asked_for() -> Test {
+fn the_views_read_tiles_types_and_places_of_the_inventory() -> Test {
     let dir = TempDir::new()?;
     let folder = docs(&dir)?;
-    let watched = dir.0.join("watched");
-    fs::create_dir(&watched).describe()?;
     let rig = rig(
         true,
         Policy {
             inventory_roots: vec![folder.clone()],
-            watch_folders: vec![watched.clone()],
             ..quiet()
         },
     )?;
     rig.run(Command::ScanAll)?;
     assert!(rig.controller.wait_scans(Duration::from_secs(20)));
-    let file = |name: &str| watched.join(name);
+    // Two more files in the folder than the scan found, for the tiles and the legend to tell apart.
+    let file = |name: &str| folder.join(name);
     rig.controller
-        .watch_store
+        .inventory()
         .record(vec![
-            entry_of(&file("w1.txt"), &[(EntityKind::Iban, 3)]),
+            entry_of(&file("w1.txt"), &[(EntityKind::Iban, 4)]),
             entry_of(
                 &file("w2.txt"),
-                &[(EntityKind::Phone, 1), (EntityKind::Iban, 1)],
+                &[(EntityKind::Phone, 2), (EntityKind::Iban, 1)],
             ),
         ])
         .describe()?;
 
-    let top = |store| rig.controller.inventory_view(store, Path::new(""), None);
-    let main = top(Store::Inventory);
-    assert_eq!(main.nodes.len(), 1);
-    assert_eq!(main.nodes[0].hits, 1);
-    let watch = top(Store::Watch);
-    assert_eq!(watch.nodes.len(), 1);
-    assert_eq!((watch.nodes[0].hits, watch.nodes[0].files), (5, 2));
-    assert_eq!(watch.nodes[0].dominant(), Some(EntityKind::Iban));
-    // What each holds in its own folders is counted by their paths.
-    let held = |store: Store| -> Vec<(PathBuf, u64, u32)> {
-        rig.controller
-            .places(store)
-            .into_iter()
-            .map(|node| (node.path, node.hits, node.files))
-            .collect()
-    };
-    assert_eq!(held(Store::Inventory), [(folder.clone(), 1, 1)]);
-    assert_eq!(held(Store::Watch), [(watched.clone(), 5, 2)]);
+    let top = rig.controller.inventory_view(Path::new(""), None);
+    assert_eq!(top.nodes.len(), 1);
+    assert_eq!((top.nodes[0].hits, top.nodes[0].files), (8, 3));
+    assert_eq!(top.nodes[0].dominant(), Some(EntityKind::Iban));
+    // What a location holds is counted by its path.
+    let held: Vec<(PathBuf, u64, u32)> = rig
+        .controller
+        .places()
+        .into_iter()
+        .map(|node| (node.path, node.hits, node.files))
+        .collect();
+    assert_eq!(held, [(folder.clone(), 8, 3)]);
 
-    let tiles = rig.controller.tiles(Store::Watch, Path::new(""), 1);
+    let tiles = rig.controller.tiles(Path::new(""), 1);
     assert_eq!(tiles.tiles.len(), 1);
     assert_eq!(tiles.tiles[0].path, file("w1.txt"));
-    assert_eq!((tiles.rest.files, tiles.rest.hits), (1, 2));
-    let legend = rig.controller.type_totals(Store::Watch, &watched);
+    assert_eq!((tiles.rest.files, tiles.rest.hits), (2, 4));
+    assert_eq!(rig.controller.tiles(Path::new(""), 10).tiles.len(), 3);
+    let legend = rig.controller.type_totals(&folder);
     assert_eq!(
         legend
             .iter()
             .map(|total| (total.kind, total.hits, total.files))
             .collect::<Vec<_>>(),
-        [(EntityKind::Iban, 4, 2), (EntityKind::Phone, 1, 1)]
+        [
+            (EntityKind::Iban, 5, 2),
+            (EntityKind::Phone, 2, 1),
+            (EntityKind::Email, 1, 1)
+        ]
     );
-    // What was scanned into the inventory is not in the watch's views, and the other way round.
-    assert_eq!(
+    // Only what lies under the folder asked for is counted.
+    assert!(
         rig.controller
-            .tiles(Store::Inventory, Path::new(""), 10)
-            .tiles
-            .len(),
-        1
+            .type_totals(&dir.0.join("elsewhere"))
+            .is_empty()
     );
-    assert!(rig.controller.type_totals(Store::Watch, &folder).is_empty());
     let selected = rig
         .controller
-        .inventory_view(Store::Watch, &watched, Some(&file("w2.txt")));
-    assert_eq!(selected.entry.map(|entry| entry.hits()), Some(2));
+        .inventory_view(&folder, Some(&file("w2.txt")));
+    assert_eq!(selected.entry.map(|entry| entry.hits()), Some(3));
     Ok(())
 }
 
@@ -668,11 +654,7 @@ fn the_tree_goes_down_the_real_folders_from_the_drive_and_a_place_counts_what_li
     rig.run(Command::ScanAll)?;
     assert!(rig.controller.wait_scans(Duration::from_secs(20)));
 
-    let view = |at: &Path| {
-        rig.controller
-            .inventory_view(Store::Inventory, at, None)
-            .nodes
-    };
+    let view = |at: &Path| rig.controller.inventory_view(at, None).nodes;
     let names = |level: &[Node]| -> Vec<String> { level.iter().map(|n| n.name.clone()).collect() };
     let (drive, root) = drive_of(&folder);
     assert_eq!(names(&view(Path::new(""))), [drive]);
@@ -696,7 +678,7 @@ fn the_tree_goes_down_the_real_folders_from_the_drive_and_a_place_counts_what_li
     // A location counts what lies in its folder; locations inside one another each do.
     let held: Vec<(PathBuf, u64, u32)> = rig
         .controller
-        .places(Store::Inventory)
+        .places()
         .into_iter()
         .map(|node| (node.path, node.hits, node.files))
         .collect();
@@ -715,16 +697,6 @@ fn entry_of(path: &Path, counts: &[(EntityKind, u32)]) -> piikey::inventory::Ent
         counts: counts.to_vec(),
         hash: None,
     }
-}
-
-#[test]
-fn the_inventory_and_the_watch_are_two_files() -> Test {
-    let rig = rig(true, quiet())?;
-    let (main, watch) = (rig.fake.open_inventory()?, rig.fake.open_watch()?);
-    let names = |inventory: &Inventory| format!("{inventory:?}");
-    assert!(names(&main).contains("inventory.jsonl"), "{}", names(&main));
-    assert!(names(&watch).contains("watch.jsonl"), "{}", names(&watch));
-    Ok(())
 }
 
 #[test]

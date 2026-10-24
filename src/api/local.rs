@@ -311,6 +311,11 @@ impl Local {
                 .iter()
                 .map(|root| lossy(root))
                 .collect(),
+            monitored: policy
+                .monitored_roots
+                .iter()
+                .map(|root| lossy(root))
+                .collect(),
             files: totals.files,
             files_with_pii: totals.files_with_pii,
             hits: totals.hits,
@@ -433,7 +438,7 @@ impl Local {
             model: self.model_status()?,
             highlight: policy.highlight,
             explorer_menu: policy.explorer_menu,
-            watch: policy.watch,
+            monitoring: !policy.monitored_roots.is_empty(),
             http_api: policy.http_api,
         })
     }
@@ -1044,22 +1049,22 @@ mod tests {
     #[test]
     fn every_answer_follows_the_settings_the_source_hands_out() -> TestResult {
         let fx = Fixture::new()?;
-        let folder = fx.dir.file("watched");
+        let folder = fx.dir.file("monitored");
         {
             let mut policy = fx.policy.lock().map_err(|_| "settings poisoned")?;
-            policy.watch = true;
             policy.background = false;
             policy.inventory_roots = vec![folder.clone()];
-            policy.watch_folders = vec![folder.clone()];
+            policy.monitored_roots = vec![folder.clone()];
             policy.disabled_kinds = vec![EntityKind::Email];
         }
         let settings = fx.ask(Request::SettingsGet)?;
-        assert_eq!(settings["watch"], true);
+        assert!(settings.get("watch").is_none() && settings.get("watch_folders").is_none());
         assert_eq!(settings["background"], false);
-        assert_eq!(settings["watch_folders"], json!([lossy(&folder)]));
+        assert_eq!(settings["monitored_roots"], json!([lossy(&folder)]));
         assert!(settings.get("inventory").is_none() && settings.get("inventory_exclude").is_none());
         let status = fx.ask(Request::InventoryStatus)?;
         assert_eq!(status["roots"], json!([lossy(&folder)]));
+        assert_eq!(status["monitored"], json!([lossy(&folder)]));
         assert!(
             status.get("enabled").is_none(),
             "the inventory has no switch: {status}"
@@ -1070,7 +1075,7 @@ mod tests {
             .and_then(|all| all.iter().find(|k| k["kind"] == "email"))
             .ok_or("no email")?;
         assert_eq!(email["enabled"], false);
-        assert_eq!(fx.ask(Request::Status)?["watch"], true);
+        assert_eq!(fx.ask(Request::Status)?["monitoring"], true);
         Ok(())
     }
 
@@ -1095,7 +1100,7 @@ mod tests {
         assert_eq!(status["vault_records"], 1);
         assert_eq!(status["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(status["model"]["state"], "missing");
-        for key in ["highlight", "explorer_menu", "watch", "http_api"] {
+        for key in ["highlight", "explorer_menu", "monitoring", "http_api"] {
             assert!(status.get(key).is_some(), "{key} missing: {status}");
         }
         Ok(())

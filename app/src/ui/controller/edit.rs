@@ -35,17 +35,15 @@ pub enum Edit {
     /// quits piikey.
     Background(bool),
     /// A folder the inventory scans when asked (one of its locations); `on` adds it, `off`
-    /// takes it off. A path that is no folder is refused. There is no location until the user
-    /// adds one.
+    /// takes it off, which ends its monitoring too. A path that is no folder is refused. There is
+    /// no location until the user adds one.
     InventoryRoot {
         path: PathBuf,
         on: bool,
     },
-    /// Whether the watch keeps an eye on its folders.
-    Watch(bool),
-    /// A folder the watch keeps an eye on; `on` adds it, `off` takes it off. A path that is no
-    /// folder is refused.
-    WatchFolder {
+    /// Whether the location `path` is monitored: its file changes are scanned as they happen.
+    /// Only a location can be: any other path is refused.
+    Monitor {
         path: PathBuf,
         on: bool,
     },
@@ -56,7 +54,8 @@ pub enum Edit {
 /// Applies `edit` to `policy`; `Ok(false)` when nothing changed.
 ///
 /// # Errors
-/// The text the user typed is not a site, a program or a folder, or the folder does not exist.
+/// The text the user typed is not a site, a program or a folder, or the folder does not exist, or
+/// the path to monitor is not one of the locations.
 pub fn apply_edit(policy: &mut Policy, edit: &Edit) -> Res<bool> {
     match edit {
         Edit::Site { site, on: true } => {
@@ -90,9 +89,36 @@ pub fn apply_edit(policy: &mut Policy, edit: &Edit) -> Res<bool> {
         Edit::Highlight(mode) => Ok(set(&mut policy.highlight, *mode)),
         Edit::ExplorerMenu(on) => Ok(set(&mut policy.explorer_menu, *on)),
         Edit::Background(on) => Ok(set(&mut policy.background, *on)),
-        Edit::InventoryRoot { path, on } => folder_edit(&mut policy.inventory_roots, path, *on),
-        Edit::Watch(on) => Ok(set(&mut policy.watch, *on)),
-        Edit::WatchFolder { path, on } => folder_edit(&mut policy.watch_folders, path, *on),
+        Edit::InventoryRoot { path, on } => {
+            let changed = folder_edit(&mut policy.inventory_roots, path, *on)?;
+            // A location that is gone is not monitored any more.
+            policy.prune_monitored();
+            Ok(changed)
+        }
+        Edit::Monitor { path, on: true } => {
+            let location = policy
+                .inventory_roots
+                .iter()
+                .find(|root| same_folder(root, path))
+                .cloned()
+                .ok_or_else(|| format!("Not a location: {}", path.display()))?;
+            if policy
+                .monitored_roots
+                .iter()
+                .any(|root| same_folder(root, &location))
+            {
+                return Ok(false);
+            }
+            policy.monitored_roots.push(location);
+            Ok(true)
+        }
+        Edit::Monitor { path, on: false } => {
+            let before = policy.monitored_roots.len();
+            policy
+                .monitored_roots
+                .retain(|root| !same_folder(root, path));
+            Ok(policy.monitored_roots.len() != before)
+        }
         Edit::HttpApi(on) => Ok(set(&mut policy.http_api, *on)),
     }
 }

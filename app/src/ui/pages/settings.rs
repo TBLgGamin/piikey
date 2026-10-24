@@ -2,8 +2,7 @@
 
 use piikey::{api::http, detect::KIND_GROUPS};
 use windows_reactor::{
-    Button, Expander, HorizontalAlignment, HyperlinkButton, Image, Orientation, StackPanel,
-    Stretch, TextBlock, View,
+    Button, Expander, HorizontalAlignment, Image, Orientation, StackPanel, Stretch, TextBlock, View,
 };
 
 use super::{
@@ -84,7 +83,7 @@ fn general(window: &MainWindow, context: Context<'_>) -> Vec<View> {
             .build(),
         Row::new("Keep piikey running in the tray when I close the window")
             .icon("\u{E946}")
-            .description("On: protection, highlighting, Watch and the API keep working with the window closed. Off: closing the window quits piikey.")
+            .description("On: protection, highlighting, monitoring and the API keep working with the window closed. Off: closing the window quits piikey.")
             .control(feature_switch(
                 "Keep piikey running in the tray when I close the window",
                 window.snap.policy.background,
@@ -164,7 +163,6 @@ fn developer(window: &MainWindow, context: Context<'_>) -> Vec<View> {
             .build(),
         Row::new("Address")
             .description(http::url(policy.http_port))
-            .selectable()
             .state(if window.snap.http { "Listening" } else { "Off" })
             .build(),
         Row::new("Token")
@@ -194,7 +192,6 @@ fn privacy(window: &MainWindow, context: Context<'_>) -> Vec<View> {
         Row::new("Data folder")
             .icon("\u{E8B7}")
             .description(folder)
-            .selectable()
             .control(
                 Button::new()
                     .content("Open folder")
@@ -202,14 +199,6 @@ fn privacy(window: &MainWindow, context: Context<'_>) -> Vec<View> {
             )
             .build(),
         caption("Settings, the encrypted vault, the activity feed, the inventory, the certificate and the detection model are kept in this folder. The inventory holds counts and paths, never the values.").into(),
-        HyperlinkButton::new()
-            .content("Export or forget swapped values")
-            .on_click(context.message(Msg::Nav(Page::Vault)))
-            .into(),
-        HyperlinkButton::new()
-            .content("Export the inventory report")
-            .on_click(context.message(Msg::Nav(Page::Inventory)))
-            .into(),
     ]
 }
 

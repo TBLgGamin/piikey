@@ -156,19 +156,20 @@ impl AppApi {
         Ok(json!({}))
     }
 
-    /// What [`Local`] says of the inventory, with the progress of the scan the controller runs:
-    /// the app's scans are its own, not [`Local`]'s.
+    /// What [`Local`] says of the inventory, with the progress of the scan the controller runs (one
+    /// somebody asked for, or one of what monitoring saw change): the app's scans are its own,
+    /// not [`Local`]'s.
     fn inventory_status(&self) -> Result<Value, ApiError> {
         let mut status = self.local.inventory_status()?;
-        status.scanning = self
-            .controller()?
-            .snapshot()
+        let snapshot = self.controller()?.snapshot();
+        status.scanning = snapshot
             .scan
+            .or(snapshot.watch.scanning)
             .map(|(done, total)| reply::Progress { done, total });
         to_json(&status)
     }
 
-    /// Scans the watched folders now and answers when the scan is over.
+    /// Scans the locations now and answers when the scan is over.
     fn inventory_rescan(&self) -> Result<Value, ApiError> {
         let controller = self.controller()?;
         controller.submit(Command::ScanAll);

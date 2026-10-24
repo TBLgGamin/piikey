@@ -1,6 +1,5 @@
-//! The state of the two dashboards, Inventory and Watch, and what their controls do. Both show
-//! one store of the controller the same way, so they share one set of messages ([`Dash`]) and one
-//! state ([`Dashboard`]) of their own each.
+//! The state of the Inventory page's dashboard and what its controls do: one set of messages
+//! ([`Dash`]) and one state ([`Dashboard`]).
 //!
 //! What a dashboard shows comes from the controller's views, which wait on the inventory and run in
 //! the background: a load brings the tree levels the user has open, the map's tiles, the types for
@@ -21,10 +20,7 @@ use piikey::{
 use windows_reactor::ComponentContext;
 
 use super::{MainWindow, Msg, Page};
-use crate::ui::{
-    controller::{Controller, Store},
-    explorer,
-};
+use crate::ui::{controller::Controller, explorer};
 
 /// Files the map gives a tile of their own; the others are one tile together.
 pub const TILES: usize = 400;
@@ -38,8 +34,7 @@ pub enum Origin {
     Map,
 }
 
-/// What a dashboard's controls ask of the window. The message that carries it says which
-/// dashboard.
+/// What the dashboard's controls ask of the window.
 #[derive(Clone)]
 pub enum Dash {
     /// Show this folder: the tree starts in it, the map and the legend cover it. Empty is
@@ -73,17 +68,16 @@ pub struct Loaded {
     /// The folder on show when it was read: a load that comes back for another one is old.
     pub at: PathBuf,
     /// The nodes of each folder the tree lists: the one of the folder on show is the top level.
-    /// For the top of the store (an empty `at`) that is its drives.
+    /// For the top of the inventory (an empty `at`) that is its drives.
     pub levels: HashMap<PathBuf, Vec<Node>>,
-    /// What the store found in each of its locations, whatever folder is on show: one node for
-    /// each that holds something. Only the Inventory's rows say that; the Watch page's have no use
-    /// for it, so a load for the watch leaves it empty.
+    /// What the inventory found in each of its locations, whatever folder is on show: one node for
+    /// each that holds something. The Inventory's location rows say that.
     pub places: Vec<Node>,
     /// The map's files.
     pub tiles: Tiles,
     /// The types found under the folder on show, for the legend.
     pub totals: Vec<TypeTotal>,
-    /// What the store knows of the selected file.
+    /// What the inventory knows of the selected file.
     pub entry: Option<Entry>,
 }
 
@@ -216,55 +210,35 @@ impl Loaded {
     /// `open` folders below it, the map's files and the types, and the entry of `file`.
     pub(in crate::ui) fn read(
         controller: &Controller,
-        store: Store,
         at: &Path,
         open: &[PathBuf],
         file: Option<&Path>,
     ) -> Self {
-        let top = controller.inventory_view(store, at, file);
+        let top = controller.inventory_view(at, file);
         let mut levels = HashMap::new();
         for folder in open
             .iter()
             .filter(|folder| is_under(folder, at) && *folder != at)
         {
-            let level = controller.inventory_view(store, folder, None);
+            let level = controller.inventory_view(folder, None);
             levels.insert(folder.clone(), level.nodes);
         }
         levels.insert(at.to_path_buf(), top.nodes);
         Self {
             at: at.to_path_buf(),
             levels,
-            places: if store == Store::Inventory {
-                controller.places(store)
-            } else {
-                Vec::new()
-            },
-            tiles: controller.tiles(store, at, TILES),
-            totals: controller.type_totals(store, at),
+            places: controller.places(),
+            tiles: controller.tiles(at, TILES),
+            totals: controller.type_totals(at),
             entry: top.entry,
         }
     }
 }
 
 impl MainWindow {
-    /// The dashboard of `store`.
-    pub(in crate::ui) const fn dash(&self, store: Store) -> &Dashboard {
-        match store {
-            Store::Inventory => &self.inventory,
-            Store::Watch => &self.watch,
-        }
-    }
-
-    fn dash_mut(&mut self, store: Store) -> &mut Dashboard {
-        match store {
-            Store::Inventory => &mut self.inventory,
-            Store::Watch => &mut self.watch,
-        }
-    }
-
-    /// Loads what the dashboard of `store` shows, in the background.
-    pub(super) fn load_dashboard(&mut self, store: Store, context: &ComponentContext<Self>) {
-        let dash = self.dash_mut(store);
+    /// Loads what the dashboard shows, in the background.
+    pub(super) fn load_dashboard(&mut self, context: &ComponentContext<Self>) {
+        let dash = &mut self.inventory;
         dash.seq += 1;
         let load = dash.seq;
         let at = dash.at.clone();
@@ -272,36 +246,31 @@ impl MainWindow {
         let file = dash.selected_file().map(Path::to_path_buf);
         let controller = Arc::clone(&self.input.controller.0);
         context.spawn_background(move |_| {
-            let loaded = Loaded::read(&controller, store, &at, &open, file.as_deref());
-            Msg::Dash(store, Dash::Loaded(load, Box::new(loaded)))
+            let loaded = Loaded::read(&controller, &at, &open, file.as_deref());
+            Msg::Dash(Dash::Loaded(load, Box::new(loaded)))
         });
     }
 
-    /// Runs what a control of the dashboard of `store` asks for.
-    pub(super) fn update_dashboard(
-        &mut self,
-        store: Store,
-        message: Dash,
-        context: &ComponentContext<Self>,
-    ) {
+    /// Runs what a control of the dashboard asks for.
+    pub(super) fn update_dashboard(&mut self, message: Dash, context: &ComponentContext<Self>) {
         match message {
             Dash::Enter(path) => {
-                self.dash_mut(store).enter(path);
-                self.load_dashboard(store, context);
+                self.inventory.enter(path);
+                self.load_dashboard(context);
             }
             Dash::Select(path, origin) => {
-                if self.dash_mut(store).select(path, origin) {
-                    self.load_dashboard(store, context);
+                if self.inventory.select(path, origin) {
+                    self.load_dashboard(context);
                 }
             }
             Dash::Toggle(folder) => {
-                if self.dash_mut(store).toggle(folder) {
-                    self.load_dashboard(store, context);
+                if self.inventory.toggle(folder) {
+                    self.load_dashboard(context);
                 }
             }
-            Dash::Type(kind) => self.dash_mut(store).show_type(kind),
+            Dash::Type(kind) => self.inventory.show_type(kind),
             Dash::Loaded(load, loaded) => {
-                self.dash_mut(store).take(load, *loaded);
+                self.inventory.take(load, *loaded);
             }
             Dash::Open(path) => self.background(context, move |_| {
                 explorer::open(&path)?;
@@ -315,9 +284,9 @@ impl MainWindow {
                 explorer::show(&controller.masked_copy(&path)?)?;
                 Ok(Msg::Noop)
             }),
-            Dash::Found(path) => self.open_findings(vec![path], store, context),
+            Dash::Found(path) => self.open_findings(vec![path], context),
             Dash::Report => {
-                let under = self.dash(store).at.clone();
+                let under = self.inventory.at.clone();
                 self.background(context, move |controller| {
                     explorer::show(&controller.export_report(&under)?)?;
                     Ok(Msg::Noop)
@@ -370,7 +339,7 @@ mod tests {
         }
     }
 
-    /// A dashboard whose store holds one drive, with `Docs` in it and a file in that.
+    /// A dashboard whose inventory holds one drive, with `Docs` in it and a file in that.
     fn dashboard() -> Dashboard {
         let mut dash = Dashboard::new();
         dash.loaded = Some(loaded(&[

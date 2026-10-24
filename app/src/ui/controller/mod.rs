@@ -1,5 +1,5 @@
 //! App state behind the UI: start and stop, certificate, settings, the vault's values, the inventory
-//! and the scans that fill it, and the watch.
+//! and the scans that fill it, and the monitoring of its locations.
 //!
 //! Everything that can block (`certutil`, CA files, binding the proxy, `WinINET`, settings and vault
 //! I/O) runs on one worker thread, in submission order. The window and the tray only submit
@@ -13,9 +13,9 @@
 //! - [`settings`]: following the settings with what runs because of them.
 //! - [`model`]: the detection model's download, load and release.
 //! - [`keyed`]: the vault's values, where they went, and the activity feed.
-//! - [`inventory`]: the inventory, its scans and the scan thread, the views of both inventories
-//!   and the findings of the files a result names.
-//! - [`watch`]: the folders the user asked to be watched, and what is done with their changes.
+//! - [`inventory`]: the inventory, its scans and the scan thread, the views of the inventory and
+//!   the findings of the files a result names.
+//! - [`watch`]: the locations the user asked to be monitored, and what is done with their changes.
 //! - [`edit`]: the edits of the settings, applied to a [`Policy`].
 //!
 //! Lock order: nothing else is locked while a `Shared` lock is held, and `Shared` is never locked
@@ -58,7 +58,7 @@ use crate::{
 
 pub use self::{
     edit::{Edit, apply_edit},
-    inventory::{FindingFiles, FindingsEvent, Reveal, RevealState, Store},
+    inventory::{FindingFiles, FindingsEvent, Reveal, RevealState},
     keyed::{Keyed, KeyedPage, KeyedQuery, Period, Sent},
     model::Model,
     watch::{Change, FolderStatus, Started, Watch, WatchedFolder},
@@ -98,9 +98,6 @@ pub trait Backend: Send + Sync + 'static {
     fn open_engine(&self) -> Res<Engine>;
     /// Opens the inventory: which files hold personal data, never the values.
     fn open_inventory(&self) -> Res<Inventory>;
-    /// Opens the watch's inventory: the same, for the folders the watch keeps an eye on, in a
-    /// file of its own.
-    fn open_watch(&self) -> Res<Inventory>;
     /// The saved activity feed; empty when there is none or it cannot be read.
     fn load_activity(&self) -> Activity;
     /// Persists the activity feed, as [`Activity::to_text`] wrote it.
@@ -130,9 +127,10 @@ pub trait Backend: Send + Sync + 'static {
     /// Registers (`on`) or gives back the shortcut of the highlight, Ctrl+Alt+P. The error says
     /// why not, in words for the user: another program may have the shortcut.
     fn set_hotkey(&self, shared: &Shared, on: bool) -> Res<()>;
-    /// Starts watching `folders`, below them too, and sends every change in them to `changes`.
-    /// A folder that cannot be watched is named in the answer with why, and the others are
-    /// watched all the same. Stopping what is returned ends the watch and drops `changes`.
+    /// Starts watching `folders` (the monitored locations), below them too, and sends every
+    /// change in them to `changes`. A folder that cannot be watched is named in the answer with
+    /// why, and the others are watched all the same. Stopping what is returned ends the watch
+    /// and drops `changes`.
     fn start_watch(&self, folders: &[PathBuf], changes: Sender<Change>) -> Res<Started>;
 }
 
@@ -209,7 +207,8 @@ pub struct Snapshot {
     /// The detection model's download state.
     pub model: Model,
     /// Files scanned and files to scan, while the inventory scans: the Scan button's scan or one
-    /// somebody asked for (Explorer's, "Scan this"). The watch's scan is [`Watch::scanning`].
+    /// somebody asked for (Explorer's, "Scan this"). The scan of what monitoring saw change is
+    /// [`Watch::scanning`].
     pub scan: Option<(u64, u64)>,
     /// The files that scan is reading now, and what each is busy with.
     pub scan_reading: Vec<Reading>,
@@ -218,7 +217,8 @@ pub struct Snapshot {
     pub reveal: Option<Reveal>,
     /// Files in the inventory that hold personal data, and the values found in them.
     pub inventory_totals: (u64, u64),
-    /// The watch: its folders, what it scans and what it found.
+    /// Monitoring: the monitored locations and the scan of what changed in them. What that finds
+    /// goes into the inventory, so it is part of [`Snapshot::inventory_totals`].
     pub watch: Watch,
     /// The local HTTP API is listening.
     pub http: bool,
@@ -262,8 +262,8 @@ pub enum Command {
     FetchModel,
     /// Go on without the detection model.
     SkipModel,
-    /// Bring everything in line with the saved settings: the Explorer menu, the local API, the
-    /// watch, the highlight and the detection model. Run once, after launch.
+    /// Bring everything in line with the saved settings: the Explorer menu, the local API,
+    /// monitoring, the highlight and the detection model. Run once, after launch.
     Startup,
     /// Apply these settings together (the API's `settings_set`).
     Settings(SettingsPatch),
@@ -322,7 +322,7 @@ struct State {
     /// See [`Snapshot::show`].
     show: u64,
     inventory_totals: Totals,
-    /// What the controller keeps of the watch.
+    /// What the controller keeps of monitoring.
     watch: watch::WatchState,
     /// How many reads of the findings of files are running: the detection model is wanted while
     /// there are any.
@@ -344,14 +344,16 @@ pub struct Controller {
     backend: Box<dyn Backend>,
     vault_path: PathBuf,
     inventory: Arc<Inventory>,
-    /// The watch's inventory: its own file, shared with nothing of the inventory above.
-    watch_store: Arc<Inventory>,
     state: Mutex<State>,
     changed: Condvar,
     commands: Mutex<Option<Sender<Command>>>,
     events: Sender<Event>,
     /// What the scan thread works through.
     scanner: Arc<Scanner>,
+    /// The files holding personal data that the last scan somebody asked for found outside the
+    /// locations, with how much each holds: the inventory keeps only what lies in its locations,
+    /// so the findings view of that scan's result reads its files from here.
+    asked_outside: Mutex<Vec<(u64, PathBuf)>>,
     /// One load or release of the detection model at a time, and when it may go after a scan.
     model_sync: Mutex<model::Hold>,
     /// This controller, for a thread that comes back to it later.
@@ -377,7 +379,7 @@ impl Controller {
     /// settings back (so the user keeps internet meanwhile) and a saved "on" waits for the
     /// download to finish.
     ///
-    /// The other saved features (the Explorer menu, the local API, the watch, the highlight)
+    /// The other saved features (the Explorer menu, the local API, monitoring, the highlight)
     /// start with [`Command::Startup`], which the caller submits once what they serve exists.
     ///
     /// # Errors
@@ -405,12 +407,9 @@ impl Controller {
                 let inventory = backend
                     .open_inventory()
                     .map_err(|error| format!("could not open the inventory: {error}"))?;
-                let watch = backend
-                    .open_watch()
-                    .map_err(|error| format!("could not open what the watch found: {error}"))?;
-                Ok((engine, inventory, watch))
+                Ok((engine, inventory))
             });
-        let (engine, inventory, watch) = match opened {
+        let (engine, inventory) = match opened {
             Ok(opened) => opened,
             Err(mut message) => {
                 // No app will start, so nothing else would give Windows its settings back.
@@ -421,9 +420,7 @@ impl Controller {
                 return Err(message);
             }
         };
-        let controller = Self::new(
-            backend, vault_path, policy, engine, inventory, watch, notice,
-        )?;
+        let controller = Self::new(backend, vault_path, policy, engine, inventory, notice)?;
         controller.submit(Command::Refresh);
         if !installed {
             controller.update(|state| {
@@ -454,7 +451,6 @@ impl Controller {
         mut policy: Policy,
         engine: Engine,
         inventory: Inventory,
-        watch: Inventory,
         notice: Option<Notice>,
     ) -> Res<Arc<Self>> {
         policy.enabled = false;
@@ -475,18 +471,13 @@ impl Controller {
         let activity = backend.load_activity();
         let inventory = Arc::new(inventory);
         let inventory_totals = inventory.totals();
-        let watch_store = Arc::new(watch);
-        let watch_state = watch::WatchState {
-            totals: watch_store.totals(),
-            ..watch::WatchState::default()
-        };
         let controller = Arc::new_cyclic(|me| Self {
             me: me.clone(),
             shared,
             backend,
             vault_path,
             inventory,
-            watch_store,
+            asked_outside: Mutex::default(),
             state: Mutex::new(State {
                 version: 0,
                 enabled: false,
@@ -510,7 +501,7 @@ impl Controller {
                 reveal: None,
                 show: 0,
                 inventory_totals,
-                watch: watch_state,
+                watch: watch::WatchState::default(),
                 findings: 0,
             }),
             changed: Condvar::new(),
@@ -634,7 +625,7 @@ impl Controller {
     }
 
     /// Whether closing the window leaves the app in the tray: the user's setting
-    /// ([`Policy::background`]). Protection, the highlight, the watch and the local API keep
+    /// ([`Policy::background`]). Protection, the highlight, monitoring and the local API keep
     /// working then; without it closing the window quits the app. Whether there is a tray icon
     /// to open the window from is the caller's to know.
     pub fn runs_in_background(&self) -> bool {

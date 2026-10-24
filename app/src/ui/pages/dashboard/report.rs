@@ -230,7 +230,8 @@ fn result_content(window: &MainWindow, reveal: &Reveal) -> View {
 }
 
 /// The dialog of the scan whose result the user has not put away yet. A result that holds personal
-/// data offers what was found itself (the default), and the Inventory with its map.
+/// data offers what was found itself (the default), and the Inventory with its map when what was
+/// scanned lies in a location or holds one: the Inventory keeps nothing else.
 fn result(window: &MainWindow, reveal: &Reveal, context: Context<'_>) -> ContentDialog {
     let (title, found) = match &reveal.state {
         RevealState::Waiting | RevealState::Scanning => ("Scanning\u{2026}", false),
@@ -249,10 +250,17 @@ fn result(window: &MainWindow, reveal: &Reveal, context: Context<'_>) -> Content
                 _ => Msg::ReportClose,
             }),
         );
-    if found {
+    let in_inventory = window.snap.policy.inventory_roots.iter().any(|root| {
+        piikey::sys::is_under(&reveal.at, root) || piikey::sys::is_under(root, &reveal.at)
+    });
+    if found && in_inventory {
         dialog
             .primary_button_text("Show what was found")
             .secondary_button_text("Show in Inventory")
+            .default_button(ContentDialogButton::Primary)
+    } else if found {
+        dialog
+            .primary_button_text("Show what was found")
             .default_button(ContentDialogButton::Primary)
     } else {
         dialog.default_button(ContentDialogButton::Close)

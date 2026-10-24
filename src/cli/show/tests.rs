@@ -297,29 +297,33 @@ fn forgetting_and_exporting_report_counts() {
 #[test]
 fn the_inventory_status_is_a_list_of_facts() {
     let value = json!({
-        "roots": [r"C:\Docs", r"C:\Desk"], "files": 120,
+        "roots": [r"C:\Docs", r"C:\Desk"], "monitored": [r"C:\Docs"], "files": 120,
         "files_with_pii": 4, "hits": 17, "scanning": {"done": 10, "total": 50}
     });
     assert_eq!(
         out_of(&View::InventoryStatus, &value),
         "folders             C:\\Docs, C:\\Desk\n\
+         monitored           C:\\Docs\n\
          files               120\n\
          with personal data  4\n\
          values found        17\n\
          scan                running, 10 of 50 files\n"
     );
     let idle = json!({
-        "roots": [], "files": 0, "files_with_pii": 0, "hits": 0, "scanning": null
+        "roots": [], "monitored": [], "files": 0, "files_with_pii": 0, "hits": 0,
+        "scanning": null
     });
     let text = out_of(&View::InventoryStatus, &idle);
     assert!(text.contains("folders             none\n"), "{text}");
+    assert!(text.contains("monitored           none\n"), "{text}");
     assert!(
         text.ends_with("scan                not running\n"),
         "{text}"
     );
     // A reply of a version that still had the switch is read all the same.
     let old = json!({
-        "enabled": true, "roots": [], "files": 0, "files_with_pii": 0, "hits": 0, "scanning": null
+        "enabled": true, "roots": [], "monitored": [], "files": 0, "files_with_pii": 0,
+        "hits": 0, "scanning": null
     });
     assert!(out_of(&View::InventoryStatus, &old).starts_with("folders"));
 }
@@ -366,16 +370,15 @@ fn inventory_entries_and_nodes_are_tables() {
 fn settings_are_shown_as_the_keys_that_set_them() {
     let value = json!({
         "enabled": true, "highlight": "hotkey", "explorer_menu": true, "background": false,
-        "watch": true, "http_api": false, "http_port": 7980, "sites": ["chatgpt.com", "claude.ai"],
+        "http_api": false, "http_port": 7980, "sites": ["chatgpt.com", "claude.ai"],
         "programs": ["chrome.exe"], "disabled_kinds": ["email"],
-        "inventory_roots": [r"C:\Docs"], "watch_folders": [r"C:\Inbox"]
+        "inventory_roots": [r"C:\Docs"], "monitored_roots": [r"C:\Docs"]
     });
     assert_eq!(
         out_of(&View::Settings, &value),
         "highlight=hotkey\n\
          explorer_menu=true\n\
          background=false\n\
-         watch=true\n\
          http_api=false\n\
          http_port=7980\n\
          site=chatgpt.com\n\
@@ -383,7 +386,7 @@ fn settings_are_shown_as_the_keys_that_set_them() {
          program=chrome.exe\n\
          disabled_kind=email\n\
          inventory_root=C:\\Docs\n\
-         watch_folder=C:\\Inbox\n"
+         monitor_root=C:\\Docs\n"
     );
 }
 
@@ -421,7 +424,7 @@ fn the_model_and_the_status() {
 
     let status = json!({
         "app": false, "protection": null, "version": "0.1.0", "vault_records": 1,
-        "model": ready, "highlight": "always", "explorer_menu": true, "watch": false,
+        "model": ready, "highlight": "always", "explorer_menu": true, "monitoring": false,
         "http_api": true
     });
     assert_eq!(
@@ -433,12 +436,12 @@ fn the_model_and_the_status() {
          model          ready (hybrid)\n\
          highlight      always\n\
          explorer menu  on\n\
-         watch          off\n\
+         monitoring     off\n\
          HTTP API       on\n"
     );
     let running = json!({
         "app": true, "protection": true, "version": "0.1.0", "vault_records": 0,
-        "model": missing, "highlight": "off", "explorer_menu": false, "watch": true,
+        "model": missing, "highlight": "off", "explorer_menu": false, "monitoring": true,
         "http_api": false
     });
     let text = out_of(&View::Status, &running);

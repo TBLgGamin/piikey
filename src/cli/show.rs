@@ -428,10 +428,12 @@ fn report(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
 
 fn inventory_status(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
     let reply = reply::<InventoryStatus>(value)?;
-    let folders = if reply.roots.is_empty() {
-        "none".to_owned()
-    } else {
-        reply.roots.join(", ")
+    let list = |paths: &[String]| {
+        if paths.is_empty() {
+            "none".to_owned()
+        } else {
+            paths.join(", ")
+        }
     };
     let scan = reply.scanning.map_or_else(
         || "not running".to_owned(),
@@ -440,7 +442,8 @@ fn inventory_status(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
     pairs(
         out,
         &[
-            ("folders", folders),
+            ("folders", list(&reply.roots)),
+            ("monitored", list(&reply.monitored)),
             ("files", reply.files.to_string()),
             ("with personal data", reply.files_with_pii.to_string()),
             ("values found", reply.hits.to_string()),
@@ -506,7 +509,6 @@ fn settings(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
     writeln!(out, "highlight={}", settings.highlight.as_str())?;
     writeln!(out, "explorer_menu={}", settings.explorer_menu)?;
     writeln!(out, "background={}", settings.background)?;
-    writeln!(out, "watch={}", settings.watch)?;
     writeln!(out, "http_api={}", settings.http_api)?;
     writeln!(out, "http_port={}", settings.http_port)?;
     let paths = |paths: &[PathBuf]| -> Vec<String> {
@@ -524,7 +526,7 @@ fn settings(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
                 .collect(),
         ),
         ("inventory_root", paths(&settings.inventory_roots)),
-        ("watch_folder", paths(&settings.watch_folders)),
+        ("monitor_root", paths(&settings.monitored_roots)),
     ];
     for (key, list) in lists {
         for item in list {
@@ -607,7 +609,7 @@ fn status(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
             ("model", model_phrase(&status.model)),
             ("highlight", status.highlight.as_str().to_owned()),
             ("explorer menu", on_off(status.explorer_menu).to_owned()),
-            ("watch", on_off(status.watch).to_owned()),
+            ("monitoring", on_off(status.monitoring).to_owned()),
             ("HTTP API", on_off(status.http_api).to_owned()),
         ],
     )?;

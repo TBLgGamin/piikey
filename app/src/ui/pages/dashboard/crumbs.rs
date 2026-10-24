@@ -5,7 +5,8 @@ use std::path::{Component, Path, PathBuf};
 
 use piikey::sys::volume_len;
 
-use crate::ui::controller::Store;
+/// What the top level is called.
+pub(super) const TOP: &str = "This PC";
 
 /// One step of the way from the top level to the folder on show.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,14 +22,6 @@ pub(super) fn name_of(path: &Path) -> String {
     path.file_name()
         .or_else(|| path.components().next().map(Component::as_os_str))
         .map_or_else(String::new, |name| name.to_string_lossy().into_owned())
-}
-
-/// What the top level of a store is called.
-pub(super) const fn top_label(store: Store) -> &'static str {
-    match store {
-        Store::Inventory => "This PC",
-        Store::Watch => "Watched folders",
-    }
 }
 
 /// The crumbs from the top level, called `top`, to `at`: the drive or share it is on (its name
@@ -126,11 +119,9 @@ mod tests {
     }
 
     #[test]
-    fn each_store_names_its_top_level() {
-        assert_eq!(top_label(Store::Inventory), "This PC");
-        assert_eq!(top_label(Store::Watch), "Watched folders");
-        let trail = crumbs(Path::new(r"C:\Down"), "Watched folders");
-        assert_eq!(labels(&trail), ["Watched folders", "C:", "Down"]);
+    fn the_top_level_is_named_by_the_caller() {
+        let trail = crumbs(Path::new(r"C:\Down"), "This PC");
+        assert_eq!(labels(&trail), ["This PC", "C:", "Down"]);
     }
 
     #[test]

@@ -718,7 +718,7 @@ fn settings_patch(pairs: &[OsString]) -> Result<SettingsPatch, ParseError> {
             "program" => push(&mut patch.programs, value),
             "disabled_kind" => push(&mut patch.disabled_kinds, value),
             "inventory_root" => push(&mut patch.inventory_roots, value),
-            "watch_folder" => push(&mut patch.watch_folders, value),
+            "monitor_root" => push(&mut patch.monitored_roots, value),
             "highlight" => {
                 patch.highlight = Some(Highlight::parse(value).ok_or_else(|| {
                     invalid(format!(
@@ -728,7 +728,6 @@ fn settings_patch(pairs: &[OsString]) -> Result<SettingsPatch, ParseError> {
             }
             "explorer_menu" => patch.explorer_menu = Some(switch(key, value)?),
             "background" => patch.background = Some(switch(key, value)?),
-            "watch" => patch.watch = Some(switch(key, value)?),
             "http_api" => patch.http_api = Some(switch(key, value)?),
             "http_port" => {
                 patch.http_port = Some(parse_port(value).ok_or_else(|| {

@@ -74,9 +74,9 @@ button on the Inventory page (which looks through your locations: there are none
 one, and removing all of them leaves none), the box that adds one more folder or file, files and
 folders dropped on the page, Explorer's menu, `explorer_scan`, `scan_files` and `inventory_rescan`
 through the API and the CLI. Nothing scans on a timer. Scans run on one scan thread in a
-half-sized thread pool, and a scan you asked for goes before whatever the watch has queued.
+half-sized thread pool, and a scan you asked for goes before monitoring's queued changes.
 
-Removing a location or a watched folder breaks off at once. Queued scans lose that folder (one
+Removing a location breaks off at once. Queued scans lose that folder (one
 with nothing else left is dropped, and its dialog says it was stopped), the scan that runs under
 it stops within the file it is in and goes on later without it, and then what the store held
 under the folder is forgotten, after that scan saved, so nothing it found comes back. What
@@ -107,12 +107,11 @@ the way to its file, from its drive. For a file the details can open it, show it
 what was found or make a masked copy (beside the file; it never replaces an existing file); for a
 folder they can show only that folder, show it in Explorer or show what was found. What is listed
 was scanned already, so the details offer no scan. The inventory has no exclusions and no switch:
-what is in it is what was scanned. The boxes that add a location or a watched folder have Browse
+what is in it is what was scanned in its locations. A scan of a path outside every location (Explorer, a drop, the box, the API) still shows its result dialog and findings view, but the inventory forgets those entries right after the scan. The box that adds a location has Browse
 buttons that open the Windows folder (or file) picker.
 
 A scan started from the page, the box, a drop or Explorer opens a result dialog in the window
-(scanning, then how much was found, with "Show what was found" and "Show in Inventory" when
-anything was). A newer scan replaces an older dialog, and a window the user opens does not replay
+(scanning, then how much was found, with "Show what was found" when anything was, and "Show in Inventory" when the scanned path lies in a location or holds one). A newer scan replaces an older dialog, and a window the user opens does not replay
 old results.
 
 "Show what was found" (also a button in the details of a file or a folder) opens the findings view
@@ -134,26 +133,29 @@ inventory and shows the result dialog, bringing its window forward also when the
 tray icon (a timer on the application thread looks four times a second); if the app is not
 running, the command starts it.
 
-## Watch
+### Monitoring
 
-The Watch is a separate feature with its own switch, its own folders (`watch_folder` in
-`guard.cfg`, none by default) and its own store, `watch.jsonl`, in the inventory's format but with
-its own locks (`watch.lock`, `watch.save.lock`). It shares nothing with the inventory: what it
-finds never appears there, and what the inventory scans never appears here.
+Each location has a Monitor switch. The monitored locations are the `monitor_root` lines of
+`guard.cfg` (none by default); each is also an `inventory_root`, and one that is not is dropped.
+What changes in them is scanned into `inventory.jsonl`, the same store as every other scan.
 
-While it is on, Windows reports changes in the watched folders (through the `notify` crate, because
-the Windows call takes `unsafe` and the project's own code forbids it). Saving one document is a
-dozen reports, so each path has to settle first: a path is looked at once it has been quiet for
-two seconds, and one that never goes quiet (a log) at most every 30 seconds. Only the settled paths
-are scanned, through the same incremental rule as the inventory, in the same pool and on the same
-scan thread, behind any scan you asked for (a running watch scan is stopped and resumed). When 64
-or more paths settle at once, or Windows says it may have lost reports, everything in the folders
-is looked at, which still reads only what changed. Switching the watch on, adding a folder and
-starting the app catch up the same way, because a folder is not watched while the app is not
-running. Turning the watch off keeps what it found; removing a folder forgets that folder's
-entries. The Watch page shows each folder as watching, scanning, not watched (the watch is off)
-or not available, with the time of its last change, above the same dashboard as the inventory: its
-tree too starts at the drives that hold what the watch found and goes down their real folders.
+Windows reports changes in the monitored locations (through the `notify` crate, because the Windows
+call takes `unsafe` and the project's own code forbids it). Saving one document is a dozen reports,
+so each path has to settle first: a path is looked at once it has been quiet for two seconds, and
+one that never goes quiet (a log) at most every 30 seconds. Only the settled paths are scanned,
+through the same incremental rule as the inventory, in the same pool and on the same scan thread. A
+scan you asked for goes first: it stops a running monitoring scan, which resumes afterwards. When 64
+or more paths settle at once, or Windows says it may have lost reports, everything in the
+monitored locations is looked at, which still reads only what changed. Turning Monitor on, adding
+or removing a monitored location and starting the app stop any monitoring scan and catch up the same
+way on every monitored location, because a location is not watched while the app is not running.
+Turning Monitor off keeps what was found; removing the location forgets it. The Inventory page
+shows each monitored location as monitoring, scanning or not available, with the time of its last
+change.
+
+An older `guard.cfg` with `watch_folder` folders keeps them as locations, monitored when its `watch`
+was `true`. The files of the separate store the old Watch kept (`watch.jsonl`, `watch.lock` and
+`watch.save.lock`) are deleted when the app starts; what they held is found again by the catch-up.
 
 ## API
 
@@ -176,32 +178,30 @@ process notices the new id and reloads.
 
 ## The app
 
-One window with a navigation pane and six pages, a tray icon, and a controller behind both. The
-pane has Overview, Protection, Inventory, Watch and Vault, Settings at its foot, and a status chip
+One window with a navigation pane and five pages, a tray icon, and a controller behind both. The
+pane has Overview, Protection, Inventory and Vault, Settings at its foot, and a status chip
 under it that is a button to Overview.
 
 - **Overview**: the status hero (a title, one sentence, and the one Turn on / Turn off button, which
   says why when it is unavailable; it is the only master switch in the window), at most one
-  attention block with its single fix button, six clickable rows (Masking, Highlighting, Inventory,
-  Watch, Vault, Detection, each with its own state and no switches) and the five most recent swaps
+  attention block with its single fix button, four clickable rows (Masking, Highlighting, Inventory,
+  Vault, each with its own state and no switches) and the five most recent swaps
   with a link to the Vault.
 - **Protection**: the highlighting mode, the protected sites and the protected apps. It has no
   switch of its own and no certificate section: turning masking on is the Overview button (and the
   tray menu), and installing the certificate is the fix button of Overview's attention block.
 - **Inventory**: the Scan button, Export report, the locations (the folders the button looks
-  through, as rows like Watch's folders: what each holds and a Remove button), the box that adds a
+  through, as rows: what each holds, a Monitor switch and a Remove button; a monitored row also says
+  when it is scanning, when it last saw a change, or why it cannot be monitored), the box that adds a
   folder or file and scans it, a status line (progress or what the inventory holds) and the
   dashboard described under Inventory and Explorer above. Files and folders dropped on the page are
   scanned.
   The scan result dialog and the details of a file or folder lead to the findings view.
-- **Watch**: its switch, the folder list with each folder's state and a Remove button, the box that
-  adds a folder (nothing is watched until you add one), a status line and the same dashboard over
-  the watch's store.
 - **Vault**: an activity feed of every value in the vault next to its stand-in, the most recently
   sent first (including values first stored long ago), then the ones never sent. Search matches
   values, stand-ins, sites and apps; filters narrow it to a type, a site (subdomains included) or a
   time (today, last 7 days, last 30 days). Every row has a check box; Select all ticks the listed
-  rows and Forget N removes the ticked ones after a confirmation. Export writes every value to a CSV
+  rows and Forget N (at the right end of the row above the list) removes the ticked ones after a confirmation. Export writes every value to a CSV
   file in Downloads. The feed persists in `%LOCALAPPDATA%\piikey\activity.cfg`, which holds
   stand-ins, sites, apps and times only; the values themselves stay in the encrypted vault.
   Forgetting a value also removes its lines from the feed.
@@ -213,7 +213,7 @@ under it that is a button to Overview.
   or failed, a row above the types says so and has a button to download it or try again; a model
   that is there needs no row. Developer access has the local HTTP API switch, its address and
   whether it listens, and the token (copy it or make a new one). Privacy & data shows the data
-  folder, with Open folder, and links to the Vault and the Inventory. About has the version, the
+  folder, with Open folder. About has the version, the
   state of the local proxy and links to the source, the issue tracker and the license.
 
 ### Status
@@ -243,7 +243,7 @@ piikey.
 
 Closing the window leaves the app running in the tray when "Keep piikey running in the tray when I
 close the window" is on, which is the default (`background` in `guard.cfg`): protection, the
-highlight, the watch and the API keep working with the window closed. With it off, closing the
+highlight, monitoring and the API keep working with the window closed. With it off, closing the
 window quits piikey, as Quit piikey (tray) does either way; both give Windows its previous proxy
 settings back.
 
@@ -266,7 +266,7 @@ alone. The uninstaller removes the `Run` and its skip entry.
 
 ## Model and devices
 
-The app loads the model while protection is on, highlighting is on, the watch has folders to watch,
+The app loads the model while protection is on, highlighting is on, a location is monitored,
 a scan is running or the findings of a file are being read, and
 frees it when none is. Small calls (a chat message) run on the CPU; large ones (documents, many
 messages) are shared between the CPU and the GPU, which work through the batch from both ends. The
@@ -307,10 +307,9 @@ Everything piikey keeps is in `%LOCALAPPDATA%\piikey`, readable only by your Win
 |---|---|
 | `vault.pkv` | the encrypted original↔stand-in pairs (XChaCha20-Poly1305, key wrapped with DPAPI) |
 | `models\` | the downloaded detection model and `device.cfg` |
-| `guard.cfg` | protected sites and apps, types switched off, on/off, the highlight mode, the Explorer menu, whether closing the window keeps piikey in the tray, the inventory locations, the watch switch and folders, and the HTTP API |
+| `guard.cfg` | protected sites and apps, types switched off, on/off, the highlight mode, the Explorer menu, whether closing the window keeps piikey in the tray, the inventory locations and which of them are monitored, and the HTTP API |
 | `activity.cfg` | the activity feed (stand-ins only) |
 | `inventory.jsonl` | per scanned file: size, write time, a fingerprint of the contents and how many values of each type it holds, never the values |
-| `watch.jsonl` | the same for the files the watch looked at, with `watch.lock` and `watch.save.lock` beside it (the inventory has `inventory.lock` and `inventory.save.lock`) |
 | `api.token` | the token the local HTTP API asks for |
 | `ca.crt`, `ca.key` | the local certificate; the key is wrapped with DPAPI |
 | `proxy.prev` | the previous Windows proxy settings, only while piikey has them changed |

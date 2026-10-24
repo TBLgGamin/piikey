@@ -122,6 +122,8 @@ pub struct Progress {
 pub struct InventoryStatus {
     /// The folders it scans when asked: the user's locations, none until one is added.
     pub roots: Vec<String>,
+    /// The locations whose changes are scanned as they happen.
+    pub monitored: Vec<String>,
     pub files: u64,
     pub files_with_pii: u64,
     pub hits: u64,
@@ -229,8 +231,8 @@ pub struct Status {
     pub model: Model,
     pub highlight: Highlight,
     pub explorer_menu: bool,
-    /// Whether the watch keeps an eye on its folders.
-    pub watch: bool,
+    /// Whether any location is monitored.
+    pub monitoring: bool,
     pub http_api: bool,
 }
 
@@ -277,6 +279,7 @@ mod tests {
 
         let status = to_json(&InventoryStatus {
             roots: vec![],
+            monitored: vec![],
             files: 0,
             files_with_pii: 0,
             hits: 0,
@@ -302,7 +305,7 @@ mod tests {
             },
             highlight: Highlight::Hotkey,
             explorer_menu: true,
-            watch: false,
+            monitoring: false,
             http_api: false,
         };
         let wire = to_json(&status)?;

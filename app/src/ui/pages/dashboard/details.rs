@@ -13,12 +13,11 @@ use windows_reactor::{
 };
 
 use super::{
-    crumbs::{name_of, top_label},
+    crumbs::{TOP, name_of},
     palette::swatch,
 };
 use crate::ui::{
-    controller::Store,
-    pages::kit::{Context, caption, counted, glyph, thousands, when},
+    pages::kit::{Context, caption, counted, place_glyph, thousands, when},
     window::{Dash, Dashboard, Loaded, Msg},
 };
 
@@ -71,18 +70,15 @@ impl Action {
     }
 
     /// What pressing it asks of the window, for the file or folder at `path`.
-    fn message(self, store: Store, path: &Path) -> Msg {
+    fn message(self, path: &Path) -> Msg {
         let path = path.to_path_buf();
-        Msg::Dash(
-            store,
-            match self {
-                Self::Open => Dash::Open(path),
-                Self::Show => Dash::Show(path),
-                Self::Found => Dash::Found(path),
-                Self::Mask => Dash::Mask(path),
-                Self::Enter => Dash::Enter(path),
-            },
-        )
+        Msg::Dash(match self {
+            Self::Open => Dash::Open(path),
+            Self::Show => Dash::Show(path),
+            Self::Found => Dash::Found(path),
+            Self::Mask => Dash::Mask(path),
+            Self::Enter => Dash::Enter(path),
+        })
     }
 }
 
@@ -163,7 +159,7 @@ fn wide(counts: &[(EntityKind, u32)]) -> Vec<(EntityKind, u64)> {
 }
 
 /// What the folder on show holds: the types the legend counts, and the files under its rows.
-fn on_show(dash: &Dashboard, loaded: &Loaded, store: Store) -> Subject {
+fn on_show(dash: &Dashboard, loaded: &Loaded) -> Subject {
     let top = dash.at.as_os_str().is_empty();
     let hits: u64 = loaded.totals.iter().map(|total| total.hits).sum();
     let files: u64 = loaded.levels.get(&dash.at).map_or(0, |nodes| {
@@ -172,7 +168,7 @@ fn on_show(dash: &Dashboard, loaded: &Loaded, store: Store) -> Subject {
     Subject {
         target: if top { Target::Top } else { Target::Folder },
         title: if top {
-            top_label(store).to_owned()
+            TOP.to_owned()
         } else {
             name_of(&dash.at)
         },
@@ -191,8 +187,8 @@ fn on_show(dash: &Dashboard, loaded: &Loaded, store: Store) -> Subject {
     }
 }
 
-/// The subject of a file: what its entry says when the store knows it, else what its tile or its
-/// row says.
+/// The subject of a file: what its entry says when the inventory knows it, else what its tile or
+/// its row says.
 fn file_subject(loaded: &Loaded, path: &Path) -> Subject {
     let entry = loaded.entry.as_ref().filter(|entry| entry.path == path);
     let tile = loaded.tiles.tiles.iter().find(|tile| tile.path == path);
@@ -227,9 +223,9 @@ fn file_subject(loaded: &Loaded, path: &Path) -> Subject {
 }
 
 /// The subject of a folder that is selected: what its row says, or what is known of it.
-fn folder_subject(dash: &Dashboard, loaded: &Loaded, store: Store, path: &Path) -> Subject {
+fn folder_subject(dash: &Dashboard, loaded: &Loaded, path: &Path) -> Subject {
     if path == dash.at {
-        return on_show(dash, loaded, store);
+        return on_show(dash, loaded);
     }
     let node = node_in(loaded, path);
     Subject {
@@ -245,12 +241,12 @@ fn folder_subject(dash: &Dashboard, loaded: &Loaded, store: Store, path: &Path) 
 }
 
 /// What the details describe: the selection, or the folder on show.
-pub(super) fn subject(dash: &Dashboard, loaded: &Loaded, store: Store) -> Subject {
+pub(super) fn subject(dash: &Dashboard, loaded: &Loaded) -> Subject {
     let Some(selected) = dash.selected.as_deref() else {
-        return on_show(dash, loaded, store);
+        return on_show(dash, loaded);
     };
     if dash.is_folder(selected) {
-        folder_subject(dash, loaded, store, selected)
+        folder_subject(dash, loaded, selected)
     } else {
         file_subject(loaded, selected)
     }
@@ -276,7 +272,7 @@ fn type_row(kind: EntityKind, n: u64) -> View {
 }
 
 /// The buttons of `actions`, two in a row.
-fn buttons(list: &[Action], store: Store, path: &Path, context: Context<'_>) -> Option<View> {
+fn buttons(list: &[Action], path: &Path, context: Context<'_>) -> Option<View> {
     if list.is_empty() {
         return None;
     }
@@ -291,7 +287,7 @@ fn buttons(list: &[Action], store: Store, path: &Path, context: Context<'_>) -> 
                         .content(action.label())
                         .horizontal_alignment(HorizontalAlignment::Stretch)
                         .grid_column(i32::try_from(i).unwrap_or(0))
-                        .on_click(context.message(action.message(store, path)))
+                        .on_click(context.message(action.message(path)))
                         .into()
                 })
                 .collect();
@@ -336,15 +332,12 @@ fn type_rows(height: f64, target: Target, buttons: usize) -> usize {
 }
 
 /// The details pane: a card that scrolls when what it says does not fit `height`.
-pub(super) fn details(dash: &Dashboard, store: Store, height: f64, context: Context<'_>) -> Border {
+pub(super) fn details(dash: &Dashboard, height: f64, dark: bool, context: Context<'_>) -> Border {
     let Some(loaded) = dash.loaded.as_ref() else {
         return super::empty_card("Looking\u{2026}");
     };
-    let subject = subject(dash, loaded, store);
-    let icon = match subject.target {
-        Target::File => "\u{E7C3}",
-        Target::Top | Target::Folder => "\u{E8B7}",
-    };
+    let subject = subject(dash, loaded);
+    let is_dir = subject.target != Target::File;
     let on_show = subject.path == dash.at;
     let todo = actions(subject.target, on_show);
     let rows = type_rows(height, subject.target, todo.len());
@@ -353,9 +346,10 @@ pub(super) fn details(dash: &Dashboard, store: Store, height: f64, context: Cont
             .columns([GridLength::Auto, GridLength::STAR])
             .column_spacing(10.0)
             .children((
-                glyph(icon, 20.0).vertical_alignment(VerticalAlignment::Center),
+                place_glyph(is_dir, 20.0, dark).vertical_alignment(VerticalAlignment::Center),
                 TextBlock::new()
                     .text(&subject.title)
+                    .is_text_selection_enabled(true)
                     .font_size(16.0)
                     .font_weight(FontWeight::SEMI_BOLD)
                     .text_trimming(TextTrimming::CharacterEllipsis)
@@ -377,6 +371,7 @@ pub(super) fn details(dash: &Dashboard, store: Store, height: f64, context: Cont
         TextBlock::new()
             .text(&subject.summary)
             .text_wrapping(windows_reactor::TextWrapping::Wrap)
+            .is_text_selection_enabled(true)
             .into(),
     );
     if let Some(note) = &subject.note {
@@ -402,7 +397,7 @@ pub(super) fn details(dash: &Dashboard, store: Store, height: f64, context: Cont
             .into(),
         );
     }
-    parts.extend(buttons(&todo, store, &subject.path, context));
+    parts.extend(buttons(&todo, &subject.path, context));
     Border::new()
         .background(ThemeBrush::CardBackground)
         .border_brush(ThemeBrush::CardStroke)
@@ -518,7 +513,7 @@ mod tests {
         let Some(loaded) = dash.loaded.as_ref() else {
             panic!("the dashboard has a load");
         };
-        subject(dash, loaded, Store::Inventory)
+        subject(dash, loaded)
     }
 
     #[test]

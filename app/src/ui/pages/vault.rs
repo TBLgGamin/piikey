@@ -58,11 +58,13 @@ fn names(item: &Keyed) -> StackPanel {
             TextBlock::new()
                 .text(&item.original)
                 .font_weight(FontWeight::SEMI_BOLD)
-                .text_trimming(TextTrimming::CharacterEllipsis),
+                .text_trimming(TextTrimming::CharacterEllipsis)
+                .is_text_selection_enabled(true),
             TextBlock::new()
                 .text(format!("\u{2192} {}", item.proxy))
                 .opacity(0.72)
-                .text_trimming(TextTrimming::CharacterEllipsis),
+                .text_trimming(TextTrimming::CharacterEllipsis)
+                .is_text_selection_enabled(true),
         ))
 }
 
@@ -252,14 +254,15 @@ fn count_text(window: &MainWindow) -> String {
     }
 }
 
-/// The row between the search and the list: Select all, and what the list says about itself.
+/// The row between the search and the list: Select all, what the list says about itself, and at
+/// its right end the button that forgets the ticked rows.
 fn commands(window: &MainWindow, context: Context<'_>) -> Grid {
     let listed = window
         .vault_page
         .as_ref()
         .map_or(0, |page| page.items.len());
     Grid::new()
-        .columns([GridLength::Auto, GridLength::STAR])
+        .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
         .column_spacing(8.0)
         .children((
             CheckBox::new()
@@ -272,6 +275,9 @@ fn commands(window: &MainWindow, context: Context<'_>) -> Grid {
                 ),
             caption(count_text(window))
                 .grid_column(1)
+                .vertical_alignment(VerticalAlignment::Center),
+            forget_button(window, context)
+                .grid_column(2)
                 .vertical_alignment(VerticalAlignment::Center),
         ))
 }
@@ -339,11 +345,7 @@ pub(super) fn vault(window: &MainWindow, context: Context<'_>) -> View {
             ])
             .row_spacing(12.0)
             .children((
-                page_header(
-                    Page::Vault.title(),
-                    DEFINITION,
-                    [export, forget_button(window, context).into()],
-                ),
+                page_header(Page::Vault.title(), DEFINITION, [export]),
                 search_bar(window, context).grid_row(1),
                 commands(window, context).grid_row(2),
                 card(list(window, context)).grid_row(3),

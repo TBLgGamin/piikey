@@ -352,7 +352,8 @@ fn words(row: &Row) -> View {
             TextBlock::new()
                 .text(&*finding.value)
                 .font_weight(FontWeight::SEMI_BOLD)
-                .text_trimming(TextTrimming::CharacterEllipsis),
+                .text_trimming(TextTrimming::CharacterEllipsis)
+                .is_text_selection_enabled(true),
             caption(format!(
                 "{} \u{b7} {}",
                 finding.kind.label(),

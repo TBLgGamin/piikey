@@ -56,13 +56,6 @@ fn feature_edits_report_whether_they_changed_anything() -> Test {
     assert!(apply_edit(&mut policy, &Edit::Background(false))?);
     assert!(!policy.background);
     assert!(apply_edit(&mut policy, &Edit::Background(true))?);
-    // The watch is off until the user switches it on.
-    assert!(!policy.watch);
-    assert!(apply_edit(&mut policy, &Edit::Watch(true))?);
-    assert!(!apply_edit(&mut policy, &Edit::Watch(true))?);
-    assert!(policy.watch);
-    assert!(apply_edit(&mut policy, &Edit::Watch(false))?);
-    assert!(!policy.watch);
     Ok(())
 }
 
@@ -88,7 +81,7 @@ fn there_is_no_location_until_one_is_added_and_removing_all_leaves_none() -> Tes
 }
 
 #[test]
-fn locations_and_watched_folders_must_be_folders_and_are_not_added_twice() -> Test {
+fn locations_must_be_folders_and_are_not_added_twice() -> Test {
     let dir = TempDir::new()?;
     let anchor = TempDir::new()?;
     let mut policy = Policy {
@@ -124,29 +117,69 @@ fn locations_and_watched_folders_must_be_folders_and_are_not_added_twice() -> Te
     assert!(apply_edit(&mut policy, &root(&shouted, false))?);
     assert!(!apply_edit(&mut policy, &root(&dir.0, false))?);
     assert_eq!(policy.inventory_roots, std::slice::from_ref(&anchor.0));
+    Ok(())
+}
 
-    // The watch's folders are a list of their own, and just as strict.
+#[test]
+fn only_a_location_can_be_monitored_and_removing_it_ends_its_monitoring() -> Test {
+    let dir = TempDir::new()?;
+    let other = TempDir::new()?;
     let mut policy = quiet();
-    let watch = |path: &Path, on| Edit::WatchFolder {
+    let root = |path: &Path, on| Edit::InventoryRoot {
         path: path.to_path_buf(),
         on,
     };
-    assert!(apply_edit(&mut policy, &watch(&dir.0, true))?);
-    assert!(!apply_edit(&mut policy, &watch(&shouted, true))?);
-    assert!(apply_edit(&mut policy, &watch(&anchor.0, true))?);
-    assert_eq!(policy.watch_folders, [dir.0.clone(), anchor.0.clone()]);
+    let monitor = |path: &Path, on| Edit::Monitor {
+        path: path.to_path_buf(),
+        on,
+    };
+
+    // A folder that is no location cannot be monitored.
+    assert!(policy.monitored_roots.is_empty());
+    let refused = apply_edit(&mut policy, &monitor(&dir.0, true))
+        .err()
+        .ok_or("only a location can be monitored")?;
+    assert_eq!(refused, format!("Not a location: {}", dir.0.display()));
+    assert!(policy.monitored_roots.is_empty());
     assert!(
-        policy.inventory_roots.is_empty(),
-        "no folder of the inventory's"
+        !apply_edit(&mut policy, &monitor(&dir.0, false))?,
+        "what is not monitored is not taken off"
     );
-    assert!(apply_edit(&mut policy, &watch(&file, true)).is_err());
-    assert!(apply_edit(&mut policy, &watch(&dir.0.join("gone"), true)).is_err());
+
+    // A location can, once, whatever the letter case of the path.
+    assert!(apply_edit(&mut policy, &root(&dir.0, true))?);
+    assert!(apply_edit(&mut policy, &root(&other.0, true))?);
     assert!(
-        apply_edit(&mut policy, &watch(Path::new(r"relative\folder"), true)).is_err(),
-        "a folder is a full path"
+        policy.monitored_roots.is_empty(),
+        "a location is not monitored until the user says so"
     );
-    assert!(apply_edit(&mut policy, &watch(&shouted, false))?);
-    assert_eq!(policy.watch_folders, std::slice::from_ref(&anchor.0));
-    assert!(!apply_edit(&mut policy, &watch(&dir.0, false))?);
+    assert!(apply_edit(&mut policy, &monitor(&dir.0, true))?);
+    assert!(
+        !apply_edit(&mut policy, &monitor(&dir.0, true))?,
+        "twice is once"
+    );
+    let shouted = PathBuf::from(dir.0.to_string_lossy().to_ascii_uppercase());
+    assert!(
+        !apply_edit(&mut policy, &monitor(&shouted, true))?,
+        "Windows paths ignore case"
+    );
+    assert_eq!(policy.monitored_roots, std::slice::from_ref(&dir.0));
+    assert!(apply_edit(&mut policy, &monitor(&other.0, true))?);
+    assert_eq!(policy.monitored_roots, [dir.0.clone(), other.0.clone()]);
+
+    // Turning it off ignores the letter case too, and the location stays.
+    assert!(apply_edit(&mut policy, &monitor(&shouted, false))?);
+    assert!(!apply_edit(&mut policy, &monitor(&dir.0, false))?);
+    assert_eq!(policy.monitored_roots, std::slice::from_ref(&other.0));
+    assert_eq!(policy.inventory_roots, [dir.0.clone(), other.0.clone()]);
+
+    // Taking a location off the list ends its monitoring.
+    assert!(apply_edit(&mut policy, &root(&other.0, false))?);
+    assert!(policy.monitored_roots.is_empty());
+    assert_eq!(policy.inventory_roots, std::slice::from_ref(&dir.0));
+    assert!(
+        apply_edit(&mut policy, &monitor(&other.0, true)).is_err(),
+        "it is no location any more"
+    );
     Ok(())
 }

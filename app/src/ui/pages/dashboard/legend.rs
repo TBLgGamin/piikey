@@ -11,7 +11,6 @@ use windows_reactor::{
 
 use super::palette::swatch;
 use crate::ui::{
-    controller::Store,
     pages::kit::{Context, counted, thousands},
     window::{Dash, Msg},
 };
@@ -90,13 +89,8 @@ pub(super) fn strip_of(chips: Vec<View>) -> View {
 
 /// One row of chips, one chip for each type found and the one for all of them first. A click on
 /// the chip of the type on show shows every type again.
-pub(super) fn strip(
-    totals: &[TypeTotal],
-    shown: Option<EntityKind>,
-    store: Store,
-    context: Context<'_>,
-) -> View {
-    let asks = |kind: Option<EntityKind>| context.message(Msg::Dash(store, Dash::Type(kind)));
+pub(super) fn strip(totals: &[TypeTotal], shown: Option<EntityKind>, context: Context<'_>) -> View {
+    let asks = |kind: Option<EntityKind>| context.message(Msg::Dash(Dash::Type(kind)));
     let mut chips: Vec<View> = vec![chip(
         None,
         "All types",
@@ -172,7 +166,6 @@ pub(super) fn list(
     totals: &[TypeTotal],
     shown: Option<EntityKind>,
     height: f64,
-    store: Store,
     context: Context<'_>,
 ) -> Border {
     let kinds: Vec<EntityKind> = totals.iter().map(|total| total.kind).collect();
@@ -213,10 +206,9 @@ pub(super) fn list(
                         // A list that is made again reports nothing chosen for a moment: that is
                         // not a choice.
                         index.map_or(Msg::Noop, |i| {
-                            Msg::Dash(
-                                store,
-                                Dash::Type(i.checked_sub(1).and_then(|k| kinds.get(k).copied())),
-                            )
+                            Msg::Dash(Dash::Type(
+                                i.checked_sub(1).and_then(|k| kinds.get(k).copied()),
+                            ))
                         })
                     })),
             )]),
