@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/TBLgGamin/piikey/compare/v0.2.1...v0.3.0) - 2026-10-24
+
+### Added
+
+- *(app)* redesign the app around one status and five clear pages ([#7](https://github.com/TBLgGamin/piikey/pull/7))
+- package piikey as an MSIX for the Microsoft Store ([#6](https://github.com/TBLgGamin/piikey/pull/6))
+
+### Build
+
+- submit each release's installer to winget
+
 ## [0.2.1](https://github.com/TBLgGamin/piikey/compare/v0.2.0...v0.2.1) - 2026-10-22
 
 ### Build
