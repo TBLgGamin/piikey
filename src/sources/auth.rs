@@ -274,6 +274,15 @@ pub(crate) enum ClientAuth {
     Body,
 }
 
+/// The host of a loopback redirect for a service that takes the address as it is:
+/// `http://127.0.0.1:<port>`. It is also where the listener is, whichever host the redirect names.
+pub(crate) const LOOPBACK: &str = "127.0.0.1";
+/// The host of a loopback redirect for a service that is registered with the name:
+/// `http://localhost:<port>`. Microsoft Entra registers the redirect of a public client as
+/// `http://localhost` (the portal's "Mobile and desktop applications") and then takes `localhost`
+/// with any port; it does not take `http://127.0.0.1:<port>` for that registration.
+pub(crate) const LOCALHOST: &str = "localhost";
+
 /// A person signs in with a browser: authorization code, with PKCE when `pkce` is set.
 #[derive(Debug, Clone)]
 pub(crate) struct Browser {
@@ -288,11 +297,15 @@ pub(crate) struct Browser {
     /// `token_access_type=offline`.
     pub authorize_extra: Vec<(String, String)>,
     pub client_auth: ClientAuth,
-    /// The port of the loopback redirect `http://127.0.0.1:<port>`; 0 takes any free port, for
-    /// a service that matches the redirect without the port.
+    /// The host of the loopback redirect `http://<redirect_host>:<port>`: [`LOOPBACK`], or
+    /// [`LOCALHOST`] for a service that is registered with that name. The listener is on
+    /// `127.0.0.1` either way.
+    pub redirect_host: &'static str,
+    /// The port of the loopback redirect `http://<redirect_host>:<port>`; 0 takes any free port,
+    /// for a service that matches the redirect without the port.
     pub port: u16,
-    /// What follows the port in the redirect `http://127.0.0.1:<port><redirect_path>`: empty, or
-    /// a path such as `/` that the service wants registered with it.
+    /// What follows the port in the redirect `http://<redirect_host>:<port><redirect_path>`:
+    /// empty, or a path such as `/` that the service wants registered with it.
     pub redirect_path: String,
     pub pkce: bool,
 }
@@ -722,6 +735,11 @@ impl Session {
 
     /// The sign-in of a person: the browser is sent to the service, which sends it back to the
     /// loopback with a code, which is exchanged for the tokens.
+    ///
+    /// The listener is on `127.0.0.1` only, whatever [`Browser::redirect_host`] tells the service:
+    /// a browser that goes to `localhost` tries `::1` first, finds nothing there and falls back to
+    /// `127.0.0.1`. The `Host` the browser sends is not looked at: what shows that a visit is the
+    /// one piikey waits for is its `state`.
     fn sign_in(
         &self,
         browser: &Browser,
@@ -729,7 +747,8 @@ impl Session {
         cancel: &AtomicBool,
         timeout: Duration,
     ) -> Result<()> {
-        let listener = TcpListener::bind(("127.0.0.1", browser.port)).map_err(|_| {
+        // The IPv4 loopback, whatever host the redirect address names (see `redirect_host`).
+        let listener = TcpListener::bind((LOOPBACK, browser.port)).map_err(|_| {
             bad_request(if browser.port == 0 {
                 "piikey could not listen for the sign-in on this PC. Try again.".to_owned()
             } else {
@@ -741,7 +760,10 @@ impl Session {
         })?;
         listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
-        let redirect_uri = format!("http://127.0.0.1:{port}{}", browser.redirect_path);
+        let redirect_uri = format!(
+            "http://{}:{port}{}",
+            browser.redirect_host, browser.redirect_path
+        );
         let state = random_hex(16)?;
         let pkce = if browser.pkce {
             Some(Pkce::new()?)
@@ -757,10 +779,17 @@ impl Session {
         let (redirect, mut stream) =
             self.wait_for_redirect(&listener, &state, &browser.redirect_path, cancel, timeout)?;
         let outcome = match redirect {
-            Redirect::Denied(why) => Err(Error::forbidden(
-                self.http.provider(),
-                format!("the sign-in was refused: {why}"),
-            )),
+            Redirect::Denied { error, description } => {
+                let detail = format!("the sign-in was refused: {error} {description}");
+                Err(if needs_admin(&error, &description) {
+                    Error::AdminApproval {
+                        provider: self.http.provider(),
+                        detail,
+                    }
+                } else {
+                    Error::forbidden(self.http.provider(), detail)
+                })
+            }
             Redirect::Code(code) => {
                 self.finish_sign_in(browser, &redirect_uri, pkce.as_ref(), &code)
             }
@@ -921,6 +950,9 @@ fn token_error(provider: Provider, reply: &Reply) -> Error {
         .take(DETAIL_LEN)
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
+    if needs_admin(code, &detail) {
+        return Error::AdminApproval { provider, detail };
+    }
     match code {
         "invalid_grant" | "interaction_required" | "login_required" => {
             Error::sign_in_needed(provider, detail)
@@ -935,6 +967,14 @@ fn token_error(provider: Provider, reply: &Reply) -> Error {
         "temporarily_unavailable" | "server_error" => Error::network(provider, detail),
         _ => reply.error(),
     }
+}
+
+/// Whether a refusal says that only an administrator can approve the app: Microsoft names it by a
+/// code in the description (`AADSTS65001` no consent yet, `AADSTS90094` admin consent required,
+/// `AADSTS90095` an admin consent request was made), whatever its `error` says.
+fn needs_admin(error: &str, description: &str) -> bool {
+    const CODES: [&str; 3] = ["AADSTS65001", "AADSTS90094", "AADSTS90095"];
+    error == "admin_consent_required" || CODES.iter().any(|code| description.contains(code))
 }
 
 /// `text` as an error about this PC: a plain sentence.
@@ -1022,8 +1062,9 @@ fn authorize_url(
 enum Redirect {
     /// The service sent a code.
     Code(Zeroizing<String>),
-    /// The service sent an error: the person did not allow it.
-    Denied(String),
+    /// The service sent an error: the person did not allow it, or may not. `description` is what
+    /// it said about it, cut short.
+    Denied { error: String, description: String },
 }
 
 /// Reads what the browser asks for. The visit that says how the sign-in went is returned with its
@@ -1057,7 +1098,15 @@ fn read_redirect(mut stream: TcpStream, state: &str, path: &str) -> Option<(Redi
         return None;
     }
     let redirect = if let Some(error) = value("error") {
-        Redirect::Denied(error.chars().take(100).collect())
+        Redirect::Denied {
+            error: error.chars().take(100).collect(),
+            description: value("error_description")
+                .unwrap_or_default()
+                .chars()
+                .take(300)
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect(),
+        }
     } else if let Some(code) = value("code").filter(|code| !code.is_empty()) {
         Redirect::Code(Zeroizing::new(code.to_owned()))
     } else {
@@ -1404,6 +1453,7 @@ mod tests {
             scope: "files.read offline_access".to_owned(),
             authorize_extra: Vec::new(),
             client_auth,
+            redirect_host: LOOPBACK,
             port: 0,
             redirect_path: String::new(),
             pkce: true,
@@ -2176,6 +2226,48 @@ mod tests {
     }
 
     #[test]
+    fn a_grant_registered_with_localhost_sends_that_name_in_both_places() -> Res {
+        let store = store_with(&temp_dir("auth-flow-localhost"), &Secrets::default())?;
+        let mock = browser_mock()?;
+        let mut grant = browser_grant(&mock, ClientAuth::None);
+        grant.redirect_host = LOCALHOST;
+        let session = session(Grant::Browser(grant), &store);
+        let (result, flow) = run_flow(
+            &session,
+            &not_cancelled(),
+            Duration::from_secs(30),
+            good_visit,
+        )?;
+        result?;
+
+        // The service is told `localhost`, in the authorize address and in the exchange.
+        let authorize = Authorize::parse(&flow.url);
+        let uri = authorize.get("redirect_uri")?;
+        let port = uri
+            .strip_prefix("http://localhost:")
+            .ok_or("the redirect is not on localhost")?;
+        assert!(
+            !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()),
+            "{uri}"
+        );
+        assert!(
+            flow.url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A"),
+            "{}",
+            flow.url
+        );
+        let seen = mock.seen_at("/token");
+        assert_eq!(field(&seen[0], "redirect_uri")?, uri);
+
+        // The test came back by that name (`Host: localhost:<port>`, reaching the IPv4 loopback
+        // where the listener is) and was let in.
+        assert_eq!(authorize.address()?, format!("localhost:{port}"));
+        let page = flow.pages.first().ok_or("the browser got no page")?;
+        assert!(page.starts_with("HTTP/1.1 200 OK"), "{page}");
+        assert_eq!(store.load(ID)?.refresh_token.as_deref(), Some("rt-browser"));
+        Ok(())
+    }
+
+    #[test]
     fn a_public_client_without_pkce_sends_neither_challenge_nor_verifier() -> Res {
         let store = store_with(&temp_dir("auth-flow-plain"), &Secrets::default())?;
         let mock = browser_mock()?;
@@ -2296,6 +2388,45 @@ mod tests {
         assert!(mock.seen().is_empty());
         assert_eq!(store.load(ID)?, Secrets::default().with_client_secret("s"));
         Ok(())
+    }
+
+    #[test]
+    fn a_refusal_that_needs_an_administrator_says_so() -> Res {
+        let store = store_with(&temp_dir("auth-flow-admin"), &Secrets::default())?;
+        let mock = browser_mock()?;
+        let session = session(
+            Grant::Browser(browser_grant(&mock, ClientAuth::None)),
+            &store,
+        );
+        let (result, _) = run_flow(
+            &session,
+            &not_cancelled(),
+            Duration::from_secs(30),
+            |authorize| {
+                Ok(vec![format!(
+                    "/?error=access_denied&error_description=AADSTS90094%3A+The+grant+requires+admin+permission.&state={}",
+                    authorize.state()?
+                )])
+            },
+        )?;
+        let error = failure(result)?;
+        assert!(matches!(error, Error::AdminApproval { .. }), "{error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains("administrator has to approve piikey")
+        );
+        assert!(!error.to_string().contains("AADSTS"));
+        Ok(())
+    }
+
+    #[test]
+    fn only_the_codes_of_an_administrators_approval_need_one() {
+        assert!(needs_admin("consent_required", "AADSTS65001: no consent"));
+        assert!(needs_admin("access_denied", "AADSTS90095: request sent"));
+        assert!(needs_admin("admin_consent_required", ""));
+        assert!(!needs_admin("access_denied", "The user cancelled."));
+        assert!(!needs_admin("consent_required", "AADSTS70000"));
     }
 
     #[test]

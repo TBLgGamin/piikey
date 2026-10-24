@@ -47,9 +47,10 @@ windows-reactor = { git = "https://github.com/TBLgGamin/windows-rs", rev = "94cf
 serde_json.workspace = true
 # Reads the Windows light/dark app setting (HKCU Personalize) with a safe registry API.
 winreg = "0.56.0"
-# The Store build's startup task and how it was started (`startup.rs`), through WinRT's safe
-# bindings; the root crate already builds this version.
-windows = { version = "0.62.2", features = ["ApplicationModel", "ApplicationModel_Activation", "Foundation"] }
+# The Store build's startup task and how it was started (`startup.rs`), and web addresses opened in
+# the default browser (`System`: `Launcher`, `ui/explorer.rs`; Explorer cuts an address at 259
+# characters), through WinRT's safe bindings; the root crate already builds this version.
+windows = { version = "0.62.2", features = ["ApplicationModel", "ApplicationModel_Activation", "Foundation", "System"] }
 # Reads the focused text field of protected sites (what the user types) through Windows UI
 # Automation, behind a safe wrapper: raw `windows` UIA calls are `unsafe` and `unsafe` is forbidden.
 # Uses windows 0.62.2, the version the root crate already builds.

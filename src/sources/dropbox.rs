@@ -41,7 +41,7 @@ use serde_json::{Value, json};
 use super::{
     Account, Changes, Connector, Error, Provider, RemoteFolder, RemoteItem, Resolved, Result,
     SignIn,
-    auth::{Browser, ClientAuth, Grant, Session, TokenStore},
+    auth::{Browser, ClientAuth, Grant, LOOPBACK, Session, TokenStore},
     child, component,
     http::{Http, Reply, Request, encode, encode_path, pages},
     parse_time, parse_virtual,
@@ -712,6 +712,7 @@ fn grant(app_key: &str, endpoints: &Endpoints) -> Grant {
         scope: SCOPES.to_owned(),
         authorize_extra: vec![("token_access_type".to_owned(), "offline".to_owned())],
         client_auth: ClientAuth::None,
+        redirect_host: LOOPBACK,
         port: REDIRECT_PORT,
         redirect_path: REDIRECT_PATH.to_owned(),
         pkce: true,
@@ -1747,6 +1748,7 @@ mod tests {
         assert_eq!(browser.port, REDIRECT_PORT);
         assert_eq!(browser.port, 53_123, "the port the app console registers");
         assert_eq!(browser.redirect_path, "/");
+        assert_eq!(browser.redirect_host, "127.0.0.1");
 
         let store = TokenStore::new(&temp_dir("dropbox-session"));
         assert!(session(&account(), &store).is_ok());

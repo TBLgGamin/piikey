@@ -7,6 +7,12 @@
 //! (and the user's own `OneDrive` for Business, listed as `OneDrive`) has no site, so its libraries
 //! are the drive itself.
 //!
+//! A person signs in as a public client (the authorization code with PKCE). Microsoft Entra
+//! registers the loopback redirect of such an app as `http://localhost` and then takes
+//! `http://localhost:<any port>`; it does not take `http://127.0.0.1:<port>`. So the address sent
+//! names `localhost`, while the listener is on `127.0.0.1` only: a browser that tries `::1` first
+//! finds nothing there and falls back to it.
+//!
 //! Change tracking is the drive's delta feed (`GET /drives/{id}/root/delta`). What the feed
 //! promises, and how the code relies on it (see also the comments next to each use):
 //! - `OneDrive` for Business and `SharePoint` support delta only on the root of a drive, so a
@@ -33,7 +39,7 @@ use serde::{
 use super::{
     Account, Changes, Connector, Credential, Error, Provider, RemoteFolder, RemoteItem, Resolved,
     Result, SignIn,
-    auth::{App, AppCredential, Browser, ClientAuth, Grant, Session, TokenStore},
+    auth::{App, AppCredential, Browser, ClientAuth, Grant, LOCALHOST, Session, TokenStore},
     child, component,
     http::{Http, Reply, Request, encode, encode_path, pages},
     parse_time, parse_virtual,
@@ -285,6 +291,9 @@ fn setup(account: &Account, endpoints: &Endpoints) -> Result<(Grant, Mode)> {
                     scope: scope.to_owned(),
                     authorize_extra: Vec::new(),
                     client_auth: ClientAuth::None,
+                    // Entra takes `http://localhost:<any port>` for the `http://localhost` that a
+                    // public client is registered with, and not `http://127.0.0.1:<port>`.
+                    redirect_host: LOCALHOST,
                     port: 0,
                     redirect_path: String::new(),
                     pkce: true,
@@ -1748,6 +1757,7 @@ mod tests {
             Error::SignInNeeded { .. } => "sign_in",
             Error::Throttled { .. } => "throttled",
             Error::Forbidden { .. } => "forbidden",
+            Error::AdminApproval { .. } => "admin_approval",
             Error::NotFound { .. } => "not_found",
             Error::Network { .. } => "network",
             Error::Unexpected { .. } => "unexpected",
@@ -2978,6 +2988,7 @@ mod tests {
         assert_eq!(work.client_id, "client");
         assert_eq!(work.client_auth, ClientAuth::None);
         assert!(work.pkce && work.port == 0 && work.redirect_path.is_empty());
+        assert_eq!(work.redirect_host, "localhost");
 
         let (Grant::Browser(own), _) = setup(&personal(), &endpoints)? else {
             return Err("a browser grant was expected".into());
@@ -2987,6 +2998,7 @@ mod tests {
             "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
         );
         assert_eq!(own.scope, "Files.Read offline_access");
+        assert_eq!(own.redirect_host, "localhost");
 
         let (Grant::App(all), Mode::App) = setup(&app(None), &endpoints)? else {
             return Err("an app grant was expected".into());
@@ -3030,6 +3042,109 @@ mod tests {
             AppCredential::Certificate { key_file, cert_file }
                 if key_file == Path::new("key.pem") && cert_file == Path::new("cert.pem")
         ));
+        Ok(())
+    }
+
+    /// The value of the field `name` in the query of `url`, as it is written there (still
+    /// percent-encoded).
+    fn raw_field<'a>(url: &'a str, name: &str) -> Option<&'a str> {
+        url.split_once('?')?
+            .1
+            .split('&')
+            .find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='))
+    }
+
+    #[test]
+    fn the_microsoft_sign_in_sends_localhost_and_the_code_is_exchanged_with_the_same_address() -> Res
+    {
+        use std::io::{Read, Write};
+
+        for account in [work(), personal()] {
+            let answer = |seen: &Seen| {
+                if seen.path().ends_with("/token") {
+                    Answer::json(
+                        200,
+                        &json!({"access_token": "at", "refresh_token": "rt", "expires_in": 3600}),
+                    )
+                } else {
+                    Answer::empty(404)
+                }
+            };
+            let rig = rig_with(&account, &Secrets::default(), answer)?;
+
+            // The test is the browser: given the address to open, it comes back to the redirect
+            // by the name the service was told, with a code. If it cannot, it stops the wait.
+            let cancel = Arc::new(AtomicBool::new(false));
+            let given = Mutex::new(String::new());
+            let visitor = Mutex::new(None);
+            let open = |address: &str| {
+                if let Ok(mut given) = given.lock() {
+                    address.clone_into(&mut given);
+                }
+                let redirect = raw_field(address, "redirect_uri").unwrap_or_default();
+                let host = redirect
+                    .strip_prefix("http%3A%2F%2F")
+                    .unwrap_or_default()
+                    .replace("%3A", ":");
+                let state = raw_field(address, "state").unwrap_or_default().to_owned();
+                let stop = Arc::clone(&cancel);
+                let handle = std::thread::spawn(move || {
+                    let visit = || -> std::io::Result<String> {
+                        let mut stream = std::net::TcpStream::connect(host.as_str())?;
+                        stream.set_read_timeout(Some(Duration::from_secs(20)))?;
+                        write!(
+                            stream,
+                            "GET /?code=abc&state={state} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+                        )?;
+                        let mut page = String::new();
+                        stream.read_to_string(&mut page)?;
+                        Ok(page)
+                    };
+                    let page = visit();
+                    if page.is_err() {
+                        stop.store(true, Ordering::SeqCst);
+                    }
+                    page
+                });
+                if let Ok(mut visitor) = visitor.lock() {
+                    *visitor = Some(handle);
+                }
+            };
+            rig.graph.session.connect(&open, &cancel)?;
+
+            // The service was told `localhost`, as Entra registers it...
+            let first = given.into_inner().map_err(|_| "poisoned")?;
+            assert!(
+                first.contains("redirect_uri=http%3A%2F%2Flocalhost%3A"),
+                "{first}"
+            );
+            let redirect = raw_field(&first, "redirect_uri").ok_or("no redirect address")?;
+            let port = redirect
+                .strip_prefix("http%3A%2F%2Flocalhost%3A")
+                .ok_or("the redirect is not on localhost")?;
+            assert!(
+                !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()),
+                "{redirect}"
+            );
+
+            // ...and the code was exchanged with the very same address.
+            let tokens = rig.tokens();
+            assert_eq!(tokens.len(), 1);
+            assert_eq!(
+                tokens[0].field("redirect_uri"),
+                Some(format!("http://localhost:{port}"))
+            );
+            assert_eq!(tokens[0].field("code").as_deref(), Some("abc"));
+
+            // The browser, which came back as `localhost:<port>`, was let in.
+            let page = visitor
+                .into_inner()
+                .map_err(|_| "poisoned")?
+                .ok_or("the browser never came back")?
+                .join()
+                .map_err(|_| "the browser's thread panicked")??;
+            assert!(page.starts_with("HTTP/1.1 200 OK"), "{page}");
+        }
         Ok(())
     }
 

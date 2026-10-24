@@ -6,7 +6,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicU32, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
         mpsc::Sender,
     },
 };
@@ -15,6 +15,7 @@ use piikey::{
     engine::Engine,
     inventory::Inventory,
     policy::{Highlight, Policy},
+    sources::{self, Account, Connector},
 };
 
 use super::{
@@ -176,6 +177,25 @@ impl Backend for Stub {
             running: Box::new(Nothing),
             failed: Vec::new(),
         })
+    }
+
+    fn connector(&self, _account: &Account) -> sources::Result<Box<dyn Connector>> {
+        Err(sources::Error::Local(piikey::Error::BadRequest(
+            "the stub has no cloud".to_owned(),
+        )))
+    }
+
+    fn connect(
+        &self,
+        _account: &Account,
+        _open: &dyn Fn(&str),
+        _cancel: &AtomicBool,
+    ) -> sources::Result<()> {
+        Ok(())
+    }
+
+    fn open_url(&self, _url: &str) -> Res<()> {
+        Ok(())
     }
 }
 

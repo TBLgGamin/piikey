@@ -6,18 +6,23 @@ use std::path::{Path, PathBuf};
 use piikey::{
     detect::EntityKind,
     inventory::{Entry, MAX_FILE, Node, Status},
+    sources::{is_virtual, parse_virtual},
 };
 use windows_reactor::{
     Border, Button, FontWeight, Grid, GridLength, HorizontalAlignment, ScrollViewer, StackPanel,
-    TextBlock, TextTrimming, ThemeBrush, Thickness, VerticalAlignment, View,
+    TextBlock, TextTrimming, ThemeBrush, Thickness, TooltipExt, VerticalAlignment, View,
 };
 
 use super::{
-    crumbs::{TOP, name_of},
+    crumbs::{TOP, account_top, name_of},
     palette::swatch,
 };
 use crate::ui::{
-    pages::kit::{Context, caption, counted, place_glyph, thousands, when},
+    controller::AccountView,
+    pages::{
+        kit::{Context, caption, counted, place_glyph, provider_icon, thousands, when},
+        lists::{provider_label, shown},
+    },
     window::{Dash, Dashboard, Loaded, Msg},
 };
 
@@ -83,17 +88,26 @@ impl Action {
 }
 
 /// What can be done with a `target`. What is listed was scanned already, so there is nothing to
-/// scan here; a folder already on show cannot be shown again (`on_show`).
-pub(super) fn actions(target: Target, on_show: bool) -> Vec<Action> {
-    let mut list = match target {
-        Target::File => vec![Action::Open, Action::Show, Action::Found, Action::Mask],
-        Target::Folder => vec![Action::Show, Action::Found],
-        Target::Top => Vec::new(),
+/// scan here; a folder already on show cannot be shown again (`on_show`). An item of a cloud
+/// account (`cloud`) is not on this PC: its file opens its web page, and it has no place in
+/// Explorer and no masked copy beside it.
+pub(super) fn actions(target: Target, on_show: bool, cloud: bool) -> Vec<Action> {
+    let mut list = match (target, cloud) {
+        (Target::File, false) => vec![Action::Open, Action::Show, Action::Found, Action::Mask],
+        (Target::File, true) => vec![Action::Open, Action::Found],
+        (Target::Folder, false) => vec![Action::Show, Action::Found],
+        (Target::Folder, true) => vec![Action::Found],
+        (Target::Top, _) => Vec::new(),
     };
     if target == Target::Folder && !on_show {
         list.insert(0, Action::Enter);
     }
     list
+}
+
+/// What a folder is called: its name, or for the top of a cloud account the account's name.
+fn title_of(path: &Path) -> String {
+    account_top(path).map_or_else(|| name_of(path), |account| account.label)
 }
 
 /// `12 found in 3 files`.
@@ -170,7 +184,7 @@ fn on_show(dash: &Dashboard, loaded: &Loaded) -> Subject {
         title: if top {
             TOP.to_owned()
         } else {
-            name_of(&dash.at)
+            title_of(&dash.at)
         },
         path: dash.at.clone(),
         summary: if hits == 0 {
@@ -230,7 +244,7 @@ fn folder_subject(dash: &Dashboard, loaded: &Loaded, path: &Path) -> Subject {
     let node = node_in(loaded, path);
     Subject {
         target: Target::Folder,
-        title: name_of(path),
+        title: title_of(path),
         path: path.to_path_buf(),
         summary: node.map_or_else(String::new, |node| {
             found_in(node.hits, u64::from(node.files))
@@ -332,14 +346,20 @@ fn type_rows(height: f64, target: Target, buttons: usize) -> usize {
 }
 
 /// The details pane: a card that scrolls when what it says does not fit `height`.
-pub(super) fn details(dash: &Dashboard, height: f64, dark: bool, context: Context<'_>) -> Border {
+pub(super) fn details(
+    dash: &Dashboard,
+    accounts: &[AccountView],
+    height: f64,
+    dark: bool,
+    context: Context<'_>,
+) -> Border {
     let Some(loaded) = dash.loaded.as_ref() else {
         return super::empty_card("Looking\u{2026}");
     };
     let subject = subject(dash, loaded);
     let is_dir = subject.target != Target::File;
     let on_show = subject.path == dash.at;
-    let todo = actions(subject.target, on_show);
+    let todo = actions(subject.target, on_show, is_virtual(&subject.path));
     let rows = type_rows(height, subject.target, todo.len());
     let mut parts: Vec<View> = vec![
         Grid::new()
@@ -359,13 +379,26 @@ pub(super) fn details(dash: &Dashboard, height: f64, dark: bool, context: Contex
             .into(),
     ];
     if !subject.path.as_os_str().is_empty() {
-        parts.push(
-            caption(subject.path.display().to_string())
-                .is_text_selection_enabled(true)
-                .max_lines(2)
-                .text_trimming(TextTrimming::CharacterEllipsis)
-                .into(),
-        );
+        let path = caption(shown(&subject.path))
+            .is_text_selection_enabled(true)
+            .max_lines(2)
+            .text_trimming(TextTrimming::CharacterEllipsis);
+        // A cloud item has its provider's logo before its path, and the provider's name in a
+        // tooltip: the path itself starts with the account.
+        parts.push(match parse_virtual(&subject.path) {
+            Some(cloud) => Grid::new()
+                .columns([GridLength::Auto, GridLength::STAR])
+                .column_spacing(8.0)
+                .children((
+                    provider_icon(cloud.provider, Some(&cloud.label), 14.0, dark),
+                    path.grid_column(1),
+                ))
+                .tooltip(
+                    provider_label(accounts, &subject.path)
+                        .unwrap_or_else(|| cloud.provider.name()),
+                ),
+            None => path.into(),
+        });
     }
     parts.push(
         TextBlock::new()
@@ -470,6 +503,7 @@ mod tests {
         );
         Loaded {
             at: PathBuf::new(),
+            map_at: PathBuf::new(),
             levels,
             places: Vec::new(),
             tiles: Tiles {
@@ -610,7 +644,7 @@ mod tests {
     fn each_target_offers_what_applies_to_it_and_nothing_to_scan_again() {
         let labels = |list: Vec<Action>| list.into_iter().map(Action::label).collect::<Vec<_>>();
         assert_eq!(
-            labels(actions(Target::File, false)),
+            labels(actions(Target::File, false, false)),
             [
                 "Open",
                 "Show in Explorer",
@@ -619,7 +653,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            labels(actions(Target::Folder, false)),
+            labels(actions(Target::Folder, false, false)),
             [
                 "Show only this folder",
                 "Show in Explorer",
@@ -628,10 +662,41 @@ mod tests {
         );
         // The folder on show cannot be shown again.
         assert_eq!(
-            labels(actions(Target::Folder, true)),
+            labels(actions(Target::Folder, true, false)),
             ["Show in Explorer", "Show what was found"]
         );
-        assert!(actions(Target::Top, true).is_empty());
+        assert!(actions(Target::Top, true, false).is_empty());
+    }
+
+    #[test]
+    fn a_cloud_item_has_no_place_in_explorer_and_no_masked_copy() {
+        let labels = |list: Vec<Action>| list.into_iter().map(Action::label).collect::<Vec<_>>();
+        assert_eq!(
+            labels(actions(Target::File, false, true)),
+            ["Open", "Show what was found"]
+        );
+        assert_eq!(
+            labels(actions(Target::Folder, false, true)),
+            ["Show only this folder", "Show what was found"]
+        );
+        assert_eq!(
+            labels(actions(Target::Folder, true, true)),
+            ["Show what was found"]
+        );
+        assert!(actions(Target::Top, true, true).is_empty());
+    }
+
+    #[test]
+    fn the_top_of_a_cloud_account_is_titled_by_the_account() {
+        assert_eq!(
+            title_of(Path::new(r"\\Google Drive\jan@acme.com")),
+            "jan@acme.com"
+        );
+        assert_eq!(
+            title_of(Path::new(r"\\Google Drive\jan@acme.com\My Drive")),
+            "My Drive"
+        );
+        assert_eq!(title_of(Path::new(r"C:\")), "C:");
     }
 
     #[test]

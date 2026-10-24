@@ -528,3 +528,278 @@ fn a_server_answers_before_this_process_does() -> TestResult {
     assert!(local.err.contains("note:"), "{}", local.err);
     Ok(())
 }
+
+/// The settings file of the account list in the sandbox's data folder.
+fn accounts_file(sandbox: &Sandbox) -> PathBuf {
+    sandbox.dir.join("piikey").join("sources.json")
+}
+
+#[test]
+fn the_help_lists_the_account_commands() -> TestResult {
+    let sandbox = Sandbox::new()?;
+    let got = sandbox.run(&["--help"], "")?;
+    assert_eq!(got.code, Some(0));
+    for line in [
+        "piikey-cli account list | connect ID | remove ID --yes | browse ID [--under PATH]",
+        "piikey-cli account add PROVIDER --label NAME",
+        "--client-secret-stdin",
+    ] {
+        assert!(
+            got.out.contains(line),
+            "{line} is not in the help: {}",
+            got.out
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_wrong_account_command_exits_two_and_adds_nothing() -> TestResult {
+    let sandbox = Sandbox::new()?;
+    let lines: [&[&str]; 8] = [
+        &["account"],
+        &["account", "sign"],
+        &["account", "connect"],
+        &["account", "remove", "ab"],
+        &["account", "browse"],
+        &["account", "add", "dropbox", "--label", "W"],
+        &["account", "add", "icloud", "--label", "W"],
+        // The client secret has to come on stdin.
+        &[
+            "account",
+            "add",
+            "box",
+            "--label",
+            "T",
+            "--mode",
+            "box_delegated",
+            "--client-id",
+            "c",
+        ],
+    ];
+    for args in lines {
+        let mut line = vec!["--local"];
+        line.extend_from_slice(args);
+        let got = sandbox.run(&line, "")?;
+        assert_eq!(got.code, Some(2), "{args:?}: {}", got.err);
+        assert_eq!(got.out, "", "{args:?}");
+    }
+    assert!(!accounts_file(&sandbox).exists());
+    Ok(())
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one scenario over a data folder: add, list, scan a location, remove, list again"
+)]
+fn accounts_are_added_listed_and_removed_with_their_locations() -> TestResult {
+    let sandbox = Sandbox::new()?;
+    fs::write(sandbox.dir.join("key.json"), "{}")?;
+    let key = sandbox.path("key.json");
+    let none = sandbox.run(&["--local", "account", "list"], "")?;
+    assert_eq!(none.code, Some(0), "{}", none.err);
+    assert!(none.out.starts_with("no cloud accounts"), "{}", none.out);
+
+    let added = sandbox.json(
+        &[
+            "account",
+            "add",
+            "google_drive",
+            "--mode",
+            "google_service_account",
+            "--label",
+            "Workspace",
+            "--key-file",
+            &key,
+            "--user",
+            "a@acme.nl",
+        ],
+        "",
+    )?;
+    assert_eq!(added["provider"], "google_drive");
+    assert_eq!(added["label"], "Workspace");
+    assert_eq!(added["path"], r"\\Google Drive\Workspace");
+    assert_eq!(added["sign_in"]["mode"], "google_service_account");
+    assert_eq!(added["sign_in"]["key_file"], key.as_str());
+    assert_eq!(added["connected"], true);
+    let id = added["id"].as_str().ok_or("no id")?.to_owned();
+
+    // Dropbox has one way to sign in, so the mode can be left out; nobody has signed in yet.
+    let dropbox = sandbox.json(
+        &[
+            "account",
+            "add",
+            "dropbox",
+            "--label",
+            "Personal",
+            "--app-key",
+            "key-1",
+        ],
+        "",
+    )?;
+    assert_eq!(dropbox["connected"], false);
+    let dropbox_id = dropbox["id"].as_str().ok_or("no id")?.to_owned();
+
+    let listed = sandbox.json(&["account", "list"], "")?;
+    assert_eq!(listed["accounts"].as_array().map(Vec::len), Some(2));
+    assert_eq!(listed["accounts"][0]["id"], id.as_str());
+    assert_eq!(listed["accounts"][1]["id"], dropbox_id.as_str());
+    let table = sandbox.run(&["--local", "account", "list"], "")?;
+    assert_eq!(table.code, Some(0), "{}", table.err);
+    assert!(table.out.starts_with("ID "), "{}", table.out);
+    for text in [
+        id.as_str(),
+        "Google Drive",
+        "Workspace",
+        "google_service_account",
+        "connected",
+        dropbox_id.as_str(),
+        "not connected",
+        r"\\Dropbox\Personal",
+    ] {
+        assert!(table.out.contains(text), "{text} is not in {}", table.out);
+    }
+
+    // The same label is refused, and so is a location of an account that is not there.
+    let again = sandbox.run(
+        &[
+            "--local",
+            "account",
+            "add",
+            "dropbox",
+            "--label",
+            "personal",
+            "--app-key",
+            "k",
+        ],
+        "",
+    )?;
+    assert_eq!(again.code, Some(3), "{}", again.out);
+    assert!(again.err.contains("already"), "{}", again.err);
+    let stranger = sandbox.run(
+        &[
+            "--local",
+            "settings",
+            "set",
+            r"inventory_root=\\Google Drive\Nobody\Docs",
+        ],
+        "",
+    )?;
+    assert_eq!(stranger.code, Some(3), "{}", stranger.out);
+    assert!(
+        stranger.err.contains("add the account first"),
+        "{}",
+        stranger.err
+    );
+
+    // A location of the account goes with it.
+    let location = r"inventory_root=\\Google Drive\Workspace\Docs";
+    sandbox.json(&["settings", "set", location], "")?;
+    let status = sandbox.json(&["inventory", "status"], "")?;
+    assert_eq!(
+        status["roots"],
+        serde_json::json!([r"\\Google Drive\Workspace\Docs"])
+    );
+    let refused = sandbox.run(&["--local", "account", "remove", &id], "")?;
+    assert_eq!(refused.code, Some(2), "{}", refused.err);
+    let removed = sandbox.json(&["account", "remove", &id, "--yes"], "")?;
+    assert_eq!(
+        removed,
+        serde_json::json!({"id": id, "locations": [r"\\Google Drive\Workspace\Docs"], "forgotten": 0})
+    );
+    let status = sandbox.json(&["inventory", "status"], "")?;
+    assert_eq!(status["roots"], serde_json::json!([]));
+    let left = sandbox.json(&["account", "list"], "")?;
+    assert_eq!(left["accounts"].as_array().map(Vec::len), Some(1));
+    let text = sandbox.run(&["--local", "account", "remove", &dropbox_id, "--yes"], "")?;
+    assert_eq!(text.code, Some(0), "{}", text.err);
+    assert!(
+        text.out
+            .starts_with(&format!("removed the account {dropbox_id}\n")),
+        "{}",
+        text.out
+    );
+    Ok(())
+}
+
+#[test]
+fn an_account_that_is_not_there_is_an_api_error() -> TestResult {
+    let sandbox = Sandbox::new()?;
+    for args in [
+        &["account", "connect", "0123456789abcdef"][..],
+        &["account", "browse", "0123456789abcdef"],
+        &["account", "remove", "0123456789abcdef", "--yes"],
+    ] {
+        let mut line = vec!["--local"];
+        line.extend_from_slice(args);
+        let got = sandbox.run(&line, "")?;
+        assert_eq!(got.code, Some(3), "{args:?}: {}", got.out);
+        assert!(
+            got.err.contains("no cloud account has the id"),
+            "{}",
+            got.err
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn the_client_secret_comes_on_stdin_and_is_kept_in_neither_the_output_nor_the_settings()
+-> TestResult {
+    let sandbox = Sandbox::new()?;
+    let added = sandbox.json(
+        &[
+            "account",
+            "add",
+            "box",
+            "--label",
+            "Team",
+            "--mode",
+            "box_delegated",
+            "--client-id",
+            "id-1",
+            "--client-secret-stdin",
+        ],
+        "s3cret-xyz\n",
+    )?;
+    assert_eq!(added["connected"], false, "a person still has to sign in");
+    assert!(!added.to_string().contains("s3cret"), "{added}");
+    let settings = fs::read_to_string(accounts_file(&sandbox))?;
+    assert!(!settings.contains("s3cret"), "{settings}");
+    assert!(settings.contains("Team"));
+    let id = added["id"].as_str().ok_or("no id")?;
+
+    // Without a secret nothing is added.
+    let empty = sandbox.run(
+        &[
+            "--local",
+            "account",
+            "add",
+            "box",
+            "--label",
+            "Other",
+            "--mode",
+            "box_delegated",
+            "--client-id",
+            "id-2",
+            "--client-secret-stdin",
+        ],
+        "\n",
+    )?;
+    assert_eq!(empty.code, Some(3), "{}", empty.out);
+    assert!(empty.err.contains("no client secret"), "{}", empty.err);
+    let listed = sandbox.json(&["account", "list"], "")?;
+    assert_eq!(listed["accounts"].as_array().map(Vec::len), Some(1));
+    sandbox.json(&["account", "remove", id, "--yes"], "")?;
+    Ok(())
+}
+
+#[test]
+fn a_path_in_a_cloud_account_is_no_path_to_scan() -> TestResult {
+    let sandbox = Sandbox::new()?;
+    let got = sandbox.run(&["--local", "scan", r"\\Google Drive\Work\Docs"], "")?;
+    assert_eq!(got.code, Some(3), "{}", got.out);
+    assert!(got.err.contains("cloud account"), "{}", got.err);
+    Ok(())
+}

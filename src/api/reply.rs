@@ -12,6 +12,7 @@ use crate::{
     detect::EntityKind,
     inventory::{Entry, Node},
     policy::Highlight,
+    sources::{Account, Provider, SignIn},
     subject::SubjectMatch,
 };
 
@@ -283,6 +284,82 @@ pub struct Protection {
     pub protection: bool,
 }
 
+/// One cloud account, in the reply to `account_add` and `account_connect` and in the list
+/// `accounts_list` answers. It holds no secret: a client secret is kept DPAPI-protected in the
+/// data folder, a key stays in its file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AccountInfo {
+    /// The account's id (16 hexadecimal digits), which never changes: the other account
+    /// operations take it.
+    pub id: String,
+    /// The cloud service.
+    pub provider: Provider,
+    /// The name the account goes by, unique among the accounts of its service. It is the second
+    /// part of the paths of the account's folders.
+    pub label: String,
+    /// How the account signs in, with what that way needs (no secret).
+    pub sign_in: SignIn,
+    /// The path of the account's top, `\\<service>\<name>`: the start of the path of every
+    /// folder and file in it, and what a location of the inventory is picked below.
+    pub path: String,
+    /// Whether piikey has what it needs to read the account: a person has signed in, or the app
+    /// has its secret or its key files. It says nothing about whether the service still accepts
+    /// it.
+    pub connected: bool,
+}
+
+impl AccountInfo {
+    /// `account` as the API shows it.
+    #[must_use]
+    pub fn new(account: &Account, connected: bool) -> Self {
+        Self {
+            id: account.id.clone(),
+            provider: account.provider,
+            label: account.label.clone(),
+            sign_in: account.sign_in.clone(),
+            path: account.root().to_string_lossy().into_owned(),
+            connected,
+        }
+    }
+}
+
+/// `accounts_list`: the cloud accounts piikey may read, in the order they were added.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct Accounts {
+    /// The accounts, in the order they were added.
+    pub accounts: Vec<AccountInfo>,
+}
+
+/// `account_remove`: what went with the account.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AccountRemoved {
+    /// The id of the account that was removed.
+    pub id: String,
+    /// The locations of the inventory that were taken off the list, because they were in the
+    /// account.
+    pub locations: Vec<String>,
+    /// How many files of the account the inventory forgot.
+    pub forgotten: u64,
+}
+
+/// A folder of a cloud account, in the reply to `account_browse`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct FolderInfo {
+    /// The folder's path, which a location of the inventory can be and the next
+    /// `account_browse` can look under.
+    pub path: String,
+    /// The folder's name: the last part of its path.
+    pub name: String,
+}
+
+/// `account_browse`: the folders directly in one folder of an account, or the top of the
+/// account.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct Folders {
+    /// The folders, in the order the service lists them.
+    pub folders: Vec<FolderInfo>,
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error as StdError;
@@ -372,6 +449,71 @@ mod tests {
             r#"{"start":5,"end":23,"kind":"email","value":"jan.jansen@acme.nl"}"#
         );
         assert_eq!(serde_json::from_value::<Spans>(wire)?, spans);
+        Ok(())
+    }
+
+    #[test]
+    fn an_account_is_shown_with_its_path_and_never_with_a_secret() -> TestResult {
+        let account = Account {
+            id: "3f9c2a7d41b8e605".to_owned(),
+            provider: Provider::Box,
+            label: "Team".to_owned(),
+            sign_in: SignIn::BoxApp {
+                client_id: "client-1".to_owned(),
+                subject: crate::sources::BoxSubject::Enterprise("77".to_owned()),
+            },
+        };
+        let info = AccountInfo::new(&account, true);
+        let wire = to_json(&info)?;
+        assert_eq!(
+            wire,
+            json!({
+                "id": "3f9c2a7d41b8e605",
+                "provider": "box",
+                "label": "Team",
+                "sign_in": {
+                    "mode": "box_app",
+                    "client_id": "client-1",
+                    "subject": {"type": "enterprise", "id": "77"},
+                },
+                "path": r"\\Box\Team",
+                "connected": true,
+            })
+        );
+        assert!(!wire.to_string().contains("secret"), "{wire}");
+        assert_eq!(serde_json::from_value::<AccountInfo>(wire)?, info);
+        let list = Accounts {
+            accounts: vec![info, AccountInfo::new(&account, false)],
+        };
+        assert_eq!(serde_json::from_value::<Accounts>(to_json(&list)?)?, list);
+        Ok(())
+    }
+
+    #[test]
+    fn what_went_with_an_account_and_its_folders_read_back() -> TestResult {
+        let removed = AccountRemoved {
+            id: "ab".to_owned(),
+            locations: vec![r"\\Box\Team\Docs".to_owned()],
+            forgotten: 12,
+        };
+        let wire = to_json(&removed)?;
+        assert_eq!(
+            wire,
+            json!({"id": "ab", "locations": [r"\\Box\Team\Docs"], "forgotten": 12})
+        );
+        assert_eq!(serde_json::from_value::<AccountRemoved>(wire)?, removed);
+        let folders = Folders {
+            folders: vec![FolderInfo {
+                path: r"\\Box\Team\Docs".to_owned(),
+                name: "Docs".to_owned(),
+            }],
+        };
+        let wire = to_json(&folders)?;
+        assert_eq!(
+            wire,
+            json!({"folders": [{"path": r"\\Box\Team\Docs", "name": "Docs"}]})
+        );
+        assert_eq!(serde_json::from_value::<Folders>(wire)?, folders);
         Ok(())
     }
 }

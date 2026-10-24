@@ -6,6 +6,7 @@ use windows_reactor::{
 };
 
 use super::{
+    accounts,
     kit::{
         Context, Row, caption, card, column, feature_switch, section, subtitle, title, web_link,
     },
@@ -25,6 +26,7 @@ pub(super) fn settings(window: &MainWindow, context: Context<'_>) -> View {
     column(vec![
         title(Page::Settings.title()).into(),
         section("General", general(window, context)),
+        accounts::section(window, context),
         section("Types of personal data", kinds(window, context)),
         section("Developer access", developer(window, context)),
         section("Privacy & data", privacy(window, context)),

@@ -77,11 +77,13 @@ A stand-in whose record was forgotten (`vault_forget`, `vault_wipe`) stays as it
 '''
 
 [scan_files]
-reviewed = "a321a4e76cb961c2"
+reviewed = "a423fcaa8c7a6b35"
 text = '''
 CLI: `piikey-cli scan [--fail-on KINDS|any] [--no-record] [PATH...]`
 
 Every path must be absolute (the CLI makes its arguments absolute for you). Folders are walked recursively and symbolic links are skipped. A file named twice, or inside a folder you also named, is scanned once.
+
+A path in a cloud account (`\\Google Drive\Work\Docs`) is refused with `bad_request`: it is no file of this PC. The files of a cloud account are scanned through its locations, with `inventory_rescan`.
 
 Each call reads every file again; the incremental rule that skips unchanged files belongs to `inventory_rescan`. The result holds counts per type, never the values.
 
@@ -89,11 +91,13 @@ The CLI's `--no-record` is `"record": false`. `piikey-cli scan --fail-on` exits 
 '''
 
 [anonymize_files]
-reviewed = "00e77360a8d5bb34"
+reviewed = "fb15909004a2f962"
 text = '''
 CLI: `piikey-cli anonymize [--out DIR] [PATH...]` (with PATHs, `--out DIR` is required)
 
 `paths` and `out` must be absolute. Folders are walked recursively and each result keeps its place relative to the folder it was found under. Missing folders under `out` are created and a file already there is overwritten, but a result is never written over an input, and an `out` inside a folder you name is refused with `bad_request`.
+
+A path in a cloud account is refused with `bad_request`, in `paths` and in `out`: the files of a cloud account are only read, into memory, by the inventory's scan.
 
 A result that is text (from a PDF, an image or a mail) is written as `<name>.txt`.
 
@@ -101,21 +105,21 @@ One file that cannot be read does not stop the others: it is listed under `faile
 '''
 
 [deanonymize_files]
-reviewed = "2df3ec4d26323840"
+reviewed = "6e3efbd3edbc61ae"
 text = '''
 CLI: `piikey-cli deanonymize [--tolerant] [--out DIR] [PATH...]` (with PATHs, `--out DIR` is required)
 
-The same rules as `anonymize_files` for paths, `out`, results written as `.txt` and files that fail.
+The same rules as `anonymize_files` for paths, `out`, paths in a cloud account (refused), results written as `.txt` and files that fail.
 
 With `tolerant` a document is read one piece of text at a time, so typos and lone names are restored within each piece.
 '''
 
 [subject_search]
-reviewed = "99779794f36c6b37"
+reviewed = "794304c2a81baf54"
 text = '''
 CLI: `piikey-cli subject --value V [--value V ...] [PATH...]`
 
-A value matches a file as a whole word in any letter case, or as the same value spelled another way: `+31 6 1234 5678` and `+31612345678` match, `06 1234 5678` does not. Without `paths` it searches the inventory's locations, so with no locations there is nothing to search.
+A value matches a file as a whole word in any letter case, or as the same value spelled another way: `+31 6 1234 5678` and `+31612345678` match, `06 1234 5678` does not. Without `paths` it searches the inventory's locations on this PC, so with no such location there is nothing to search; the folders of cloud accounts are not searched, and a path in a cloud account in `paths` is refused with `bad_request`.
 
 Folders are walked recursively without following links. A blank value is a `bad_request`.
 
@@ -167,7 +171,7 @@ reviewed = "03630f9ed0f629bf"
 text = '''
 CLI: `piikey-cli inventory status`
 
-`roots` is empty until a location has been added in the app or with `settings_set`. The inventory scans only when asked (`inventory_rescan`, `scan_files`, `explorer_scan`, the app's Scan button) and, for a location with Monitor on, when the app sees it change.
+`roots` is empty until a location has been added in the app or with `settings_set`; a location is a folder on this PC or a folder of a cloud account (`\\Google Drive\Work\Docs`). The inventory scans only when asked (`inventory_rescan`, `scan_files`, `explorer_scan`, the app's Scan button) and, for a location with Monitor on, when the app sees it change (a cloud location asks its account what changed every 5 minutes).
 
 While a scan runs, `scanning` says how far it is; poll this operation to follow `inventory_rescan` called from another client.
 '''
@@ -189,17 +193,19 @@ CLI: `piikey-cli inventory tree [--under PATH]`
 
 One level per call, the node with the most values first. Take the `path` of a node whose `is_dir` is true and send it as `under` to open it; a drive's path is `C:\`. `under` must be absolute.
 
-The tree follows the computer's real folders, whichever location or scan a file came from.
+The tree follows the computer's real folders, whichever location or scan a file came from. The files of a cloud account are in it too: the account is listed beside the drives, and opens the same way.
 '''
 
 [inventory_rescan]
-reviewed = "ad6919e118289605"
+reviewed = "2239aef0f9b096c5"
 text = '''
 CLI: `piikey-cli inventory rescan`
 
 It scans the inventory's locations (`inventory_status` lists them) and answers when the scan is over, however long that takes: give your client a long timeout. With no locations there is nothing to scan.
 
-The scan is incremental: a file whose size and write time match its entry is not read, and a changed file that turns out to hold the same content is not detected again.
+The folders on this PC are scanned first, then the folders of cloud accounts, in one run with one count of files. The scan is incremental: a file whose size and write time match its entry is not read, and a changed file that turns out to hold the same content is not detected again; a cloud location is asked what changed since its last scan (every 5 minutes, for a location with Monitor on, in the app) and a file is downloaded into memory, scanned and dropped.
+
+A cloud location that cannot be read (its account has to sign in again, or the service cannot be reached) does not stop the others. When the run is over the first failure is the error of the call, with a sentence that says what to do (`bad_request`, or `busy` when the service cannot be reached or asks piikey to slow down), and what was scanned stays in the inventory.
 
 Progress is visible meanwhile in `inventory_status`.
 '''
@@ -229,9 +235,67 @@ CLI: `piikey-cli settings set KEY=VALUE...` (the keys are the `guard.cfg` keys, 
 
 The body holds the fields under `settings`. A field you leave out is unchanged; a list you send replaces the whole list. The patch is checked as a whole: when one value is invalid, nothing changes and the error names it. A monitored folder must be one of the inventory's folders after the same patch.
 
-Folders must be absolute. `enabled` is refused: protection is switched with `protection`. The CLI's keys are singular (`site`, `program`, `disabled_kind`, `inventory_root`, `monitor_root`), the JSON fields plural (`sites`, `programs`, ...).
+Folders must be absolute. A folder of a cloud account (a `path` from `account_browse`, such as `\\Google Drive\Work\Docs`) can be a location when its account has been added (`account_add`); a new location of an account that does not exist is refused with `bad_request`. `enabled` is refused: protection is switched with `protection`. The CLI's keys are singular (`site`, `program`, `disabled_kind`, `inventory_root`, `monitor_root`), the JSON fields plural (`sites`, `programs`, ...).
 
 In the running app the change takes effect the way a click in Settings does (Explorer menu, highlight, inventory, HTTP API). Changing `http_api` or `http_port` answers first and then restarts the listener, so a new port applies from the next call.
+'''
+
+[accounts_list]
+reviewed = "15563bd67bb292c6"
+text = '''
+CLI: `piikey-cli account list`
+
+The cloud accounts piikey may read, in the order they were added. `path` is the top of an account's folders: the path of every folder and file in it starts with it, and a location of the inventory is a path below it (see `account_browse`).
+
+`connected` says that piikey holds what it needs to read the account: a person has signed in, or the account's app has its secret or its key files. It does not say that the service still accepts it; a call to the account finds that out. `sign_in` shows how the account signs in and never holds a secret.
+
+None of the account operations needs the app: the command line, run on its own, uses the same `sources.json` in the data folder. What to set up at each service (the app to register, the permissions to give it) is described in [docs/sources.md](https://github.com/TBLgGamin/piikey/blob/main/docs/sources.md) on GitHub.
+'''
+
+[account_add]
+reviewed = "153159c07288ed98"
+text = '''
+CLI: `piikey-cli account add PROVIDER --label NAME [--mode MODE] [--tenant T] [--client-id ID] [--app-key KEY] [--key-file FILE] [--cert-file FILE] [--site URL ...] [--user EMAIL ...] [--enterprise-id ID | --user-id ID] [--client-secret-stdin]`
+
+`provider` is `microsoft365`, `onedrive`, `google_drive`, `dropbox` or `box`. The `mode` of `sign_in` is the way the account signs in, and each service has its own: `microsoft_delegated` (Microsoft 365 and OneDrive), `microsoft_app` and `microsoft_app_selected` (Microsoft 365), `google_delegated` and `google_service_account` (Google Drive), `dropbox_delegated` (Dropbox), `box_delegated` and `box_app` (Box). The fields each way takes are in the schema below; a field the way needs and that is empty is a `bad_request` that names it. The CLI's `--mode` can be left out for a service that has one way.
+
+This adds the account and does not sign in: a way with a browser (`microsoft_delegated`, `google_delegated`, `dropbox_delegated`, `box_delegated`) needs `account_connect` before piikey can read anything, and `connected` is `false` until then.
+
+`client_secret` is required for `google_delegated`, `box_delegated`, `box_app`, and for `microsoft_app` and `microsoft_app_selected` with the `secret` credential; for the other ways it is ignored. It goes into the DPAPI-protected store in the data folder, never into the settings, and no reply or log holds it. The CLI reads it from stdin (`--client-secret-stdin`), so it never shows in a process list.
+
+The `label` is the name of the account, unique among the accounts of its service, and a part of the paths of its folders, so it cannot hold `\ / : * ? " < > |`. Where to find what each service asks for is described in [docs/sources.md](https://github.com/TBLgGamin/piikey/blob/main/docs/sources.md) on GitHub.
+'''
+
+[account_connect]
+reviewed = "5eeff8eab797c380"
+text = '''
+CLI: `piikey-cli account connect ID`
+
+Signs the account in and answers when that is done, so give your client a long timeout: it can take 5 minutes. For a way with a browser the app opens the browser; `piikey-cli`, run on its own, prints the address on stderr for you to open. It waits at most 5 minutes for the person to finish. A sign-in that is refused or not finished in time is a `bad_request` that says so, and a service that cannot be reached is `busy`.
+
+For an app that holds its own credentials (a certificate, a client secret or a key file) there is no browser: piikey asks the service for access once, which shows that the credentials work.
+
+An `id` that no account has is `not_found`.
+'''
+
+[account_remove]
+reviewed = "90f7fa057b180ca2"
+text = '''
+CLI: `piikey-cli account remove ID --yes`
+
+The account's locations come off the list of the inventory (so they are no longer monitored), the inventory forgets its files, and its secrets, settings and the places piikey had reached in its change feeds are deleted, in that order. `locations` lists the locations that came off and `forgotten` counts the files the inventory forgot. Nothing in the account itself changes. Add the account again and scan to get the files back in the inventory.
+
+The CLI asks for `--yes`; the API does not. An `id` that no account has is `not_found`.
+'''
+
+[account_browse]
+reviewed = "85b4b3be98b40089"
+text = '''
+CLI: `piikey-cli account browse ID [--under PATH]`
+
+Without `under` the answer is the top of the account: its drives, sites or "My Drive", whichever the service has. Send the `path` of one of the folders as `under` to open it. The `path` of a folder is what a location of the inventory is made of: give it to `settings_set` (`inventory_roots`) once the account has been added.
+
+An `under` that is not a path of this account is a `bad_request`, and so is a folder that is no longer there, with a sentence that says what to do. The call waits on the service, so an account that has not been signed in (`account_connect`) fails with a sentence to sign in. An `id` that no account has is `not_found`.
 '''
 
 [kinds]

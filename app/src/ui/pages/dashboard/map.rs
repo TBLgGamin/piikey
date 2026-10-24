@@ -19,6 +19,7 @@ use windows_reactor::{
 };
 
 use super::{
+    super::lists::shown,
     crumbs::name_of,
     palette::{NEUTRAL, kind_color, text_on},
     types,
@@ -225,11 +226,7 @@ fn file_item(tile: &Tile, kind: Option<EntityKind>) -> Option<Item> {
     }
     let color = kind.or_else(|| tile.dominant()).map_or(NEUTRAL, kind_color);
     let name = name_of(&tile.path);
-    let folder = tile
-        .path
-        .parent()
-        .map(|parent| parent.display().to_string())
-        .unwrap_or_default();
+    let folder = tile.path.parent().map(shown).unwrap_or_default();
     let tip = format!(
         "{name}\n{} \u{b7} {}\n{folder}",
         found(hits),
@@ -315,44 +312,18 @@ fn label(tile: &Placed, with_count: bool) -> View {
         .into()
 }
 
-/// What a selected file or folder looks like among the tiles.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Focus {
-    /// Nothing is selected: every tile as it is.
-    None,
-    /// This tile is selected.
-    Chosen,
-    /// A folder is selected and the tile lies in it.
-    Inside,
-    /// A folder is selected and the tile lies elsewhere.
-    Outside,
-}
-
-/// How the tile `of` looks given what is `selected`.
-pub(super) fn focus(of: &Of, selected: Option<&Path>, folder_selected: bool) -> Focus {
-    let Some(selected) = selected else {
-        return Focus::None;
-    };
-    match of {
-        Of::Rest => {
-            if folder_selected {
-                Focus::Outside
-            } else {
-                Focus::None
-            }
-        }
-        Of::File(path) if same_path(path, selected) => Focus::Chosen,
-        Of::File(path) if folder_selected && is_under(path, selected) => Focus::Inside,
-        Of::File(_) if folder_selected => Focus::Outside,
-        Of::File(_) => Focus::None,
-    }
+/// Whether the tile `of` is the selected file, which gets a ring. A selected folder marks no
+/// tile: the map shows only what is in it.
+fn chosen(of: &Of, selected: Option<&Path>) -> bool {
+    matches!((of, selected), (Of::File(path), Some(selected)) if same_path(path, selected))
 }
 
 /// One tile as a bordered box on the canvas. A click selects its file.
-fn tile_view(tile: &Placed, focus: Focus, context: Context<'_>) -> View {
-    let ring = match focus {
-        Focus::Chosen => tile.text,
-        _ => Color::transparent(),
+fn tile_view(tile: &Placed, chosen: bool, context: Context<'_>) -> View {
+    let ring = if chosen {
+        tile.text
+    } else {
+        Color::transparent()
     };
     let mut border = Border::new()
         .canvas_left(tile.rect.x)
@@ -361,8 +332,7 @@ fn tile_view(tile: &Placed, focus: Focus, context: Context<'_>) -> View {
         .height(tile.rect.h)
         .background(tile.color)
         .border_brush(ring)
-        .border_thickness(if focus == Focus::Chosen { 2.0 } else { 0.0 })
-        .opacity(if focus == Focus::Outside { 0.3 } else { 1.0 })
+        .border_thickness(if chosen { 2.0 } else { 0.0 })
         .corner_radius(2.0)
         .padding(Thickness::new(4.0, 2.0, 4.0, 2.0))
         .is_tab_stop(false)
@@ -385,12 +355,11 @@ pub(super) fn map(
     placed: &[Placed],
     canvas: (f64, f64),
     selected: Option<&Path>,
-    folder_selected: bool,
     context: Context<'_>,
 ) -> Border {
     let tiles: Vec<View> = placed
         .iter()
-        .map(|tile| tile_view(tile, focus(&tile.of, selected, folder_selected), context))
+        .map(|tile| tile_view(tile, chosen(&tile.of, selected), context))
         .collect();
     Border::new()
         .background(ThemeBrush::CardBackground)
@@ -617,18 +586,16 @@ mod tests {
     }
 
     #[test]
-    fn a_selected_folder_picks_out_its_files() {
-        let docs = Path::new(r"C:\Docs");
-        let inside = Of::File(PathBuf::from(r"c:\docs\Taxes\2023.pdf"));
-        let outside = Of::File(PathBuf::from(r"C:\Mail\jan.eml"));
-        assert_eq!(focus(&inside, Some(docs), true), Focus::Inside);
-        assert_eq!(focus(&outside, Some(docs), true), Focus::Outside);
-        assert_eq!(focus(&Of::Rest, Some(docs), true), Focus::Outside);
-        // A selected file is the one tile; the others stay as they are.
-        let file = Path::new(r"C:\Mail\jan.eml");
-        assert_eq!(focus(&outside, Some(file), false), Focus::Chosen);
-        assert_eq!(focus(&inside, Some(file), false), Focus::None);
-        assert_eq!(focus(&inside, None, false), Focus::None);
+    fn only_the_selected_file_gets_a_ring() {
+        let file = Of::File(PathBuf::from(r"c:\docs\Taxes\2023.pdf"));
+        let other = Of::File(PathBuf::from(r"C:\Mail\jan.eml"));
+        let selected = Path::new(r"C:\Docs\Taxes\2023.pdf");
+        assert!(chosen(&file, Some(selected)));
+        assert!(!chosen(&other, Some(selected)));
+        assert!(!chosen(&Of::Rest, Some(selected)));
+        // A selected folder marks no tile: the map holds only what is in it.
+        assert!(!chosen(&file, Some(Path::new(r"C:\Docs"))));
+        assert!(!chosen(&file, None));
     }
 
     #[test]

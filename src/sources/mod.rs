@@ -31,7 +31,7 @@ mod scan;
 mod testing;
 
 pub use auth::{SIGN_IN_TIMEOUT, Secrets, TokenStore};
-pub use scan::{Cursors, Scanned, findings, scan_remote};
+pub use scan::{CloudScan, Cursors, Scanned, findings, scan_clouds, scan_remote};
 
 use std::{
     fmt::{self, Write as _},
@@ -214,6 +214,26 @@ impl SignIn {
             Self::DropboxDelegated { .. } => matches!(provider, Provider::Dropbox),
             Self::BoxDelegated { .. } | Self::BoxApp { .. } => matches!(provider, Provider::Box),
         }
+    }
+
+    /// Where an administrator of a Microsoft tenant approves the app of this way for everybody in
+    /// it, for a way a person signs in to with Microsoft; `None` for the other ways. A tenant that
+    /// is no tenant of its own (`organizations`, `consumers`, `common`) leaves the administrator's
+    /// own tenant to the sign-in.
+    #[must_use]
+    pub fn admin_consent_url(&self) -> Option<String> {
+        let Self::MicrosoftDelegated { tenant, client_id } = self else {
+            return None;
+        };
+        let tenant = match tenant.trim() {
+            "" | "consumers" | "common" => "organizations",
+            tenant => tenant,
+        };
+        Some(format!(
+            "https://login.microsoftonline.com/{}/adminconsent?client_id={}",
+            http::encode(tenant),
+            http::encode(client_id.trim()),
+        ))
     }
 
     /// Whether a person signs in with a browser (the account has to be connected before it can
@@ -609,6 +629,37 @@ pub fn is_virtual(path: &Path) -> bool {
     parse_virtual(path).is_some()
 }
 
+/// How the window and its messages write a cloud path: the account's name, then each folder and
+/// the file, with `›` between them (`Example cloud › Shared › Clients › contacts.csv`); `None` for
+/// a path of this PC. The virtual form (`\\Google Drive\jan@acme.com\...`) is the inventory's own
+/// address and is never shown to a person: the provider is told by its logo.
+#[must_use]
+pub fn display_path(path: &Path) -> Option<String> {
+    let Virtual { label, rest, .. } = parse_virtual(path)?;
+    let mut shown = label;
+    for part in rest.components() {
+        shown.push_str(" \u{203a} ");
+        shown.push_str(&part.as_os_str().to_string_lossy());
+    }
+    Some(shown)
+}
+
+/// `path` as a person reads it in a message: [`display_path`] for a cloud path, the path itself
+/// for any other.
+#[must_use]
+pub fn shown(path: &Path) -> String {
+    display_path(path).unwrap_or_else(|| path.display().to_string())
+}
+
+/// `roots` (the locations of the inventory) split into the folders on this PC and the folders of
+/// cloud accounts, each in the order given. A cloud location is never looked at on this PC's file
+/// system: Windows would take its `\\Google Drive\...` for a network share and wait for a server
+/// that does not exist.
+#[must_use]
+pub fn split_roots(roots: &[PathBuf]) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    roots.iter().cloned().partition(|root| !is_virtual(root))
+}
+
 /// `name` as one part of a virtual path: a legal Windows file name. A character Windows does not
 /// allow in one (`\ / : * ? " < > |`) becomes its full-width look-alike, a control character
 /// `_`, a dot or space at the end `_`, and a name of a device (`CON`, `NUL`, `COM1`...) gets a `_`
@@ -889,6 +940,10 @@ pub enum Error {
     },
     /// The account may not read this: a permission or an administrator's consent is missing.
     Forbidden { provider: Provider, detail: String },
+    /// The organization lets only an administrator approve the app: nobody may sign in with it
+    /// until one has (Microsoft's `AADSTS65001`, `AADSTS90094`, `AADSTS90095`). The link that
+    /// approves it is [`SignIn::admin_consent_url`].
+    AdminApproval { provider: Provider, detail: String },
     /// The folder or file is not there (any more).
     NotFound { provider: Provider, detail: String },
     /// The service could not be reached, or did not answer in time.
@@ -970,6 +1025,7 @@ impl Error {
             Self::SignInNeeded { provider, .. }
             | Self::Throttled { provider, .. }
             | Self::Forbidden { provider, .. }
+            | Self::AdminApproval { provider, .. }
             | Self::NotFound { provider, .. }
             | Self::Network { provider, .. }
             | Self::Unexpected { provider, .. } => Some(*provider),
@@ -999,6 +1055,11 @@ impl fmt::Display for Error {
             Self::Forbidden { provider, .. } => write!(
                 f,
                 "{} does not allow piikey to read this. Check what piikey may read there.",
+                provider.name()
+            ),
+            Self::AdminApproval { provider, .. } => write!(
+                f,
+                "Your organization's administrator has to approve piikey before it can read {}. Send them the approval link.",
                 provider.name()
             ),
             Self::NotFound { provider, .. } => write!(
@@ -1106,9 +1167,54 @@ pub fn connect(
     session.connect(open, cancel)
 }
 
+/// The folders directly in `under`, a virtual path of the account `connector` reads; the top of
+/// the account (its drives, sites or "My Drive") for `None` and for the account's own path. What
+/// a person picks a location from.
+///
+/// # Errors
+/// `NotFound` when `under` is no folder of the account; the other errors of an account.
+pub fn browse(connector: &dyn Connector, under: Option<&Path>) -> Result<Vec<RemoteFolder>> {
+    let inside = under
+        .filter(|path| parse_virtual(path).is_some_and(|found| !found.rest.as_os_str().is_empty()));
+    match inside {
+        None => connector.browse(None),
+        Some(path) => {
+            let folder = connector.folder(path)?;
+            connector.browse(Some(&folder))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_approval_link_names_the_tenant_and_the_app() {
+        let link = |tenant: &str| {
+            SignIn::MicrosoftDelegated {
+                tenant: tenant.to_owned(),
+                client_id: "abc-123".to_owned(),
+            }
+            .admin_consent_url()
+        };
+        assert_eq!(
+            link("contoso.com").as_deref(),
+            Some("https://login.microsoftonline.com/contoso.com/adminconsent?client_id=abc-123")
+        );
+        assert_eq!(
+            link("organizations").as_deref(),
+            Some("https://login.microsoftonline.com/organizations/adminconsent?client_id=abc-123")
+        );
+        assert_eq!(link("consumers"), link("organizations"));
+        assert_eq!(
+            SignIn::GoogleDelegated {
+                client_id: "g".to_owned()
+            }
+            .admin_consent_url(),
+            None
+        );
+    }
 
     #[test]
     fn provider_names_and_ids_round_trip() {
@@ -1120,6 +1226,22 @@ mod tests {
             );
         }
         assert_eq!(Provider::parse("gdrive"), None);
+    }
+
+    #[test]
+    fn a_cloud_path_is_shown_as_the_account_and_the_folders_below_it() {
+        let shown = |path: &str| display_path(Path::new(path));
+        assert_eq!(
+            shown(r"\\Box\Example cloud\Shared\Clients\contacts.csv").as_deref(),
+            Some("Example cloud \u{203a} Shared \u{203a} Clients \u{203a} contacts.csv")
+        );
+        assert_eq!(
+            shown(r"\\Google Drive\jan@acme.com").as_deref(),
+            Some("jan@acme.com")
+        );
+        assert_eq!(shown(r"\\Dropbox\Work\").as_deref(), Some("Work"));
+        assert_eq!(shown(r"C:\Users\jan\a.txt"), None);
+        assert_eq!(shown(r"\\fileserver\share\x.txt"), None);
     }
 
     #[test]
@@ -1670,6 +1792,173 @@ mod tests {
             connect(&wrong, &tokens, &|_| {}, &stopped),
             Err(Error::Local(crate::Error::BadRequest(_)))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn the_locations_are_split_into_folders_of_this_pc_and_folders_of_accounts() {
+        let path = PathBuf::from;
+        let roots = [
+            path(r"C:\Docs"),
+            path(r"\\Google Drive\Work\Docs"),
+            // A share of a real server is a folder of this PC, whatever the server is called.
+            path(r"\\server\share\x"),
+            path(r"\\Dropbox\Work"),
+            path(r"D:\"),
+        ];
+        let (local, cloud) = split_roots(&roots);
+        assert_eq!(
+            local,
+            [path(r"C:\Docs"), path(r"\\server\share\x"), path(r"D:\")]
+        );
+        assert_eq!(
+            cloud,
+            [path(r"\\Google Drive\Work\Docs"), path(r"\\Dropbox\Work")]
+        );
+        let (local, cloud) = split_roots(&[]);
+        assert!(local.is_empty() && cloud.is_empty());
+        let (local, cloud) = split_roots(&[path(r"C:\Docs")]);
+        assert_eq!((local.len(), cloud.len()), (1, 0));
+    }
+
+    /// An account with a top (`Docs` and `Sheets`), a folder `Docs` and a file in it. It
+    /// remembers what it was asked.
+    struct Tree {
+        asked: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Tree {
+        fn new() -> Self {
+            Self {
+                asked: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn note(&self, what: String) {
+            self.asked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(what);
+        }
+
+        fn asked(&self) -> Vec<String> {
+            self.asked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        fn folder(id: &str, path: &str) -> RemoteFolder {
+            RemoteFolder {
+                id: id.to_owned(),
+                path: PathBuf::from(path),
+                web_url: String::new(),
+            }
+        }
+    }
+
+    impl Connector for Tree {
+        fn provider(&self) -> Provider {
+            Provider::Dropbox
+        }
+
+        fn browse(&self, under: Option<&RemoteFolder>) -> Result<Vec<RemoteFolder>> {
+            self.note(format!(
+                "browse {}",
+                under.map_or("top", |folder| &folder.id)
+            ));
+            Ok(match under.map(|folder| folder.id.as_str()) {
+                None => vec![
+                    Self::folder("docs", r"\\Dropbox\Work\Docs"),
+                    Self::folder("sheets", r"\\Dropbox\Work\Sheets"),
+                ],
+                Some("docs") => vec![Self::folder("sub", r"\\Dropbox\Work\Docs\Sub")],
+                Some(_) => Vec::new(),
+            })
+        }
+
+        fn resolve(&self, path: &Path) -> Result<Resolved> {
+            self.note(format!("resolve {}", path.display()));
+            if sys::same_path(path, Path::new(r"\\Dropbox\Work\Docs")) {
+                Ok(Resolved::Folder(Self::folder(
+                    "docs",
+                    r"\\Dropbox\Work\Docs",
+                )))
+            } else if sys::same_path(path, Path::new(r"\\Dropbox\Work\Docs\a.txt")) {
+                Ok(Resolved::File(RemoteItem {
+                    id: "a".to_owned(),
+                    path: path.to_path_buf(),
+                    size: 0,
+                    modified: SystemTime::UNIX_EPOCH,
+                    version: String::new(),
+                    web_url: String::new(),
+                    export: None,
+                }))
+            } else {
+                Err(Error::not_found(Provider::Dropbox, "no such item"))
+            }
+        }
+
+        fn changes(&self, _: &RemoteFolder, _: Option<&str>, _: &AtomicBool) -> Result<Changes> {
+            Err(Error::Cancelled)
+        }
+
+        fn download(&self, _: &RemoteItem, _: u64, _: &AtomicBool) -> Result<Vec<u8>> {
+            Err(Error::Cancelled)
+        }
+    }
+
+    fn paths_of(folders: Vec<RemoteFolder>) -> Vec<String> {
+        folders
+            .into_iter()
+            .map(|folder| folder.path.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn browsing_lists_the_top_for_no_path_and_for_the_accounts_own_path() -> Result<()> {
+        let tree = Tree::new();
+        let top = [r"\\Dropbox\Work\Docs", r"\\Dropbox\Work\Sheets"];
+        assert_eq!(paths_of(browse(&tree, None)?), top);
+        // The account's own path is no folder to look up: it is the top.
+        assert_eq!(
+            paths_of(browse(&tree, Some(Path::new(r"\\Dropbox\Work")))?),
+            top
+        );
+        assert_eq!(
+            paths_of(browse(&tree, Some(Path::new(r"\\dropbox\WORK\")))?),
+            top
+        );
+        assert_eq!(tree.asked(), ["browse top", "browse top", "browse top"]);
+        Ok(())
+    }
+
+    #[test]
+    fn browsing_a_deeper_path_looks_the_folder_up_and_then_lists_it() -> Result<()> {
+        let tree = Tree::new();
+        let sub = browse(&tree, Some(Path::new(r"\\Dropbox\Work\Docs")))?;
+        assert_eq!(paths_of(sub), [r"\\Dropbox\Work\Docs\Sub"]);
+        assert_eq!(
+            tree.asked(),
+            [
+                r"resolve \\Dropbox\Work\Docs".to_owned(),
+                "browse docs".to_owned()
+            ]
+        );
+
+        // What is not there, and a file, are `NotFound`, and nothing is listed.
+        let tree = Tree::new();
+        for gone in [r"\\Dropbox\Work\Missing", r"\\Dropbox\Work\Docs\a.txt"] {
+            let error = browse(&tree, Some(Path::new(gone)))
+                .err()
+                .ok_or_else(|| Error::from(crate::Error::BadRequest(gone.to_owned())))?;
+            assert!(matches!(error, Error::NotFound { .. }), "{gone}: {error:?}");
+        }
+        assert!(
+            tree.asked()
+                .iter()
+                .all(|asked| asked.starts_with("resolve "))
+        );
         Ok(())
     }
 }

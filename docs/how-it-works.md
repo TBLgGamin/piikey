@@ -73,8 +73,9 @@ The inventory records which files hold personal data. It scans only when somebod
 button on the Inventory page (which looks through your locations: there are none until you add
 one, and removing all of them leaves none), the box that adds one more folder or file, files and
 folders dropped on the page, Explorer's menu, `explorer_scan`, `scan_files` and `inventory_rescan`
-through the API and the CLI. Nothing scans on a timer. Scans run on one scan thread in a
-half-sized thread pool, and a scan you asked for goes before monitoring's queued changes.
+through the API and the CLI. Nothing scans on a timer, except that Monitor asks a cloud location
+what changed every 5 minutes (see Sources below). Scans run on one scan thread in a half-sized
+thread pool, and a scan you asked for goes before monitoring's queued changes.
 
 Removing a location breaks off at once. Queued scans lose that folder (one
 with nothing else left is dropped, and its dialog says it was stopped), the scan that runs under
@@ -93,7 +94,7 @@ as clean. The fingerprint is stored in the file but is never shown in the API, t
 
 The Inventory page shows the result as a dashboard, like a disk-usage viewer. A tree of folders and
 files has a bar by type on each row and follows the computer's real folders: its top is the drives
-(and network shares) that hold scanned files, such as `C:`, and below a drive come its real
+(and network shares) that hold scanned files, such as `C:`, and the cloud accounts that do (each with its provider's logo), and below a drive come its real
 folders down to the files, however they came to be scanned (the locations only say what the Scan
 button looks through; they group nothing). Rows come in Explorer's order, not by what they hold:
 the drives by letter and then the shares, and in a folder its folders and then its files, each by
@@ -105,10 +106,10 @@ tile for every file, nested by folder and coloured by type (up to 400 tiles, the
 files" tile); and a details pane describes what is selected. Selecting a tile opens the tree along
 the way to its file, from its drive. For a file the details can open it, show it in Explorer, show
 what was found or make a masked copy (beside the file; it never replaces an existing file); for a
-folder they can show only that folder, show it in Explorer or show what was found. What is listed
+folder they can show only that folder, show it in Explorer or show what was found. For an item of a cloud account Open opens its web page, and Show in Explorer and Make masked copy are not offered. What is listed
 was scanned already, so the details offer no scan. The inventory has no exclusions and no switch:
 what is in it is what was scanned in its locations. A scan of a path outside every location (Explorer, a drop, the box, the API) still shows its result dialog and findings view, but the inventory forgets those entries right after the scan. The box that adds a location has Browse
-buttons that open the Windows folder (or file) picker.
+buttons that open the Windows folder (or file) picker, and Browse cloud... picks a folder of a connected account.
 
 A scan started from the page, the box, a drop or Explorer opens a result dialog in the window
 (scanning, then how much was found, with Close on the left and "Show what was found" on the right
@@ -154,9 +155,77 @@ Turning Monitor off keeps what was found; removing the location forgets it. The 
 shows each monitored location as monitoring, scanning or not available, with the time of its last
 change.
 
+A cloud location has no file system to watch. Monitor on a cloud location asks the provider what
+changed in it when piikey starts and then every 5 minutes (see Sources), on the same scan thread, so
+a scan you asked for still goes first.
+
 An older `guard.cfg` with `watch_folder` folders keeps them as locations, monitored when its `watch`
 was `true`. The files of the separate store the old Watch kept (`watch.jsonl`, `watch.lock` and
 `watch.save.lock`) are deleted when the app starts; what they held is found again by the catch-up.
+
+### Sources
+
+Cloud accounts are inventory locations too: Microsoft 365 (SharePoint and OneDrive for work or
+school), OneDrive, Google Drive, Dropbox and Box. `src/sources/` has one connector per provider
+behind one interface: browse the folders, ask what changed since a cursor, download a file. It is
+all read-only: only read scopes and permissions are asked for, and nothing is ever written to a
+provider. How to set each provider up is in [sources.md](sources.md).
+
+**Accounts.** Settings > Connected accounts lists them. `sources.json` in the data folder keeps the
+settings that are not secret: for each account an id that never changes (16 hexadecimal digits), the
+provider, the name you gave it (unique per provider), and how it signs in with what that way needs
+(tenant, client or app ID, site and user addresses, the paths of key and certificate files). A client
+secret and the tokens are never in it: one file per account, `sources\<id>.token`, holds them,
+protected with DPAPI. A way that has a person sign in opens the browser and listens on a loopback
+address on this PC for the answer (the authorization code flow; PKCE where the provider has it), and
+the token store keeps a refresh token. An app that holds its own credentials (a client secret, a
+certificate, a Google service account key) asks for a token once when it is connected, which shows
+that the credentials work, and again when the token has run out. Every call goes over Windows' own
+TLS, so the Windows certificate store, and a company's inspection certificate in it, is trusted.
+
+**Administrator approval.** When Microsoft says only an administrator can approve the app
+(`AADSTS65001`, `AADSTS90094`, `AADSTS90095`), the sign-in ends in `AdminApproval` and the Add
+account dialog offers to copy the administrator's approval link (`/adminconsent?client_id=...`,
+`SignIn::admin_consent_url`).
+
+**Paths.** An item of an account is stored under a virtual path that looks like a network share,
+`\\<provider>\<account name>\<drive or site>\<folder>\<file>`, for example
+`\\Google Drive\jan@acme.com\My Drive\Clients\a.docx`. This address form is what the inventory
+keeps and what the API, the CLI, the export report and `--under` use. Every part is a legal Windows
+file name (a character Windows does not allow becomes its full-width look-alike), so the "is under"
+checks work on it as on any path. The window shows a readable form instead, the account name and
+then the folders (`jan@acme.com › My Drive › Clients › a.docx`), with the provider told by its logo,
+and the tree shows each account as a top-level node next to the drives.
+
+**Scanning.** A scan of a cloud location asks the account what changed in it since the location's
+cursor, reads the files that are new or changed, and forgets what is gone. A cursor is whatever the
+provider's change feed gives (a Microsoft Graph delta link, a Google changes token, a Dropbox
+cursor, a Box event position); `sources\cursors.json` keeps one per location. With no cursor, the
+first time, a cursor older than 7 days or one the provider no longer knows, the whole location is
+listed, and what the inventory holds under it that the listing does not name is forgotten. The
+week is because a feed cannot always say where a moved or renamed file used to be, so the full
+listing cleans up what such a move left behind. Each listed file carries a version, a content
+hash or a revision that changes when the contents do. A file whose version is the one stored is not
+read. A new or changed file is downloaded into memory (a file over 64 MB is skipped), read with the
+same formats and detectors as a file on this PC (a Google Docs, Sheets or Slides file is exported
+to Word, Excel or PowerPoint first), recorded as counts per type, and dropped. The values and the
+file never reach the disk. The scan reports through the same progress as a scan of this PC, so one
+run can cover both, and cancelling it keeps the old cursor, so what was not read is found next
+time.
+
+**Monitor.** A monitored cloud location is scanned from its cursor when piikey starts and every 5
+minutes, through the same scan thread as every other scan, so a scan you asked for goes first. It
+does not use the file system watcher.
+
+**Errors.** What goes wrong is said in words, never as an HTTP code. *Sign in again*: the provider
+no longer accepts what piikey holds. The scan stops and keeps its cursor, and after you sign in again
+the next scan finds the same changes. *Throttled*: the provider asked piikey to slow down. piikey
+waits as long as it asks, up to a minute inside one call, and tries again; a longer wait ends the
+scan, and the next scan, or the next 5 minutes of Monitor, goes on. *No permission*: a permission or
+an administrator's consent is missing; a file the account does not let piikey read is recorded as
+one that failed, with a sentence that says what to do. *Folder gone*: the location is no longer in
+the account; nothing is forgotten. A connection that fails is tried again a few times and then
+reported as unreachable.
 
 ## API
 
@@ -204,7 +273,7 @@ under it that is a button to Overview.
 - **Inventory**: the Scan button, Export report, the locations (the folders the button looks
   through, as rows: what each holds, a Monitor switch and a Remove button; a monitored row also says
   when it is scanning, when it last saw a change, or why it cannot be monitored), the box that adds a
-  folder or file and scans it, a status line (progress or what the inventory holds) and the
+  folder or file and scans it (Browse cloud... beside Browse folder... picks a folder of a connected account), a status line (progress or what the inventory holds) and the
   dashboard described under Inventory and Explorer above. Files and folders dropped on the page are
   scanned.
   The scan result dialog and the details of a file or folder lead to the findings view.
@@ -216,9 +285,11 @@ under it that is a button to Overview.
   file in Downloads. The feed persists in `%LOCALAPPDATA%\piikey\activity.cfg`, which holds
   stand-ins, sites, apps and times only; the values themselves stay in the encrypted vault.
   Forgetting a value also removes its lines from the feed.
-- **Settings**: one scrolling page with five sections. General has Start piikey when I sign in,
+- **Settings**: one scrolling page with six sections. General has Start piikey when I sign in,
   Scan for personal data in Explorer (the right-click menu entry) and Keep piikey running in the
-  tray when I close the window. Types of personal data has a switch for every type, all on by
+  tray when I close the window. Connected accounts lists the cloud accounts (each with its provider's
+  logo, name, how it signs in, status and Disconnect) and Add account, which opens a dialog: pick a
+  provider, pick how it signs in, fill in what that way needs, then Connect. Types of personal data has a switch for every type, all on by
   default; a value masked earlier still comes back after its type is switched off, and the setting
   applies to masking, the highlight, scans and the inventory. When the detection model was skipped
   or failed, a row above the types says so and has a button to download it or try again; a model
@@ -321,6 +392,9 @@ Everything piikey keeps is in `%LOCALAPPDATA%\piikey`, readable only by your Win
 | `guard.cfg` | protected sites and apps, types switched off, on/off, the highlight mode, the Explorer menu, whether closing the window keeps piikey in the tray, the inventory locations and which of them are monitored, and the HTTP API |
 | `activity.cfg` | the activity feed (stand-ins only) |
 | `inventory.jsonl` | per scanned file: size, write time, a fingerprint of the contents and how many values of each type it holds, never the values |
+| `sources.json` | the connected cloud accounts: provider, name, how each signs in and the non-secret values it needs (no secret, no token) |
+| `sources\<id>.token` | one file per account with its client secret and tokens, protected with DPAPI |
+| `sources\cursors.json` | where each cloud location's scan left off (a cursor older than 7 days is ignored) |
 | `api.token` | the token the local HTTP API asks for |
 | `ca.crt`, `ca.key` | the local certificate; the key is wrapped with DPAPI |
 | `proxy.prev` | the previous Windows proxy settings, only while piikey has them changed |

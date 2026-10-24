@@ -3,8 +3,8 @@
 
 use std::{
     cell::RefCell,
-    path::PathBuf,
-    sync::{Arc, OnceLock, mpsc::Sender},
+    path::{Path, PathBuf},
+    sync::{Arc, OnceLock, atomic::AtomicBool, mpsc::Sender},
     time::Duration,
 };
 
@@ -18,6 +18,7 @@ use piikey::{
     inventory::{Inventory, remove_retired_files},
     policy::Policy,
     service::Server,
+    sources::{self, Account, Connector, TokenStore},
     sys::{data_dir, is_packaged, launch_path, write_atomic},
 };
 
@@ -25,7 +26,7 @@ use super::{
     activity::Activity,
     assets,
     controller::{Backend, Change, Running, Started},
-    watcher,
+    explorer, watcher,
 };
 use crate::{
     Describe, Res, ca,
@@ -54,6 +55,13 @@ pub struct System {
     /// What the local HTTP API serves. It needs the controller, which needs this backend, so
     /// [`ui::open`](super::open) fills it once the controller exists, before anything starts the API.
     pub api: Arc<OnceLock<Arc<dyn Handler>>>,
+}
+
+impl System {
+    /// The data folder: next to the vault, where the cloud accounts keep their tokens.
+    fn data(&self) -> &Path {
+        self.vault.parent().unwrap_or_else(|| Path::new("."))
+    }
 }
 
 impl Backend for System {
@@ -104,6 +112,33 @@ impl Backend for System {
 
     fn start_watch(&self, folders: &[PathBuf], changes: Sender<Change>) -> Res<Started> {
         watcher::start(folders, changes)
+    }
+
+    fn connector(&self, account: &Account) -> sources::Result<Box<dyn Connector>> {
+        // Debug builds only: the pretend account of `PIIKEY_FAKE_CLOUD` has no service behind it.
+        #[cfg(debug_assertions)]
+        if super::fake_cloud::enabled() && super::fake_cloud::is_fake(account) {
+            return Ok(Box::new(super::fake_cloud::FakeCloud::new(account)));
+        }
+        sources::connector(account, &TokenStore::new(self.data()))
+    }
+
+    fn connect(
+        &self,
+        account: &Account,
+        open: &dyn Fn(&str),
+        cancel: &AtomicBool,
+    ) -> sources::Result<()> {
+        // Debug builds only: nothing to sign in to, so no browser opens.
+        #[cfg(debug_assertions)]
+        if super::fake_cloud::enabled() && super::fake_cloud::is_fake(account) {
+            return Ok(());
+        }
+        sources::connect(account, &TokenStore::new(self.data()), open, cancel)
+    }
+
+    fn open_url(&self, url: &str) -> Res<()> {
+        explorer::open_url(url)
     }
 
     fn model_installed(&self) -> bool {

@@ -7,7 +7,10 @@
 //! than a screenful. The values are on screen and nowhere else: see
 //! [`FindingsView`](crate::ui::window::FindingsView).
 
-use piikey::inventory::{Busy, Location};
+use piikey::{
+    inventory::{Busy, Location},
+    sources,
+};
 use windows_reactor::{
     Border, Button, ButtonStyle, Callback, ComboBox, FontIcon, FontWeight, Grid, GridLength,
     HorizontalAlignment, ItemsRepeater, KeyedView, Orientation, ProgressRing, ScrollViewer,
@@ -21,7 +24,10 @@ use super::{
     report::scanned_what,
 };
 use crate::ui::{
-    pages::kit::{Context, caption, counted, glyph, kind_glyph, measured, subtitle, thousands},
+    pages::{
+        kit::{Context, caption, counted, glyph, kind_glyph, measured, subtitle, thousands},
+        lists::shown,
+    },
     window::{FindingsView, Msg, Reading, Row, Working},
 };
 
@@ -36,6 +42,12 @@ const OPEN_HINT: &str = "Open at this place";
 /// What the button of a row says once it could only open the file.
 const OPENED_ONLY: &str =
     "Opened the file. piikey cannot jump to the value in this app: search for it there.";
+/// What the button of a row of a file in the cloud says: the file opens in the browser.
+const CLOUD_HINT: &str =
+    "Open in your browser. piikey cannot jump to the value there: search for it.";
+/// What it says once the browser has opened the file.
+const CLOUD_OPENED_ONLY: &str =
+    "Opened in your browser. piikey cannot jump to the value there: search for it.";
 
 /// Where a value is in its file, in words: `line 12`, `page 3`, `Sheet1, cell B7`, `slide 4`,
 /// `slide 4, notes`. A paragraph is named by its page when the file knows it (the page is what a
@@ -376,7 +388,7 @@ fn whereabouts(row: &Row, single: bool) -> StackPanel {
                 .max_width(FILE_WIDTH)
                 .horizontal_alignment(HorizontalAlignment::Right)
                 .text_trimming(TextTrimming::CharacterEllipsis)
-                .tooltip(row.file.path.display().to_string()),
+                .tooltip(shown(&row.file.path)),
         );
     }
     if let Some(location) = &row.finding.location {
@@ -396,11 +408,17 @@ fn whereabouts(row: &Row, single: bool) -> StackPanel {
 }
 
 /// The button that opens the file at the place of the value. While one row is being opened every
-/// button waits, and the row itself shows a ring.
+/// button waits, and the row itself shows a ring. A file in the cloud opens in the browser, which
+/// the tooltip says: piikey cannot take the browser to the value.
 fn open_button(row: &Row, opened_only: bool, opening: Option<u32>, open: &Callback<Msg>) -> View {
     let id = row.id;
     let open = open.clone();
-    let hint = if opened_only { OPENED_ONLY } else { OPEN_HINT };
+    let hint = match (sources::is_virtual(&row.file.path), opened_only) {
+        (false, false) => OPEN_HINT,
+        (false, true) => OPENED_ONLY,
+        (true, false) => CLOUD_HINT,
+        (true, true) => CLOUD_OPENED_ONLY,
+    };
     let icon: View = if opening == Some(id) {
         ProgressRing::new()
             .is_active(true)

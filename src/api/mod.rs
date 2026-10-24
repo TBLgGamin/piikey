@@ -44,10 +44,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use self::{
-    local::{DownloadProgress, EngineSource, Local, PolicySource},
+    local::{ConnectorSource, DownloadProgress, EngineSource, Local, PolicySource, UrlOpener},
     token::read_or_create_token,
 };
-use crate::{Error, policy::SettingsPatch, vault::ExportFormat};
+use crate::{
+    Error,
+    policy::SettingsPatch,
+    sources::{Provider, SignIn},
+    vault::ExportFormat,
+};
 
 /// How an export or a report is written.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -104,28 +109,29 @@ pub enum Request {
         #[serde(default)]
         tolerant: bool,
     },
-    /// Scans files and folders (recursively). With `record`, what was found is also kept in
-    /// the inventory. Result: [`reply::Scanned`].
+    /// Scans files and folders on this PC (recursively). With `record`, what was found is also
+    /// kept in the inventory. A path in a cloud account is refused: its folders are scanned as
+    /// locations, by `inventory_rescan`. Result: [`reply::Scanned`].
     ScanFiles {
-        /// The files and folders to scan, as absolute paths.
+        /// The files and folders to scan, as absolute paths on this PC.
         #[schemars(extend("examples" = [["C:\\Users\\jan\\Documents"]]))]
         paths: Vec<PathBuf>,
         /// Whether to keep what was found in the inventory.
         #[serde(default = "yes")]
         record: bool,
     },
-    /// Masks files and folders into the folder `out`. Result: [`reply::Written`].
+    /// Masks files and folders on this PC into the folder `out`. Result: [`reply::Written`].
     AnonymizeFiles {
-        /// The files and folders to mask, as absolute paths.
+        /// The files and folders to mask, as absolute paths on this PC.
         #[schemars(extend("examples" = [["C:\\Users\\jan\\Documents"]]))]
         paths: Vec<PathBuf>,
         /// The folder the masked files are written to, as an absolute path.
         #[schemars(extend("examples" = ["C:\\Users\\jan\\Masked"]))]
         out: PathBuf,
     },
-    /// Restores files and folders into the folder `out`. Result: [`reply::Written`].
+    /// Restores files and folders on this PC into the folder `out`. Result: [`reply::Written`].
     DeanonymizeFiles {
-        /// The files and folders to restore, as absolute paths.
+        /// The files and folders to restore, as absolute paths on this PC.
         #[schemars(extend("examples" = [["C:\\Users\\jan\\Documents"]]))]
         paths: Vec<PathBuf>,
         /// The folder the restored files are written to, as an absolute path.
@@ -136,12 +142,14 @@ pub enum Request {
         tolerant: bool,
     },
     /// Which files hold the given values (a name, a phone number, an email address, ...); an
-    /// empty `paths` means the inventory's folders. Result: [`reply::Found`].
+    /// empty `paths` means the inventory's folders on this PC (a folder of a cloud account is
+    /// not searched). Result: [`reply::Found`].
     SubjectSearch {
         /// The values that identify the person: a name, a phone number, an email address, ...
         #[schemars(extend("examples" = [["Jan Jansen", "jan@acme.nl"]]))]
         values: Vec<String>,
-        /// The files and folders to look in, as absolute paths. Empty: the inventory's folders.
+        /// The files and folders to look in, as absolute paths on this PC. Empty: the inventory's
+        /// folders on this PC.
         #[serde(default)]
         paths: Vec<PathBuf>,
     },
@@ -211,9 +219,11 @@ pub enum Request {
         #[serde(skip_serializing_if = "Option::is_none")]
         under: Option<PathBuf>,
     },
-    /// Scans the inventory's folders (the locations it scans) now, and answers when the scan is
-    /// over: the inventory scans only when it is asked to. Result: the inventory's
-    /// [`Totals`](crate::inventory::Totals).
+    /// Scans the inventory's locations now (the folders on this PC and the folders of cloud
+    /// accounts, in one run), and answers when the scan is over: the inventory scans only when
+    /// it is asked to. A cloud location that cannot be read (its account has to sign in again,
+    /// or the service cannot be reached) is an error, answered after the other locations were
+    /// scanned. Result: the inventory's [`Totals`](crate::inventory::Totals).
     InventoryRescan,
     /// Writes the inventory's findings to a new file `path`. Result: [`reply::Reported`].
     InventoryReport {
@@ -232,6 +242,65 @@ pub enum Request {
         /// The settings to change. A setting that is left out stays as it is.
         #[schemars(extend("examples" = [{"highlight": "always"}]))]
         settings: SettingsPatch,
+    },
+    /// The cloud accounts piikey may read (Microsoft 365, `OneDrive`, Google Drive, Dropbox and
+    /// Box), in the order they were added, each with how it signs in and whether it is
+    /// connected. Result: [`reply::Accounts`].
+    AccountsList,
+    /// Adds a cloud account. The settings keep what the account needs to sign in; the client
+    /// secret, when its way to sign in has one, goes into the DPAPI-protected store of the data
+    /// folder and never into the settings. This does not sign in: `account_connect` does, and
+    /// the account's folders can be made locations of the inventory after that. Result:
+    /// [`reply::AccountInfo`].
+    AccountAdd {
+        /// The cloud service.
+        #[schemars(extend("examples" = ["dropbox"]))]
+        provider: Provider,
+        /// The name the account goes by, unique among the accounts of its service: a legal file
+        /// name, since it is a part of the paths of the account's folders.
+        #[schemars(extend("examples" = ["Work"]))]
+        label: String,
+        /// How the account signs in, with what that way needs. `mode` says which way it is.
+        #[schemars(extend("examples" = [{"mode": "dropbox_delegated", "app_key": "abc123"}]))]
+        sign_in: SignIn,
+        /// The client secret, for a way to sign in that has one (`microsoft_app` and
+        /// `microsoft_app_selected` with a `secret` credential, `google_delegated`,
+        /// `box_delegated`, `box_app`). It is required for those and ignored for the others.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schemars(extend("examples" = ["s3cret-value"]))]
+        client_secret: Option<String>,
+    },
+    /// Signs an account in and answers when that is done. A way to sign in with a browser
+    /// (`microsoft_delegated`, `google_delegated`, `dropbox_delegated`, `box_delegated`) opens
+    /// the browser, or `piikey-cli` run on its own prints the address to open, and waits up to
+    /// 5 minutes for the person to finish. An app that holds its own credentials is asked for
+    /// access once, which shows that the credentials work. Result: [`reply::AccountInfo`].
+    AccountConnect {
+        /// The account's id, as `accounts_list` shows it.
+        #[schemars(extend("examples" = ["3f9c2a7d41b8e605"]))]
+        id: String,
+    },
+    /// Removes an account: its locations come off the list of the inventory (and so are no
+    /// longer monitored), the inventory forgets its files, and its secrets, settings and the
+    /// places piikey had reached in its change feeds are deleted. Nothing in the account itself
+    /// changes. Result: [`reply::AccountRemoved`].
+    AccountRemove {
+        /// The account's id, as `accounts_list` shows it.
+        #[schemars(extend("examples" = ["3f9c2a7d41b8e605"]))]
+        id: String,
+    },
+    /// The folders directly in `under`, a path of the account, or without it the top of the
+    /// account (its drives, sites or "My Drive"): what a location of the inventory is picked
+    /// from. Result: [`reply::Folders`].
+    AccountBrowse {
+        /// The account's id, as `accounts_list` shows it.
+        #[schemars(extend("examples" = ["3f9c2a7d41b8e605"]))]
+        id: String,
+        /// The folder to look in, a path from an earlier answer. Without it: the top of the
+        /// account.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schemars(extend("examples" = ["\\\\Dropbox\\Work"]))]
+        under: Option<PathBuf>,
     },
     /// Every type of personal data. Result: a list of [`reply::Kind`].
     Kinds,
@@ -270,7 +339,7 @@ pub enum Request {
 
 impl Request {
     /// The names of all ops, as they are spelled in `op` and in HTTP paths.
-    pub const OPS: [&'static str; 26] = [
+    pub const OPS: [&'static str; 31] = [
         "scan_text",
         "anonymize",
         "deanonymize",
@@ -289,6 +358,11 @@ impl Request {
         "inventory_report",
         "settings_get",
         "settings_set",
+        "accounts_list",
+        "account_add",
+        "account_connect",
+        "account_remove",
+        "account_browse",
         "kinds",
         "model_status",
         "model_download",
@@ -321,6 +395,11 @@ impl Request {
             Self::InventoryReport { .. } => "inventory_report",
             Self::SettingsGet => "settings_get",
             Self::SettingsSet { .. } => "settings_set",
+            Self::AccountsList => "accounts_list",
+            Self::AccountAdd { .. } => "account_add",
+            Self::AccountConnect { .. } => "account_connect",
+            Self::AccountRemove { .. } => "account_remove",
+            Self::AccountBrowse { .. } => "account_browse",
             Self::Kinds => "kinds",
             Self::ModelStatus => "model_status",
             Self::ModelDownload => "model_download",
@@ -532,6 +611,23 @@ pub fn require_absolute(path: &Path) -> Result<(), ApiError> {
     }
 }
 
+/// Checks that `path` of a request is an absolute path on this PC: a path in a cloud account
+/// (`\\Google Drive\...`) is no file of this PC, and Windows would take it for a share of a
+/// server that is not there. A cloud folder is scanned as a location of the inventory.
+///
+/// # Errors
+/// `bad_request` for a path that is not absolute, or is in a cloud account.
+pub fn require_on_this_pc(path: &Path) -> Result<(), ApiError> {
+    require_absolute(path)?;
+    if crate::sources::is_virtual(path) {
+        return Err(ApiError::bad_request(format!(
+            "{} is in a cloud account. Add its folder to the inventory's locations and scan the locations instead.",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// A JSON object of `fields`, in the order given.
 fn object<const N: usize>(fields: [(&'static str, Value); N]) -> Value {
     Value::Object(
@@ -697,6 +793,21 @@ mod tests {
             Request::SettingsSet {
                 settings: SettingsPatch::default(),
             },
+            Request::AccountsList,
+            Request::AccountAdd {
+                provider: Provider::Dropbox,
+                label: "Work".into(),
+                sign_in: SignIn::DropboxDelegated {
+                    app_key: "abc".into(),
+                },
+                client_secret: None,
+            },
+            Request::AccountConnect { id: "1".into() },
+            Request::AccountRemove { id: "1".into() },
+            Request::AccountBrowse {
+                id: "1".into(),
+                under: None,
+            },
             Request::Kinds,
             Request::ModelStatus,
             Request::ModelDownload,
@@ -814,6 +925,81 @@ mod tests {
         let shown = format!("{request:?}");
         assert!(shown.contains("scan_text"));
         assert!(!shown.contains("jan.jansen"), "{shown}");
+    }
+
+    #[test]
+    fn debug_never_shows_the_client_secret_of_an_account() -> TestResult {
+        let request = Request::AccountAdd {
+            provider: Provider::Box,
+            label: "Team".into(),
+            sign_in: SignIn::BoxDelegated {
+                client_id: "id-1".into(),
+            },
+            client_secret: Some("hunter2-secret".into()),
+        };
+        let shown = format!("{request:?}");
+        assert!(shown.contains("account_add"));
+        assert!(
+            !shown.contains("hunter2") && !shown.contains("id-1"),
+            "{shown}"
+        );
+        // On the wire it is there: the handler needs it.
+        assert!(serde_json::to_string(&request)?.contains("hunter2-secret"));
+        Ok(())
+    }
+
+    #[test]
+    fn the_account_ops_take_what_they_say_and_leave_the_rest_out() -> TestResult {
+        let add: Request = serde_json::from_str(
+            r#"{"op":"account_add","provider":"google_drive","label":"Me","sign_in":{"mode":"google_delegated","client_id":"c"}}"#,
+        )?;
+        assert_eq!(
+            add,
+            Request::AccountAdd {
+                provider: Provider::GoogleDrive,
+                label: "Me".into(),
+                sign_in: SignIn::GoogleDelegated {
+                    client_id: "c".into()
+                },
+                client_secret: None,
+            }
+        );
+        let browse: Request = serde_json::from_str(r#"{"op":"account_browse","id":"ab"}"#)?;
+        assert_eq!(
+            browse,
+            Request::AccountBrowse {
+                id: "ab".into(),
+                under: None
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&browse)?,
+            json!({"op": "account_browse", "id": "ab"})
+        );
+        assert_eq!(
+            serde_json::to_value(Request::AccountAdd {
+                provider: Provider::Dropbox,
+                label: "W".into(),
+                sign_in: SignIn::DropboxDelegated {
+                    app_key: "k".into()
+                },
+                client_secret: None,
+            })?,
+            json!({"op": "account_add", "provider": "dropbox", "label": "W",
+                   "sign_in": {"mode": "dropbox_delegated", "app_key": "k"}})
+        );
+        for bad in [
+            r#"{"op":"account_connect"}"#,
+            r#"{"op":"account_remove","id":"a","yes":true}"#,
+            r#"{"op":"account_add","provider":"icloud","label":"x","sign_in":{"mode":"dropbox_delegated","app_key":"k"}}"#,
+            r#"{"op":"account_add","provider":"dropbox","label":"x","sign_in":{"mode":"dropbox_oauth"}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Request>(bad).is_err(),
+                "accepted {bad}"
+            );
+        }
+        Ok(())
     }
 
     #[test]

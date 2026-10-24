@@ -452,3 +452,161 @@ fn any_other_write_error_is_exit_three() {
     assert_eq!(got.exit, Exit::Failed);
     assert!(got.err.contains("disk full"), "{}", got.err);
 }
+
+fn added_account() -> Value {
+    json!({
+        "id": "3f9c2a7d41b8e605",
+        "provider": "box",
+        "label": "Team",
+        "sign_in": {"mode": "box_delegated", "client_id": "c"},
+        "path": r"\\Box\Team",
+        "connected": false,
+    })
+}
+
+const ADD_BOX: [&str; 10] = [
+    "account",
+    "add",
+    "box",
+    "--label",
+    "Team",
+    "--mode",
+    "box_delegated",
+    "--client-id",
+    "c",
+    "--client-secret-stdin",
+];
+
+#[test]
+fn the_client_secret_is_the_first_line_of_stdin_and_goes_only_into_the_request() {
+    let got = ran(
+        &ADD_BOX,
+        b"  s3cret value \r\nsecond line",
+        vec![Ok(added_account())],
+    );
+    assert_eq!(got.exit, Exit::Ok);
+    assert_eq!(
+        got.asked,
+        [Request::AccountAdd {
+            provider: piikey::sources::Provider::Box,
+            label: "Team".to_owned(),
+            sign_in: SignIn::BoxDelegated {
+                client_id: "c".to_owned()
+            },
+            client_secret: Some("s3cret value".to_owned()),
+        }]
+    );
+    assert!(!got.out.contains("s3cret") && !got.err.contains("s3cret"));
+    assert!(
+        got.out
+            .contains("not connected yet: piikey-cli account connect 3f9c2a7d41b8e605 signs in"),
+        "{}",
+        got.out
+    );
+    // A secret with no line break after it is read to the end of stdin.
+    let bare = ran(&ADD_BOX, b"abc", vec![Ok(added_account())]);
+    assert!(matches!(
+        bare.asked.as_slice(),
+        [Request::AccountAdd { client_secret: Some(secret), .. }] if secret == "abc"
+    ));
+}
+
+#[test]
+fn a_client_secret_that_is_not_there_stops_the_command_before_it_asks() {
+    for stdin in [&b""[..], b"\n", b"   \r\nsecret", &[0xff, 0xfe, b'\n']] {
+        let got = ran(&ADD_BOX, stdin, vec![]);
+        assert_eq!(got.exit, Exit::Failed, "{stdin:?}");
+        assert!(got.asked.is_empty(), "{stdin:?}");
+        assert!(got.err.contains("client secret"), "{}", got.err);
+    }
+    let long = vec![b'x'; 5000];
+    let got = ran(&ADD_BOX, &long, vec![]);
+    assert_eq!(got.exit, Exit::Failed);
+    assert!(got.err.contains("too long"), "{}", got.err);
+}
+
+#[test]
+fn the_files_of_an_account_are_made_absolute_but_a_path_of_an_account_is_left_alone()
+-> io::Result<()> {
+    let mut add = Request::AccountAdd {
+        provider: piikey::sources::Provider::GoogleDrive,
+        label: "Workspace".to_owned(),
+        sign_in: SignIn::GoogleServiceAccount {
+            key_file: PathBuf::from("key.json"),
+            users: vec!["a@acme.nl".to_owned()],
+        },
+        client_secret: None,
+    };
+    make_absolute(&mut add)?;
+    let Request::AccountAdd {
+        sign_in: SignIn::GoogleServiceAccount { key_file, .. },
+        ..
+    } = &add
+    else {
+        return Err(io::Error::other("the request changed its kind"));
+    };
+    assert!(key_file.is_absolute(), "{key_file:?}");
+    assert!(key_file.ends_with("key.json"));
+
+    let mut certificate = Request::AccountAdd {
+        provider: piikey::sources::Provider::Microsoft365,
+        label: "App".to_owned(),
+        sign_in: SignIn::MicrosoftApp {
+            tenant: "t".to_owned(),
+            client_id: "c".to_owned(),
+            credential: Credential::Certificate {
+                key_file: PathBuf::from("k.pem"),
+                cert_file: PathBuf::from("c.pem"),
+            },
+        },
+        client_secret: None,
+    };
+    make_absolute(&mut certificate)?;
+    let Request::AccountAdd {
+        sign_in:
+            SignIn::MicrosoftApp {
+                credential:
+                    Credential::Certificate {
+                        key_file,
+                        cert_file,
+                    },
+                ..
+            },
+        ..
+    } = &certificate
+    else {
+        return Err(io::Error::other("the request changed its kind"));
+    };
+    assert!(key_file.is_absolute() && cert_file.is_absolute());
+
+    // `\\Dropbox\Work\Docs` is not a folder of this PC: it is the same however it is written.
+    let virtual_path = PathBuf::from(r"\\Dropbox\Work\Docs");
+    let mut browse = Request::AccountBrowse {
+        id: "ab".to_owned(),
+        under: Some(virtual_path.clone()),
+    };
+    make_absolute(&mut browse)?;
+    assert_eq!(
+        browse,
+        Request::AccountBrowse {
+            id: "ab".to_owned(),
+            under: Some(virtual_path)
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn the_help_lists_the_account_commands() {
+    for line in [
+        "piikey-cli account list | connect ID | remove ID --yes | browse ID [--under PATH]",
+        "piikey-cli account add PROVIDER --label NAME",
+    ] {
+        assert!(
+            USAGE
+                .lines()
+                .any(|usage| usage.trim_start().starts_with(line)),
+            "{line}"
+        );
+    }
+}

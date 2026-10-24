@@ -43,7 +43,8 @@ in four ways:
   and see which of them hold personal data, in a WinDirStat-style dashboard. Open a file or a
   folder to read the values themselves, with where each one sits (line, page or cell) and a
   button that opens the file at that place. Nothing is scanned until you ask, and a rescan reads
-  only what changed. The inventory keeps only what lies in your locations. Switch on Monitor for a location and piikey looks at a file again a moment after it changes.
+  only what changed. The inventory keeps only what lies in your locations, and a location can be a
+  folder in Microsoft 365, OneDrive, Google Drive, Dropbox or Box ([cloud locations](docs/sources.md)). Switch on Monitor for a location and piikey looks at a file again a moment after it changes.
 - **Manage what is kept.** Search the vault, forget values and export it. The CLI and the API
   also find every file that mentions a person, and gate scripts and CI on personal data.
 
@@ -75,7 +76,7 @@ back into your values by `piikey-cli deanonymize --tolerant`: the full names, th
   </tr>
   <tr>
     <td><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/icons/dark/inventory.svg"><img src="docs/assets/icons/light/inventory.svg" width="28" height="28" alt=""></picture></td>
-    <td><b>Inventory</b><br>Scan your folders and see where personal data is stored, in a dashboard like a disk-usage viewer: a tree of your real folders from the drives down (<code>C:</code>, Users, ...) in Explorer's order with a bar by type on each row, a legend of the types found, a treemap with a tile for every file, and details with actions per file: open, show in Explorer, show what was found, make a masked copy. <b>Show what was found</b> lists every value with its type, the text around it and where it is (line, page, sheet and cell), searchable and filterable by type and file, and <b>Open at this place</b> jumps to it in the file. The values are read when you ask and never stored. Add folders and files with Browse or by dropping them on the page, and write a CSV with Export report. It scans when you ask, and skips files that did not change. The inventory keeps only what lies in your locations: a file or folder scanned from outside them (Explorer, a drop, the box) still shows its result and what was found, but is forgotten from the inventory right after. Switch on <b>Monitor</b> for a location and its files are looked at again a moment after they change; each location says what it holds and what monitoring is doing.</td>
+    <td><b>Inventory</b><br>Scan your folders and see where personal data is stored, in a dashboard like a disk-usage viewer: a tree of your real folders from the drives down (<code>C:</code>, Users, ...) in Explorer's order with a bar by type on each row, a legend of the types found, a treemap with a tile for every file, and details with actions per file: open, show in Explorer, show what was found, make a masked copy. <b>Show what was found</b> lists every value with its type, the text around it and where it is (line, page, sheet and cell), searchable and filterable by type and file, and <b>Open at this place</b> jumps to it in the file. The values are read when you ask and never stored. Add folders and files with Browse or by dropping them on the page, and write a CSV with Export report. It scans when you ask, and skips files that did not change. The inventory keeps only what lies in your locations: a file or folder scanned from outside them (Explorer, a drop, the box) still shows its result and what was found, but is forgotten from the inventory right after. Switch on <b>Monitor</b> for a location and its files are looked at again a moment after they change; each location says what it holds and what monitoring is doing. <b>Cloud locations</b>: connect Microsoft 365 (SharePoint and OneDrive for work or school), OneDrive, Google Drive, Dropbox or Box in Settings, pick a folder with <b>Browse cloud...</b>, and it is scanned like a folder on this PC, read-only and into memory, never stored. A monitored cloud location is asked what changed every 5 minutes. <a href="docs/sources.md">How to connect each provider</a>.</td>
   </tr>
   <tr>
     <td><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/icons/dark/subject.svg"><img src="docs/assets/icons/light/subject.svg" width="28" height="28" alt=""></picture></td>
@@ -103,7 +104,7 @@ back into your values by `piikey-cli deanonymize --tolerant`: the full names, th
   </tr>
   <tr>
     <td><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/icons/dark/local.svg"><img src="docs/assets/icons/light/local.svg" width="28" height="28" alt=""></picture></td>
-    <td><b>Nothing leaves your PC</b><br>No cloud service or account, no browser extension. The project's own code is 100% safe Rust (<code>unsafe</code> is forbidden).</td>
+    <td><b>Nothing leaves your PC</b><br>No piikey cloud service or account, no browser extension. Cloud locations you connect are read from the provider, read-only, into memory. The project's own code is 100% safe Rust (<code>unsafe</code> is forbidden).</td>
   </tr>
 </table>
 
@@ -163,10 +164,12 @@ keeps are described in [docs/how-it-works.md](docs/how-it-works.md).
   protected sites and the protected apps. The certificate is installed from Overview.
 - **Inventory** is where you scan. It lists your locations (none until you add one) with what each
   holds, a Monitor switch (on: piikey keeps an eye on the location and looks at a file again a
-  moment after it changes; it says when it is scanning, when it last saw a change, or why it cannot
-  monitor) and a Remove button, which also breaks off a scan of it. The Scan button looks through
-  them; the box below scans one more folder or file, with Browse buttons for the Windows pickers,
-  and you can drop files and folders from Explorer onto the page.
+  moment after it changes; a cloud location is asked what changed every 5 minutes instead; it says
+  when it is scanning, when it last saw a change, or why it cannot monitor) and a Remove button,
+  which also breaks off a scan of it. The Scan button looks through them; the box below scans one
+  more folder or file, with Browse buttons for the Windows pickers, and Browse cloud... picks a
+  folder of a connected account (see [cloud locations](docs/sources.md)). You can drop files and
+  folders from Explorer onto the page.
   - A scan that you start from the page, the box, a drop or Explorer ends in a **result dialog**:
     while it runs, a bar for the whole scan and one for each file being read; afterwards how much
     was found, by type, with Close and Show what was found. Closing it while it runs stops the
@@ -193,9 +196,11 @@ keeps are described in [docs/how-it-works.md](docs/how-it-works.md).
   so keep it safe.
 - **Settings** is one scrolling page: General (Start piikey when I sign in, Scan for personal data
   in Explorer, which adds the right-click entry, and Keep piikey running in the tray when I close
-  the window), Types of personal data, Developer access (the local HTTP API switch, a link to the
-  API reference and the token), Privacy & data (the data folder, with Open folder) and About. A
-  row for the detection model appears only when it was skipped or failed.
+  the window), Connected accounts (the Microsoft 365, OneDrive, Google Drive, Dropbox and Box
+  accounts piikey reads, each with how it signs in, its status and Disconnect, and Add account),
+  Types of personal data, Developer access (the local HTTP API switch, a link to the API reference
+  and the token), Privacy & data (the data folder, with Open folder) and About. A row for the
+  detection model appears only when it was skipped or failed.
 
 The tray icon shows the same status as Overview (the key in grey while protection is off, the app
 icon while it is on, with an amber dot when it needs you). Its menu has Open piikey, Turn protection
@@ -216,13 +221,13 @@ piikey starts in the tray at sign-in without a window.
     <td width="50%">
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/inventory-dark.png">
-        <img alt="Inventory page: the locations with their Monitor switches, the Scan button and the dashboard, with a tree of the real folders and files that hold personal data from the drive down, the types found, a treemap of the files and the details of the selection" src="docs/assets/screenshots/inventory-light.png">
+        <img alt="Inventory page: the locations with their Monitor switches, one of them a cloud location, the Scan button and the dashboard, with a tree of the real folders and files that hold personal data from the drive down and a cloud account as a top-level node next to the drives, the types found, a treemap of the files and the details of the selection" src="docs/assets/screenshots/inventory-light.png">
       </picture>
     </td>
   </tr>
   <tr>
     <td><b>Protection</b>: what piikey masks and highlights. The highlighting mode and the sites and apps you protect.</td>
-    <td><b>Inventory</b>: where personal data is stored on this PC, as a tree of your real folders from the drive down, a legend of types and a treemap with a tile for every file, from what you scanned.</td>
+    <td><b>Inventory</b>: where personal data is stored on this PC and in your cloud accounts, as a tree of your real folders from the drive down, a legend of types and a treemap with a tile for every file, from what you scanned.</td>
   </tr>
   <tr>
     <td width="50%">
@@ -234,13 +239,13 @@ piikey starts in the tray at sign-in without a window.
     <td width="50%">
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/settings-dark.png">
-        <img alt="Settings page: start at sign-in, the Explorer menu entry, keep running in the tray, the types of personal data, developer access, privacy and data, and about" src="docs/assets/screenshots/settings-light.png">
+        <img alt="Settings page: start at sign-in, the Explorer menu entry, keep running in the tray, a Connected accounts section with an account, the types of personal data, developer access, privacy and data, and about" src="docs/assets/screenshots/settings-light.png">
       </picture>
     </td>
   </tr>
   <tr>
     <td><b>Vault</b>: every value next to its stand-in, most recently swapped first, with search and filters by type, site and time, and Forget for the ticked ones (its button sits above the list, next to Select all).</td>
-    <td><b>Settings</b>: start at sign-in, the Explorer menu, whether closing the window keeps piikey in the tray, the types of personal data piikey looks for, the local HTTP API, and where your data is kept.</td>
+    <td><b>Settings</b>: start at sign-in, the Explorer menu, whether closing the window keeps piikey in the tray, the connected cloud accounts, the types of personal data piikey looks for, the local HTTP API, and where your data is kept.</td>
   </tr>
   <tr>
     <td width="50%">
@@ -396,6 +401,8 @@ piikey-cli vault export --out FILE [--format json|csv]
 piikey-cli vault wipe --yes
 piikey-cli inventory status | list [--under PATH] [--limit N] [--offset N] | tree [--under PATH] | rescan | report --out FILE [--format json|csv]
 piikey-cli settings get | settings set KEY=VALUE...      keys = guard.cfg keys; list keys repeat (site=a site=b)
+piikey-cli account list | connect ID | remove ID --yes | browse ID [--under PATH]
+piikey-cli account add PROVIDER --label NAME [--mode MODE] [--tenant T] [--client-id ID] [--app-key KEY] [--key-file FILE] [--cert-file FILE] [--site URL ...] [--user EMAIL ...] [--enterprise-id ID | --user-id ID] [--client-secret-stdin]
 piikey-cli kinds | model status | model download | token [--rotate] | status | protection on|off
 piikey-cli open      brings the running app's window forward (needs the app)
 piikey-cli serve [--http [--port N]] [--pipe NAME]
@@ -482,7 +489,9 @@ Checks: `cargo fmt-check`, `cargo lint`, and `cargo test --all-targets`.
 ## Privacy and security
 
 - Everything runs locally. piikey makes one network call of its own: the model download from
-  Hugging Face, which is checked with SHA-256.
+  Hugging Face, which is checked with SHA-256. When you connect a cloud account piikey also calls
+  that provider's API, read-only, with the access you gave. Files are read into memory and dropped,
+  and values are never stored.
 - Your values are kept in one place only, the encrypted vault in `%LOCALAPPDATA%\piikey`, apart
   from what you export. The list of swaps on the Vault page keeps stand-ins, sites and times. The
   inventory keeps paths, counts per type and a fingerprint of each file's contents,
@@ -511,6 +520,8 @@ are automated by release-plz, so never edit them by hand.
 [MIT](LICENSE) © 2026 TBLgGamin. [NOTICE.md](NOTICE.md) lists the third-party components (the
 detection model, ONNX Runtime, DirectML and the Windows App SDK runtime). Every release includes
 `THIRD_PARTY_LICENSES.html` for the Rust crates.
+
+**Trademarks.** Microsoft 365, SharePoint, OneDrive, Google Drive, Dropbox and Box are trademarks of their owners. piikey uses their names and logos only to identify the integrations, and is independent of these companies (Box, Inc. and its affiliates included) and not endorsed or sponsored by them. Google Drive is a trademark of Google Inc. Use of this trademark is subject to [Google Permissions](https://www.google.com/permissions/index.html).
 
 **Acknowledgements:**
 - [bardsai/eu-pii-anonimization-multilang-v2](https://huggingface.co/bardsai/eu-pii-anonimization-multilang-v2), the detection model

@@ -33,13 +33,13 @@ fn rig_monitoring(folders: &[&Path]) -> Result<Rig, String> {
 }
 
 /// Waits until monitoring has scanned and the inventory holds `totals`.
-fn watch_holds(rig: &Rig, totals: (u64, u64)) -> Result<Snapshot, String> {
+pub(super) fn watch_holds(rig: &Rig, totals: (u64, u64)) -> Result<Snapshot, String> {
     wait_for(&rig.controller, |s| {
         s.inventory_totals == totals && s.watch.scanning.is_none()
     })
 }
 
-fn statuses(snapshot: &Snapshot) -> Vec<FolderStatus> {
+pub(super) fn statuses(snapshot: &Snapshot) -> Vec<FolderStatus> {
     snapshot
         .watch
         .folders

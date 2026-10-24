@@ -4,15 +4,15 @@ Official logos of the cloud providers piikey can connect to. They are used only 
 identify the matching integration (account rows, the provider picker, location rows,
 the tree, and the details pane). Do not recolour, distort, crop, redraw or combine them.
 Keep clear space around them (Microsoft publishes 1/4 of the icon size as the minimum;
-Google and Dropbox state no figure, but require the logo to stay unaltered, and Dropbox
+Google, Dropbox and Box state no figure, but require the logo to stay unaltered, and Dropbox
 requires that our own name and logo are more prominent than theirs).
 
 Names and logos are trademarks of their owners and are used only to identify the
-integrations. No provider endorses or sponsors piikey.
+integrations. piikey is independent of these companies and not endorsed by them.
 
-All files were fetched on **2026-10-24** and are stored byte-for-byte as served
-(no editing, no recolouring, no metadata stripping needed). None contains scripts,
-external references or fonts.
+All files were fetched on **2026-10-24** and are stored byte-for-byte as served (no editing,
+no recolouring, no metadata stripping needed), except for one change of form in Box's two files,
+described under Box. None contains scripts, external references or fonts.
 
 | File | Provider | Dark or mono variant |
 |---|---|---|
@@ -21,7 +21,7 @@ external references or fonts.
 | `microsoft365.svg` | Microsoft 365 | none shipped |
 | `google-drive.svg` | Google Drive | none shipped |
 | `dropbox.svg` | Dropbox (glyph) | none shipped as SVG (see below) |
-| `box.svg` | Box | **missing**, see "Not obtained" |
+| `box.svg`, `box-dark.svg` | Box | `box-dark.svg`: Box's white logo, for dark backgrounds |
 
 ## Microsoft: `sharepoint.svg`, `onedrive.svg`, `microsoft365.svg`
 
@@ -91,20 +91,32 @@ external references or fonts.
   (PNG sizes 16 to 128 and the one SVG). Dropbox's partner guidelines define "Blue Night"
   (`#3984FF`) for use on Graphite for accessibility, but ship no file in it.
 
-## Not obtained: `box.svg`
+## Box: `box.svg`, `box-dark.svg`
 
-- **Source pages:** Box Branding 101 (<https://support.box.com/hc/en-us/articles/360052362674-Box-Branding-101-Guidelines-and-Assets>)
-  points to the Box brand asset kit (<https://cloud.app.box.com/v/ExternalBrandAssets>, folder
-  "01 Box Corporate Logo") and the Box Brand Style Guide
-  (<https://cloud.box.com/v/externalstyleguide>). The kit is a JavaScript Box shared folder
-  with no direct file URLs, so it could not be downloaded from the command line.
-- **Terms:** <https://www.box.com/legal/trademark> says that, unless a licence or other
-  agreement with Box allows it, "third parties generally may not use any Box logo for any
-  purpose", and that even to describe a relationship with Box a logo may not be used "in the
-  absence of an agreement or express written authorization from Box". Contact the Box
-  Partners team at <integrate@box.com> for that authorisation (and ask whether an
-  integration badge exists), then download the logo from the asset kit above into `box.svg`.
-  If a licence is granted, the required line is: "Box® is a registered trademark of Box, Inc.,
-  and/or its affiliates in the United States and other countries", and the material must state
-  that it is independent of Box.
-- Until then, the UI shows the plain word "Box" with no logo. No unofficial copy was used.
+- **Source page:** Box Developer Branding Guidelines,
+  <https://developer.box.com/platform/appendix/branding-guidelines> (source:
+  <https://github.com/box/developer.box.com/blob/main/content/pages/platform/appendix/branding-guidelines.md>).
+  Its "Approved logos" link is the Box shared folder <https://cloud.app.box.com/v/BoxCorporateLogo>,
+  folder "Web and Screen use (RGB)".
+- **Direct download URLs** (Box's own shared-file download):
+  - `box.svg` is "Box Logo_Blue (0061D5).svg":
+    `https://cloud.app.box.com/index.php?rm=box_download_shared_file&vanity_name=BoxCorporateLogo&file_id=f_693523938544`
+  - `box-dark.svg` is "Box Logo_White (FFFFFF).svg":
+    `https://cloud.app.box.com/index.php?rm=box_download_shared_file&vanity_name=BoxCorporateLogo&file_id=f_1814847335727`
+- **Date fetched:** 2026-10-24.
+- **Terms:** the Developer Branding Guidelines say: "Many apps feature a 'connect to cloud
+  services' menu, or something similar. In this case, you should feel free to use our name and
+  logo to help people find us." Use only the approved logos, "Don't alter the 'Box' logo in any
+  way", don't use it or any part of it as the app's icon, and don't use the name or logo so that
+  the app looks like an official Box application. The general trademark guidelines
+  (<https://www.box.com/legal/trademark>) also ask that material using the marks says it is
+  independent of Box, Inc.; the Settings section, `docs/sources.md` and the README say so.
+- **Dark variant:** `box-dark.svg`, the white logo Box ships in the same kit, shown on the dark
+  theme.
+- **One change of form, none of the logo:** Box's files give the colour through a CSS class in a
+  `<style>` element, which WinUI's SVG renderer does not apply (the logo drew black). The colour
+  was moved onto the two paths as a `fill` attribute (`#0061d5`, `#fff`) and the `<defs>` with
+  the style removed; the paths, the view box and the colour are unchanged, so the logo looks
+  exactly as Box's. SHA-256 of the files as served: blue
+  `357da1c808cd607783cb09d8eb03c2939cb553c8838e9edc5fe06b3bfca04ed1`, white
+  `fbf3314b16bf0b6ae57c55a1bbcf5018a8ff160289ad67e52c55c314943a08b7`.

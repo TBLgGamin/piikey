@@ -1,8 +1,10 @@
-//! Inventory: where personal data is stored on this PC. The inventory is what was scanned: the
-//! Scan button looks through the locations, the box beside it scans one more folder or file, and
-//! Explorer's "Scan for personal data" adds to it too. A location's Monitor switch has its file
-//! changes scanned as they happen. What was found is shown by the dashboard of
-//! [`super::dashboard`].
+//! Inventory: where personal data is stored, on this PC and in the cloud accounts piikey may
+//! read. The inventory is what was scanned: the Scan button looks through the locations (folders
+//! on this PC and folders of connected accounts, in one run), the box beside it scans one more
+//! folder or file, "Browse cloud…" picks a folder of an account, and Explorer's "Scan for
+//! personal data" adds to it too. A location's Monitor switch has its changes scanned as they
+//! happen (a cloud location is asked what changed every few minutes). What was found is shown by
+//! the dashboard of [`super::dashboard`].
 
 use std::path::Path;
 
@@ -20,11 +22,11 @@ use super::{
 use crate::ui::{
     controller::{FolderStatus, WatchedFolder},
     status::Tone,
-    window::{Browse, Dash, MainWindow, Msg, Page},
+    window::{Browse, CloudMsg, Dash, MainWindow, Msg, Page},
 };
 
 /// What the page is, in a sentence.
-const DEFINITION: &str = "Where personal data is stored on this PC: what you scan, kept up to date in the locations you monitor.";
+const DEFINITION: &str = "Where personal data is stored, on this PC and in your cloud accounts: what you scan, kept up to date in the locations you monitor.";
 
 /// What the dashboard has to leave room for on this page: the header, the box that adds a folder or
 /// file, the line under it, and the gaps between them.
@@ -248,16 +250,21 @@ pub(super) fn inventory(window: &MainWindow, context: Context<'_>) -> View {
     let mut children: Vec<View> = vec![page_header(Page::Inventory.title(), DEFINITION, controls)];
     children.extend(form_error(window, context));
     children.push(places);
+    // A cloud folder can be picked once an account is connected.
+    let mut browse = vec![
+        ("Browse folder\u{2026}", Msg::Browse(Browse::Location)),
+        ("Browse file\u{2026}", Msg::Browse(Browse::File)),
+    ];
+    if !window.snap.accounts.is_empty() {
+        browse.push(("Browse cloud\u{2026}", Msg::Cloud(CloudMsg::Open)));
+    }
     children.push(add_row_with(
         "A folder or file to scan, e.g. C:\\Users\\you\\Documents",
         &window.root_draft,
         "Add and scan",
         Msg::RootDraft,
         Msg::AddRoot,
-        &[
-            ("Browse folder\u{2026}", Browse::Location),
-            ("Browse file\u{2026}", Browse::File),
-        ],
+        &browse,
         context,
     ));
     children.push(status_line(window));

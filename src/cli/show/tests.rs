@@ -563,3 +563,111 @@ fn one_file_that_holds_the_values_is_named_in_the_singular() {
     let value = json!({"matches": [{"path": "a.txt", "values": [0], "count": 1}]});
     assert!(out_of(&View::Subject(values), &value).ends_with("1 file mentions them\n"));
 }
+
+/// An account as the API writes it.
+fn account_value(connected: bool) -> Value {
+    json!({
+        "id": "3f9c2a7d41b8e605",
+        "provider": "dropbox",
+        "label": "Work",
+        "sign_in": {"mode": "dropbox_delegated", "app_key": "k"},
+        "path": r"\\Dropbox\Work",
+        "connected": connected,
+    })
+}
+
+#[test]
+fn the_accounts_are_a_table_with_how_each_signs_in() {
+    let value = json!({"accounts": [
+        account_value(true),
+        {
+            "id": "00000000000000aa",
+            "provider": "google_drive",
+            "label": "Workspace",
+            "sign_in": {"mode": "google_service_account", "key_file": "k.json", "users": ["a@b.nl"]},
+            "path": r"\\Google Drive\Workspace",
+            "connected": false,
+        },
+    ]});
+    assert_eq!(
+        out_of(&View::Accounts, &value),
+        "ID                SERVICE       NAME       SIGN-IN                 STATUS         PATH\n\
+         3f9c2a7d41b8e605  Dropbox       Work       dropbox_delegated       connected      \\\\Dropbox\\Work\n\
+         00000000000000aa  Google Drive  Workspace  google_service_account  not connected  \\\\Google Drive\\Workspace\n"
+    );
+    let none = out_of(&View::Accounts, &json!({"accounts": []}));
+    assert!(none.starts_with("no cloud accounts"), "{none}");
+}
+
+#[test]
+fn an_account_is_a_list_of_facts_and_says_when_it_must_still_sign_in() {
+    let connected = out_of(&View::Account, &account_value(true));
+    assert_eq!(
+        connected,
+        "id       3f9c2a7d41b8e605\n\
+         service  Dropbox\n\
+         name     Work\n\
+         sign-in  dropbox_delegated\n\
+         status   connected\n\
+         path     \\\\Dropbox\\Work\n"
+    );
+    let waiting = out_of(&View::Account, &account_value(false));
+    assert!(waiting.contains("status   not connected\n"), "{waiting}");
+    assert!(
+        waiting
+            .ends_with("not connected yet: piikey-cli account connect 3f9c2a7d41b8e605 signs in\n"),
+        "{waiting}"
+    );
+}
+
+#[test]
+fn removing_an_account_and_browsing_it_report_what_there_is() {
+    assert_eq!(
+        out_of(
+            &View::AccountRemoved,
+            &json!({"id": "ab", "locations": [r"\\Dropbox\Work\Docs"], "forgotten": 1})
+        ),
+        "removed the account ab\ntook \\\\Dropbox\\Work\\Docs off the locations\nforgot 1 file\n"
+    );
+    assert_eq!(
+        out_of(
+            &View::AccountRemoved,
+            &json!({"id": "ab", "locations": [], "forgotten": 0})
+        ),
+        "removed the account ab\nforgot 0 files\n"
+    );
+    assert_eq!(
+        out_of(
+            &View::Folders,
+            &json!({"folders": [
+                {"path": r"\\Dropbox\Work\Docs", "name": "Docs"},
+                {"path": r"\\Dropbox\Work\Sheets", "name": "Sheets"},
+            ]})
+        ),
+        "NAME    PATH\nDocs    \\\\Dropbox\\Work\\Docs\nSheets  \\\\Dropbox\\Work\\Sheets\n"
+    );
+    assert_eq!(
+        out_of(&View::Folders, &json!({"folders": []})),
+        "no folders here\n"
+    );
+}
+
+#[test]
+fn the_account_requests_have_their_views() {
+    assert_eq!(View::of(&Request::AccountsList), View::Accounts);
+    assert_eq!(
+        View::of(&Request::AccountConnect { id: "a".into() }),
+        View::Account
+    );
+    assert_eq!(
+        View::of(&Request::AccountRemove { id: "a".into() }),
+        View::AccountRemoved
+    );
+    assert_eq!(
+        View::of(&Request::AccountBrowse {
+            id: "a".into(),
+            under: None
+        }),
+        View::Folders
+    );
+}

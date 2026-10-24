@@ -28,6 +28,7 @@ use piikey::{
     inventory::Inventory,
     policy::Policy,
     service,
+    sources::{Credential, SignIn},
     vault::default_path,
 };
 use serde_json::Value;
@@ -45,6 +46,8 @@ usage:
   piikey-cli vault wipe --yes
   piikey-cli inventory status | list [--under PATH] [--limit N] [--offset N] | tree [--under PATH] | rescan | report --out FILE [--format json|csv]
   piikey-cli settings get | settings set KEY=VALUE...      keys = guard.cfg keys; list keys repeat (site=a site=b)
+  piikey-cli account list | connect ID | remove ID --yes | browse ID [--under PATH]
+  piikey-cli account add PROVIDER --label NAME [--mode MODE] [--tenant T] [--client-id ID] [--app-key KEY] [--key-file FILE] [--cert-file FILE] [--site URL ...] [--user EMAIL ...] [--enterprise-id ID | --user-id ID] [--client-secret-stdin]
   piikey-cli kinds | model status | model download | token [--rotate] | status | protection on|off
   piikey-cli open      brings the running app's window forward (needs the app)
   piikey-cli serve [--http [--port N]] [--pipe NAME]
@@ -59,6 +62,14 @@ folders are walked recursively.
                that came back alone
 --local        work in this process even when the app is running; --vault PATH implies it
 --pipe         serve on \\\\.\\pipe\\NAME instead of \\\\.\\pipe\\piikey-<USERNAME>
+--mode         how an account signs in: microsoft_delegated, microsoft_app, microsoft_app_selected,
+               google_delegated, google_service_account, dropbox_delegated, box_delegated or box_app;
+               left out when the provider has one way (onedrive, dropbox). microsoft_app and
+               microsoft_app_selected use --key-file with --cert-file, or else the client secret
+--client-secret-stdin
+               reads the client secret (one line) from stdin, so it never shows in a process list
+account connect
+               signs in and waits up to 5 minutes; run on its own it prints the address to open
 
 exit codes: 0 done; 1 personal data found under --fail-on; 2 usage error; 3 any API error";
 
@@ -203,7 +214,9 @@ fn open_local(
     let engine = Arc::new(engine);
     let source: EngineSource = Arc::new(move || Arc::clone(&engine));
     let inventory = Arc::new(Inventory::open(&Inventory::default_path()?)?);
-    let local = Local::new(source, inventory, detector);
+    let local = Local::new(source, inventory, detector).with_opener(Arc::new(|url: &str| {
+        eprintln!("Open this address in your browser to sign in:\n{url}");
+    }));
     Ok(match progress {
         Some(progress) => local.with_progress(progress),
         None => local,
@@ -238,6 +251,7 @@ fn execute(
     let mut request = match input {
         Input::Request(request) => request,
         Input::Stdin(text) => text.request(read_text(streams.stdin)?),
+        Input::Secret(account) => account.request(read_secret(streams.stdin)?),
     };
     make_absolute(&mut request)?;
     let view = View::of(&request);
@@ -285,6 +299,40 @@ fn read_text(stdin: &mut dyn Read) -> Result<String, Fail> {
     })
 }
 
+/// The client secret: the first line of stdin, read a byte at a time so that a person who types
+/// it need not close stdin. It is kept nowhere but in the request.
+fn read_secret(stdin: &mut dyn Read) -> Result<String, Fail> {
+    const LONGEST: usize = 4096;
+    let mut bytes = Vec::new();
+    let mut next = [0_u8; 1];
+    loop {
+        match stdin.read(&mut next) {
+            Ok(0) => break,
+            Ok(_) => {
+                let [byte] = next;
+                if byte == b'\n' {
+                    break;
+                }
+                bytes.push(byte);
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error.into()),
+        }
+        if bytes.len() > LONGEST {
+            return Err(ApiError::bad_request("the client secret on stdin is too long").into());
+        }
+    }
+    let secret = String::from_utf8(bytes)
+        .map_err(|_| ApiError::bad_request("the client secret on stdin is not UTF-8 text"))?;
+    let secret = secret.trim();
+    if secret.is_empty() {
+        return Err(
+            ApiError::bad_request("stdin holds no client secret: give it as one line").into(),
+        );
+    }
+    Ok(secret.to_owned())
+}
+
 /// Makes every path in `request` absolute. The app that answers has another working folder than
 /// this process, and the API wants absolute paths whoever answers.
 fn make_absolute(request: &mut Request) -> io::Result<()> {
@@ -300,6 +348,7 @@ fn make_absolute(request: &mut Request) -> io::Result<()> {
         Request::InventoryList { under, .. } | Request::InventoryTree { under } => {
             under.as_mut().map_or(Ok(()), absolute)
         }
+        Request::AccountAdd { sign_in, .. } => absolute_key_files(sign_in),
         Request::ScanText { .. }
         | Request::Anonymize { .. }
         | Request::Deanonymize { .. }
@@ -316,7 +365,40 @@ fn make_absolute(request: &mut Request) -> io::Result<()> {
         | Request::ApiToken { .. }
         | Request::Status
         | Request::Protection { .. }
+        | Request::AccountsList
+        | Request::AccountConnect { .. }
+        | Request::AccountRemove { .. }
+        // A path of an account is absolute already: it is no path of this PC.
+        | Request::AccountBrowse { .. }
         | Request::ShowWindow => Ok(()),
+    }
+}
+
+/// The files a way to sign in names, made absolute like the paths of any other request: the app
+/// that answers has another working folder than this process.
+fn absolute_key_files(sign_in: &mut SignIn) -> io::Result<()> {
+    match sign_in {
+        SignIn::GoogleServiceAccount { key_file, .. } => absolute(key_file),
+        SignIn::MicrosoftApp {
+            credential:
+                Credential::Certificate {
+                    key_file,
+                    cert_file,
+                },
+            ..
+        }
+        | SignIn::MicrosoftAppSelected {
+            credential:
+                Credential::Certificate {
+                    key_file,
+                    cert_file,
+                },
+            ..
+        } => {
+            absolute(key_file)?;
+            absolute(cert_file)
+        }
+        _ => Ok(()),
     }
 }
 

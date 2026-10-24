@@ -18,7 +18,7 @@ use std::{
     time::Duration,
 };
 
-use piikey::{detect::EntityKind, inventory::Finding, policy::Highlight};
+use piikey::{detect::EntityKind, inventory::Finding, policy::Highlight, sources};
 use windows_reactor::{
     Callback, Component, ComponentContext, ComponentTimer, ContentDialogExt, Grid, GridLength,
     HorizontalAlignment, Icon, Image, KeyedView, NavigationView, NavigationViewBackButtonVisible,
@@ -29,19 +29,23 @@ use windows_reactor::{
 use super::{
     assets,
     controller::{
-        Command, Controller, Edit, FindingFiles, KeyedPage, KeyedQuery, Model, Notice, Period,
-        Snapshot, apply_edit,
+        Command, Controller, Edit, FindingFiles, KeyedPage, KeyedQuery, Model, Notice,
+        NoticeAction, Period, Snapshot, apply_edit,
     },
     explorer, goto, pages,
     status::Status,
 };
 use crate::{Res, startup};
 
+mod accounts;
+mod cloud;
 mod dashboard;
 mod findings;
 mod report;
 
 pub use self::{
+    accounts::{AccountMsg, AccountsState, Step},
+    cloud::{CloudMsg, CloudState},
     dashboard::{Dash, Dashboard, Loaded, Origin},
     findings::{FindingsView, Reading, Row, Working},
 };
@@ -311,6 +315,12 @@ pub enum Msg {
     RetryModel,
     /// Go on without the detection model.
     SkipModel,
+    /// Something the Connected accounts section or the Add account dialog asks for.
+    Account(AccountMsg),
+    /// Something the Browse cloud dialog asks for.
+    Cloud(CloudMsg),
+    /// The button of the notice on show: it does what the notice asks for.
+    NoticeButton(NoticeAction),
     Noop,
 }
 
@@ -370,6 +380,10 @@ pub struct MainWindow {
     /// Which [`pages::loading::FLAVOR`] line the loading screen shows.
     pub(super) flavor: usize,
     flavor_timer: Option<ComponentTimer>,
+    /// What Settings > Connected accounts and its Add account dialog keep: see [`accounts`].
+    pub(super) accounts: AccountsState,
+    /// What the Browse cloud dialog keeps: see [`cloud`].
+    pub(super) cloud: CloudState,
 }
 
 impl MainWindow {
@@ -407,6 +421,8 @@ impl MainWindow {
             timer: None,
             flavor: 0,
             flavor_timer: None,
+            accounts: AccountsState::default(),
+            cloud: CloudState::default(),
         }
     }
 
@@ -445,7 +461,7 @@ impl MainWindow {
     /// Runs `work` off the UI thread, where it may wait on the disk, the registry or the
     /// clipboard. The message it returns goes to the window; an error becomes the controller's
     /// notice instead.
-    fn background(
+    pub(super) fn background(
         &self,
         context: &ComponentContext<Self>,
         work: impl FnOnce(&Controller) -> Res<Msg> + Send + 'static,
@@ -474,6 +490,8 @@ impl MainWindow {
             || (self.snap.scan.is_some() && snapshot.scan.is_none())
             || (self.snap.watch.scanning.is_some() && snapshot.watch.scanning.is_none());
         self.snap = snapshot;
+        self.adopt_accounts(context);
+        self.adopt_cloud(context);
         if self.snap.busy.is_none() && self.snap.pending == 0 {
             self.asked = Asked::default();
         }
@@ -514,7 +532,11 @@ impl MainWindow {
             }
             Page::Inventory => self.load_dashboard(context),
             Page::Vault => self.search(context),
-            Page::Settings => self.load_settings(context),
+            Page::Settings => {
+                // The accounts may have been changed from the command line since the last look.
+                self.input.controller.submit(Command::Refresh);
+                self.load_settings(context);
+            }
         }
     }
 
@@ -656,25 +678,39 @@ impl MainWindow {
 
     /// The Inventory box: a folder is added to the locations and scanned, a file is scanned, both
     /// with the result on show. Which it is, is for the disk to say, so that is asked in the
-    /// background.
+    /// background. A path in a cloud account (`\\Google Drive\jan@acme.com\My Drive`) is a
+    /// location without a look at the disk: Windows would look for a server of that name.
     fn add_root(&self, context: &ComponentContext<Self>) {
         let path = PathBuf::from(self.root_draft.trim());
-        self.background(context, move |controller| match fs::metadata(&path) {
-            Ok(meta) if meta.is_dir() => {
-                controller.submit(Command::AddLocation(path));
-                Ok(Msg::RootAdded)
-            }
-            Ok(_) => {
-                controller.submit(Command::ScanFiles {
-                    paths: vec![path],
-                    reveal: true,
+        self.background(context, move |controller| {
+            if sources::is_virtual(&path) {
+                return Ok(if controller.knows_account(&path) {
+                    controller.submit(Command::AddLocation(path));
+                    Msg::RootAdded
+                } else {
+                    Msg::RootRefused(format!(
+                        "No connected account matches {}. Connect the account in Settings first.",
+                        sources::shown(&path)
+                    ))
                 });
-                Ok(Msg::RootAdded)
             }
-            Err(error) => Ok(Msg::RootRefused(format!(
-                "Cannot scan {}: {error}",
-                path.display()
-            ))),
+            match fs::metadata(&path) {
+                Ok(meta) if meta.is_dir() => {
+                    controller.submit(Command::AddLocation(path));
+                    Ok(Msg::RootAdded)
+                }
+                Ok(_) => {
+                    controller.submit(Command::ScanFiles {
+                        paths: vec![path],
+                        reveal: true,
+                    });
+                    Ok(Msg::RootAdded)
+                }
+                Err(error) => Ok(Msg::RootRefused(format!(
+                    "Cannot scan {}: {error}",
+                    path.display()
+                ))),
+            }
         });
     }
 
@@ -904,6 +940,9 @@ impl Component for MainWindow {
             Msg::RetryModel => self.input.controller.submit(Command::FetchModel),
             Msg::SkipModel => self.input.controller.submit(Command::SkipModel),
             Msg::Noop => {}
+            Msg::Account(message) => self.update_accounts(message, context),
+            Msg::Cloud(message) => self.update_cloud(message, context),
+            Msg::NoticeButton(action) => self.notice_button(action),
             Msg::Dash(message) => self.update_dashboard(message, context),
             Msg::SiteDraft(_)
             | Msg::AddSite

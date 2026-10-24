@@ -15,12 +15,17 @@
 //! - [`keyed`]: the vault's values, where they went, and the activity feed.
 //! - [`inventory`]: the inventory, its scans and the scan thread, the views of the inventory and
 //!   the findings of the files a result names.
-//! - [`watch`]: the locations the user asked to be monitored, and what is done with their changes.
+//! - [`watch`]: the locations the user asked to be monitored, and what is done with their changes:
+//!   what the system reports of folders on this PC, and the poll of the cloud locations.
+//! - [`accounts`]: the cloud accounts: their state, signing in, browsing them, and what a failing
+//!   one does to the window. A cloud location is scanned and monitored by [`inventory`] and
+//!   [`watch`] like a folder on this PC.
 //! - [`edit`]: the edits of the settings, applied to a [`Policy`].
 //!
 //! Lock order: nothing else is locked while a `Shared` lock is held, and `Shared` is never locked
 //! while the state mutex is held except to read the policy first in [`Controller::snapshot`].
 
+mod accounts;
 mod edit;
 mod inventory;
 mod keyed;
@@ -35,7 +40,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, LazyLock, Mutex, MutexGuard, PoisonError, RwLock, Weak,
-        atomic::Ordering,
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread,
@@ -47,6 +52,7 @@ use piikey::{
     engine::Engine,
     inventory::{Inventory, Progress, Reading, Totals},
     policy::{Policy, SettingsPatch},
+    sources::{Account, Connector},
 };
 
 use super::{activity::Activity, scanner::Scanner};
@@ -57,6 +63,7 @@ use crate::{
 };
 
 pub use self::{
+    accounts::{AccountStatus, AccountView, ConnectState, Connecting, NewAccount, NoticeAction},
     edit::{Edit, apply_edit},
     inventory::{FindingFiles, FindingsEvent, Reveal, RevealState},
     keyed::{Keyed, KeyedPage, KeyedQuery, Period, Sent},
@@ -73,6 +80,10 @@ const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 
 /// Progress of a download or a scan reaches the UI at most this often.
 const PROGRESS_EVERY: Duration = Duration::from_millis(250);
+
+/// How often the monitored cloud locations are asked what changed, unless the backend says
+/// otherwise.
+const CLOUD_POLL: Duration = Duration::from_mins(5);
 
 /// Side effects the controller needs from the system. The real implementation is
 /// [`System`](super::system::System); tests substitute a recording fake.
@@ -127,11 +138,33 @@ pub trait Backend: Send + Sync + 'static {
     /// Registers (`on`) or gives back the shortcut of the highlight, Ctrl+Alt+P. The error says
     /// why not, in words for the user: another program may have the shortcut.
     fn set_hotkey(&self, shared: &Shared, on: bool) -> Res<()>;
-    /// Starts watching `folders` (the monitored locations), below them too, and sends every
-    /// change in them to `changes`. A folder that cannot be watched is named in the answer with
-    /// why, and the others are watched all the same. Stopping what is returned ends the watch
-    /// and drops `changes`.
+    /// Starts watching `folders` (the monitored locations on this PC, never one in a cloud
+    /// account: that is asked on a timer, see [`Backend::cloud_poll`]), below them too, and sends
+    /// every change in them to `changes`. A folder that cannot be watched is named in the answer
+    /// with why, and the others are watched all the same. Stopping what is returned ends the
+    /// watch and drops `changes`.
     fn start_watch(&self, folders: &[PathBuf], changes: Sender<Change>) -> Res<Started>;
+    /// The connector that reads `account`: what the scans, the folder picker and the findings of
+    /// a cloud location go through. It signs in with what was kept by [`Backend::connect`] and
+    /// says `SignInNeeded` once that no longer works.
+    fn connector(&self, account: &Account) -> piikey::sources::Result<Box<dyn Connector>>;
+    /// Signs `account` in. A person signs in with a browser: `open` is given the address to open
+    /// there, and this waits for the person to finish (up to five minutes, or until `cancel` is
+    /// set) and keeps what lets piikey read the account from then on. An app with credentials of
+    /// its own only has them checked.
+    fn connect(
+        &self,
+        account: &Account,
+        open: &dyn Fn(&str),
+        cancel: &AtomicBool,
+    ) -> piikey::sources::Result<()>;
+    /// Opens a web page in the user's browser: a cloud file's page, or the page of a sign-in. The
+    /// error says why not, in words for the user.
+    fn open_url(&self, url: &str) -> Res<()>;
+    /// How often the monitored cloud locations are asked what changed.
+    fn cloud_poll(&self) -> Duration {
+        CLOUD_POLL
+    }
 }
 
 /// A started proxy or capture.
@@ -167,6 +200,8 @@ pub enum Severity {
 pub struct Notice {
     pub severity: Severity,
     pub text: String,
+    /// A button that does what the message asks for, when there is one.
+    pub action: Option<NoticeAction>,
 }
 
 impl Notice {
@@ -174,6 +209,7 @@ impl Notice {
         Self {
             severity: Severity::Warning,
             text: text.into(),
+            action: None,
         }
     }
 
@@ -181,7 +217,14 @@ impl Notice {
         Self {
             severity: Severity::Error,
             text: text.into(),
+            action: None,
         }
+    }
+
+    /// The notice with a button that does `action`.
+    pub(super) fn with_action(mut self, action: NoticeAction) -> Self {
+        self.action = Some(action);
+        self
     }
 }
 
@@ -215,6 +258,12 @@ pub struct Snapshot {
     /// The latest scan somebody asked to see the result of, from queued to done: the window
     /// comes forward and shows a dialog for it. It stays until a newer request replaces it.
     pub reveal: Option<Reveal>,
+    /// The connected cloud accounts and how each stands, in the order they were added. They are
+    /// read again at launch and whenever the controller is asked to refresh.
+    pub accounts: Vec<AccountView>,
+    /// The latest sign-in somebody started (the Add account dialog's Connect, a notice's or a
+    /// row's sign-in button), from working to done. It stays until a newer one replaces it.
+    pub connecting: Option<Connecting>,
     /// Files in the inventory that hold personal data, and the values found in them.
     pub inventory_totals: (u64, u64),
     /// Monitoring: the monitored locations and the scan of what changed in them. What that finds
@@ -276,8 +325,10 @@ pub enum Command {
         paths: Vec<PathBuf>,
         reveal: bool,
     },
-    /// Add a folder to the inventory's locations, and scan it with the dialog. A path that is no
-    /// folder is refused with a notice, and nothing is scanned.
+    /// Add a folder to the inventory's locations, and scan it with the dialog: a folder on this
+    /// PC, or a folder of a cloud account (`\\Google Drive\jan@acme.com\My Drive`) that is
+    /// connected. A path that is no folder, or is in no connected account, is refused with a
+    /// notice, and nothing is scanned.
     AddLocation(PathBuf),
     /// Stop the scan that was asked to be shown as this reveal (its dialog was closed while it
     /// waited or ran): it is dropped from the queue, or broken off where it is.
@@ -286,6 +337,17 @@ pub enum Command {
     Forget(Vec<String>),
     /// Start the local API again: its token changed.
     RestartHttp,
+    /// Add a cloud account and sign it in: the Add account dialog's Connect. Both happen on a
+    /// thread of their own (the person may take minutes in the browser), shown as
+    /// [`Snapshot::connecting`]; when the sign-in fails, nothing of the account stays.
+    AddAccount(NewAccount),
+    /// Sign the account with this id in again (its tokens ran out, or it was never signed in).
+    ConnectAccount(String),
+    /// Stop the sign-in that was started as this [`Connecting::seq`] and is waiting for the browser.
+    CancelConnect(u64),
+    /// Disconnect the account with this id: its locations go, and what the inventory holds of
+    /// them, and what piikey keeps of the account.
+    RemoveAccount(String),
 }
 
 struct State {
@@ -327,6 +389,8 @@ struct State {
     /// How many reads of the findings of files are running: the detection model is wanted while
     /// there are any.
     findings: usize,
+    /// The cloud accounts and the sign-in that runs: see [`accounts`].
+    accounts: accounts::AccountsState,
 }
 
 /// The model download's flags.
@@ -503,6 +567,7 @@ impl Controller {
                 inventory_totals,
                 watch: watch::WatchState::default(),
                 findings: 0,
+                accounts: accounts::AccountsState::default(),
             }),
             changed: Condvar::new(),
             commands: Mutex::new(Some(command_tx)),
@@ -572,6 +637,8 @@ impl Controller {
                 .map(|progress| progress.reading())
                 .unwrap_or_default(),
             reveal: state.reveal.clone(),
+            accounts: state.accounts.views.clone(),
+            connecting: state.accounts.connecting.clone(),
             show: state.show,
             inventory_totals: (
                 state.inventory_totals.files_with_pii,
@@ -791,10 +858,16 @@ impl Controller {
                     self.edit(&edit);
                 }
                 Command::Fatal(reason) => self.stop(Some(reason)),
-                Command::Refresh => self.refresh(),
+                Command::Refresh => {
+                    self.refresh();
+                    self.refresh_accounts();
+                }
                 Command::FetchModel => self.refetch(),
                 Command::SkipModel => self.skip_model(),
-                Command::Startup => self.startup(),
+                Command::Startup => {
+                    self.refresh_accounts();
+                    self.startup();
+                }
                 Command::Settings(patch) => self.settings(&patch),
                 Command::ScanAll => self.scan_all(),
                 Command::ScanFiles { paths, reveal } => self.ask_scan(paths, reveal),
@@ -802,6 +875,10 @@ impl Controller {
                 Command::StopScan(seq) => self.stop_scan(seq),
                 Command::Forget(values) => self.forget(&values),
                 Command::RestartHttp => self.restart_http(),
+                Command::AddAccount(new) => self.start_sign_in(accounts::SignInFor::New(new)),
+                Command::ConnectAccount(id) => self.start_sign_in(accounts::SignInFor::Account(id)),
+                Command::CancelConnect(seq) => self.cancel_sign_in(seq),
+                Command::RemoveAccount(id) => self.disconnect_account(&id),
             }
         }
         self.update(|state| {

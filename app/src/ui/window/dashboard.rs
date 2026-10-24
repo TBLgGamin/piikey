@@ -15,12 +15,19 @@ use std::{
 use piikey::{
     detect::EntityKind,
     inventory::{Entry, Node, Tiles, TypeTotal},
+    sources,
     sys::is_under,
 };
 use windows_reactor::ComponentContext;
 
 use super::{MainWindow, Msg};
-use crate::ui::{controller::Controller, explorer};
+use crate::{
+    Describe, Res,
+    ui::{
+        controller::{Controller, Notice},
+        explorer,
+    },
+};
 
 /// Files the map gives a tile of their own; the others are one tile together.
 pub const TILES: usize = 400;
@@ -67,6 +74,8 @@ pub enum Dash {
 pub struct Loaded {
     /// The folder on show when it was read: a load that comes back for another one is old.
     pub at: PathBuf,
+    /// The folder the map's tiles were read for ([`Dashboard::map_at`]).
+    pub map_at: PathBuf,
     /// The nodes of each folder the tree lists: the one of the folder on show is the top level.
     /// For the top of the inventory (an empty `at`) that is its drives.
     pub levels: HashMap<PathBuf, Vec<Node>>,
@@ -87,6 +96,9 @@ pub struct Dashboard {
     pub(in crate::ui) at: PathBuf,
     /// The folder or file the details describe.
     pub(in crate::ui) selected: Option<PathBuf>,
+    /// The folder the map lays out: `at`, or the folder selected last (a file selected outside it
+    /// moves the map to the file's folder), so the map holds only what is in that folder.
+    pub(in crate::ui) map_at: PathBuf,
     /// The folders opened in the tree.
     pub(in crate::ui) open: HashSet<PathBuf>,
     /// The only type on show, or all.
@@ -106,6 +118,7 @@ impl Dashboard {
         Self {
             at: PathBuf::new(),
             selected: None,
+            map_at: PathBuf::new(),
             open: HashSet::new(),
             kind: None,
             loaded: None,
@@ -144,6 +157,14 @@ impl Dashboard {
             let way = ancestors(&path, &self.at);
             self.open.extend(way);
         }
+        if self.is_folder(&path) {
+            self.map_at.clone_from(&path);
+        } else if !is_under(&path, &self.map_at) {
+            self.map_at = path
+                .parent()
+                .filter(|folder| is_under(folder, &self.at))
+                .map_or_else(|| self.at.clone(), Path::to_path_buf);
+        }
         self.selected = Some(path);
         true
     }
@@ -160,6 +181,7 @@ impl Dashboard {
     /// Shows the folder `at`: what was open below it stays open.
     fn enter(&mut self, at: PathBuf) {
         self.open.retain(|folder| is_under(folder, &at));
+        self.map_at.clone_from(&at);
         self.at = at;
         self.selected = None;
     }
@@ -167,7 +189,7 @@ impl Dashboard {
     /// Takes what load number `load` brought, unless it is older than what is shown or was read for
     /// a folder that is not on show any more; `true` when it was taken.
     fn take(&mut self, load: u64, loaded: Loaded) -> bool {
-        if load <= self.shown || loaded.at != self.at {
+        if load <= self.shown || loaded.at != self.at || loaded.map_at != self.map_at {
             return false;
         }
         self.shown = load;
@@ -199,10 +221,12 @@ fn ancestors(path: &Path, at: &Path) -> Vec<PathBuf> {
 
 impl Loaded {
     /// Reads what a dashboard shows from the controller: the level of `at`, the levels of the
-    /// `open` folders below it, the map's files and the types, and the entry of `file`.
+    /// `open` folders below it, the files of the map's folder `map_at`, the types, and the entry
+    /// of `file`.
     pub(in crate::ui) fn read(
         controller: &Controller,
         at: &Path,
+        map_at: &Path,
         open: &[PathBuf],
         file: Option<&Path>,
     ) -> Self {
@@ -218,13 +242,24 @@ impl Loaded {
         levels.insert(at.to_path_buf(), top.nodes);
         Self {
             at: at.to_path_buf(),
+            map_at: map_at.to_path_buf(),
             levels,
             places: controller.places(),
-            tiles: controller.tiles(at, TILES),
+            tiles: controller.tiles(map_at, TILES),
             totals: controller.type_totals(at),
             entry: top.entry,
         }
     }
+}
+
+/// Opens the web page of the cloud item at `path` in the browser: the provider says where it is
+/// (which waits on the service), then the browser takes it.
+///
+/// # Errors
+/// Why the page could not be found or opened, in words for the user.
+pub(super) fn open_web_page(controller: &Controller, path: &Path) -> Res<()> {
+    let url = controller.web_url(path).describe()?;
+    controller.open_url(&url)
 }
 
 impl MainWindow {
@@ -234,11 +269,12 @@ impl MainWindow {
         dash.seq += 1;
         let load = dash.seq;
         let at = dash.at.clone();
+        let map_at = dash.map_at.clone();
         let open: Vec<PathBuf> = dash.open.iter().cloned().collect();
         let file = dash.selected_file().map(Path::to_path_buf);
         let controller = Arc::clone(&self.input.controller.0);
         context.spawn_background(move |_| {
-            let loaded = Loaded::read(&controller, &at, &open, file.as_deref());
+            let loaded = Loaded::read(&controller, &at, &map_at, &open, file.as_deref());
             Msg::Dash(Dash::Loaded(load, Box::new(loaded)))
         });
     }
@@ -264,10 +300,21 @@ impl MainWindow {
             Dash::Loaded(load, loaded) => {
                 self.inventory.take(load, *loaded);
             }
-            Dash::Open(path) => self.background(context, move |_| {
-                explorer::open(&path)?;
+            Dash::Open(path) => self.background(context, move |controller| {
+                if sources::is_virtual(&path) {
+                    open_web_page(controller, &path)?;
+                } else {
+                    explorer::open(&path)?;
+                }
                 Ok(Msg::Noop)
             }),
+            // An item of a cloud account is not on this PC: the buttons are not offered, and a
+            // message that arrives anyway says so instead of handing the path to Explorer.
+            Dash::Show(path) | Dash::Mask(path) if sources::is_virtual(&path) => {
+                self.input.controller.notify(Notice::error(
+                    "A file in the cloud is not on this PC: it cannot be shown in Explorer or copied masked.",
+                ));
+            }
             Dash::Show(path) => self.background(context, move |_| {
                 explorer::show(&path)?;
                 Ok(Msg::Noop)
@@ -306,6 +353,7 @@ mod tests {
     fn loaded(levels: &[(&str, &[Node])]) -> Loaded {
         Loaded {
             at: PathBuf::new(),
+            map_at: PathBuf::new(),
             levels: levels
                 .iter()
                 .map(|(at, nodes)| (PathBuf::from(at), nodes.to_vec()))
@@ -367,6 +415,43 @@ mod tests {
     }
 
     #[test]
+    fn the_map_holds_the_selected_folder_and_follows_a_file_out_of_it() {
+        let mut dash = dashboard();
+        let docs = PathBuf::from(r"C:\Docs");
+        assert!(dash.select(docs.clone(), Origin::Tree));
+        assert_eq!(dash.map_at, docs, "a folder becomes the map");
+        // A file in it keeps the map where it is.
+        assert!(dash.select(PathBuf::from(r"C:\Docs\a.pdf"), Origin::Map));
+        assert_eq!(dash.map_at, docs);
+        // A file elsewhere moves the map to its folder.
+        assert!(dash.select(PathBuf::from(r"D:\Mail\jan.eml"), Origin::Tree));
+        assert_eq!(dash.map_at, PathBuf::from(r"D:\Mail"));
+        // A folder entered through the way back is the map again.
+        dash.enter(PathBuf::from(r"C:\"));
+        assert_eq!(dash.map_at, PathBuf::from(r"C:\"));
+        // Below a folder on show, a file outside the map goes no higher than that folder.
+        dash.map_at = docs;
+        assert!(dash.select(PathBuf::from(r"C:\top.txt"), Origin::Tree));
+        assert_eq!(dash.map_at, PathBuf::from(r"C:\"));
+    }
+
+    #[test]
+    fn a_load_for_another_map_folder_is_not_shown() {
+        let mut dash = Dashboard::new();
+        dash.map_at = PathBuf::from(r"C:\Docs");
+        let stale = Loaded {
+            map_at: PathBuf::new(),
+            ..loaded(&[])
+        };
+        assert!(!dash.take(1, stale));
+        let fresh = Loaded {
+            map_at: PathBuf::from(r"C:\Docs"),
+            ..loaded(&[])
+        };
+        assert!(dash.take(2, fresh));
+    }
+
+    #[test]
     fn a_folder_opens_and_closes_and_only_opening_needs_a_load() {
         let mut dash = dashboard();
         let folder = PathBuf::from(r"C:\Docs");
@@ -394,6 +479,7 @@ mod tests {
         let mut dash = Dashboard::new();
         let read = |at: &str| Loaded {
             at: PathBuf::from(at),
+            map_at: PathBuf::from(at),
             ..loaded(&[])
         };
         assert!(dash.take(2, read("")));

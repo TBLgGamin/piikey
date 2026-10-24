@@ -12,7 +12,7 @@
 //! millisecond, which no service reports.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, hash_map::Entry as MapEntry},
     fs, io,
     path::{Path, PathBuf},
     sync::{
@@ -24,7 +24,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use super::{Connector, Error, RemoteItem, Result};
+use super::{Account, Accounts, Connector, Error, RemoteItem, Result, is_virtual};
 use crate::{
     engine::Engine,
     formats::{self, Report},
@@ -181,6 +181,124 @@ pub fn scan_remote(
         read: outcome.recorded,
         forgotten,
     })
+}
+
+/// One cloud location of a run of [`scan_clouds`], and how its scan ended.
+#[derive(Debug)]
+pub struct CloudScan {
+    /// The location, as it was given.
+    pub root: PathBuf,
+    /// The account it is in; `None` when no connected account has that name any more.
+    pub account: Option<Account>,
+    /// How the scan ended. The cursor of a scan that got to the end is kept already (see
+    /// [`Cursors`]).
+    pub result: Result<Scanned>,
+}
+
+/// Scans the cloud locations among `roots` one after the other, each as [`scan_remote`] does,
+/// with the accounts and the cursors of the data folder `data`, and keeps the cursor of each scan
+/// that got to the end. The paths that are not cloud locations are not looked at (see
+/// [`super::split_roots`]): scan the folders on this PC first with [`Inventory::scan_paths`],
+/// which starts the count, then call this with the same `progress` and `cancel`. `connect` makes
+/// the connector of an account, once for each account of the run ([`super::connector`] is the
+/// real one). The work goes on the rayon pool the caller runs in. Hold [`Inventory::lock_scan`]
+/// for the whole run.
+///
+/// A location that fails does not stop the others: its error is in its [`CloudScan`]. A set
+/// `cancel` ends the run after the location it is in, and the locations that were not reached are
+/// not in the answer.
+#[must_use]
+pub fn scan_clouds(
+    data: &Path,
+    connect: &dyn Fn(&Account) -> Result<Box<dyn Connector>>,
+    inventory: &Inventory,
+    engine: &Engine,
+    roots: &[PathBuf],
+    progress: &Progress,
+    cancel: &AtomicBool,
+) -> Vec<CloudScan> {
+    let clouds: Vec<&PathBuf> = roots.iter().filter(|root| is_virtual(root)).collect();
+    let accounts = match Accounts::open(data) {
+        Ok(accounts) => accounts,
+        Err(error) => {
+            let why = format!("Could not read the connected accounts: {error}");
+            return clouds
+                .into_iter()
+                .map(|root| CloudScan {
+                    root: root.clone(),
+                    account: None,
+                    result: Err(Error::Local(crate::Error::Io(io::Error::other(
+                        why.clone(),
+                    )))),
+                })
+                .collect();
+        }
+    };
+    let mut run = Clouds {
+        connect,
+        inventory,
+        engine,
+        cursors: Cursors::new(data),
+        progress,
+        cancel,
+        connectors: HashMap::new(),
+    };
+    let mut done = Vec::with_capacity(clouds.len());
+    for root in clouds {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let account = accounts.of(root).cloned();
+        let result = match &account {
+            Some(account) => run.scan(account, root),
+            None => Err(Error::Local(crate::Error::BadRequest(format!(
+                "The account of {} is not connected any more. Connect it again in Settings, or remove the location.",
+                super::shown(root)
+            )))),
+        };
+        done.push(CloudScan {
+            root: root.clone(),
+            account,
+            result,
+        });
+    }
+    done
+}
+
+/// What a run of [`scan_clouds`] holds besides its locations.
+struct Clouds<'a> {
+    connect: &'a dyn Fn(&Account) -> Result<Box<dyn Connector>>,
+    inventory: &'a Inventory,
+    engine: &'a Engine,
+    cursors: Cursors,
+    progress: &'a Progress,
+    cancel: &'a AtomicBool,
+    /// The connector of each account of the run, made when its first location is reached.
+    connectors: HashMap<String, Box<dyn Connector>>,
+}
+
+impl Clouds<'_> {
+    /// Scans `root`, a location of `account`, from where its cursor left off.
+    fn scan(&mut self, account: &Account, root: &Path) -> Result<Scanned> {
+        let connector = match self.connectors.entry(account.id.clone()) {
+            MapEntry::Occupied(held) => held.into_mut(),
+            MapEntry::Vacant(slot) => slot.insert((self.connect)(account)?),
+        };
+        let cursor = self.cursors.get(root)?;
+        let scanned = scan_remote(
+            &**connector,
+            self.inventory,
+            self.engine,
+            root,
+            cursor.as_deref(),
+            self.progress,
+            self.cancel,
+        )?;
+        if let Some(next) = &scanned.cursor {
+            self.cursors.set(root, next)?;
+        }
+        Ok(scanned)
+    }
 }
 
 /// The items under `root`, each path once (the last of two wins), in the order they came.
@@ -350,13 +468,18 @@ impl Cursors {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::atomic::AtomicUsize, time::Duration};
+    use std::{
+        sync::{Arc, atomic::AtomicUsize},
+        time::Duration,
+    };
 
     use super::*;
     use crate::{
         detect::EntityKind::{Email, Iban},
         inventory::Status,
-        sources::{Changes, Export, Provider, RemoteFolder, Resolved, testing::Res},
+        sources::{
+            Changes, Export, Provider, RemoteFolder, Resolved, SignIn, add_account, testing::Res,
+        },
         testing::temp_dir,
     };
 
@@ -1176,5 +1299,322 @@ mod tests {
         );
         assert_ne!(filetime(UNIX_EPOCH, ""), 0);
         assert_ne!(filetime(UNIX_EPOCH - Duration::from_secs(1), ""), 0);
+    }
+
+    /// The fake account for a run of [`scan_clouds`], which makes a connector of it each time
+    /// and keeps nothing of its own: the test fills it and counts through the `Arc`. `ROOT\sub`
+    /// is a folder of it too.
+    struct Shared(Arc<Cloud>);
+
+    impl Connector for Shared {
+        fn provider(&self) -> Provider {
+            self.0.provider()
+        }
+
+        fn browse(&self, under: Option<&RemoteFolder>) -> Result<Vec<RemoteFolder>> {
+            self.0.browse(under)
+        }
+
+        fn resolve(&self, path: &Path) -> Result<Resolved> {
+            let sub = Path::new(ROOT).join("sub");
+            if sys::same_path(path, &sub) {
+                return Ok(Resolved::Folder(RemoteFolder {
+                    id: "sub".to_owned(),
+                    path: sub,
+                    web_url: String::new(),
+                }));
+            }
+            self.0.resolve(path)
+        }
+
+        fn changes(
+            &self,
+            root: &RemoteFolder,
+            cursor: Option<&str>,
+            cancel: &AtomicBool,
+        ) -> Result<Changes> {
+            self.0.changes(root, cursor, cancel)
+        }
+
+        fn download(&self, item: &RemoteItem, max: u64, cancel: &AtomicBool) -> Result<Vec<u8>> {
+            self.0.download(item, max, cancel)
+        }
+    }
+
+    /// A connector of the shared in-memory cloud, as the `connect` callback of a run answers.
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the answer of the callback `scan_clouds` is given, which can fail"
+    )]
+    fn shared(cloud: &Arc<Cloud>) -> Result<Box<dyn Connector>> {
+        Ok(Box::new(Shared(Arc::clone(cloud))))
+    }
+
+    /// Connects the account `label` of Dropbox in the data folder of `world`.
+    fn add_dropbox(world: &World, label: &str) -> Res {
+        add_account(
+            &world.dir,
+            Provider::Dropbox,
+            label,
+            SignIn::DropboxDelegated {
+                app_key: "key-1".to_owned(),
+            },
+            None,
+        )?;
+        Ok(())
+    }
+
+    fn run_clouds(
+        world: &World,
+        connect: &dyn Fn(&Account) -> Result<Box<dyn Connector>>,
+        roots: &[PathBuf],
+        cancel: &AtomicBool,
+    ) -> Vec<CloudScan> {
+        scan_clouds(
+            &world.dir,
+            connect,
+            &world.inventory,
+            &world.engine,
+            roots,
+            &Progress::default(),
+            cancel,
+        )
+    }
+
+    #[test]
+    fn a_run_scans_the_cloud_locations_among_its_roots_and_leaves_the_folders_of_this_pc_alone()
+    -> Res {
+        let world = World::new("clouds-only")?;
+        add_dropbox(&world, "work")?;
+        let cloud = Arc::new(Cloud::default());
+        cloud.put("a.txt", &format!("mail {EMAIL}"), "v1", 1_000);
+        let local = world.dir.join("docs");
+        fs::create_dir_all(&local)?;
+        fs::write(local.join("one.txt"), format!("mail {EMAIL}"))?;
+
+        let roots = [local.clone(), PathBuf::from(ROOT)];
+        let done = run_clouds(&world, &|_| shared(&cloud), &roots, &AtomicBool::new(false));
+        assert_eq!(done.len(), 1, "{done:?}");
+        let [scan] = done.as_slice() else {
+            return Err("one location was scanned".into());
+        };
+        assert_eq!(scan.root, Path::new(ROOT));
+        assert_eq!(
+            scan.account.as_ref().map(|a| a.label.as_str()),
+            Some("work")
+        );
+        let scanned = scan.result.as_ref().map_err(ToString::to_string)?;
+        assert_eq!(
+            (scanned.full, scanned.read, scanned.finished()),
+            (true, 1, true)
+        );
+        assert_eq!(world.counts("a.txt"), Some(vec![(Email, 1)]));
+        assert!(
+            world.inventory.entry(&local.join("one.txt")).is_none(),
+            "a folder on this PC is for Inventory::scan_paths"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_cursor_of_a_location_is_kept_when_its_scan_finished_and_not_when_it_was_cancelled() -> Res
+    {
+        let world = World::new("clouds-cursor")?;
+        add_dropbox(&world, "work")?;
+        let cloud = Arc::new(Cloud::default());
+        cloud.put("a.txt", &format!("mail {EMAIL}"), "v1", 1_000);
+        let roots = [PathBuf::from(ROOT)];
+        let location = Path::new(ROOT);
+        let never = AtomicBool::new(false);
+        assert_eq!(world.cursors.get(location)?, None);
+
+        // Finished: the cursor is kept, and the next run reads only what changed.
+        let first = run_clouds(&world, &|_| shared(&cloud), &roots, &never);
+        assert!(matches!(first.as_slice(), [CloudScan { result: Ok(s), .. }] if s.finished()));
+        assert_eq!(world.cursors.get(location)?.as_deref(), Some("g1"));
+        cloud.put("b.txt", "plain", "v1", 1_001);
+        let second = run_clouds(&world, &|_| shared(&cloud), &roots, &never);
+        let [
+            CloudScan {
+                result: Ok(scanned),
+                ..
+            },
+        ] = second.as_slice()
+        else {
+            return Err(format!("the second run failed: {second:?}").into());
+        };
+        assert_eq!((scanned.full, scanned.read), (false, 1));
+        assert_eq!(world.cursors.get(location)?.as_deref(), Some("g2"));
+
+        // Cancelled before the first location: nothing was reached, nothing is in the answer.
+        cloud.put("c.txt", "plain", "v1", 1_002);
+        let stopped = AtomicBool::new(true);
+        assert!(run_clouds(&world, &|_| shared(&cloud), &roots, &stopped).is_empty());
+        assert_eq!(world.cursors.get(location)?.as_deref(), Some("g2"));
+
+        // Cancelled while the first of two locations is reached: that scan did not get to the
+        // end, so its cursor is not moved, and the second location is not reached.
+        let cancel = AtomicBool::new(false);
+        let two = [PathBuf::from(ROOT), Path::new(ROOT).join("sub")];
+        let during = run_clouds(
+            &world,
+            &|_| {
+                cancel.store(true, Ordering::SeqCst);
+                shared(&cloud)
+            },
+            &two,
+            &cancel,
+        );
+        let [
+            CloudScan {
+                result: Ok(scanned),
+                ..
+            },
+        ] = during.as_slice()
+        else {
+            return Err(format!("the cancelled run: {during:?}").into());
+        };
+        assert!(!scanned.finished());
+        assert_eq!(world.cursors.get(location)?.as_deref(), Some("g2"));
+        assert_eq!(world.cursors.get(&two[1])?, None);
+        assert_eq!(
+            world.counts("c.txt"),
+            None,
+            "what was not read is found next time"
+        );
+
+        let after = run_clouds(&world, &|_| shared(&cloud), &roots, &never);
+        let [
+            CloudScan {
+                result: Ok(scanned),
+                ..
+            },
+        ] = after.as_slice()
+        else {
+            return Err(format!("the run after: {after:?}").into());
+        };
+        assert_eq!((scanned.full, scanned.read), (false, 1));
+        assert_eq!(world.counts("c.txt"), Some(vec![]));
+        Ok(())
+    }
+
+    #[test]
+    fn a_location_that_cannot_be_scanned_is_an_error_of_its_own_and_the_others_go_on() -> Res {
+        let world = World::new("clouds-errors")?;
+        add_dropbox(&world, "work")?;
+        add_dropbox(&world, "broken")?;
+        let cloud = Arc::new(Cloud::default());
+        cloud.put("a.txt", &format!("mail {EMAIL}"), "v1", 1_000);
+        let connects = AtomicUsize::new(0);
+        let connect = |account: &Account| {
+            connects.fetch_add(1, Ordering::SeqCst);
+            if account.label == "broken" {
+                Err(Error::sign_in_needed(Provider::Dropbox, "expired"))
+            } else {
+                shared(&cloud)
+            }
+        };
+        let roots = [
+            PathBuf::from(r"\\Dropbox\ghost\Docs"),
+            PathBuf::from(r"\\Dropbox\broken\Docs"),
+            PathBuf::from(ROOT),
+        ];
+        let done = run_clouds(&world, &connect, &roots, &AtomicBool::new(false));
+        let [ghost, broken, work] = done.as_slice() else {
+            return Err(format!("every location has an answer: {done:?}").into());
+        };
+
+        // No account has that name: said in words, and nothing was connected for it.
+        assert!(ghost.account.is_none());
+        let why = ghost
+            .result
+            .as_ref()
+            .err()
+            .ok_or("the ghost was scanned")?
+            .to_string();
+        assert!(why.contains("not connected any more"), "{why}");
+        assert!(why.contains("ghost \u{203a} Docs"), "{why}");
+
+        // An account that cannot be connected to.
+        assert_eq!(
+            broken.account.as_ref().map(|a| a.label.as_str()),
+            Some("broken")
+        );
+        let why = broken
+            .result
+            .as_ref()
+            .err()
+            .ok_or("the broken one was scanned")?;
+        assert_eq!(why.to_string(), "Sign in to Dropbox again.");
+        assert_eq!(world.cursors.get(&roots[1])?, None);
+
+        // The one that works was scanned after both.
+        assert!(matches!(&work.result, Ok(s) if s.finished() && s.read == 1));
+        assert_eq!(world.counts("a.txt"), Some(vec![(Email, 1)]));
+        assert_eq!(connects.load(Ordering::SeqCst), 2, "none for the ghost");
+        Ok(())
+    }
+
+    #[test]
+    fn an_account_is_connected_to_once_in_a_run_whatever_its_locations() -> Res {
+        let world = World::new("clouds-once")?;
+        add_dropbox(&world, "work")?;
+        let cloud = Arc::new(Cloud::default());
+        cloud.put("a.txt", &format!("mail {EMAIL}"), "v1", 1_000);
+        cloud.put(r"sub\b.txt", &format!("iban {IBAN}"), "v1", 1_001);
+        let connects = AtomicUsize::new(0);
+        let connect = |_: &Account| {
+            connects.fetch_add(1, Ordering::SeqCst);
+            shared(&cloud)
+        };
+        let roots = [PathBuf::from(ROOT), Path::new(ROOT).join("sub")];
+        let done = run_clouds(&world, &connect, &roots, &AtomicBool::new(false));
+        assert_eq!(done.len(), 2, "{done:?}");
+        assert!(
+            done.iter()
+                .all(|scan| matches!(&scan.result, Ok(s) if s.finished()))
+        );
+        assert_eq!(connects.load(Ordering::SeqCst), 1);
+        assert_eq!(world.counts("a.txt"), Some(vec![(Email, 1)]));
+        assert_eq!(world.counts(r"sub\b.txt"), Some(vec![(Iban, 1)]));
+        // The cursor of each location is its own.
+        assert!(world.cursors.get(&roots[0])?.is_some());
+        assert!(world.cursors.get(&roots[1])?.is_some());
+
+        // Another run makes a connector again: one is for a run.
+        run_clouds(&world, &connect, &roots, &AtomicBool::new(false));
+        assert_eq!(connects.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn accounts_that_cannot_be_read_are_an_error_for_every_cloud_location() -> Res {
+        let world = World::new("clouds-damaged")?;
+        fs::write(world.dir.join("sources.json"), "{ this is not json")?;
+        let cloud = Arc::new(Cloud::default());
+        let connects = AtomicUsize::new(0);
+        let connect = |_: &Account| {
+            connects.fetch_add(1, Ordering::SeqCst);
+            shared(&cloud)
+        };
+        let local = world.dir.join("docs");
+        let roots = [PathBuf::from(ROOT), local, PathBuf::from(r"\\Box\team")];
+        let done = run_clouds(&world, &connect, &roots, &AtomicBool::new(false));
+        assert_eq!(done.len(), 2, "the folder on this PC is not looked at");
+        for scan in &done {
+            assert!(scan.account.is_none());
+            let why = scan
+                .result
+                .as_ref()
+                .err()
+                .ok_or("a location was scanned")?
+                .to_string();
+            assert!(
+                why.contains("Could not read the connected accounts"),
+                "{why}"
+            );
+        }
+        assert_eq!(connects.load(Ordering::SeqCst), 0);
+        Ok(())
     }
 }

@@ -1,10 +1,12 @@
-//! The brand: the embedded icon file, the logo images per theme and the Windows theme probe.
+//! The brand: the embedded icon file, the logo images per theme, the logos of the cloud providers
+//! and the Windows theme probe.
 
 use std::{
     fs,
     path::{Path, PathBuf},
 };
 
+use piikey::sources::{Account, Provider};
 use windows_reactor::{EncodedImage, WindowTheme};
 use winreg::{RegKey, enums::HKEY_CURRENT_USER};
 
@@ -33,6 +35,26 @@ const LOCKUP_DARK: &[u8] = kit!("horizontal/piikey-horizontal-mono-d6c9f9.svg");
 const STACKED_LIGHT: &[u8] = kit!("stacked/piikey-stacked-mono-6f49b1.svg");
 const STACKED_DARK: &[u8] = kit!("stacked/piikey-stacked-mono-d6c9f9.svg");
 
+/// The logos of the cloud providers, official files kept as they were served (see
+/// `assets/providers/README.md`: no recolouring, no distortion, only to name the integration).
+macro_rules! provider {
+    ($file:literal) => {
+        include_bytes!(concat!("../../assets/providers/", $file))
+    };
+}
+
+const MICROSOFT_365: &[u8] = provider!("microsoft365.svg");
+const ONEDRIVE: &[u8] = provider!("onedrive.svg");
+const GOOGLE_DRIVE: &[u8] = provider!("google-drive.svg");
+const DROPBOX: &[u8] = provider!("dropbox.svg");
+/// Box's corporate logo in its blue, and the white one Box ships for dark backgrounds.
+const BOX: &[u8] = provider!("box.svg");
+const BOX_DARK: &[u8] = provider!("box-dark.svg");
+
+/// The Segoe Fluent Icons glyph that stands for a cloud account whose provider is not shown: the
+/// cloud.
+pub const CLOUD_GLYPH: &str = "\u{E753}";
+
 /// The Windows setting that holds the app theme.
 const PERSONALIZE: &str = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize";
 
@@ -57,6 +79,45 @@ pub fn lockup(dark: bool) -> EncodedImage {
 #[must_use]
 pub fn stacked(dark: bool) -> EncodedImage {
     themed(dark, STACKED_LIGHT, STACKED_DARK)
+}
+
+/// The official logo of a cloud provider for the theme: the providers' own files, of which only
+/// Box ships one for dark backgrounds; the others are the same on both themes.
+#[must_use]
+pub fn provider_logo(provider: Provider, dark: bool) -> EncodedImage {
+    EncodedImage::from_static(match provider {
+        Provider::Microsoft365 => MICROSOFT_365,
+        Provider::OneDrive => ONEDRIVE,
+        Provider::GoogleDrive => GOOGLE_DRIVE,
+        Provider::Dropbox => DROPBOX,
+        Provider::Box if dark => BOX_DARK,
+        Provider::Box => BOX,
+    })
+}
+
+/// Whether the account called `label` of `provider` shows its provider's logo: every account but
+/// the pretend one of a debug build (see [`provider_name`]), which has [`CLOUD_GLYPH`] instead.
+#[must_use]
+pub fn shows_logo(provider: Provider, label: &str) -> bool {
+    #[cfg(debug_assertions)]
+    if super::fake_cloud::is_fake_named(provider, label) {
+        return false;
+    }
+    let _ = (provider, label);
+    true
+}
+
+/// The name of the provider of `account` as the window writes it: [`Provider::name`], except for
+/// the pretend account of a debug build (the Box account `Example cloud` of `PIIKEY_FAKE_CLOUD=1`),
+/// whose provider is called "Example provider". It is stored as a Box account (the library has no
+/// provider for it), and a demo or a screenshot must never show a made-up Box integration.
+#[must_use]
+pub fn provider_name(account: &Account) -> &'static str {
+    #[cfg(debug_assertions)]
+    if super::fake_cloud::is_fake(account) {
+        return super::fake_cloud::PROVIDER;
+    }
+    account.provider.name()
 }
 
 /// Whether Windows apps use the dark theme now (`AppsUseLightTheme` is 0). Cheap, so it can be
@@ -255,6 +316,31 @@ mod tests {
                 "{name} dark has the light colour"
             );
         }
+    }
+
+    #[test]
+    fn every_provider_has_a_plain_svg_logo_and_box_one_for_each_theme() {
+        for provider in Provider::ALL {
+            for dark in [false, true] {
+                let logo = provider_logo(provider, dark);
+                let text = String::from_utf8_lossy(logo.as_bytes());
+                let name = provider.name();
+                assert!(text.contains("<svg"), "{name} is no svg");
+                assert!(text.trim_end().ends_with("</svg>"), "{name} svg is cut off");
+                for forbidden in ["<script", "<image", "<foreignObject", "href="] {
+                    assert!(
+                        !text.contains(forbidden),
+                        "{name} svg holds {forbidden}: logos are plain shapes"
+                    );
+                }
+            }
+        }
+        // Box's blue on light, its white on dark: the files as Box ships them.
+        let light = String::from_utf8_lossy(BOX).to_lowercase();
+        let dark = String::from_utf8_lossy(BOX_DARK).to_lowercase();
+        assert!(light.contains("#0061d5"), "Box light is not Box blue");
+        assert!(dark.contains("#fff"), "Box dark is not white");
+        assert!(!CLOUD_GLYPH.is_empty());
     }
 
     #[test]

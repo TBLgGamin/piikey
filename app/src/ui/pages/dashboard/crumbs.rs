@@ -3,7 +3,10 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use piikey::sys::volume_len;
+use piikey::{
+    sources::{Virtual, parse_virtual},
+    sys::volume_len,
+};
 
 /// What the top level is called.
 pub(super) const TOP: &str = "This PC";
@@ -24,6 +27,12 @@ pub(super) fn name_of(path: &Path) -> String {
         .map_or_else(String::new, |name| name.to_string_lossy().into_owned())
 }
 
+/// The account of the cloud that `path` is the top of (`\\Google Drive\jan@acme.com`), or `None`
+/// for any other path, including everything below an account's top.
+pub(super) fn account_top(path: &Path) -> Option<Virtual> {
+    parse_virtual(path).filter(|account| account.rest.as_os_str().is_empty())
+}
+
 /// The crumbs from the top level, called `top`, to `at`: the drive or share it is on (its name
 /// and its root are one crumb, `C:` leading to `C:\`) and every folder from there down.
 pub(super) fn crumbs(at: &Path, top: &str) -> Vec<Crumb> {
@@ -35,7 +44,7 @@ pub(super) fn crumbs(at: &Path, top: &str) -> Vec<Crumb> {
     let mut path: PathBuf = parts.by_ref().take(volume_len(at)).collect();
     if !path.as_os_str().is_empty() {
         trail.push(Crumb {
-            label: name_of(&path),
+            label: account_top(&path).map_or_else(|| name_of(&path), |account| account.label),
             target: path.clone(),
         });
     }
@@ -130,5 +139,17 @@ mod tests {
         assert_eq!(name_of(Path::new(r"C:\")), "C:");
         assert_eq!(name_of(Path::new(r"\\nas\share\")), r"\\nas\share");
         assert_eq!(name_of(Path::new(r"\\nas\share\docs")), "docs");
+    }
+
+    #[test]
+    fn only_the_top_of_a_cloud_account_is_an_account() {
+        let top = account_top(Path::new(r"\\Google Drive\jan@acme.com"));
+        assert_eq!(
+            top.map(|account| (account.provider.name(), account.label)),
+            Some(("Google Drive", "jan@acme.com".to_owned()))
+        );
+        assert!(account_top(Path::new(r"\\Google Drive\jan@acme.com\My Drive")).is_none());
+        assert!(account_top(Path::new(r"\\nas\share")).is_none());
+        assert!(account_top(Path::new(r"C:\")).is_none());
     }
 }

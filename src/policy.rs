@@ -27,7 +27,9 @@
 //! `http_port` is a port from 1 to 65535. `program` is an exe name; a path stands for its file
 //! name. `inventory_root` (the folders the inventory scans when asked) and `monitor_root` (a
 //! location whose changes are scanned as they happen; it must also be an `inventory_root`, and
-//! one that is not is dropped) repeat, one absolute folder each. A file from an older
+//! one that is not is dropped) repeat, one absolute folder each. A folder of a connected cloud
+//! account is a virtual path (`\\Google Drive\jan@acme.com\My Drive\Clients`, see
+//! [`crate::sources`]); it has no folder on this PC to check. A file from an older
 //! version lacks the newer keys and gets their defaults; the keys of features that are gone
 //! (`inventory`, `inventory_exclude`) are skipped like any unknown key, and the next save leaves
 //! them out. The retired `watch` and `watch_folder` keys are migrated: an older file's
@@ -48,7 +50,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use crate::{
     Error, Result,
     detect::{EntityKind, KindSet},
-    sys::{data_dir, io_context, same_path, write_atomic},
+    sources::{Accounts, is_virtual},
+    sys::{data_dir, io_context, is_under, same_path, write_atomic},
 };
 
 /// Site presets offered in the UI.
@@ -195,7 +198,15 @@ impl Policy {
     /// # Errors
     /// Unreadable file.
     pub fn load() -> Result<Self> {
-        Self::load_from(&data_dir()?.join(FILE_NAME))
+        Self::load_in(&data_dir()?)
+    }
+
+    /// [`Policy::load`] from the data folder `dir` instead of the user's.
+    ///
+    /// # Errors
+    /// Unreadable file.
+    pub fn load_in(dir: &Path) -> Result<Self> {
+        Self::load_from(&dir.join(FILE_NAME))
     }
 
     /// Saves atomically.
@@ -203,7 +214,15 @@ impl Policy {
     /// # Errors
     /// Write failure.
     pub fn save(&self) -> Result<()> {
-        write_atomic(&data_dir()?.join(FILE_NAME), self.to_text().as_bytes())
+        self.save_in(&data_dir()?)
+    }
+
+    /// [`Policy::save`] into the data folder `dir` instead of the user's.
+    ///
+    /// # Errors
+    /// Write failure.
+    pub fn save_in(&self, dir: &Path) -> Result<()> {
+        write_atomic(&dir.join(FILE_NAME), self.to_text().as_bytes())
     }
 
     /// Normalizes a user-typed site; `None` when invalid.
@@ -277,6 +296,18 @@ impl Policy {
         let roots = &self.inventory_roots;
         self.monitored_roots
             .retain(|m| roots.iter().any(|r| same_path(r, m)));
+    }
+
+    /// Takes the location `prefix` and every location under it off the list, with their
+    /// monitoring, and returns them in the order they were listed. Disconnecting a cloud account
+    /// does this with the account's top (`\\Google Drive\jan@acme.com`).
+    pub fn remove_under(&mut self, prefix: &Path) -> Vec<PathBuf> {
+        let (gone, kept) = std::mem::take(&mut self.inventory_roots)
+            .into_iter()
+            .partition(|root| is_under(root, prefix));
+        self.inventory_roots = kept;
+        self.prune_monitored();
+        gone
     }
 
     /// Whether traffic to `host` from program `exe` is intercepted: the app
@@ -462,12 +493,24 @@ pub struct SettingsPatch {
 }
 
 impl SettingsPatch {
-    /// Applies every present field to `policy`. Nothing is changed when any value is invalid.
+    /// Applies every present field to `policy`. Nothing is changed when any value is invalid. A
+    /// folder of a cloud account that is new to the locations must belong to a connected account
+    /// ([`Accounts`] in the user's data folder says); [`SettingsPatch::apply_with`] asks
+    /// something else.
     ///
     /// # Errors
     /// [`crate::Error::BadRequest`] naming the first invalid site, program, kind, folder or
     /// port.
     pub fn apply(&self, policy: &mut Policy) -> Result<()> {
+        self.apply_with(policy, &known_account)
+    }
+
+    /// [`SettingsPatch::apply`], with `known` saying whether a connected cloud account holds the
+    /// virtual path it is given.
+    ///
+    /// # Errors
+    /// As [`SettingsPatch::apply`].
+    pub fn apply_with(&self, policy: &mut Policy, known: &dyn Fn(&Path) -> bool) -> Result<()> {
         let mut next = policy.clone();
         if let Some(sites) = &self.sites {
             next.sites = checked(sites, "site", Policy::parse_site)?;
@@ -491,6 +534,20 @@ impl SettingsPatch {
         }
         if let Some(folders) = &self.inventory_roots {
             next.inventory_roots = checked_folders(folders, "inventory folder")?;
+            // A cloud folder has no folder on this PC to look at: its account has to be there.
+            if let Some(stray) = next.inventory_roots.iter().find(|root| {
+                is_virtual(root)
+                    && !policy
+                        .inventory_roots
+                        .iter()
+                        .any(|old| same_path(old, root))
+                    && !known(root)
+            }) {
+                return Err(Error::BadRequest(format!(
+                    "Not a location: {} (no connected account has that name: add the account first)",
+                    stray.display()
+                )));
+            }
         }
         if let Some(folders) = &self.monitored_roots {
             let monitored = checked_folders(folders, "monitored folder")?;
@@ -520,6 +577,13 @@ impl SettingsPatch {
         *policy = next;
         Ok(())
     }
+}
+
+/// Whether a connected cloud account of the user's data folder holds the virtual path `path`.
+fn known_account(path: &Path) -> bool {
+    data_dir()
+        .and_then(|dir| Accounts::open(&dir))
+        .is_ok_and(|accounts| accounts.of(path).is_some())
 }
 
 /// `values` normalized by `parse`, without duplicates.
@@ -1321,5 +1385,136 @@ mod tests {
         for preset in PRESETS {
             assert_eq!(Policy::parse_site(preset).as_deref(), Some(*preset));
         }
+    }
+
+    #[test]
+    fn remove_under_takes_the_locations_under_a_prefix_with_their_monitoring() {
+        let path = PathBuf::from;
+        let mut p = Policy {
+            inventory_roots: vec![
+                path(r"C:\Docs"),
+                path(r"\\Google Drive\Work"),
+                path(r"\\Google Drive\Work\Docs"),
+                path(r"\\Google Drive\Work2"),
+                path(r"\\Dropbox\Work"),
+                path(r"\\google drive\WORK\Other"),
+            ],
+            monitored_roots: vec![
+                path(r"\\Google Drive\Work\Docs"),
+                path(r"C:\Docs"),
+                path(r"\\Google Drive\Work2"),
+            ],
+            ..Policy::default()
+        };
+        let gone = p.remove_under(Path::new(r"\\Google Drive\Work"));
+        assert_eq!(
+            gone,
+            [
+                path(r"\\Google Drive\Work"),
+                path(r"\\Google Drive\Work\Docs"),
+                path(r"\\google drive\WORK\Other"),
+            ],
+            "in the order they were listed, whatever the letter case"
+        );
+        assert_eq!(
+            p.inventory_roots,
+            [
+                path(r"C:\Docs"),
+                path(r"\\Google Drive\Work2"),
+                path(r"\\Dropbox\Work")
+            ]
+        );
+        // What was monitored there is not any more; the rest still is.
+        assert_eq!(
+            p.monitored_roots,
+            [path(r"C:\Docs"), path(r"\\Google Drive\Work2")]
+        );
+        // A prefix that holds no location takes nothing.
+        let before = p.clone();
+        assert!(p.remove_under(Path::new(r"\\Box\Team")).is_empty());
+        assert_eq!(p, before);
+    }
+
+    #[test]
+    fn a_policy_is_saved_into_and_loaded_from_the_folder_it_is_given() -> Result<()> {
+        let dir = temp_dir("in");
+        assert_eq!(Policy::load_in(&dir)?, Policy::default(), "no file yet");
+        let saved = policy();
+        saved.save_in(&dir)?;
+        assert!(dir.join(FILE_NAME).is_file());
+        assert_eq!(Policy::load_in(&dir)?, saved);
+        // Another folder has its own.
+        let other = temp_dir("in-other");
+        assert_eq!(Policy::load_in(&other)?, Policy::default());
+        Ok(())
+    }
+
+    fn locations(roots: &[&str]) -> SettingsPatch {
+        SettingsPatch {
+            inventory_roots: Some(roots.iter().map(PathBuf::from).collect()),
+            ..SettingsPatch::default()
+        }
+    }
+
+    #[test]
+    fn a_new_cloud_location_needs_a_known_account_and_an_old_one_does_not() -> Result<()> {
+        let work = Path::new(r"\\Google Drive\Work");
+        let known = |path: &Path| path.starts_with(work);
+        let mut p = Policy::default();
+
+        // An account that is there, next to a folder on this PC (which asks nothing).
+        locations(&[r"\\Google Drive\Work\Docs", r"C:\X"]).apply_with(&mut p, &known)?;
+        assert_eq!(
+            p.inventory_roots,
+            [
+                PathBuf::from(r"\\Google Drive\Work\Docs"),
+                PathBuf::from(r"C:\X")
+            ]
+        );
+
+        // A stranger's folder is refused, and nothing changes.
+        let before = p.clone();
+        let refused = locations(&[r"\\Google Drive\Work\Docs", r"\\Dropbox\Nobody\Docs"])
+            .apply_with(&mut p, &known);
+        let Err(error) = refused else {
+            return Err(Error::BadRequest(
+                "a folder of an unknown account was accepted".to_owned(),
+            ));
+        };
+        assert!(matches!(error, Error::BadRequest(_)), "{error:?}");
+        assert!(
+            error.to_string().contains("add the account first"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("Nobody"), "{error}");
+        assert_eq!(p, before);
+
+        // A location the list already has stays whatever became of its account, in the same
+        // patch as a new one of an account that is there.
+        p.inventory_roots = vec![PathBuf::from(r"\\Dropbox\Gone\Docs")];
+        locations(&[r"\\Dropbox\Gone\Docs", r"\\Google Drive\Work"]).apply_with(&mut p, &known)?;
+        assert_eq!(p.inventory_roots.len(), 2);
+
+        // Nothing is known: only folders on this PC, and the old ones, go through.
+        let none = |_: &Path| false;
+        locations(&[r"C:\X"]).apply_with(&mut p, &none)?;
+        assert_eq!(p.inventory_roots, [PathBuf::from(r"C:\X")]);
+        assert!(
+            locations(&[r"\\Box\Team"])
+                .apply_with(&mut p, &none)
+                .is_err()
+        );
+
+        // A cloud location can be monitored like any other.
+        let both = SettingsPatch {
+            monitored_roots: Some(vec![PathBuf::from(r"\\Google Drive\Work\Docs")]),
+            ..locations(&[r"\\Google Drive\Work\Docs"])
+        };
+        both.apply_with(&mut p, &known)?;
+        assert_eq!(
+            p.monitored_roots,
+            [PathBuf::from(r"\\Google Drive\Work\Docs")]
+        );
+        Ok(())
     }
 }

@@ -17,7 +17,7 @@ mod report;
 mod tree;
 mod types;
 
-use piikey::detect::EntityKind;
+use piikey::{detect::EntityKind, inventory::Node};
 use windows_reactor::{
     Border, Button, ButtonStyle, Callback, Color, FontIcon, FontWeight, Grid, GridLength,
     HorizontalAlignment, HyperlinkButton, KeyedView, Orientation, ScrollViewer, StackPanel,
@@ -26,12 +26,16 @@ use windows_reactor::{
 };
 
 use self::{
-    crumbs::{TOP, crumbs},
+    crumbs::{TOP, account_top, crumbs},
     tree::{Line, Row, lines, segments},
 };
 pub(in crate::ui) use self::{findings::panel as findings_panel, report::dialog};
-use super::kit::{Context, caption, card, counted, glyph, place_glyph, thousands};
+use super::{
+    kit::{Context, caption, card, counted, glyph, place_glyph, provider_icon, thousands},
+    lists::{provider_label, shown},
+};
 use crate::ui::{
+    controller::AccountView,
     treemap::Rect,
     window::{Dash, Dashboard, Loaded, Msg, Origin, PANE_WIDTH},
 };
@@ -238,6 +242,31 @@ fn row_caption(row: &Row, kind: Option<EntityKind>) -> String {
 /// The fill behind the selected row of the tree, light enough for both themes.
 const SELECTED_FILL: Color = Color::argb(0x1f, 0x80, 0x80, 0x80);
 
+/// What a row of the tree is called, what its tooltip says and its icon. The top of a cloud
+/// account reads as the account's name with its provider's logo, and the provider's name (the
+/// connected account's, see [`provider_label`]) is in the tooltip; everything below it is a folder
+/// or file like any other, with its path as a person reads it.
+fn row_face(node: &Node, accounts: &[AccountView], dark: bool) -> (String, String, View) {
+    match account_top(&node.path) {
+        Some(account) => (
+            account.label.clone(),
+            format!(
+                "{}: {}",
+                provider_label(accounts, &node.path).unwrap_or_else(|| account.provider.name()),
+                account.label
+            ),
+            provider_icon(account.provider, Some(&account.label), 14.0, dark),
+        ),
+        None => (
+            node.name.clone(),
+            shown(&node.path),
+            place_glyph(node.is_dir, 14.0, dark)
+                .vertical_alignment(VerticalAlignment::Center)
+                .into(),
+        ),
+    }
+}
+
 /// One row of the tree: how deep it is, a button to open it when it is a folder, and the row
 /// itself, a button that selects it, with its name over a bar and the types it holds, and what it
 /// holds. The two buttons lie side by side, so each has its own pointer, focus and keys.
@@ -245,10 +274,12 @@ fn row_view(
     row: &Row,
     kind: Option<EntityKind>,
     selected: bool,
+    accounts: &[AccountView],
     dark: bool,
     send: &Callback<Msg>,
 ) -> View {
     let node = &row.node;
+    let (title, tip, icon) = row_face(node, accounts, dark);
     let chevron: View = if node.is_dir {
         let send = send.clone();
         let folder = node.path.clone();
@@ -259,7 +290,7 @@ fn row_view(
             .automation_name(format!(
                 "{} {}",
                 if row.open { "Close" } else { "Open" },
-                node.name
+                title
             ))
             .on_click(move || send.call(Msg::Dash(Dash::Toggle(folder.clone()))))
             .content(glyph(if row.open { "\u{E70D}" } else { "\u{E76C}" }, 10.0))
@@ -271,9 +302,9 @@ fn row_view(
         .columns([GridLength::Auto, GridLength::STAR])
         .column_spacing(8.0)
         .children((
-            place_glyph(node.is_dir, 14.0, dark).vertical_alignment(VerticalAlignment::Center),
+            icon,
             TextBlock::new()
-                .text(&node.name)
+                .text(&title)
                 .text_trimming(TextTrimming::CharacterEllipsis)
                 .grid_column(1),
         ));
@@ -297,7 +328,7 @@ fn row_view(
             .horizontal_alignment(HorizontalAlignment::Stretch)
             .horizontal_content_alignment(HorizontalAlignment::Stretch)
             .grid_column(3)
-            .automation_name(node.name.as_str())
+            .automation_name(title.as_str())
             .on_click(move || send.call(Msg::Dash(Dash::Select(path.clone(), Origin::Tree))))
             .content(
                 Grid::new()
@@ -314,7 +345,7 @@ fn row_view(
                             .grid_column(1),
                     )),
             )
-            .tooltip(node.path.display().to_string())
+            .tooltip(tip)
     };
     let mark: View = if selected {
         Border::new()
@@ -366,7 +397,13 @@ fn leftover(line: &Line) -> Option<String> {
 /// reused the containers of its rows and drew rows in the places of others; an `ItemsRepeater`
 /// gets its rows a moment after it measures them, so a new folder emptied the list and scrolled
 /// it to the top, and the end of the list jittered as rows grew under the scroll bar.)
-fn tree_card(dash: &Dashboard, loaded: &Loaded, dark: bool, context: Context<'_>) -> Border {
+fn tree_card(
+    dash: &Dashboard,
+    loaded: &Loaded,
+    accounts: &[AccountView],
+    dark: bool,
+    context: Context<'_>,
+) -> Border {
     let send = context.forward();
     let rows = lines(&loaded.levels, &dash.at, &dash.open, dash.kind)
         .into_iter()
@@ -374,7 +411,7 @@ fn tree_card(dash: &Dashboard, loaded: &Loaded, dark: bool, context: Context<'_>
             let view: View = match &line {
                 Line::Row(row) => {
                     let picked = dash.selected.as_deref() == Some(row.node.path.as_path());
-                    row_view(row, dash.kind, picked, dark, &send)
+                    row_view(row, dash.kind, picked, accounts, dark, &send)
                 }
                 other => caption(leftover(other).unwrap_or_default())
                     .text_wrapping(TextWrapping::Wrap)
@@ -446,7 +483,7 @@ pub(super) fn dashboard(
     let plan = Plan::of(space, loaded.totals.len());
     let placed = map::place(
         &loaded.tiles,
-        &dash.at,
+        &loaded.map_at,
         dash.kind,
         Rect {
             x: 0.0,
@@ -455,11 +492,15 @@ pub(super) fn dashboard(
             h: plan.canvas.1,
         },
     );
-    let selected = dash.selected.as_deref();
-    let folder_selected = selected.is_some_and(|path| dash.is_folder(path));
-    let map = map::map(&placed, plan.canvas, selected, folder_selected, context);
-    let tree = tree_card(dash, loaded, window.dark, context);
-    let details = details::details(dash, plan.details, window.dark, context);
+    let map = map::map(&placed, plan.canvas, dash.selected.as_deref(), context);
+    let tree = tree_card(dash, loaded, &window.snap.accounts, window.dark, context);
+    let details = details::details(
+        dash,
+        &window.snap.accounts,
+        plan.details,
+        window.dark,
+        context,
+    );
     if plan.wide {
         let side = Grid::new()
             .rows([GridLength::Pixel(plan.legend), GridLength::STAR])

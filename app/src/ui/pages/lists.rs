@@ -4,17 +4,15 @@
 
 use std::{path::Path, rc::Rc};
 
+use piikey::sources;
 use windows_reactor::{
     Button, ButtonStyle, CheckBox, DataItem, Grid, GridLength, ListView, ListViewSelectionMode,
-    ScrollBarVisibility, ScrollViewer, StackPanel, TextBlock, TextBox, TextTrimming, Thickness,
-    ToggleSwitch, VerticalAlignment, View,
+    Orientation, ScrollBarVisibility, ScrollViewer, StackPanel, TextBlock, TextBox, TextTrimming,
+    Thickness, ToggleSwitch, VerticalAlignment, View,
 };
 
-use super::kit::{Context, caption, card, place_glyph, toned_glyph};
-use crate::ui::{
-    status::Tone,
-    window::{Browse, Msg},
-};
+use super::kit::{Context, caption, card, place_glyph, provider_icon, toned_glyph};
+use crate::ui::{assets, controller::AccountView, status::Tone, window::Msg};
 
 /// The height of the row of a place.
 const PLACE_ROW: f64 = 44.0;
@@ -91,15 +89,16 @@ pub(super) fn add_row(
     add_row_with(placeholder, draft, button, on_text, on_add, &[], context)
 }
 
-/// [`add_row`] with Browse buttons after its button: each opens the Windows picker named by its
-/// label, and what is picked goes where the box's text would.
+/// [`add_row`] with buttons after its button: each sends its message when pressed (a Browse button
+/// opens the Windows picker named by its label, the cloud one the dialog of the accounts), and
+/// what is picked goes where the box's text would.
 pub(super) fn add_row_with(
     placeholder: &str,
     draft: &str,
     button: &str,
     on_text: impl Fn(String) -> Msg + 'static,
     on_add: Msg,
-    browse: &[(&str, Browse)],
+    browse: &[(&str, Msg)],
     context: Context<'_>,
 ) -> View {
     let mut columns = vec![GridLength::STAR, GridLength::Auto];
@@ -117,13 +116,13 @@ pub(super) fn add_row_with(
             .on_click(context.message(on_add))
             .into(),
     ];
-    for (column, &(label, kind)) in (2..).zip(browse) {
+    for (column, (label, message)) in (2..).zip(browse) {
         columns.push(GridLength::Auto);
         children.push(
             Button::new()
-                .content(label)
+                .content(*label)
                 .grid_column(column)
-                .on_click(context.message(Msg::Browse(kind)))
+                .on_click(context.message(message.clone()))
                 .into(),
         );
     }
@@ -134,10 +133,61 @@ pub(super) fn add_row_with(
         .into()
 }
 
-/// One place a page looks through (a location of the inventory): its folder icon in the brand
-/// colour (in the caution colour when `tone` says something is wrong), its path, what it is doing,
-/// its Monitor switch (`monitored` says where it stands, and `monitor` turns a toggle into the
-/// message) and the button that takes it off.
+/// `path` as a person reads it: a path in a cloud account as the account's name and its folders
+/// (`Example cloud › Shared › contacts.csv`: its provider is told by its logo), any other as
+/// Windows writes it. The inventory's own address of a cloud item is never drawn.
+pub(super) fn shown(path: &Path) -> String {
+    sources::display_path(path).unwrap_or_else(|| path.display().to_string())
+}
+
+/// The name of the provider of the cloud item at `path`, as the window writes it: that of the
+/// connected account the path names ([`assets::provider_name`], which keeps a pretend account from
+/// passing for a real provider), else the provider's own name. `None` for a path on this PC.
+pub(super) fn provider_label(accounts: &[AccountView], path: &Path) -> Option<&'static str> {
+    let cloud = sources::parse_virtual(path)?;
+    Some(
+        accounts
+            .iter()
+            .find(|view| {
+                view.account.provider == cloud.provider
+                    && view.account.label.to_lowercase() == cloud.label.to_lowercase()
+            })
+            .map_or_else(
+                || cloud.provider.name(),
+                |view| assets::provider_name(&view.account),
+            ),
+    )
+}
+
+/// The icon of a place: a folder in the brand colour, in the caution colour when `tone` says
+/// something is wrong. A folder of a cloud account has its provider's logo instead, which is never
+/// recoloured: a caution is a small warning sign beside it.
+fn place_icon(path: &Path, tone: Tone, dark: bool) -> View {
+    let Some(cloud) = sources::parse_virtual(path) else {
+        return if tone == Tone::Caution {
+            toned_glyph("\u{E8B7}", 18.0, tone, dark)
+        } else {
+            place_glyph(true, 18.0, dark)
+        }
+        .vertical_alignment(VerticalAlignment::Center)
+        .into();
+    };
+    let logo = provider_icon(cloud.provider, Some(&cloud.label), 18.0, dark);
+    if tone != Tone::Caution {
+        return logo;
+    }
+    let parts: Vec<View> = vec![logo, toned_glyph("\u{E7BA}", 14.0, tone, dark).into()];
+    StackPanel::new()
+        .orientation(Orientation::Horizontal)
+        .spacing(6.0)
+        .vertical_alignment(VerticalAlignment::Center)
+        .children(parts)
+        .into()
+}
+
+/// One place a page looks through (a location of the inventory): its icon (see [`place_icon`]),
+/// its path, what it is doing, its Monitor switch (`monitored` says where it stands, and `monitor`
+/// turns a toggle into the message) and the button that takes it off.
 #[expect(
     clippy::too_many_arguments,
     reason = "each part of the row is its own input: what it says, its switch and its button"
@@ -162,18 +212,13 @@ pub(super) fn place_row(
         .column_spacing(12.0)
         .height(PLACE_ROW)
         .children((
-            if tone == Tone::Caution {
-                toned_glyph("\u{E8B7}", 18.0, tone, dark)
-            } else {
-                place_glyph(true, 18.0, dark)
-            }
-            .vertical_alignment(VerticalAlignment::Center),
+            place_icon(path, tone, dark),
             StackPanel::new()
                 .grid_column(1)
                 .vertical_alignment(VerticalAlignment::Center)
                 .children((
                     TextBlock::new()
-                        .text(path.display().to_string())
+                        .text(shown(path))
                         .text_trimming(TextTrimming::CharacterEllipsis)
                         .is_text_selection_enabled(true),
                     caption(state),
@@ -182,14 +227,14 @@ pub(super) fn place_row(
                 .is_on(monitored)
                 .on_content("Monitoring")
                 .off_content("Not monitored")
-                .automation_name(format!("Monitor {}", path.display()))
+                .automation_name(format!("Monitor {}", shown(path)))
                 .grid_column(2)
                 .vertical_alignment(VerticalAlignment::Center)
                 .on_toggled(context.callback(monitor)),
             Button::new()
                 .content("Remove")
                 .style(ButtonStyle::Subtle)
-                .automation_name(format!("Remove {}", path.display()))
+                .automation_name(format!("Remove {}", shown(path)))
                 .grid_column(3)
                 .vertical_alignment(VerticalAlignment::Center)
                 .on_click(context.message(remove)),

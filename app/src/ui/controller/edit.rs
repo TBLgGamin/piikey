@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use piikey::{
     detect::EntityKind,
     policy::{Highlight, Policy},
+    sources,
 };
 
 use crate::Res;
@@ -35,14 +36,17 @@ pub enum Edit {
     /// quits piikey.
     Background(bool),
     /// A folder the inventory scans when asked (one of its locations); `on` adds it, `off`
-    /// takes it off, which ends its monitoring too. A path that is no folder is refused. There is
-    /// no location until the user adds one.
+    /// takes it off, which ends its monitoring too. A path that is no folder is refused. A folder
+    /// of a cloud account (`\\Google Drive\jan@acme.com\My Drive`) is no folder on this PC, so
+    /// the disk has nothing to say of it: it is added, and the controller refuses it when no
+    /// connected account has that name. There is no location until the user adds one.
     InventoryRoot {
         path: PathBuf,
         on: bool,
     },
-    /// Whether the location `path` is monitored: its file changes are scanned as they happen.
-    /// Only a location can be: any other path is refused.
+    /// Whether the location `path` is monitored: its file changes are scanned as they happen, and
+    /// a location in a cloud account is asked what changed every few minutes. Only a location can
+    /// be: any other path is refused.
     Monitor {
         path: PathBuf,
         on: bool,
@@ -101,7 +105,7 @@ pub fn apply_edit(policy: &mut Policy, edit: &Edit) -> Res<bool> {
                 .iter()
                 .find(|root| same_folder(root, path))
                 .cloned()
-                .ok_or_else(|| format!("Not a location: {}", path.display()))?;
+                .ok_or_else(|| format!("Not a location: {}", sources::shown(path)))?;
             if policy
                 .monitored_roots
                 .iter()
@@ -150,14 +154,14 @@ fn set<T: PartialEq>(slot: &mut T, value: T) -> bool {
 }
 
 /// Adds `path` to a list of folders, or takes it off; whether the list changed. An added path
-/// must be a folder that exists.
+/// must be a folder that exists, or a folder of a cloud account, which no disk holds.
 fn folder_edit(list: &mut Vec<PathBuf>, path: &Path, on: bool) -> Res<bool> {
     if !on {
         let before = list.len();
         list.retain(|item| !same_folder(item, path));
         return Ok(list.len() != before);
     }
-    if !path.is_dir() {
+    if !sources::is_virtual(path) && !path.is_dir() {
         return Err(format!("Not a folder: {}", path.display()));
     }
     let folder = Policy::parse_folder(&path.to_string_lossy()).ok_or_else(|| {

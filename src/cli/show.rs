@@ -12,8 +12,9 @@ use piikey::{
     api::{
         ApiError, Request,
         reply::{
-            Entries, Exported, Forgotten, Found, InventoryStatus, Kind, Model, ModelState, Nodes,
-            Protection, Records, Reported, Scanned, Spans, Status, Texts, Token, Written,
+            AccountInfo, AccountRemoved, Accounts, Entries, Exported, Folders, Forgotten, Found,
+            InventoryStatus, Kind, Model, ModelState, Nodes, Protection, Records, Reported,
+            Scanned, Spans, Status, Texts, Token, Written,
         },
     },
     detect::EntityKind,
@@ -59,6 +60,13 @@ pub enum View {
     Token,
     Status,
     Protection,
+    /// `account list`.
+    Accounts,
+    /// `account add` and `account connect`: one account.
+    Account,
+    AccountRemoved,
+    /// `account browse`.
+    Folders,
     /// Nothing better than the JSON.
     Json,
 }
@@ -82,6 +90,10 @@ impl View {
             Request::InventoryRescan => Self::Rescanned,
             Request::InventoryReport { .. } => Self::Report,
             Request::SettingsGet | Request::SettingsSet { .. } => Self::Settings,
+            Request::AccountsList => Self::Accounts,
+            Request::AccountAdd { .. } | Request::AccountConnect { .. } => Self::Account,
+            Request::AccountRemove { .. } => Self::AccountRemoved,
+            Request::AccountBrowse { .. } => Self::Folders,
             Request::Kinds => Self::Kinds,
             Request::ModelStatus => Self::Model,
             Request::ModelDownload => Self::Downloaded,
@@ -125,6 +137,10 @@ pub fn print(
         View::Token => token(value, out),
         View::Status => status(value, out),
         View::Protection => protection(value, out),
+        View::Accounts => accounts(value, out),
+        View::Account => account(value, out),
+        View::AccountRemoved => account_removed(value, out),
+        View::Folders => folders(value, out),
         View::Json => Ok(writeln!(out, "{}", pretty(value))?),
     }
 }
@@ -619,6 +635,100 @@ fn status(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
 fn protection(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
     let on = reply::<Protection>(value)?.protection;
     writeln!(out, "protection is {}", on_off(on))?;
+    Ok(())
+}
+
+/// The way an account signs in, as `account add --mode` spells it.
+fn way(info: &AccountInfo) -> String {
+    serde_json::to_value(&info.sign_in)
+        .ok()
+        .and_then(|value| value.get("mode").and_then(Value::as_str).map(str::to_owned))
+        .unwrap_or_default()
+}
+
+fn account_state(info: &AccountInfo) -> &'static str {
+    if info.connected {
+        "connected"
+    } else {
+        "not connected"
+    }
+}
+
+fn accounts(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
+    let accounts = reply::<Accounts>(value)?.accounts;
+    if accounts.is_empty() {
+        writeln!(
+            out,
+            "no cloud accounts (piikey-cli account add connects one)"
+        )?;
+        return Ok(());
+    }
+    let rows: Vec<Vec<String>> = accounts
+        .iter()
+        .map(|info| {
+            vec![
+                info.id.clone(),
+                info.provider.name().to_owned(),
+                info.label.clone(),
+                way(info),
+                account_state(info).to_owned(),
+                info.path.clone(),
+            ]
+        })
+        .collect();
+    table(
+        out,
+        &["ID", "SERVICE", "NAME", "SIGN-IN", "STATUS", "PATH"],
+        &[],
+        &rows,
+    )?;
+    Ok(())
+}
+
+fn account(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
+    let info = reply::<AccountInfo>(value)?;
+    pairs(
+        out,
+        &[
+            ("id", info.id.clone()),
+            ("service", info.provider.name().to_owned()),
+            ("name", info.label.clone()),
+            ("sign-in", way(&info)),
+            ("status", account_state(&info).to_owned()),
+            ("path", info.path.clone()),
+        ],
+    )?;
+    if !info.connected {
+        writeln!(
+            out,
+            "not connected yet: piikey-cli account connect {} signs in",
+            info.id
+        )?;
+    }
+    Ok(())
+}
+
+fn account_removed(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
+    let removed = reply::<AccountRemoved>(value)?;
+    writeln!(out, "removed the account {}", removed.id)?;
+    for location in &removed.locations {
+        writeln!(out, "took {location} off the locations")?;
+    }
+    writeln!(out, "forgot {}", plural(removed.forgotten, "file"))?;
+    Ok(())
+}
+
+fn folders(value: &Value, out: &mut dyn Write) -> Result<(), Fail> {
+    let folders = reply::<Folders>(value)?.folders;
+    if folders.is_empty() {
+        writeln!(out, "no folders here")?;
+        return Ok(());
+    }
+    let rows: Vec<Vec<String>> = folders
+        .iter()
+        .map(|folder| vec![folder.name.clone(), folder.path.clone()])
+        .collect();
+    table(out, &["NAME", "PATH"], &[], &rows)?;
     Ok(())
 }
 

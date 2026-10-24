@@ -183,3 +183,40 @@ fn only_a_location_can_be_monitored_and_removing_it_ends_its_monitoring() -> Tes
     );
     Ok(())
 }
+
+#[test]
+fn a_location_in_a_cloud_account_is_no_folder_on_this_pc_and_needs_none() -> Test {
+    let drive = PathBuf::from(r"\\Google Drive\jan@acme.com\My Drive");
+    let shouted = PathBuf::from(drive.to_string_lossy().to_ascii_uppercase());
+    let root = |path: &Path, on| Edit::InventoryRoot {
+        path: path.to_path_buf(),
+        on,
+    };
+    let monitor = |path: &Path, on| Edit::Monitor {
+        path: path.to_path_buf(),
+        on,
+    };
+    let mut policy = quiet();
+
+    // The disk has nothing to say of it: Windows would look for a server of that name.
+    assert!(apply_edit(&mut policy, &root(&drive, true))?);
+    assert!(
+        !apply_edit(&mut policy, &root(&drive, true))?,
+        "twice is once"
+    );
+    assert!(
+        !apply_edit(&mut policy, &root(&shouted, true))?,
+        "Windows paths ignore case"
+    );
+    assert_eq!(policy.inventory_roots, std::slice::from_ref(&drive));
+
+    // It is monitored as any location is, spelled as the location is, and taking it off ends that.
+    assert!(apply_edit(&mut policy, &monitor(&shouted, true))?);
+    assert_eq!(policy.monitored_roots, std::slice::from_ref(&drive));
+    assert!(apply_edit(&mut policy, &monitor(&drive, false))?);
+    assert!(apply_edit(&mut policy, &monitor(&drive, true))?);
+    assert!(apply_edit(&mut policy, &root(&shouted, false))?);
+    assert!(policy.inventory_roots.is_empty());
+    assert!(policy.monitored_roots.is_empty());
+    Ok(())
+}

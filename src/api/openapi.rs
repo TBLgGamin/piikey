@@ -219,18 +219,20 @@ enum Tag {
     Subject,
     Vault,
     Inventory,
+    Accounts,
     Settings,
     Model,
     App,
 }
 
 impl Tag {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::Text,
         Self::Files,
         Self::Subject,
         Self::Vault,
         Self::Inventory,
+        Self::Accounts,
         Self::Settings,
         Self::Model,
         Self::App,
@@ -243,6 +245,7 @@ impl Tag {
             Self::Subject => "Subject search",
             Self::Vault => "Vault",
             Self::Inventory => "Inventory",
+            Self::Accounts => "Accounts",
             Self::Settings => "Settings",
             Self::Model => "Model",
             Self::App => "App",
@@ -258,6 +261,7 @@ impl Tag {
             Self::Inventory => {
                 "What the scans found in your locations: counts and paths, never the values."
             }
+            Self::Accounts => "The cloud accounts piikey may read.",
             Self::Settings => {
                 "What piikey is set to, the types of personal data, and the API token."
             }
@@ -336,6 +340,21 @@ fn route(request: &Request) -> Route {
         }
         Request::SettingsGet => Route::of::<Policy>(Tag::Settings, "Read the settings"),
         Request::SettingsSet { .. } => Route::of::<Policy>(Tag::Settings, "Change the settings"),
+        Request::AccountsList => {
+            Route::of::<reply::Accounts>(Tag::Accounts, "List the cloud accounts")
+        }
+        Request::AccountAdd { .. } => {
+            Route::of::<reply::AccountInfo>(Tag::Accounts, "Add a cloud account")
+        }
+        Request::AccountConnect { .. } => {
+            Route::of::<reply::AccountInfo>(Tag::Accounts, "Sign in to a cloud account")
+        }
+        Request::AccountRemove { .. } => {
+            Route::of::<reply::AccountRemoved>(Tag::Accounts, "Remove a cloud account")
+        }
+        Request::AccountBrowse { .. } => {
+            Route::of::<reply::Folders>(Tag::Accounts, "Browse a cloud account")
+        }
         Request::Kinds => {
             Route::of::<Vec<reply::Kind>>(Tag::Settings, "List the types of personal data")
         }

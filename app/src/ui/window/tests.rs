@@ -17,6 +17,9 @@ use crate::ui::controller::{
 };
 use crate::{Describe, proxy::PORT};
 
+mod accounts;
+mod cloud;
+
 type Test = Result<(), String>;
 
 /// How long a test waits for the controller's worker.
@@ -212,7 +215,7 @@ impl Headless {
     /// controller as the window reads it, and returns what that drew.
     fn loaded(&mut self, at: &Path) -> Result<Vec<String>, String> {
         self.loads += 1;
-        let loaded = Loaded::read(&self.controller, at, &[], None);
+        let loaded = Loaded::read(&self.controller, at, at, &[], None);
         self.send(Msg::Dash(Dash::Loaded(self.loads, Box::new(loaded))))
     }
 
@@ -223,8 +226,20 @@ impl Headless {
         open: &[PathBuf],
         file: Option<&Path>,
     ) -> Result<Vec<String>, String> {
+        self.loaded_in(at, at, open, file)
+    }
+
+    /// As [`Headless::loaded_with`], with the map on the folder `map_at`: the folder a selection
+    /// moved it to.
+    fn loaded_in(
+        &mut self,
+        at: &Path,
+        map_at: &Path,
+        open: &[PathBuf],
+        file: Option<&Path>,
+    ) -> Result<Vec<String>, String> {
         self.loads += 1;
-        let loaded = Loaded::read(&self.controller, at, open, file);
+        let loaded = Loaded::read(&self.controller, at, map_at, open, file);
         self.send(Msg::Dash(Dash::Loaded(self.loads, Box::new(loaded))))
     }
 
@@ -469,7 +484,7 @@ fn pages() -> [(Page, &'static [&'static str]); 4] {
             Page::Inventory,
             &[
                 "Inventory",
-                "Where personal data is stored on this PC: what you scan, kept up to date in the locations you monitor.",
+                "Where personal data is stored, on this PC and in your cloud accounts: what you scan, kept up to date in the locations you monitor.",
                 "Scan",
                 "Export report",
                 "Add and scan",
@@ -1205,8 +1220,9 @@ fn the_inventory_dashboard_lists_what_was_scanned_in_the_tree_the_legend_the_map
         &["Open", "Show what was found", "Make masked copy"],
     )?;
     expect_not_drawn("nothing to scan again", &picked, &["Scan this"])?;
-    // The load that follows brings the entry of the file: when it was scanned, and how big.
-    let entry = ui.loaded_with(&parent, &[folder], Some(&file))?;
+    // The load that follows brings the entry of the file: when it was scanned, and how big. The
+    // map is on the folder selected before, which holds the file.
+    let entry = ui.loaded_in(&parent, &folder, std::slice::from_ref(&folder), Some(&file))?;
     assert!(
         entry.iter().any(|text| text.starts_with("Last scanned ")),
         "{entry:?}"

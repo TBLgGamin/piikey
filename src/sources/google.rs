@@ -35,7 +35,7 @@ use serde_json::Value;
 use super::{
     Account, Changes, Connector, Error, Export, Provider, RemoteFolder, RemoteItem, Resolved,
     Result, SignIn, TokenStore,
-    auth::{Browser, ClientAuth, Grant, ServiceAccount, Session},
+    auth::{Browser, ClientAuth, Grant, LOOPBACK, ServiceAccount, Session},
     child, component,
     http::{Http, Reply, Request, encode, pages},
     parse_time, parse_virtual,
@@ -454,6 +454,7 @@ fn grants(account: &Account, endpoints: &Endpoints) -> Result<Vec<Grant>> {
                 ("prompt".to_owned(), "consent".to_owned()),
             ],
             client_auth: ClientAuth::Body,
+            redirect_host: LOOPBACK,
             port: 0,
             redirect_path: String::new(),
             pkce: true,
@@ -1870,6 +1871,7 @@ mod tests {
         assert_eq!(browser.client_auth, ClientAuth::Body);
         assert_eq!((browser.port, browser.pkce), (0, true));
         assert!(browser.redirect_path.is_empty());
+        assert_eq!(browser.redirect_host, "127.0.0.1");
         let store = TokenStore::new(&temp_dir("google-session"));
         assert!(session(&delegated(), &store).is_ok());
         Ok(())

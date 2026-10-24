@@ -15,6 +15,7 @@ use piikey::{
     api::{Format, Request},
     detect::EntityKind,
     policy::{Highlight, KEYS, SettingsPatch, valid_port},
+    sources::{BoxSubject, Credential, Provider, SignIn},
 };
 
 /// A parsed command line.
@@ -79,6 +80,29 @@ pub enum Input {
     Request(Request),
     /// The text on stdin, as one text through a text operation.
     Stdin(Text),
+    /// `account add --client-secret-stdin`: the first line of stdin is the client secret.
+    Secret(NewAccount),
+}
+
+/// An account to add whose client secret is still to be read from stdin.
+#[derive(Debug, PartialEq)]
+pub struct NewAccount {
+    pub provider: Provider,
+    pub label: String,
+    pub sign_in: SignIn,
+}
+
+impl NewAccount {
+    /// The request that adds the account with `secret` as its client secret.
+    #[must_use]
+    pub fn request(self, secret: String) -> Request {
+        Request::AccountAdd {
+            provider: self.provider,
+            label: self.label,
+            sign_in: self.sign_in,
+            client_secret: Some(secret),
+        }
+    }
 }
 
 /// The operations that work on text, for stdin.
@@ -167,10 +191,22 @@ enum Opt {
     Http,
     Port,
     Pipe,
+    Label,
+    Mode,
+    Tenant,
+    ClientId,
+    AppKey,
+    KeyFile,
+    CertFile,
+    Site,
+    User,
+    EnterpriseId,
+    UserId,
+    ClientSecretStdin,
 }
 
 /// The long names, without the dashes.
-const OPTS: [(&str, Opt); 19] = [
+const OPTS: [(&str, Opt); 31] = [
     ("json", Opt::Json),
     ("local", Opt::Local),
     ("vault", Opt::Vault),
@@ -190,6 +226,18 @@ const OPTS: [(&str, Opt); 19] = [
     ("http", Opt::Http),
     ("port", Opt::Port),
     ("pipe", Opt::Pipe),
+    ("label", Opt::Label),
+    ("mode", Opt::Mode),
+    ("tenant", Opt::Tenant),
+    ("client-id", Opt::ClientId),
+    ("app-key", Opt::AppKey),
+    ("key-file", Opt::KeyFile),
+    ("cert-file", Opt::CertFile),
+    ("site", Opt::Site),
+    ("user", Opt::User),
+    ("enterprise-id", Opt::EnterpriseId),
+    ("user-id", Opt::UserId),
+    ("client-secret-stdin", Opt::ClientSecretStdin),
 ];
 
 impl Opt {
@@ -225,6 +273,17 @@ struct Flags {
     format: Option<Format>,
     port: Option<u16>,
     pipe: Option<String>,
+    label: Option<String>,
+    mode: Option<String>,
+    tenant: Option<String>,
+    client_id: Option<String>,
+    app_key: Option<String>,
+    key_file: Option<PathBuf>,
+    cert_file: Option<PathBuf>,
+    sites: Vec<String>,
+    users: Vec<String>,
+    enterprise_id: Option<String>,
+    user_id: Option<String>,
 }
 
 /// Parses the arguments after the program name.
@@ -268,7 +327,8 @@ impl Flags {
             | Opt::NoRecord
             | Opt::Yes
             | Opt::Rotate
-            | Opt::Http => {}
+            | Opt::Http
+            | Opt::ClientSecretStdin => {}
             Opt::Vault => self.vault = Some(path(parser.value()?)?),
             Opt::Out => self.out = Some(path(parser.value()?)?),
             Opt::Under => self.under = Some(path(parser.value()?)?),
@@ -284,6 +344,17 @@ impl Flags {
             Opt::Format => self.format = Some(format(&parser.value()?.string()?)?),
             Opt::Port => self.port = Some(port(parser)?),
             Opt::Pipe => self.pipe = Some(parser.value()?.string()?),
+            Opt::Label => self.label = Some(parser.value()?.string()?),
+            Opt::Mode => self.mode = Some(parser.value()?.string()?),
+            Opt::Tenant => self.tenant = Some(parser.value()?.string()?),
+            Opt::ClientId => self.client_id = Some(parser.value()?.string()?),
+            Opt::AppKey => self.app_key = Some(parser.value()?.string()?),
+            Opt::KeyFile => self.key_file = Some(path(parser.value()?)?),
+            Opt::CertFile => self.cert_file = Some(path(parser.value()?)?),
+            Opt::Site => self.sites.push(parser.value()?.string()?),
+            Opt::User => self.users.push(parser.value()?.string()?),
+            Opt::EnterpriseId => self.enterprise_id = Some(parser.value()?.string()?),
+            Opt::UserId => self.user_id = Some(parser.value()?.string()?),
         }
         self.seen.push(opt);
         Ok(())
@@ -318,6 +389,7 @@ impl Flags {
             "vault" => self.vault_command(rest)?,
             "inventory" => self.inventory(rest)?,
             "settings" => self.settings(rest)?,
+            "account" => self.account(rest)?,
             "kinds" => self.plain("kinds", Request::Kinds, rest)?,
             "model" => self.model(rest)?,
             "token" => self.token(rest)?,
@@ -504,6 +576,209 @@ impl Flags {
         }
     }
 
+    fn account(&mut self, rest: &[OsString]) -> Result<Command, ParseError> {
+        const SUB: &str = "list, add, connect, remove or browse";
+        let (sub, rest) = subcommand("account", SUB, rest)?;
+        match sub {
+            "list" => self.plain("account list", Request::AccountsList, rest),
+            "add" => self.account_add(rest),
+            "connect" => {
+                self.only("account connect", &[])?;
+                Ok(call(Request::AccountConnect {
+                    id: account_id("account connect", rest)?,
+                }))
+            }
+            "remove" => {
+                self.only("account remove", &[Opt::Yes])?;
+                let id = account_id("account remove", rest)?;
+                if !self.has(Opt::Yes) {
+                    return Err(invalid(
+                        "account remove takes the account's locations off the list and makes the inventory forget its files: add --yes to confirm",
+                    ));
+                }
+                Ok(call(Request::AccountRemove { id }))
+            }
+            "browse" => {
+                self.only("account browse", &[Opt::Under])?;
+                Ok(call(Request::AccountBrowse {
+                    id: account_id("account browse", rest)?,
+                    under: self.under.take(),
+                }))
+            }
+            other => Err(unknown_sub("account", other, SUB)),
+        }
+    }
+
+    /// `account add PROVIDER --label NAME ...`: the options of the way to sign in become the
+    /// `sign_in` of the request.
+    fn account_add(&mut self, rest: &[OsString]) -> Result<Command, ParseError> {
+        const PROVIDERS: &str = "microsoft365, onedrive, google_drive, dropbox or box";
+        let [word] = rest else {
+            return Err(usage(format!("account add needs a PROVIDER: {PROVIDERS}")));
+        };
+        let name = utf8(word)?;
+        let provider = Provider::parse(name)
+            .ok_or_else(|| usage(format!("unknown provider '{name}': use {PROVIDERS}")))?;
+        let way = self.way(provider)?;
+        let command = format!("account add {}", way.mode);
+        let allowed: Vec<Opt> = [Opt::Label, Opt::Mode, Opt::ClientSecretStdin]
+            .into_iter()
+            .chain(way.takes.iter().copied())
+            .collect();
+        self.only(&command, &allowed)?;
+        let label = self
+            .label
+            .take()
+            .ok_or_else(|| invalid(format!("{command} needs --label NAME")))?;
+        let sign_in = self.sign_in(provider, way.mode, &command)?;
+        let stdin = self.has(Opt::ClientSecretStdin);
+        match (sign_in.needs_secret(), stdin) {
+            (true, false) => Err(invalid(format!(
+                "{command} needs the client secret: give it on stdin with --client-secret-stdin"
+            ))),
+            (false, true) => Err(invalid(format!(
+                "{command} has no client secret: --client-secret-stdin is not valid"
+            ))),
+            (true, true) => Ok(Command::Call(Call {
+                input: Input::Secret(NewAccount {
+                    provider,
+                    label,
+                    sign_in,
+                }),
+                fail_on: None,
+            })),
+            (false, false) => Ok(call(Request::AccountAdd {
+                provider,
+                label,
+                sign_in,
+                client_secret: None,
+            })),
+        }
+    }
+
+    /// The way to sign in that `--mode` names, or the only one `provider` has.
+    fn way(&mut self, provider: Provider) -> Result<&'static Way, ParseError> {
+        let ways: Vec<&'static Way> = WAYS
+            .iter()
+            .filter(|way| way.providers.contains(&provider))
+            .collect();
+        let names = |ways: &[&Way]| {
+            ways.iter()
+                .map(|way| way.mode)
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        match self.mode.take() {
+            Some(mode) => ways
+                .iter()
+                .copied()
+                .find(|way| way.mode == mode)
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "{} cannot sign in with '{mode}': use {}",
+                        provider.id(),
+                        names(&ways)
+                    ))
+                }),
+            None => match ways.as_slice() {
+                [only] => Ok(*only),
+                _ => Err(invalid(format!(
+                    "{} has more than one way to sign in: give --mode {}",
+                    provider.id(),
+                    names(&ways)
+                ))),
+            },
+        }
+    }
+
+    /// The `sign_in` for `mode` from the options given; `command` names it in the errors.
+    fn sign_in(
+        &mut self,
+        provider: Provider,
+        mode: &str,
+        command: &str,
+    ) -> Result<SignIn, ParseError> {
+        fn need<T>(value: Option<T>, command: &str, flag: &str) -> Result<T, ParseError> {
+            value.ok_or_else(|| invalid(format!("{command} needs {flag}")))
+        }
+        let tenant = |this: &mut Self| match (provider, this.tenant.take()) {
+            (Provider::OneDrive, None) => Ok("consumers".to_owned()),
+            (Provider::OneDrive, Some(tenant)) if tenant != "consumers" => Err(invalid(format!(
+                "{command} uses the tenant consumers, not '{tenant}'"
+            ))),
+            (_, tenant) => need(tenant, command, "--tenant T"),
+        };
+        Ok(match mode {
+            "microsoft_delegated" => SignIn::MicrosoftDelegated {
+                tenant: tenant(self)?,
+                client_id: need(self.client_id.take(), command, "--client-id ID")?,
+            },
+            "microsoft_app" => SignIn::MicrosoftApp {
+                tenant: tenant(self)?,
+                client_id: need(self.client_id.take(), command, "--client-id ID")?,
+                credential: self.credential(command)?,
+            },
+            "microsoft_app_selected" => SignIn::MicrosoftAppSelected {
+                tenant: tenant(self)?,
+                client_id: need(self.client_id.take(), command, "--client-id ID")?,
+                credential: self.credential(command)?,
+                sites: match mem::take(&mut self.sites) {
+                    sites if sites.is_empty() => {
+                        return Err(invalid(format!("{command} needs at least one --site URL")));
+                    }
+                    sites => sites,
+                },
+            },
+            "google_delegated" => SignIn::GoogleDelegated {
+                client_id: need(self.client_id.take(), command, "--client-id ID")?,
+            },
+            "google_service_account" => SignIn::GoogleServiceAccount {
+                key_file: need(self.key_file.take(), command, "--key-file FILE")?,
+                users: match mem::take(&mut self.users) {
+                    users if users.is_empty() => {
+                        return Err(invalid(format!(
+                            "{command} needs at least one --user EMAIL"
+                        )));
+                    }
+                    users => users,
+                },
+            },
+            "dropbox_delegated" => SignIn::DropboxDelegated {
+                app_key: need(self.app_key.take(), command, "--app-key KEY")?,
+            },
+            "box_delegated" => SignIn::BoxDelegated {
+                client_id: need(self.client_id.take(), command, "--client-id ID")?,
+            },
+            _ => SignIn::BoxApp {
+                client_id: need(self.client_id.take(), command, "--client-id ID")?,
+                subject: match (self.enterprise_id.take(), self.user_id.take()) {
+                    (Some(id), None) => BoxSubject::Enterprise(id),
+                    (None, Some(id)) => BoxSubject::User(id),
+                    _ => {
+                        return Err(invalid(format!(
+                            "{command} needs --enterprise-id ID or --user-id ID, one of them"
+                        )));
+                    }
+                },
+            },
+        })
+    }
+
+    /// How a Microsoft app proves who it is: a certificate when both files are given, else a
+    /// secret.
+    fn credential(&mut self, command: &str) -> Result<Credential, ParseError> {
+        match (self.key_file.take(), self.cert_file.take()) {
+            (Some(key_file), Some(cert_file)) => Ok(Credential::Certificate {
+                key_file,
+                cert_file,
+            }),
+            (None, None) => Ok(Credential::Secret),
+            _ => Err(invalid(format!(
+                "{command}: --key-file and --cert-file go together"
+            ))),
+        }
+    }
+
     fn model(&mut self, rest: &[OsString]) -> Result<Command, ParseError> {
         const SUB: &str = "status or download";
         let (sub, rest) = subcommand("model", SUB, rest)?;
@@ -572,6 +847,74 @@ fn call(request: Request) -> Command {
         input: Input::Request(request),
         fail_on: None,
     })
+}
+
+/// One way to sign in to an account: its `mode` in the API, the providers that have it and the
+/// options it takes besides `--label`, `--mode` and `--client-secret-stdin`.
+struct Way {
+    mode: &'static str,
+    providers: &'static [Provider],
+    takes: &'static [Opt],
+}
+
+/// Every way to sign in, the way `account add` offers them.
+const WAYS: [Way; 8] = [
+    Way {
+        mode: "microsoft_delegated",
+        providers: &[Provider::Microsoft365, Provider::OneDrive],
+        takes: &[Opt::Tenant, Opt::ClientId],
+    },
+    Way {
+        mode: "microsoft_app",
+        providers: &[Provider::Microsoft365],
+        takes: &[Opt::Tenant, Opt::ClientId, Opt::KeyFile, Opt::CertFile],
+    },
+    Way {
+        mode: "microsoft_app_selected",
+        providers: &[Provider::Microsoft365],
+        takes: &[
+            Opt::Tenant,
+            Opt::ClientId,
+            Opt::KeyFile,
+            Opt::CertFile,
+            Opt::Site,
+        ],
+    },
+    Way {
+        mode: "google_delegated",
+        providers: &[Provider::GoogleDrive],
+        takes: &[Opt::ClientId],
+    },
+    Way {
+        mode: "google_service_account",
+        providers: &[Provider::GoogleDrive],
+        takes: &[Opt::KeyFile, Opt::User],
+    },
+    Way {
+        mode: "dropbox_delegated",
+        providers: &[Provider::Dropbox],
+        takes: &[Opt::AppKey],
+    },
+    Way {
+        mode: "box_delegated",
+        providers: &[Provider::Box],
+        takes: &[Opt::ClientId],
+    },
+    Way {
+        mode: "box_app",
+        providers: &[Provider::Box],
+        takes: &[Opt::ClientId, Opt::EnterpriseId, Opt::UserId],
+    },
+];
+
+/// The one account id of `account connect`, `remove` or `browse`.
+fn account_id(command: &str, rest: &[OsString]) -> Result<String, ParseError> {
+    let [id] = rest else {
+        return Err(usage(format!(
+            "{command} needs an account ID (see piikey-cli account list)"
+        )));
+    };
+    Ok(utf8(id)?.to_owned())
 }
 
 /// The word after a command group: `vault` is followed by `list`, `forget`...

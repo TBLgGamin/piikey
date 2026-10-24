@@ -11,6 +11,8 @@
 //! card, the row, the section); each page has its own file, and [`dashboard`] is what Inventory
 //! shows its files in.
 
+mod accounts;
+mod cloud;
 mod dashboard;
 mod inventory;
 mod kit;
@@ -21,9 +23,9 @@ mod protection;
 mod settings;
 mod vault;
 
-use windows_reactor::{Grid, GridLength, KeyedView, StackPanel, Thickness, View};
+use windows_reactor::{ContentDialog, Grid, GridLength, KeyedView, StackPanel, Thickness, View};
 
-pub(super) use self::{dashboard::dialog, kit::status_chip};
+pub(super) use self::kit::status_chip;
 use self::{
     dashboard::findings_panel,
     kit::{Context, measured, notice},
@@ -32,6 +34,14 @@ use super::{
     status::{Cause, Status},
     window::{MainWindow, Page},
 };
+
+/// The dialog over the page, if one is open: the Add account and Disconnect dialogs, the Browse
+/// cloud dialog, or the result of a scan, in that order of priority.
+pub(super) fn dialog(window: &MainWindow, context: Context<'_>) -> Option<ContentDialog> {
+    accounts::dialog(window, context)
+        .or_else(|| cloud::dialog(window, context))
+        .or_else(|| dashboard::dialog(window, context))
+}
 
 /// The page the navigation selected, under the notice the controller may have raised; while the
 /// findings view is open it takes the page's place, and the page comes back when it closes. Each

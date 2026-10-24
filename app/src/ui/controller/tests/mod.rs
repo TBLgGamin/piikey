@@ -1,5 +1,7 @@
 //! The controller against a recording fake of the system.
 
+mod accounts;
+mod cloud;
 mod edit;
 mod inventory;
 mod keyed;
@@ -9,12 +11,14 @@ mod settings;
 mod watch;
 
 use std::{
+    collections::HashMap,
     fs,
     sync::atomic::{AtomicBool, Ordering},
 };
 
 use piikey::{detect::EntityKind, policy::Highlight};
 
+use self::cloud::{Cloud, Handle};
 use super::*;
 use crate::{Describe, ui::testing::TempDir};
 
@@ -73,6 +77,14 @@ struct Fake {
     watch_unavailable: Mutex<Vec<(PathBuf, String)>>,
     /// The system would not make a watcher at all.
     fail_watch: AtomicBool,
+    /// The cloud accounts the fake can read, by the name of the account ([`Account::label`]):
+    /// what `connector` hands out. An account that is not here cannot be read.
+    clouds: Mutex<HashMap<String, Arc<Cloud>>>,
+    /// How the next sign-in goes, see [`SignInScript`].
+    sign_in: Mutex<SignInScript>,
+    /// How often the monitored cloud locations are asked what changed: [`CLOUD_POLL`] unless a
+    /// test says so.
+    poll: Mutex<Option<Duration>>,
 }
 
 impl Fake {
@@ -99,6 +111,41 @@ impl Fake {
         let sender = changes.as_ref().ok_or("nothing is watched")?;
         sender.send(change).map_err(|error| error.to_string())
     }
+
+    /// Registers `cloud` as the account called `name`.
+    fn add_cloud(&self, name: &str, cloud: &Arc<Cloud>) {
+        self.clouds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(name.to_owned(), Arc::clone(cloud));
+    }
+
+    /// The monitored cloud locations are asked what changed every `every`.
+    fn poll_every(&self, every: Duration) {
+        *self.poll.lock().unwrap_or_else(PoisonError::into_inner) = Some(every);
+    }
+
+    /// The next sign-in goes as `script` says; the ones after it work.
+    fn script_sign_in(&self, script: SignInScript) {
+        *self.sign_in.lock().unwrap_or_else(PoisonError::into_inner) = script;
+    }
+}
+
+/// How a sign-in of the fake goes, see [`Fake::script_sign_in`].
+#[derive(Default)]
+enum SignInScript {
+    /// It works at once.
+    #[default]
+    Works,
+    /// It fails with this error.
+    Fails(fn() -> piikey::sources::Error),
+    /// A person signs in in the browser: `open` is given `url`, `waiting` is told, and it works
+    /// once `done` is set. It ends as stopped when the sign-in is stopped first.
+    Waits {
+        url: &'static str,
+        waiting: Sender<()>,
+        done: Arc<AtomicBool>,
+    },
 }
 
 /// The watcher the fake starts: stopping it drops the sender, as the system's does.
@@ -281,6 +328,55 @@ impl Backend for Arc<Fake> {
         }
         self.model_missing.store(false, Ordering::Relaxed);
         Ok(())
+    }
+
+    fn connector(&self, account: &Account) -> piikey::sources::Result<Box<dyn Connector>> {
+        log(&self.calls, &format!("connector({})", account.label));
+        let clouds = self.clouds.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(cloud) = clouds.get(&account.label) else {
+            return Err(piikey::sources::Error::Local(piikey::Error::BadRequest(
+                format!("the fake has no cloud called {}", account.label),
+            )));
+        };
+        Ok(Box::new(Handle(Arc::clone(cloud))))
+    }
+
+    fn connect(
+        &self,
+        account: &Account,
+        open: &dyn Fn(&str),
+        cancel: &AtomicBool,
+    ) -> piikey::sources::Result<()> {
+        log(&self.calls, &format!("connect({})", account.label));
+        let script =
+            std::mem::take(&mut *self.sign_in.lock().unwrap_or_else(PoisonError::into_inner));
+        match script {
+            SignInScript::Works => Ok(()),
+            SignInScript::Fails(error) => Err(error()),
+            SignInScript::Waits { url, waiting, done } => {
+                open(url);
+                let _ = waiting.send(());
+                while !done.load(Ordering::SeqCst) {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err(piikey::sources::Error::Cancelled);
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn open_url(&self, url: &str) -> Res<()> {
+        log(&self.calls, &format!("open_url({url})"));
+        Ok(())
+    }
+
+    fn cloud_poll(&self) -> Duration {
+        self.poll
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .unwrap_or(CLOUD_POLL)
     }
 
     fn load_model(&self) -> Res<()> {

@@ -14,6 +14,8 @@ pub(crate) mod assets;
 pub(crate) mod controller;
 mod explorer;
 mod exports;
+#[cfg(debug_assertions)]
+mod fake_cloud;
 mod goto;
 mod instance;
 mod pages;
@@ -151,6 +153,10 @@ fn run_with(scan: Option<Vec<PathBuf>>, hidden: bool) -> Res<Ran> {
     let _watchdog = watchdog::spawn()
         .inspect_err(|error| eprintln!("piikey: {error}"))
         .ok();
+    // Debug builds only: the pretend cloud account of `PIIKEY_FAKE_CLOUD`, before anything reads
+    // the accounts.
+    #[cfg(debug_assertions)]
+    fake_cloud::bootstrap(&folder);
     let (controller, api) = open(vault)?;
     // The saved features start now: they serve the API, which exists.
     controller.submit(Command::Startup);

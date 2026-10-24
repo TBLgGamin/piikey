@@ -544,6 +544,571 @@ fn small_commands() {
     assert!(usage_error(&["token", "--yes"]));
 }
 
+/// The account that `list` adds once its client secret has been read from stdin.
+fn waiting_for_a_secret(list: &[&str]) -> NewAccount {
+    match parsed(list).command {
+        Command::Call(Call {
+            input: Input::Secret(account),
+            ..
+        }) => account,
+        other => panic!("{list:?} does not wait for a secret: {other:?}"),
+    }
+}
+
+fn adding(provider: Provider, label: &str, sign_in: SignIn) -> Request {
+    Request::AccountAdd {
+        provider,
+        label: label.to_owned(),
+        sign_in,
+        client_secret: None,
+    }
+}
+
+#[test]
+fn the_account_commands_take_an_id() {
+    same(&request(&["account", "list"]), &Request::AccountsList);
+    same(
+        &request(&["account", "connect", "ab12"]),
+        &Request::AccountConnect { id: "ab12".into() },
+    );
+    same(
+        &request(&["account", "remove", "ab12", "--yes"]),
+        &Request::AccountRemove { id: "ab12".into() },
+    );
+    same(
+        &request(&["account", "browse", "ab12"]),
+        &Request::AccountBrowse {
+            id: "ab12".into(),
+            under: None,
+        },
+    );
+    same(
+        &request(&[
+            "account",
+            "browse",
+            "ab12",
+            "--under",
+            r"\\Dropbox\Work\Docs",
+        ]),
+        &Request::AccountBrowse {
+            id: "ab12".into(),
+            under: Some(PathBuf::from(r"\\Dropbox\Work\Docs")),
+        },
+    );
+    // Removing needs the word, as wiping the vault does.
+    assert!(invalid_value(&["account", "remove", "ab12"]));
+    for line in [
+        &["account"][..],
+        &["account", "sign"],
+        &["account", "list", "ab12"],
+        &["account", "connect"],
+        &["account", "connect", "a", "b"],
+        &["account", "remove", "--yes"],
+        &["account", "browse"],
+        &["account", "browse", "a", "b"],
+        &["account", "list", "--under", "x"],
+        &["account", "connect", "a", "--yes"],
+        &["account", "remove", "a", "--yes", "--under", "x"],
+    ] {
+        assert!(usage_error(line), "{line:?}");
+    }
+}
+
+#[test]
+fn a_way_to_sign_in_that_needs_no_secret_is_one_request() {
+    same(
+        &request(&[
+            "account",
+            "add",
+            "dropbox",
+            "--label",
+            "Work",
+            "--app-key",
+            "key-1",
+        ]),
+        &adding(
+            Provider::Dropbox,
+            "Work",
+            SignIn::DropboxDelegated {
+                app_key: "key-1".into(),
+            },
+        ),
+    );
+    // Personal OneDrive has the one tenant there is.
+    same(
+        &request(&[
+            "account",
+            "add",
+            "onedrive",
+            "--label",
+            "Me",
+            "--client-id",
+            "c",
+        ]),
+        &adding(
+            Provider::OneDrive,
+            "Me",
+            SignIn::MicrosoftDelegated {
+                tenant: "consumers".into(),
+                client_id: "c".into(),
+            },
+        ),
+    );
+    same(
+        &request(&[
+            "account",
+            "add",
+            "microsoft365",
+            "--mode",
+            "microsoft_delegated",
+            "--label",
+            "Contoso",
+            "--tenant",
+            "contoso.com",
+            "--client-id",
+            "c",
+        ]),
+        &adding(
+            Provider::Microsoft365,
+            "Contoso",
+            SignIn::MicrosoftDelegated {
+                tenant: "contoso.com".into(),
+                client_id: "c".into(),
+            },
+        ),
+    );
+    same(
+        &request(&[
+            "account",
+            "add",
+            "microsoft365",
+            "--mode",
+            "microsoft_app",
+            "--label",
+            "App",
+            "--tenant",
+            "t",
+            "--client-id",
+            "c",
+            "--key-file",
+            "key.pem",
+            "--cert-file",
+            "cert.pem",
+        ]),
+        &adding(
+            Provider::Microsoft365,
+            "App",
+            SignIn::MicrosoftApp {
+                tenant: "t".into(),
+                client_id: "c".into(),
+                credential: Credential::Certificate {
+                    key_file: "key.pem".into(),
+                    cert_file: "cert.pem".into(),
+                },
+            },
+        ),
+    );
+}
+
+#[test]
+fn the_other_ways_that_need_no_secret_are_one_request_too() {
+    same(
+        &request(&[
+            "account",
+            "add",
+            "microsoft365",
+            "--mode",
+            "microsoft_app_selected",
+            "--label",
+            "Sites",
+            "--tenant",
+            "t",
+            "--client-id",
+            "c",
+            "--key-file",
+            "key.pem",
+            "--cert-file",
+            "cert.pem",
+            "--site",
+            "https://a.sharepoint.com/sites/A",
+            "--site",
+            "https://a.sharepoint.com/sites/B",
+        ]),
+        &adding(
+            Provider::Microsoft365,
+            "Sites",
+            SignIn::MicrosoftAppSelected {
+                tenant: "t".into(),
+                client_id: "c".into(),
+                credential: Credential::Certificate {
+                    key_file: "key.pem".into(),
+                    cert_file: "cert.pem".into(),
+                },
+                sites: strings(&[
+                    "https://a.sharepoint.com/sites/A",
+                    "https://a.sharepoint.com/sites/B",
+                ]),
+            },
+        ),
+    );
+    same(
+        &request(&[
+            "account",
+            "add",
+            "google_drive",
+            "--mode",
+            "google_service_account",
+            "--label",
+            "Workspace",
+            "--key-file",
+            "key.json",
+            "--user",
+            "a@acme.nl",
+            "--user",
+            "b@acme.nl",
+        ]),
+        &adding(
+            Provider::GoogleDrive,
+            "Workspace",
+            SignIn::GoogleServiceAccount {
+                key_file: "key.json".into(),
+                users: strings(&["a@acme.nl", "b@acme.nl"]),
+            },
+        ),
+    );
+}
+
+#[test]
+fn a_way_to_sign_in_with_a_secret_reads_it_from_stdin() {
+    let box_app = |subject: &[&str]| {
+        let mut line = vec![
+            "account",
+            "add",
+            "box",
+            "--mode",
+            "box_app",
+            "--label",
+            "Team",
+            "--client-id",
+            "c",
+            "--client-secret-stdin",
+        ];
+        line.extend_from_slice(subject);
+        waiting_for_a_secret(&line)
+    };
+    let account = box_app(&["--enterprise-id", "77"]);
+    assert_eq!(account.provider, Provider::Box);
+    assert_eq!(account.label, "Team");
+    assert_eq!(
+        account.sign_in,
+        SignIn::BoxApp {
+            client_id: "c".into(),
+            subject: BoxSubject::Enterprise("77".into()),
+        }
+    );
+    assert_eq!(
+        box_app(&["--user-id", "5"]).sign_in,
+        SignIn::BoxApp {
+            client_id: "c".into(),
+            subject: BoxSubject::User("5".into()),
+        }
+    );
+    // The secret travels with the request, and nowhere else.
+    same(
+        &account.request("hunter2".into()),
+        &Request::AccountAdd {
+            provider: Provider::Box,
+            label: "Team".into(),
+            sign_in: SignIn::BoxApp {
+                client_id: "c".into(),
+                subject: BoxSubject::Enterprise("77".into()),
+            },
+            client_secret: Some("hunter2".into()),
+        },
+    );
+}
+
+#[test]
+fn the_other_ways_with_a_secret_wait_for_it_too() {
+    let google = waiting_for_a_secret(&[
+        "account",
+        "add",
+        "google_drive",
+        "--mode",
+        "google_delegated",
+        "--label",
+        "Me",
+        "--client-id",
+        "c",
+        "--client-secret-stdin",
+    ]);
+    assert_eq!(
+        google.sign_in,
+        SignIn::GoogleDelegated {
+            client_id: "c".into()
+        }
+    );
+    // Without a certificate a Microsoft app signs in with its secret.
+    let app = waiting_for_a_secret(&[
+        "account",
+        "add",
+        "microsoft365",
+        "--mode",
+        "microsoft_app",
+        "--label",
+        "App",
+        "--tenant",
+        "t",
+        "--client-id",
+        "c",
+        "--client-secret-stdin",
+    ]);
+    assert_eq!(
+        app.sign_in,
+        SignIn::MicrosoftApp {
+            tenant: "t".into(),
+            client_id: "c".into(),
+            credential: Credential::Secret,
+        }
+    );
+    let delegated = waiting_for_a_secret(&[
+        "account",
+        "add",
+        "box",
+        "--label",
+        "Me",
+        "--mode",
+        "box_delegated",
+        "--client-id",
+        "c",
+        "--client-secret-stdin",
+    ]);
+    assert_eq!(delegated.provider, Provider::Box);
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "a table of command lines and the refusal each one gets"
+)]
+fn account_add_refuses_what_does_not_fit() {
+    const DROPBOX: [&str; 7] = [
+        "account",
+        "add",
+        "dropbox",
+        "--label",
+        "W",
+        "--app-key",
+        "k",
+    ];
+    fn with<'a>(extra: &[&'a str]) -> Vec<&'a str> {
+        let mut line = DROPBOX.to_vec();
+        line.extend_from_slice(extra);
+        line
+    }
+    // The provider.
+    assert!(usage_error(&["account", "add"]));
+    assert!(usage_error(&["account", "add", "icloud", "--label", "x"]));
+    assert!(usage_error(&[
+        "account", "add", "dropbox", "box", "--label", "x"
+    ]));
+    // The label and what the way needs.
+    assert!(invalid_value(&[
+        "account",
+        "add",
+        "dropbox",
+        "--app-key",
+        "k"
+    ]));
+    assert!(invalid_value(&[
+        "account", "add", "dropbox", "--label", "W"
+    ]));
+    // Options of another way.
+    assert!(usage_error(&with(&["--site", "https://a"])));
+    assert!(usage_error(&with(&["--tenant", "t"])));
+    assert!(usage_error(&with(&["--user-id", "1"])));
+    assert!(usage_error(&with(&["--under", "x"])));
+    // A secret where the way has none.
+    assert!(invalid_value(&with(&["--client-secret-stdin"])));
+    // The mode.
+    assert!(invalid_value(&with(&["--mode", "box_app"])));
+    assert!(invalid_value(&with(&["--mode", "magic"])));
+    assert!(invalid_value(&[
+        "account",
+        "add",
+        "microsoft365",
+        "--label",
+        "x",
+        "--tenant",
+        "t",
+        "--client-id",
+        "c",
+    ]));
+    assert!(invalid_value(&[
+        "account",
+        "add",
+        "google_drive",
+        "--label",
+        "x",
+        "--client-id",
+        "c",
+        "--client-secret-stdin",
+    ]));
+    // A tenant that is not the one of personal accounts.
+    assert!(invalid_value(&[
+        "account",
+        "add",
+        "onedrive",
+        "--label",
+        "x",
+        "--client-id",
+        "c",
+        "--tenant",
+        "contoso",
+    ]));
+    // What the way needs, and the secret it cannot do without.
+    for line in [
+        &[
+            "account",
+            "add",
+            "microsoft365",
+            "--mode",
+            "microsoft_delegated",
+            "--label",
+            "x",
+            "--client-id",
+            "c",
+        ][..],
+        &[
+            "account",
+            "add",
+            "microsoft365",
+            "--mode",
+            "microsoft_delegated",
+            "--label",
+            "x",
+            "--tenant",
+            "t",
+        ],
+        &[
+            "account",
+            "add",
+            "microsoft365",
+            "--mode",
+            "microsoft_app_selected",
+            "--label",
+            "x",
+            "--tenant",
+            "t",
+            "--client-id",
+            "c",
+            "--client-secret-stdin",
+        ],
+        &[
+            "account",
+            "add",
+            "microsoft365",
+            "--mode",
+            "microsoft_app",
+            "--label",
+            "x",
+            "--tenant",
+            "t",
+            "--client-id",
+            "c",
+            "--key-file",
+            "k.pem",
+        ],
+        &[
+            "account",
+            "add",
+            "microsoft365",
+            "--mode",
+            "microsoft_app",
+            "--label",
+            "x",
+            "--tenant",
+            "t",
+            "--client-id",
+            "c",
+        ],
+        &[
+            "account",
+            "add",
+            "google_drive",
+            "--mode",
+            "google_service_account",
+            "--label",
+            "x",
+            "--key-file",
+            "k.json",
+        ],
+        &[
+            "account",
+            "add",
+            "google_drive",
+            "--mode",
+            "google_service_account",
+            "--label",
+            "x",
+            "--user",
+            "a@b.c",
+        ],
+        &[
+            "account",
+            "add",
+            "google_drive",
+            "--mode",
+            "google_delegated",
+            "--label",
+            "x",
+            "--client-id",
+            "c",
+        ],
+        &[
+            "account",
+            "add",
+            "box",
+            "--mode",
+            "box_app",
+            "--label",
+            "x",
+            "--client-id",
+            "c",
+            "--client-secret-stdin",
+        ],
+        &[
+            "account",
+            "add",
+            "box",
+            "--mode",
+            "box_app",
+            "--label",
+            "x",
+            "--client-id",
+            "c",
+            "--enterprise-id",
+            "1",
+            "--user-id",
+            "2",
+            "--client-secret-stdin",
+        ],
+        &[
+            "account",
+            "add",
+            "box",
+            "--mode",
+            "box_delegated",
+            "--label",
+            "x",
+            "--client-id",
+            "c",
+        ],
+    ] {
+        assert!(invalid_value(line), "{line:?}");
+    }
+}
+
 #[test]
 fn serve_takes_http_and_a_pipe() {
     assert_eq!(
@@ -636,7 +1201,7 @@ fn an_empty_path_is_a_mistake() {
 
 #[test]
 fn every_operation_but_the_explorer_one_has_a_command() {
-    let lines: [&[&str]; 26] = [
+    let lines: [&[&str]; 31] = [
         &["scan"],
         &["anonymize"],
         &["deanonymize"],
@@ -655,6 +1220,19 @@ fn every_operation_but_the_explorer_one_has_a_command() {
         &["inventory", "report", "--out", "f"],
         &["settings", "get"],
         &["settings", "set", "http_api=true"],
+        &["account", "list"],
+        &[
+            "account",
+            "add",
+            "dropbox",
+            "--label",
+            "W",
+            "--app-key",
+            "k",
+        ],
+        &["account", "connect", "ab"],
+        &["account", "remove", "ab", "--yes"],
+        &["account", "browse", "ab"],
         &["kinds"],
         &["model", "status"],
         &["model", "download"],
@@ -678,6 +1256,12 @@ fn every_operation_but_the_explorer_one_has_a_command() {
                 ..
             }) => {
                 ops.insert(text.request(String::new()).op());
+            }
+            Command::Call(Call {
+                input: Input::Secret(account),
+                ..
+            }) => {
+                ops.insert(account.request(String::new()).op());
             }
             _ => {}
         }

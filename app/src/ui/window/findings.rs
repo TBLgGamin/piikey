@@ -17,13 +17,17 @@ use std::{
 use piikey::{
     detect::EntityKind,
     inventory::{Busy, Finding},
+    sources,
 };
 use windows_reactor::{ComponentContext, ComponentTask};
 
-use super::{MainWindow, Msg};
-use crate::ui::{
-    controller::{FindingFiles, FindingsEvent, Notice},
-    goto,
+use super::{MainWindow, Msg, dashboard::open_web_page};
+use crate::{
+    Res,
+    ui::{
+        controller::{Controller, FindingFiles, FindingsEvent, Notice},
+        goto,
+    },
 };
 
 /// The most values the view keeps: a folder of spreadsheets can hold millions, which no list is
@@ -330,7 +334,7 @@ fn contains_fold(haystack: &str, needle: &str) -> bool {
 /// The name of the file at `path`.
 fn name_of(path: &Path) -> String {
     path.file_name().map_or_else(
-        || path.display().to_string(),
+        || sources::display_path(path).unwrap_or_else(|| path.display().to_string()),
         |name| name.to_string_lossy().into_owned(),
     )
 }
@@ -471,8 +475,7 @@ impl MainWindow {
         let target = row.target();
         self.background(context, move |controller| {
             // Whatever happens, the row is let go of: an error is a notice, the row is done.
-            let opened = goto::open_at(&target, &controller.purpose());
-            match opened {
+            match open_row(controller, &target) {
                 Ok(outcome) => Ok(Msg::FindingsOpened(id, outcome)),
                 Err(error) => {
                     controller.notify(Notice::error(error));
@@ -480,6 +483,17 @@ impl MainWindow {
                 }
             }
         });
+    }
+}
+
+/// Opens the file of a row at the place of its value. A file in the cloud has no app on this PC to
+/// take to the value: its web page opens in the browser, which is as far as piikey can go there.
+pub(super) fn open_row(controller: &Controller, target: &goto::Target) -> Res<goto::Outcome> {
+    if sources::is_virtual(&target.file) {
+        open_web_page(controller, &target.file)?;
+        Ok(goto::Outcome::Opened)
+    } else {
+        goto::open_at(target, &controller.purpose())
     }
 }
 

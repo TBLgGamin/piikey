@@ -64,10 +64,10 @@ Every reply is an envelope. A call that worked is answered with status 200 and `
 | [`scan_text`](#scan_text) | What the detector finds in each text, without changing anything (the vault is left as it is, and stand-ins piikey issued are not counted). |
 | [`anonymize`](#anonymize) | Masks the personal data in each text. |
 | [`deanonymize`](#deanonymize) | Restores the masked values in each text. |
-| [`scan_files`](#scan_files) | Scans files and folders (recursively). |
-| [`anonymize_files`](#anonymize_files) | Masks files and folders into the folder `out`. |
-| [`deanonymize_files`](#deanonymize_files) | Restores files and folders into the folder `out`. |
-| [`subject_search`](#subject_search) | Which files hold the given values (a name, a phone number, an email address, ...); an empty `paths` means the inventory's folders. |
+| [`scan_files`](#scan_files) | Scans files and folders on this PC (recursively). |
+| [`anonymize_files`](#anonymize_files) | Masks files and folders on this PC into the folder `out`. |
+| [`deanonymize_files`](#deanonymize_files) | Restores files and folders on this PC into the folder `out`. |
+| [`subject_search`](#subject_search) | Which files hold the given values (a name, a phone number, an email address, ...); an empty `paths` means the inventory's folders on this PC (a folder of a cloud account is not searched). |
 | [`vault_list`](#vault_list) | The vault's records, the newest first, whose original or stand-in holds `query` (any letter case; all of them without a query), of one type if `kind` says. |
 | [`vault_forget`](#vault_forget) | Removes the records whose original or stand-in is one of `values`; the vault file is rewritten without them. |
 | [`vault_export`](#vault_export) | Writes every record of the vault to a new file `path` (an existing file is an error). |
@@ -75,8 +75,13 @@ Every reply is an envelope. A call that worked is answered with status 200 and `
 | [`inventory_status`](#inventory_status) | The inventory in numbers. |
 | [`inventory_list`](#inventory_list) | The inventory's files that hold personal data, the one with the most first, at and under `under`. |
 | [`inventory_tree`](#inventory_tree) | The tiles of the inventory's tree at one level: what lies directly under `under`, or without it the drives and network shares that hold files with personal data (`C:`, with `C:\` as the path). |
-| [`inventory_rescan`](#inventory_rescan) | Scans the inventory's folders (the locations it scans) now, and answers when the scan is over: the inventory scans only when it is asked to. |
+| [`inventory_rescan`](#inventory_rescan) | Scans the inventory's locations now (the folders on this PC and the folders of cloud accounts, in one run), and answers when the scan is over: the inventory scans only when it is asked to. |
 | [`inventory_report`](#inventory_report) | Writes the inventory's findings to a new file `path`. |
+| [`accounts_list`](#accounts_list) | The cloud accounts piikey may read (Microsoft 365, `OneDrive`, Google Drive, Dropbox and Box), in the order they were added, each with how it signs in and whether it is connected. |
+| [`account_add`](#account_add) | Adds a cloud account. |
+| [`account_connect`](#account_connect) | Signs an account in and answers when that is done. |
+| [`account_remove`](#account_remove) | Removes an account: its locations come off the list of the inventory (and so are no longer monitored), the inventory forgets its files, and its secrets, settings and the places piikey had reached in its change feeds are deleted. |
+| [`account_browse`](#account_browse) | The folders directly in `under`, a path of the account, or without it the top of the account (its drives, sites or "My Drive"): what a location of the inventory is picked from. |
 | [`settings_get`](#settings_get) | The saved settings. |
 | [`settings_set`](#settings_set) | Changes the given settings, validated as a whole. |
 | [`kinds`](#kinds) | Every type of personal data. |
@@ -196,11 +201,13 @@ The same for files and folders.
 
 #### `scan_files`
 
-Scans files and folders (recursively). With `record`, what was found is also kept in the inventory.
+Scans files and folders on this PC (recursively). With `record`, what was found is also kept in the inventory. A path in a cloud account is refused: its folders are scanned as locations, by `inventory_rescan`.
 
 CLI: `piikey-cli scan [--fail-on KINDS|any] [--no-record] [PATH...]`
 
 Every path must be absolute (the CLI makes its arguments absolute for you). Folders are walked recursively and symbolic links are skipped. A file named twice, or inside a folder you also named, is scanned once.
+
+A path in a cloud account (`\\Google Drive\Work\Docs`) is refused with `bad_request`: it is no file of this PC. The files of a cloud account are scanned through its locations, with `inventory_rescan`.
 
 Each call reads every file again; the incremental rule that skips unchanged files belongs to `inventory_rescan`. The result holds counts per type, never the values.
 
@@ -212,7 +219,7 @@ The CLI's `--no-record` is `"record": false`. `piikey-cli scan --fail-on` exits 
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `paths` | `string[]` | yes | The files and folders to scan, as absolute paths. |
+| `paths` | `string[]` | yes | The files and folders to scan, as absolute paths on this PC. |
 | `record` | `boolean` | no | Whether to keep what was found in the inventory.<br><br>Default: `true`. |
 
 **Result**
@@ -231,11 +238,13 @@ $token = piikey-cli token
 
 #### `anonymize_files`
 
-Masks files and folders into the folder `out`.
+Masks files and folders on this PC into the folder `out`.
 
 CLI: `piikey-cli anonymize [--out DIR] [PATH...]` (with PATHs, `--out DIR` is required)
 
 `paths` and `out` must be absolute. Folders are walked recursively and each result keeps its place relative to the folder it was found under. Missing folders under `out` are created and a file already there is overwritten, but a result is never written over an input, and an `out` inside a folder you name is refused with `bad_request`.
+
+A path in a cloud account is refused with `bad_request`, in `paths` and in `out`: the files of a cloud account are only read, into memory, by the inventory's scan.
 
 A result that is text (from a PDF, an image or a mail) is written as `<name>.txt`.
 
@@ -247,7 +256,7 @@ One file that cannot be read does not stop the others: it is listed under `faile
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `paths` | `string[]` | yes | The files and folders to mask, as absolute paths. |
+| `paths` | `string[]` | yes | The files and folders to mask, as absolute paths on this PC. |
 | `out` | `string` | yes | The folder the masked files are written to, as an absolute path. |
 
 **Result**
@@ -266,11 +275,11 @@ $token = piikey-cli token
 
 #### `deanonymize_files`
 
-Restores files and folders into the folder `out`.
+Restores files and folders on this PC into the folder `out`.
 
 CLI: `piikey-cli deanonymize [--tolerant] [--out DIR] [PATH...]` (with PATHs, `--out DIR` is required)
 
-The same rules as `anonymize_files` for paths, `out`, results written as `.txt` and files that fail.
+The same rules as `anonymize_files` for paths, `out`, paths in a cloud account (refused), results written as `.txt` and files that fail.
 
 With `tolerant` a document is read one piece of text at a time, so typos and lone names are restored within each piece.
 
@@ -280,7 +289,7 @@ With `tolerant` a document is read one piece of text at a time, so typos and lon
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `paths` | `string[]` | yes | The files and folders to restore, as absolute paths. |
+| `paths` | `string[]` | yes | The files and folders to restore, as absolute paths on this PC. |
 | `out` | `string` | yes | The folder the restored files are written to, as an absolute path. |
 | `tolerant` | `boolean` | no | Also restore stand-ins that came back with a typo, and names that came back alone.<br><br>Default: `false`. |
 
@@ -304,11 +313,11 @@ Find the files that mention a person, for access requests.
 
 #### `subject_search`
 
-Which files hold the given values (a name, a phone number, an email address, ...); an empty `paths` means the inventory's folders.
+Which files hold the given values (a name, a phone number, an email address, ...); an empty `paths` means the inventory's folders on this PC (a folder of a cloud account is not searched).
 
 CLI: `piikey-cli subject --value V [--value V ...] [PATH...]`
 
-A value matches a file as a whole word in any letter case, or as the same value spelled another way: `+31 6 1234 5678` and `+31612345678` match, `06 1234 5678` does not. Without `paths` it searches the inventory's locations, so with no locations there is nothing to search.
+A value matches a file as a whole word in any letter case, or as the same value spelled another way: `+31 6 1234 5678` and `+31612345678` match, `06 1234 5678` does not. Without `paths` it searches the inventory's locations on this PC, so with no such location there is nothing to search; the folders of cloud accounts are not searched, and a path in a cloud account in `paths` is refused with `bad_request`.
 
 Folders are walked recursively without following links. A blank value is a `bad_request`.
 
@@ -321,7 +330,7 @@ This operation is in the API and the CLI only; the app's window has no subject s
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `values` | `string[]` | yes | The values that identify the person: a name, a phone number, an email address, ... |
-| `paths` | `string[]` | no | The files and folders to look in, as absolute paths. Empty: the inventory's folders.<br><br>Default: `[]`. |
+| `paths` | `string[]` | no | The files and folders to look in, as absolute paths on this PC. Empty: the inventory's folders on this PC.<br><br>Default: `[]`. |
 
 **Result**
 
@@ -480,7 +489,7 @@ The inventory in numbers.
 
 CLI: `piikey-cli inventory status`
 
-`roots` is empty until a location has been added in the app or with `settings_set`. The inventory scans only when asked (`inventory_rescan`, `scan_files`, `explorer_scan`, the app's Scan button) and, for a location with Monitor on, when the app sees it change.
+`roots` is empty until a location has been added in the app or with `settings_set`; a location is a folder on this PC or a folder of a cloud account (`\\Google Drive\Work\Docs`). The inventory scans only when asked (`inventory_rescan`, `scan_files`, `explorer_scan`, the app's Scan button) and, for a location with Monitor on, when the app sees it change (a cloud location asks its account what changed every 5 minutes).
 
 While a scan runs, `scanning` says how far it is; poll this operation to follow `inventory_rescan` called from another client.
 
@@ -548,7 +557,7 @@ CLI: `piikey-cli inventory tree [--under PATH]`
 
 One level per call, the node with the most values first. Take the `path` of a node whose `is_dir` is true and send it as `under` to open it; a drive's path is `C:\`. `under` must be absolute.
 
-The tree follows the computer's real folders, whichever location or scan a file came from.
+The tree follows the computer's real folders, whichever location or scan a file came from. The files of a cloud account are in it too: the account is listed beside the drives, and opens the same way.
 
 `POST /v1/inventory_tree`
 
@@ -573,13 +582,15 @@ $token = piikey-cli token
 
 #### `inventory_rescan`
 
-Scans the inventory's folders (the locations it scans) now, and answers when the scan is over: the inventory scans only when it is asked to.
+Scans the inventory's locations now (the folders on this PC and the folders of cloud accounts, in one run), and answers when the scan is over: the inventory scans only when it is asked to. A cloud location that cannot be read (its account has to sign in again, or the service cannot be reached) is an error, answered after the other locations were scanned.
 
 CLI: `piikey-cli inventory rescan`
 
 It scans the inventory's locations (`inventory_status` lists them) and answers when the scan is over, however long that takes: give your client a long timeout. With no locations there is nothing to scan.
 
-The scan is incremental: a file whose size and write time match its entry is not read, and a changed file that turns out to hold the same content is not detected again.
+The folders on this PC are scanned first, then the folders of cloud accounts, in one run with one count of files. The scan is incremental: a file whose size and write time match its entry is not read, and a changed file that turns out to hold the same content is not detected again; a cloud location is asked what changed since its last scan (every 5 minutes, for a location with Monitor on, in the app) and a file is downloaded into memory, scanned and dropped.
+
+A cloud location that cannot be read (its account has to sign in again, or the service cannot be reached) does not stop the others. When the run is over the first failure is the error of the call, with a sentence that says what to do (`bad_request`, or `busy` when the service cannot be reached or asks piikey to slow down), and what was scanned stays in the inventory.
 
 Progress is visible meanwhile in `inventory_status`.
 
@@ -635,6 +646,185 @@ $token = piikey-cli token
 '{"path":"C:\\Users\\jan\\Downloads\\inventory.json"}' | curl.exe -s -H "Authorization: Bearer $token" --data-binary '@-' http://127.0.0.1:7980/v1/inventory_report
 ```
 
+### Accounts
+
+The cloud accounts piikey may read.
+
+#### `accounts_list`
+
+The cloud accounts piikey may read (Microsoft 365, `OneDrive`, Google Drive, Dropbox and Box), in the order they were added, each with how it signs in and whether it is connected.
+
+CLI: `piikey-cli account list`
+
+The cloud accounts piikey may read, in the order they were added. `path` is the top of an account's folders: the path of every folder and file in it starts with it, and a location of the inventory is a path below it (see `account_browse`).
+
+`connected` says that piikey holds what it needs to read the account: a person has signed in, or the account's app has its secret or its key files. It does not say that the service still accepts it; a call to the account finds that out. `sign_in` shows how the account signs in and never holds a secret.
+
+None of the account operations needs the app: the command line, run on its own, uses the same `sources.json` in the data folder. What to set up at each service (the app to register, the permissions to give it) is described in [docs/sources.md](https://github.com/TBLgGamin/piikey/blob/main/docs/sources.md) on GitHub.
+
+`POST /v1/accounts_list`
+
+This operation takes no fields: any that are sent are ignored.
+
+**Result**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `accounts` | [`AccountInfo[]`](#accountinfo-schema) | yes | The accounts, in the order they were added. |
+
+**Example**
+
+```powershell
+$token = piikey-cli token
+'{}' | curl.exe -s -H "Authorization: Bearer $token" --data-binary '@-' http://127.0.0.1:7980/v1/accounts_list
+```
+
+#### `account_add`
+
+Adds a cloud account. The settings keep what the account needs to sign in; the client secret, when its way to sign in has one, goes into the DPAPI-protected store of the data folder and never into the settings. This does not sign in: `account_connect` does, and the account's folders can be made locations of the inventory after that.
+
+CLI: `piikey-cli account add PROVIDER --label NAME [--mode MODE] [--tenant T] [--client-id ID] [--app-key KEY] [--key-file FILE] [--cert-file FILE] [--site URL ...] [--user EMAIL ...] [--enterprise-id ID | --user-id ID] [--client-secret-stdin]`
+
+`provider` is `microsoft365`, `onedrive`, `google_drive`, `dropbox` or `box`. The `mode` of `sign_in` is the way the account signs in, and each service has its own: `microsoft_delegated` (Microsoft 365 and OneDrive), `microsoft_app` and `microsoft_app_selected` (Microsoft 365), `google_delegated` and `google_service_account` (Google Drive), `dropbox_delegated` (Dropbox), `box_delegated` and `box_app` (Box). The fields each way takes are in the schema below; a field the way needs and that is empty is a `bad_request` that names it. The CLI's `--mode` can be left out for a service that has one way.
+
+This adds the account and does not sign in: a way with a browser (`microsoft_delegated`, `google_delegated`, `dropbox_delegated`, `box_delegated`) needs `account_connect` before piikey can read anything, and `connected` is `false` until then.
+
+`client_secret` is required for `google_delegated`, `box_delegated`, `box_app`, and for `microsoft_app` and `microsoft_app_selected` with the `secret` credential; for the other ways it is ignored. It goes into the DPAPI-protected store in the data folder, never into the settings, and no reply or log holds it. The CLI reads it from stdin (`--client-secret-stdin`), so it never shows in a process list.
+
+The `label` is the name of the account, unique among the accounts of its service, and a part of the paths of its folders, so it cannot hold `\ / : * ? " < > |`. Where to find what each service asks for is described in [docs/sources.md](https://github.com/TBLgGamin/piikey/blob/main/docs/sources.md) on GitHub.
+
+`POST /v1/account_add`
+
+**Request fields**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `provider` | [`Provider`](#provider-schema) | yes | The cloud service. |
+| `label` | `string` | yes | The name the account goes by, unique among the accounts of its service: a legal file name, since it is a part of the paths of the account's folders. |
+| `sign_in` | [`SignIn`](#signin-schema) | yes | How the account signs in, with what that way needs. `mode` says which way it is. |
+| `client_secret` | `string` | no | The client secret, for a way to sign in that has one (`microsoft_app` and `microsoft_app_selected` with a `secret` credential, `google_delegated`, `box_delegated`, `box_app`). It is required for those and ignored for the others. |
+
+**Result**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `id` | `string` | yes | The account's id (16 hexadecimal digits), which never changes: the other account operations take it. |
+| `provider` | [`Provider`](#provider-schema) | yes | The cloud service. |
+| `label` | `string` | yes | The name the account goes by, unique among the accounts of its service. It is the second part of the paths of the account's folders. |
+| `sign_in` | [`SignIn`](#signin-schema) | yes | How the account signs in, with what that way needs (no secret). |
+| `path` | `string` | yes | The path of the account's top, `\\<service>\<name>`: the start of the path of every folder and file in it, and what a location of the inventory is picked below. |
+| `connected` | `boolean` | yes | Whether piikey has what it needs to read the account: a person has signed in, or the app has its secret or its key files. It says nothing about whether the service still accepts it. |
+
+**Example**
+
+```powershell
+$token = piikey-cli token
+'{"provider":"dropbox","label":"Work","sign_in":{"mode":"dropbox_delegated","app_key":"abc123"},"client_secret":"s3cret-value"}' | curl.exe -s -H "Authorization: Bearer $token" --data-binary '@-' http://127.0.0.1:7980/v1/account_add
+```
+
+#### `account_connect`
+
+Signs an account in and answers when that is done. A way to sign in with a browser (`microsoft_delegated`, `google_delegated`, `dropbox_delegated`, `box_delegated`) opens the browser, or `piikey-cli` run on its own prints the address to open, and waits up to 5 minutes for the person to finish. An app that holds its own credentials is asked for access once, which shows that the credentials work.
+
+CLI: `piikey-cli account connect ID`
+
+Signs the account in and answers when that is done, so give your client a long timeout: it can take 5 minutes. For a way with a browser the app opens the browser; `piikey-cli`, run on its own, prints the address on stderr for you to open. It waits at most 5 minutes for the person to finish. A sign-in that is refused or not finished in time is a `bad_request` that says so, and a service that cannot be reached is `busy`.
+
+For an app that holds its own credentials (a certificate, a client secret or a key file) there is no browser: piikey asks the service for access once, which shows that the credentials work.
+
+An `id` that no account has is `not_found`.
+
+`POST /v1/account_connect`
+
+**Request fields**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `id` | `string` | yes | The account's id, as `accounts_list` shows it. |
+
+**Result**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `id` | `string` | yes | The account's id (16 hexadecimal digits), which never changes: the other account operations take it. |
+| `provider` | [`Provider`](#provider-schema) | yes | The cloud service. |
+| `label` | `string` | yes | The name the account goes by, unique among the accounts of its service. It is the second part of the paths of the account's folders. |
+| `sign_in` | [`SignIn`](#signin-schema) | yes | How the account signs in, with what that way needs (no secret). |
+| `path` | `string` | yes | The path of the account's top, `\\<service>\<name>`: the start of the path of every folder and file in it, and what a location of the inventory is picked below. |
+| `connected` | `boolean` | yes | Whether piikey has what it needs to read the account: a person has signed in, or the app has its secret or its key files. It says nothing about whether the service still accepts it. |
+
+**Example**
+
+```powershell
+$token = piikey-cli token
+'{"id":"3f9c2a7d41b8e605"}' | curl.exe -s -H "Authorization: Bearer $token" --data-binary '@-' http://127.0.0.1:7980/v1/account_connect
+```
+
+#### `account_remove`
+
+Removes an account: its locations come off the list of the inventory (and so are no longer monitored), the inventory forgets its files, and its secrets, settings and the places piikey had reached in its change feeds are deleted. Nothing in the account itself changes.
+
+CLI: `piikey-cli account remove ID --yes`
+
+The account's locations come off the list of the inventory (so they are no longer monitored), the inventory forgets its files, and its secrets, settings and the places piikey had reached in its change feeds are deleted, in that order. `locations` lists the locations that came off and `forgotten` counts the files the inventory forgot. Nothing in the account itself changes. Add the account again and scan to get the files back in the inventory.
+
+The CLI asks for `--yes`; the API does not. An `id` that no account has is `not_found`.
+
+`POST /v1/account_remove`
+
+**Request fields**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `id` | `string` | yes | The account's id, as `accounts_list` shows it. |
+
+**Result**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `id` | `string` | yes | The id of the account that was removed. |
+| `locations` | `string[]` | yes | The locations of the inventory that were taken off the list, because they were in the account. |
+| `forgotten` | `integer` | yes | How many files of the account the inventory forgot. |
+
+**Example**
+
+```powershell
+$token = piikey-cli token
+'{"id":"3f9c2a7d41b8e605"}' | curl.exe -s -H "Authorization: Bearer $token" --data-binary '@-' http://127.0.0.1:7980/v1/account_remove
+```
+
+#### `account_browse`
+
+The folders directly in `under`, a path of the account, or without it the top of the account (its drives, sites or "My Drive"): what a location of the inventory is picked from.
+
+CLI: `piikey-cli account browse ID [--under PATH]`
+
+Without `under` the answer is the top of the account: its drives, sites or "My Drive", whichever the service has. Send the `path` of one of the folders as `under` to open it. The `path` of a folder is what a location of the inventory is made of: give it to `settings_set` (`inventory_roots`) once the account has been added.
+
+An `under` that is not a path of this account is a `bad_request`, and so is a folder that is no longer there, with a sentence that says what to do. The call waits on the service, so an account that has not been signed in (`account_connect`) fails with a sentence to sign in. An `id` that no account has is `not_found`.
+
+`POST /v1/account_browse`
+
+**Request fields**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `id` | `string` | yes | The account's id, as `accounts_list` shows it. |
+| `under` | `string` | no | The folder to look in, a path from an earlier answer. Without it: the top of the account. |
+
+**Result**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `folders` | [`FolderInfo[]`](#folderinfo-schema) | yes | The folders, in the order the service lists them. |
+
+**Example**
+
+```powershell
+$token = piikey-cli token
+'{"id":"3f9c2a7d41b8e605","under":"\\\\Dropbox\\Work"}' | curl.exe -s -H "Authorization: Bearer $token" --data-binary '@-' http://127.0.0.1:7980/v1/account_browse
+```
+
 ### Settings
 
 What piikey is set to, the types of personal data, and the API token.
@@ -682,7 +872,7 @@ CLI: `piikey-cli settings set KEY=VALUE...` (the keys are the `guard.cfg` keys, 
 
 The body holds the fields under `settings`. A field you leave out is unchanged; a list you send replaces the whole list. The patch is checked as a whole: when one value is invalid, nothing changes and the error names it. A monitored folder must be one of the inventory's folders after the same patch.
 
-Folders must be absolute. `enabled` is refused: protection is switched with `protection`. The CLI's keys are singular (`site`, `program`, `disabled_kind`, `inventory_root`, `monitor_root`), the JSON fields plural (`sites`, `programs`, ...).
+Folders must be absolute. A folder of a cloud account (a `path` from `account_browse`, such as `\\Google Drive\Work\Docs`) can be a location when its account has been added (`account_add`); a new location of an account that does not exist is refused with `bad_request`. `enabled` is refused: protection is switched with `protection`. The CLI's keys are singular (`site`, `program`, `disabled_kind`, `inventory_root`, `monitor_root`), the JSON fields plural (`sites`, `programs`, ...).
 
 In the running app the change takes effect the way a click in Settings does (Explorer menu, highlight, inventory, HTTP API). Changing `http_api` or `http_port` answers first and then restarts the listener, so a new port applies from the next call.
 
@@ -964,6 +1154,27 @@ $token = piikey-cli token
 
 The objects and values that the tables above point at.
 
+### `AccountInfo` schema
+
+One cloud account, in the reply to `account_add` and `account_connect` and in the list `accounts_list` answers. It holds no secret: a client secret is kept DPAPI-protected in the data folder, a key stays in its file.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `id` | `string` | yes | The account's id (16 hexadecimal digits), which never changes: the other account operations take it. |
+| `provider` | [`Provider`](#provider-schema) | yes | The cloud service. |
+| `label` | `string` | yes | The name the account goes by, unique among the accounts of its service. It is the second part of the paths of the account's folders. |
+| `sign_in` | [`SignIn`](#signin-schema) | yes | How the account signs in, with what that way needs (no secret). |
+| `path` | `string` | yes | The path of the account's top, `\\<service>\<name>`: the start of the path of every folder and file in it, and what a location of the inventory is picked below. |
+| `connected` | `boolean` | yes | Whether piikey has what it needs to read the account: a person has signed in, or the app has its secret or its key files. It says nothing about whether the service still accepts it. |
+
+### `BoxSubject` schema
+
+Whom a Box app acts as when it signs in with its client credentials.
+
+### `Credential` schema
+
+How an app registration proves who it is when no user signs in.
+
 ### `Device` schema
 
 What the loaded model runs on.
@@ -996,6 +1207,15 @@ A file that could not be written, and why.
 |---|---|---|---|
 | `input` | `string` | yes | The file that could not be written. |
 | `error` | `string` | yes | Why it could not be. |
+
+### `FolderInfo` schema
+
+A folder of a cloud account, in the reply to `account_browse`.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `path` | `string` | yes | The folder's path, which a location of the inventory can be and the next `account_browse` can look under. |
+| `name` | `string` | yes | The folder's name: the last part of its path. |
 
 ### `Format` schema
 
@@ -1070,6 +1290,18 @@ How far a scan or a download is: `done` of `total`.
 | `done` | `integer` | yes | How many are done. |
 | `total` | `integer` | yes | How many there are in all (files for a scan, bytes for a download). |
 
+### `Provider` schema
+
+A cloud service whose folders piikey can scan.
+
+| Value | Meaning |
+|---|---|
+| `microsoft365` | `SharePoint` and `OneDrive` for Business, through Microsoft Graph. |
+| `onedrive` | A personal Microsoft account's `OneDrive`, through Microsoft Graph. |
+| `google_drive` | Google Drive, through the Drive API. |
+| `dropbox` | Dropbox. |
+| `box` | Box. |
+
 ### `Record` schema
 
 A value and the stand-in piikey issued for it.
@@ -1098,6 +1330,10 @@ Every field that is present replaces the saved one, the others stay. All values 
 | `monitored_roots` | `string[]` | no | Replaces `monitored_roots`; each entry must be one of the `inventory_roots` after this patch. |
 | `http_api` | `boolean` | no | Replaces `http_api`. |
 | `http_port` | `integer (1 to 65535)` | no | Replaces `http_port`; 1 to 65535. |
+
+### `SignIn` schema
+
+How an account signs in, with what that way needs. The settings hold no secret: a client secret is given to the token store, a key stays in its file.
 
 ### `Span` schema
 

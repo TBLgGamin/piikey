@@ -9,6 +9,7 @@ use crate::{
     detect::EntityKind,
     inventory::{ContentHash, Entry, Node, Status},
     policy::{Highlight, SettingsPatch},
+    sources::{Account, Provider, SignIn},
     subject::SubjectMatch,
     vault::ExportFormat,
 };
@@ -360,6 +361,14 @@ fn conform_object(
 
 /// A request of each op with every field given, as the serde writes it.
 fn full_requests() -> Vec<Request> {
+    let mut all = requests_to_the_settings();
+    all.extend(account_requests());
+    all.extend(requests_of_the_app());
+    all
+}
+
+/// The requests of the text, file, vault, inventory and settings ops.
+fn requests_to_the_settings() -> Vec<Request> {
     let path = || PathBuf::from(r"C:\data");
     vec![
         Request::ScanText {
@@ -432,6 +441,34 @@ fn full_requests() -> Vec<Request> {
                 http_port: Some(8000),
             },
         },
+    ]
+}
+
+/// The requests of the cloud account ops.
+fn account_requests() -> [Request; 5] {
+    [
+        Request::AccountsList,
+        Request::AccountAdd {
+            provider: Provider::Box,
+            label: "Team".into(),
+            sign_in: SignIn::BoxDelegated {
+                client_id: "id".into(),
+            },
+            client_secret: Some("secret".into()),
+        },
+        Request::AccountConnect { id: "ab".into() },
+        Request::AccountRemove { id: "ab".into() },
+        Request::AccountBrowse {
+            id: "ab".into(),
+            under: Some(PathBuf::from(r"\\Box\Team")),
+        },
+    ]
+}
+
+/// The requests of the model, token, status and app ops.
+fn requests_of_the_app() -> Vec<Request> {
+    let path = || PathBuf::from(r"C:\data");
+    vec![
         Request::Kinds,
         Request::ModelStatus,
         Request::ModelDownload,
@@ -685,6 +722,21 @@ fn vault_and_inventory_replies() -> Samples {
     ])
 }
 
+/// A connected account of Box, as the API shows it.
+fn an_account() -> reply::AccountInfo {
+    reply::AccountInfo::new(
+        &Account {
+            id: "ab".into(),
+            provider: Provider::Box,
+            label: "Team".into(),
+            sign_in: SignIn::BoxDelegated {
+                client_id: "id".into(),
+            },
+        },
+        true,
+    )
+}
+
 /// What the ops on the settings, the model and the app answer.
 fn app_replies() -> Samples {
     let model = a_model(false);
@@ -700,6 +752,31 @@ fn app_replies() -> Samples {
     Ok(vec![
         ("settings_get", written(&Policy::default())?),
         ("settings_set", written(&set)?),
+        (
+            "accounts_list",
+            written(&reply::Accounts {
+                accounts: vec![an_account()],
+            })?,
+        ),
+        ("account_add", written(&an_account())?),
+        ("account_connect", written(&an_account())?),
+        (
+            "account_remove",
+            written(&reply::AccountRemoved {
+                id: "ab".into(),
+                locations: vec![r"\\Box\Team\Docs".into()],
+                forgotten: 3,
+            })?,
+        ),
+        (
+            "account_browse",
+            written(&reply::Folders {
+                folders: vec![reply::FolderInfo {
+                    path: r"\\Box\Team\Docs".into(),
+                    name: "Docs".into(),
+                }],
+            })?,
+        ),
         (
             "kinds",
             written(&vec![reply::Kind {

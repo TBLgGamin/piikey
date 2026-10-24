@@ -9,7 +9,7 @@ use std::{
 
 use piikey::{
     policy::{Highlight, Policy, SettingsPatch},
-    sys,
+    sources, sys,
 };
 
 use super::{Controller, Edit, Notice, apply_edit};
@@ -21,8 +21,19 @@ fn monitoring(policy: &Policy) -> bool {
 
 impl Controller {
     /// Applies one edit of the settings; `false` when it was refused or could not be saved (the
-    /// notice says why), `true` when it was applied or changed nothing.
+    /// notice says why), `true` when it was applied or changed nothing. A location in a cloud
+    /// account is refused unless a connected account has that name.
     pub(super) fn edit(self: &Arc<Self>, edit: &Edit) -> bool {
+        if let Edit::InventoryRoot { path, on: true } = edit
+            && sources::is_virtual(path)
+            && !self.knows_account(path)
+        {
+            self.notify(Notice::error(format!(
+                "Not added: no connected account matches {}. Connect the account in Settings first.",
+                piikey::sources::shown(path)
+            )));
+            return false;
+        }
         let mut policy = self.policy();
         match apply_edit(&mut policy, edit) {
             Ok(true) => {}
@@ -35,11 +46,12 @@ impl Controller {
         self.commit(&policy)
     }
 
-    /// Applies the settings the API sent, as a whole: a patch with a bad value changes nothing.
+    /// Applies the settings the API sent, as a whole: a patch with a bad value changes nothing. A
+    /// location in a cloud account is taken only when a connected account has that name.
     pub(super) fn settings(self: &Arc<Self>, patch: &SettingsPatch) {
         let mut policy = self.policy();
         let before = policy.clone();
-        if let Err(error) = patch.apply(&mut policy) {
+        if let Err(error) = self.apply_patch(patch, &mut policy) {
             self.notify(Notice::error(error.to_string()));
             return;
         }

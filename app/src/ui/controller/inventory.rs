@@ -5,6 +5,13 @@
 //! The inventory is scanned when somebody asks: the Scan button, a folder or file the user
 //! points at, Explorer's menu, the API. Nothing is scanned on a timer. What changes in the
 //! monitored locations is scanned into it too, see [`watch`](super::watch).
+//!
+//! A location is a folder on this PC or a folder of a cloud account, and one scan runs over
+//! both: the folders on this PC first, then the cloud locations, with one count of files, one
+//! result and one thread. A path in a cloud account is never looked at on this PC's file system:
+//! Windows would take `\\Google Drive\...` for a network share and wait for a server of that
+//! name. A cloud file's contents are downloaded into memory, scanned and dropped: the inventory
+//! keeps counts and paths of it, as of any file.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -19,11 +26,15 @@ use std::{
 };
 
 use piikey::{
+    engine::Engine,
     inventory::{self, Busy, Entry, Finding, Inventory, Node, Progress, Report, Tiles, TypeTotal},
+    sources::{self, Accounts, CloudScan, Connector, Cursors, Scanned},
     sys,
 };
 
-use super::{Controller, Edit, Notice, PROGRESS_EVERY, ScanSummary, State};
+use super::{
+    Controller, Edit, FolderStatus, Notice, PROGRESS_EVERY, ScanSummary, State, watch::unix_now,
+};
 use crate::{
     Describe, Res,
     ui::{
@@ -132,20 +143,122 @@ impl Drop for FindingsRead<'_> {
     }
 }
 
-/// The name of the file or folder at `path`; the whole path for one that has none (a drive).
-fn name_of(path: &Path) -> String {
-    path.file_name().map_or_else(
-        || path.display().to_string(),
-        |name| name.to_string_lossy().into_owned(),
+/// The accounts the cloud files of a read of findings are in, each with the connector that reads
+/// it. A connector is made once for an account and shared by the threads of the read, as one run
+/// of a scan shares one.
+struct CloudReaders {
+    /// The accounts, or why they could not be read; none when no file of the read is in one.
+    accounts: Res<Accounts>,
+    /// The connector of each account a file of the read is in, by the account's id, or why it
+    /// has none.
+    connectors: HashMap<String, Res<Box<dyn Connector>>>,
+}
+
+impl CloudReaders {
+    /// The readers `files` need. Nothing is opened when none of them is in a cloud account.
+    fn of(controller: &Controller, files: &[PathBuf]) -> Self {
+        let mut readers = Self {
+            accounts: Ok(Accounts::default()),
+            connectors: HashMap::new(),
+        };
+        if !files.iter().any(|file| sources::is_virtual(file)) {
+            return readers;
+        }
+        let accounts = match Accounts::open(controller.data_dir()) {
+            Ok(accounts) => accounts,
+            Err(error) => {
+                readers.accounts = Err(format!("Could not read the connected accounts: {error}"));
+                return readers;
+            }
+        };
+        for account in files.iter().filter_map(|file| accounts.of(file)) {
+            readers
+                .connectors
+                .entry(account.id.clone())
+                .or_insert_with(|| {
+                    controller
+                        .backend
+                        .connector(account)
+                        .map_err(|error| controller.cloud_failed(Some(account), &error))
+                });
+        }
+        readers.accounts = Ok(accounts);
+        readers
+    }
+
+    /// Reads what the detector finds in the cloud file at `path` to `report`, through the
+    /// connector of its account.
+    fn read(
+        &self,
+        controller: &Controller,
+        engine: &Engine,
+        path: &Path,
+        stopped: &AtomicBool,
+        report: &(dyn Fn(Report) -> bool + Sync),
+    ) -> Res<()> {
+        let accounts = self.accounts.as_ref().map_err(Clone::clone)?;
+        let Some(account) = accounts.of(path) else {
+            return Err(not_connected(path));
+        };
+        let connector = self
+            .connectors
+            .get(&account.id)
+            .ok_or_else(|| not_connected(path))?
+            .as_ref()
+            .map_err(Clone::clone)?;
+        sources::findings(connector.as_ref(), engine, path, stopped, report).map_err(|error| {
+            // What goes wrong with the file (it is gone, or no format piikey reads) is about the
+            // file; an account that has to sign in again is about the account.
+            if matches!(error, sources::Error::SignInNeeded { .. }) {
+                controller.cloud_failed(Some(account), &error)
+            } else {
+                error.to_string()
+            }
+        })
+    }
+}
+
+/// Why a file of a cloud account cannot be read when no connected account has its name.
+fn not_connected(path: &Path) -> String {
+    format!(
+        "The account of {} is not connected any more. Connect it again in Settings, or remove the location.",
+        shown(path)
     )
 }
 
-/// `path` as seen from the folder `root` it was found in; its name when it is not below it.
+/// `path` as a person reads it: a cloud path as the account's name and its folders
+/// ([`sources::display_path`]), any other as Windows writes it.
+fn shown(path: &Path) -> String {
+    sources::display_path(path).unwrap_or_else(|| path.display().to_string())
+}
+
+/// The name of the file or folder at `path`; the whole path for one that has none (a drive, or the
+/// top of a cloud account, which reads as the account's name).
+fn name_of(path: &Path) -> String {
+    path.file_name()
+        .map_or_else(|| shown(path), |name| name.to_string_lossy().into_owned())
+}
+
+/// `path` as seen from the folder `root` it was found in; its name when it is not below it. The
+/// folders of a cloud path are told apart with `›`, as everywhere else.
 fn label_under(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .ok()
         .filter(|rest| !rest.as_os_str().is_empty())
-        .map_or_else(|| name_of(path), |rest| rest.display().to_string())
+        .map_or_else(
+            || name_of(path),
+            |rest| {
+                if sources::is_virtual(path) {
+                    let parts: Vec<_> = rest
+                        .components()
+                        .map(|part| part.as_os_str().to_string_lossy())
+                        .collect();
+                    parts.join(" \u{203a} ")
+                } else {
+                    rest.display().to_string()
+                }
+            },
+        )
 }
 
 /// What identifies a file among the ones listed: its path as Windows compares it.
@@ -186,13 +299,23 @@ fn pick_files(
             .get(&file.label.to_lowercase())
             .is_some_and(|&n| n > 1)
         {
-            file.label = file.path.display().to_string();
+            file.label = shown(&file.path);
         }
     }
     FindingFiles {
         left_out: all - files.len(),
         files,
     }
+}
+
+/// How the scan of one cloud location came out, for the window.
+struct Settled {
+    /// The location, as it was given.
+    root: PathBuf,
+    /// No connected account has the name of the location any more.
+    orphan: bool,
+    /// What the scan did, or why it could not: the plain words of the account's error.
+    result: Result<Scanned, String>,
 }
 
 impl Controller {
@@ -238,7 +361,9 @@ impl Controller {
     /// the files the inventory found personal data in (or, outside the locations, the last asked
     /// scan found), the ones with the most first. A folder holds thousands of files at worst, so
     /// the list stops at [`MOST_FILES`] and says how many it left out. Waits on the disk (a root
-    /// may be a folder or a file), so it is for the background.
+    /// may be a folder or a file), so it is for the background. A root in a cloud account is not
+    /// on the disk: the inventory says what it is, a file when it has an entry of its own and a
+    /// folder otherwise.
     pub fn finding_files(&self, roots: &[PathBuf]) -> FindingFiles {
         let outside = self
             .asked_outside
@@ -248,7 +373,12 @@ impl Controller {
         let mut named: Vec<(PathBuf, String)> = Vec::new();
         let mut held: Vec<(u64, PathBuf, String)> = Vec::new();
         for root in roots {
-            if root.is_dir() {
+            let folder = if sources::is_virtual(root) {
+                self.inventory.entry(root).is_none()
+            } else {
+                root.is_dir()
+            };
+            if folder {
                 let stored = self
                     .inventory
                     .entries(Some(root), 1)
@@ -291,7 +421,8 @@ impl Controller {
     /// nothing is stored, not by the inventory and not anywhere else. The detection model stays
     /// loaded from the first file to the last, as for a scan, and a while after it. A file that
     /// cannot be read, is bigger than piikey reads or is not a format it understands comes with a
-    /// message for the user instead of its findings.
+    /// message for the user instead of its findings. A file in a cloud account is downloaded into
+    /// memory through its account, read and dropped.
     pub fn read_findings(
         &self,
         files: &[PathBuf],
@@ -302,46 +433,49 @@ impl Controller {
             return;
         }
         let report = Mutex::new(report);
-        let go = AtomicBool::new(true);
+        let stopped = AtomicBool::new(false);
         let found = AtomicUsize::new(0);
         let tell = |event: FindingsEvent| -> bool {
-            if !go.load(Ordering::Relaxed) {
+            if stopped.load(Ordering::Relaxed) {
                 return false;
             }
             let more = (report.lock().unwrap_or_else(PoisonError::into_inner))(event);
             if !more {
-                go.store(false, Ordering::Relaxed);
+                stopped.store(true, Ordering::Relaxed);
             }
             more
         };
         tell(FindingsEvent::Loading);
         let _reading = FindingsRead::start(self);
         let engine = self.engine();
+        let clouds = CloudReaders::of(self, files);
         let next = AtomicUsize::new(0);
         self.in_scan_pool(|| {
             rayon::scope(|scope| {
                 for _ in 0..FINDINGS_PARALLEL.min(files.len()) {
                     scope.spawn(|_| {
-                        while go.load(Ordering::Relaxed) {
+                        while !stopped.load(Ordering::Relaxed) {
                             let Some(path) = files.get(next.fetch_add(1, Ordering::Relaxed)) else {
                                 break;
                             };
-                            let result =
-                                inventory::findings(&engine, path, &|report| match report {
-                                    Report::Busy(busy) => {
-                                        tell(FindingsEvent::Busy(path.clone(), busy))
+                            let on_report = |report: Report| match report {
+                                Report::Busy(busy) => tell(FindingsEvent::Busy(path.clone(), busy)),
+                                Report::Found(list) => {
+                                    let total =
+                                        found.fetch_add(list.len(), Ordering::Relaxed) + list.len();
+                                    let more = tell(FindingsEvent::Found(path.clone(), list));
+                                    if total >= limit {
+                                        stopped.store(true, Ordering::Relaxed);
                                     }
-                                    Report::Found(list) => {
-                                        let total = found.fetch_add(list.len(), Ordering::Relaxed)
-                                            + list.len();
-                                        let more = tell(FindingsEvent::Found(path.clone(), list));
-                                        if total >= limit {
-                                            go.store(false, Ordering::Relaxed);
-                                        }
-                                        more && go.load(Ordering::Relaxed)
-                                    }
-                                });
-                            tell(FindingsEvent::Done(path.clone(), result.describe()));
+                                    more && !stopped.load(Ordering::Relaxed)
+                                }
+                            };
+                            let result = if sources::is_virtual(path) {
+                                clouds.read(self, &engine, path, &stopped, &on_report)
+                            } else {
+                                inventory::findings(&engine, path, &on_report).describe()
+                            };
+                            tell(FindingsEvent::Done(path.clone(), result));
                         }
                     });
                 }
@@ -367,8 +501,11 @@ impl Controller {
     ///
     /// # Errors
     /// A message when the file cannot be read, is not a format piikey reads, or the copy cannot
-    /// be written.
+    /// be written; and for a file in a cloud account, which is not on this PC to write beside.
     pub fn masked_copy(&self, file: &Path) -> Res<PathBuf> {
+        if sources::is_virtual(file) {
+            return Err("A masked copy can only be made of a file on this PC.".to_owned());
+        }
         exports::masked_copy(&self.engine(), file)
     }
 
@@ -528,7 +665,8 @@ impl Controller {
     }
 
     /// `folder` was removed from the locations: what the inventory holds under it goes, unless a
-    /// location that is still listed holds it.
+    /// location that is still listed holds it. For a folder in a cloud account where the last
+    /// scan of it left off goes too, so that adding it again lists it in full.
     fn run_forget(&self, folder: &Path) {
         let still = self
             .policy()
@@ -538,14 +676,23 @@ impl Controller {
         if !still && let Err(error) = self.inventory.forget_under(folder) {
             self.notify(Notice::error(format!(
                 "Could not forget what was found in {}: {error}",
-                folder.display()
+                shown(folder)
+            )));
+        }
+        if sources::is_virtual(folder)
+            && let Err(error) = Cursors::new(self.data_dir()).forget_under(folder)
+        {
+            self.notify(Notice::error(format!(
+                "Could not forget where the scan of {} left off: {error}",
+                shown(folder)
             )));
         }
         let totals = self.inventory.totals();
         self.update(|state| state.inventory_totals = totals);
     }
 
-    /// Scans what `request` names into the inventory. What it found outside the locations is
+    /// Scans what `request` names into the inventory: the folders on this PC, then the cloud
+    /// locations among them, as one run with one count. What it found outside the locations is
     /// shown by its dialog and findings view, then forgotten by the inventory.
     fn run_asked(&self, job: &Job, request: &Request) {
         // A `piikey-cli` run on its own may be scanning the same inventory.
@@ -569,21 +716,32 @@ impl Controller {
         });
         self.sync_model();
         let engine = self.engine();
-        let result = self.with_progress(|| {
-            self.inventory
-                .scan_paths(&engine, &request.paths, &progress, &job.cancel)
+        let (local, cloud) = sources::split_roots(&request.paths);
+        let (result, scans) = self.with_progress(|| {
+            // The folders on this PC first: that starts the count the cloud locations add to.
+            let result = if local.is_empty() {
+                Ok(())
+            } else {
+                self.inventory
+                    .scan_paths(&engine, &local, &progress, &job.cancel)
+            };
+            let scans = self.scan_cloud_roots(&engine, &cloud, &progress, &job.cancel);
+            (result, scans)
         });
+        let clouds = self.settle_clouds(scans);
+        // Nobody else would hear of a location whose account is gone: the dialog tells only
+        // when nothing else was scanned.
+        for lost in clouds.iter().filter(|one| one.orphan) {
+            if let Err(text) = &lost.result {
+                self.notify(Notice::error(text.clone()));
+            }
+        }
         // The result comes from the inventory before it forgets what lies outside the locations.
         // A scan that was stopped either goes on later (its dialog keeps waiting) or is told so
         // by `scan_stopped`.
+        let local_result = (!local.is_empty()).then_some(&result);
         let outcome = request.reveal.filter(|_| !job.cancelled()).map(|seq| {
-            let state = match &result {
-                Err(error) => RevealState::Failed(format!("Could not save the inventory: {error}")),
-                Ok(()) => RevealState::Done(ScanSummary {
-                    cloud_only: progress.cloud_only.load(Ordering::Relaxed),
-                    ..self.inventory.summary(&request.paths)
-                }),
-            };
+            let state = self.scan_result(request, local_result, &clouds, &progress);
             (seq, state)
         });
         let roots = self.policy().inventory_roots;
@@ -599,6 +757,8 @@ impl Controller {
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = outside;
         let forgot = self.inventory.forget_outside(&roots);
+        // What lies outside the locations is not kept, and neither is where its scan left off.
+        let forgot_cursors = self.forget_unplaced(&cloud, &roots);
         let totals = self.inventory.totals();
         self.update(|state| {
             state.scan = None;
@@ -607,7 +767,7 @@ impl Controller {
                 set_reveal(state, seq, outcome);
             }
         });
-        if let Err(error) = result.and(forgot.map(drop)) {
+        if let Err(error) = result.and(forgot.map(drop)).and(forgot_cursors) {
             self.notify(Notice::error(format!(
                 "Could not save the inventory: {error}"
             )));
@@ -616,7 +776,8 @@ impl Controller {
     }
 
     /// Scans what monitoring saw change into the inventory: everything, or the paths that were
-    /// reported. Only the monitored locations are looked at.
+    /// reported, and the cloud locations that were asked about. Only the monitored locations are
+    /// looked at.
     fn run_watch(&self, job: &Job, changes: &Changes) {
         let policy = self.policy();
         if policy.monitored_roots.is_empty() {
@@ -636,16 +797,31 @@ impl Controller {
         self.update(|state| state.watch.scan = Some(Arc::clone(&progress)));
         self.sync_model();
         let engine = self.engine();
-        let roots = policy.monitored_roots;
-        let result = self.with_progress(|| {
-            if changes.everything {
+        // The system reports on the folders on this PC; a cloud location is asked, never looked
+        // at on the file system. Of those, the ones that were asked about and are still monitored.
+        let (local, cloud) = sources::split_roots(&policy.monitored_roots);
+        let asked: Vec<PathBuf> = cloud
+            .into_iter()
+            .filter(|root| {
+                changes.everything || changes.clouds().any(|polled| sys::same_path(polled, root))
+            })
+            .collect();
+        let touched = changes.list();
+        let (result, scans) = self.with_progress(|| {
+            // The count starts with the folders on this PC, if there is anything to look at there.
+            let result = if local.is_empty() || (!changes.everything && touched.is_empty()) {
+                Ok(())
+            } else if changes.everything {
                 self.inventory
-                    .scan_paths(&engine, &roots, &progress, &job.cancel)
+                    .scan_paths(&engine, &local, &progress, &job.cancel)
             } else {
                 self.inventory
-                    .refresh(&engine, &roots, &changes.list(), &progress, &job.cancel)
-            }
+                    .refresh(&engine, &local, &touched, &progress, &job.cancel)
+            };
+            let scans = self.scan_cloud_roots(&engine, &asked, &progress, &job.cancel);
+            (result, scans)
         });
+        self.settle_clouds(scans);
         let totals = self.inventory.totals();
         self.update(|state| {
             state.watch.scan = None;
@@ -657,6 +833,124 @@ impl Controller {
             )));
         }
         self.sync_model_after_use();
+    }
+
+    /// Scans the cloud locations among `roots` into the inventory, as the part of a run that
+    /// `progress` and `cancel` belong to (see [`sources::scan_clouds`]). Nothing happens, and no
+    /// account is read, without one.
+    fn scan_cloud_roots(
+        &self,
+        engine: &Engine,
+        roots: &[PathBuf],
+        progress: &Progress,
+        cancel: &AtomicBool,
+    ) -> Vec<CloudScan> {
+        if roots.is_empty() {
+            return Vec::new();
+        }
+        sources::scan_clouds(
+            self.data_dir(),
+            &|account| self.backend.connector(account),
+            &self.inventory,
+            engine,
+            roots,
+            progress,
+            cancel,
+        )
+    }
+
+    /// Tells what the scans of cloud locations came to. An account whose scan worked is as good
+    /// as it was; one whose scan failed is remembered with what is wrong with it, and the user is
+    /// told once (see [`Controller::cloud_failed`]). A monitored location stands as its scan
+    /// found it, and has a change to show when the scan read or forgot something. A scan that was
+    /// stopped says nothing.
+    fn settle_clouds(&self, scans: Vec<CloudScan>) -> Vec<Settled> {
+        let settled: Vec<Settled> = scans
+            .into_iter()
+            .filter_map(|scan| {
+                let CloudScan {
+                    root,
+                    account,
+                    result,
+                } = scan;
+                let result = match result {
+                    Ok(scanned) => {
+                        if let Some(account) = &account {
+                            self.cloud_worked(account);
+                        }
+                        Ok(scanned)
+                    }
+                    Err(sources::Error::Cancelled) => return None,
+                    Err(error) => Err(self.cloud_failed(account.as_ref(), &error)),
+                };
+                Some(Settled {
+                    root,
+                    orphan: account.is_none(),
+                    result,
+                })
+            })
+            .collect();
+        if !settled.is_empty() {
+            let now = unix_now();
+            self.update(|state| {
+                for one in &settled {
+                    let (status, changed) = match &one.result {
+                        Ok(scanned) => (
+                            FolderStatus::Watching,
+                            (scanned.read > 0 || scanned.forgotten > 0).then_some(now),
+                        ),
+                        Err(text) => (FolderStatus::Unavailable(text.clone()), None),
+                    };
+                    state.watch.cloud_scanned(&one.root, status, changed);
+                }
+            });
+        }
+        settled
+    }
+
+    /// What the dialog of a scan shows once it is over: what the inventory holds of what was asked
+    /// for or, when none of it could be scanned, why not. `local` is how the folders on this PC
+    /// went, `None` when none was asked for. The reason is the first one, in the order they were
+    /// tried: the inventory's, then each cloud location's.
+    fn scan_result(
+        &self,
+        request: &Request,
+        local: Option<&Result<(), piikey::Error>>,
+        clouds: &[Settled],
+        progress: &Progress,
+    ) -> RevealState {
+        let saved = local
+            .and_then(|result| result.as_ref().err())
+            .map(|error| format!("Could not save the inventory: {error}"));
+        let worked =
+            local.is_some_and(Result::is_ok) || clouds.iter().any(|one| one.result.is_ok());
+        let why = saved.or_else(|| {
+            clouds
+                .iter()
+                .find_map(|one| one.result.as_ref().err().cloned())
+        });
+        match why {
+            Some(why) if !worked => RevealState::Failed(why),
+            _ => RevealState::Done(ScanSummary {
+                cloud_only: progress.cloud_only.load(Ordering::Relaxed),
+                ..self.inventory.summary(&request.paths)
+            }),
+        }
+    }
+
+    /// Forgets where the scans of the cloud locations among `scanned` left off, for those that no
+    /// location of `locations` holds: what lies outside the locations is not kept, so the next
+    /// scan of one lists it in full.
+    fn forget_unplaced(&self, scanned: &[PathBuf], locations: &[PathBuf]) -> piikey::Result<()> {
+        let cursors = Cursors::new(self.data_dir());
+        scanned
+            .iter()
+            .filter(|root| {
+                !locations
+                    .iter()
+                    .any(|location| sys::is_under(root, location))
+            })
+            .try_for_each(|root| cursors.forget_under(root))
     }
 
     /// Runs `work` in the scan pool while the progress it makes reaches the window a few times a
@@ -731,7 +1025,7 @@ fn scan_loop(controller: &Weak<Controller>, scanner: &Scanner) {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{FindingFiles, label_under, name_of, pick_files, under};
+    use super::{FindingFiles, label_under, name_of, pick_files, shown, under};
 
     #[test]
     fn the_empty_path_means_all_of_an_inventory() {
@@ -800,6 +1094,32 @@ mod tests {
         );
         assert_eq!(labels(&picked), ["A.txt", "b.txt"]);
         assert_eq!(picked.left_out, 0);
+    }
+
+    #[test]
+    fn a_cloud_file_is_labelled_by_the_account_and_its_folders_never_by_its_address() {
+        let root = Path::new(r"\\Box\Example cloud\Shared");
+        let file = Path::new(r"\\Box\Example cloud\Shared\Clients\contacts.csv");
+        assert_eq!(
+            label_under(root, file),
+            "Clients \u{203a} contacts.csv".to_owned()
+        );
+        assert_eq!(name_of(file), "contacts.csv");
+        assert_eq!(name_of(Path::new(r"\\Box\Example cloud")), "Example cloud");
+        assert_eq!(
+            shown(file),
+            "Example cloud \u{203a} Shared \u{203a} Clients \u{203a} contacts.csv"
+        );
+        assert_eq!(shown(Path::new(r"C:\Docs\a.txt")), r"C:\Docs\a.txt");
+        let same = |name: &str| held(1, &format!(r"\\Box\Example cloud\{name}\a.txt"), "a.txt");
+        let picked = pick_files(Vec::new(), vec![same("One"), same("Two")], 10);
+        assert_eq!(
+            labels(&picked),
+            [
+                "Example cloud \u{203a} One \u{203a} a.txt",
+                "Example cloud \u{203a} Two \u{203a} a.txt"
+            ]
+        );
     }
 
     #[test]

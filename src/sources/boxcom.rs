@@ -27,7 +27,7 @@ use serde_json::Value;
 use super::{
     Account, BoxSubject, Changes, Connector, Error, Provider, RemoteFolder, RemoteItem, Resolved,
     Result, SignIn, TokenStore,
-    auth::{App, AppCredential, Browser, ClientAuth, Grant, Session},
+    auth::{App, AppCredential, Browser, ClientAuth, Grant, LOOPBACK, Session},
     child, component,
     http::{Http, Request, encode, pages},
     parse_time, parse_virtual,
@@ -91,6 +91,7 @@ fn grant(account: &Account, endpoints: &Endpoints) -> Result<Grant> {
                 scope: SCOPE.to_owned(),
                 authorize_extra: Vec::new(),
                 client_auth: ClientAuth::Body,
+                redirect_host: LOOPBACK,
                 port: 0,
                 redirect_path: String::new(),
                 pkce: false,
@@ -1821,6 +1822,7 @@ mod tests {
             (browser.port, browser.redirect_path.as_str(), browser.pkce),
             (0, "", false)
         );
+        assert_eq!(browser.redirect_host, "127.0.0.1");
 
         for (subject, kind, id) in [
             (

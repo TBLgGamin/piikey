@@ -12,7 +12,10 @@ use windows_reactor::{
 };
 
 use super::palette::swatch;
-use crate::ui::pages::kit::{Context, body, caption, counted, subtitle, thousands};
+use crate::ui::pages::{
+    kit::{Context, body, caption, counted, subtitle, thousands},
+    lists::shown,
+};
 use crate::ui::{
     controller::{Reveal, RevealState, ScanSummary},
     window::{MainWindow, Msg},
@@ -63,10 +66,10 @@ fn type_rows(counts: &[(EntityKind, u32)]) -> Vec<View> {
 pub(super) fn scanned_what(paths: &[PathBuf]) -> String {
     match paths {
         [] => String::new(),
-        [one] => one.display().to_string(),
+        [one] => shown(one),
         [first, rest @ ..] => format!(
             "{} and {}",
-            first.display(),
+            shown(first),
             counted(
                 u64::try_from(rest.len()).unwrap_or(u64::MAX),
                 "other item",
@@ -190,7 +193,7 @@ fn file_row(file: &ScanReading) -> View {
         .children((
             body(file_name(&file.path))
                 .text_trimming(TextTrimming::CharacterEllipsis)
-                .tooltip(file.path.display().to_string()),
+                .tooltip(shown(&file.path)),
             bar,
             caption(percent.map(|p| format!("{p} %")).unwrap_or_default())
                 .vertical_alignment(VerticalAlignment::Center)
@@ -211,10 +214,8 @@ fn percent_of(busy: Option<Busy>) -> Option<u8> {
 
 /// The name of a file, or its whole path when it has none.
 fn file_name(path: &std::path::Path) -> String {
-    path.file_name().map_or_else(
-        || path.display().to_string(),
-        |name| name.to_string_lossy().into_owned(),
-    )
+    path.file_name()
+        .map_or_else(|| shown(path), |name| name.to_string_lossy().into_owned())
 }
 
 /// The content of the result dialog for a scan that is `reveal`.
@@ -290,6 +291,20 @@ pub(in crate::ui) fn dialog(window: &MainWindow, context: Context<'_>) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_was_scanned_in_the_cloud_reads_as_the_account_and_its_folders() {
+        let file = PathBuf::from(r"\\Box\Example cloud\Shared\Clients\contacts.csv");
+        assert_eq!(
+            scanned_what(std::slice::from_ref(&file)),
+            "Example cloud \u{203a} Shared \u{203a} Clients \u{203a} contacts.csv"
+        );
+        assert_eq!(
+            scanned_what(&[file, PathBuf::from(r"C:\Docs")]),
+            "Example cloud \u{203a} Shared \u{203a} Clients \u{203a} contacts.csv and 1 other item"
+        );
+        assert_eq!(scanned_what(&[PathBuf::from(r"C:\Docs")]), r"C:\Docs");
+    }
 
     fn summary(hits: u64, files_with_data: u64, files: u64, unread: u64) -> ScanSummary {
         ScanSummary {

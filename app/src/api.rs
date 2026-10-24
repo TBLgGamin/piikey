@@ -4,12 +4,13 @@
 //! only the app can do, or what must reach the rest of the app, goes through the controller:
 //! protection, settings (so the features follow them), Explorer scans, the inventory's rescan (the
 //! scans are the controller's), what removes values from the vault (so what was typed is forgotten
-//! too) and the model's download (so its state is the app's). File work runs in the pool of the
-//! app's own scans, so it leaves half the cores to the PC.
+//! too), the model's download (so its state is the app's) and the cloud accounts (so the window's
+//! list, the locations and the notices follow them, and the app opens the browser to sign in).
+//! File work runs in the pool of the app's own scans, so it leaves half the cores to the PC.
 
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, Weak},
+    sync::{Arc, Weak, atomic::AtomicBool},
     time::Duration,
 };
 
@@ -18,14 +19,18 @@ use piikey::{
     api::{
         ApiError, Handler, Local, PolicySource, Request,
         reply::{self, ModelState},
-        require_absolute, to_json,
+        require_absolute, require_on_this_pc, to_json,
     },
     detect::NerDetector,
     policy::SettingsPatch,
+    sources::{Account, Provider, SignIn},
+    sys,
 };
 use serde_json::{Value, json};
 
-use crate::ui::controller::{Command, Controller, Model, Snapshot};
+use crate::ui::controller::{
+    AccountStatus, AccountView, Command, Controller, Model, NewAccount, Snapshot,
+};
 
 /// How long a call waits for the controller to finish what it asked for.
 const WAIT: Duration = Duration::from_mins(1);
@@ -114,7 +119,7 @@ impl AppApi {
     fn settings_set(&self, patch: &SettingsPatch) -> Result<Value, ApiError> {
         let controller = self.controller()?;
         let mut expected = controller.policy();
-        patch.apply(&mut expected)?;
+        controller.apply_patch(patch, &mut expected)?;
         controller.submit(Command::Settings(patch.clone()));
         // The listener of this very request may be the one that restarts: it waits for the request
         // to end, so the answer goes out first and the change follows.
@@ -154,6 +159,112 @@ impl AppApi {
     fn show_window(&self) -> Result<Value, ApiError> {
         self.controller()?.request_window();
         Ok(json!({}))
+    }
+
+    /// The accounts as the controller lists them, read again first: the command line, run on its
+    /// own, may have added one since the app last looked.
+    fn account_views(controller: &Controller) -> Result<Vec<AccountView>, ApiError> {
+        controller.submit(Command::Refresh);
+        if !controller.wait_idle(WAIT) {
+            return Err(ApiError::busy("piikey is still reading the accounts"));
+        }
+        Ok(controller.accounts())
+    }
+
+    /// The account with this id, or `not_found`.
+    fn account_view(controller: &Controller, id: &str) -> Result<AccountView, ApiError> {
+        Self::account_views(controller)?
+            .into_iter()
+            .find(|view| view.account.id == id)
+            .ok_or_else(|| ApiError::not_found(format!("no cloud account has the id {id}")))
+    }
+
+    /// `account` as the API shows it, with how the controller says it stands.
+    fn account_info(controller: &Controller, account: &Account) -> reply::AccountInfo {
+        let connected = controller
+            .accounts()
+            .iter()
+            .any(|view| view.account.id == account.id && view.status == AccountStatus::Connected);
+        reply::AccountInfo::new(account, connected)
+    }
+
+    fn accounts_list(&self) -> Result<Value, ApiError> {
+        let controller = self.controller()?;
+        let accounts = Self::account_views(&controller)?
+            .iter()
+            .map(|view| {
+                reply::AccountInfo::new(&view.account, view.status == AccountStatus::Connected)
+            })
+            .collect();
+        to_json(&reply::Accounts { accounts })
+    }
+
+    fn account_add(
+        &self,
+        provider: Provider,
+        label: String,
+        sign_in: SignIn,
+        client_secret: Option<String>,
+    ) -> Result<Value, ApiError> {
+        let controller = self.controller()?;
+        let account = controller.add_account(NewAccount {
+            provider,
+            label,
+            sign_in,
+            client_secret,
+        })?;
+        to_json(&Self::account_info(&controller, &account))
+    }
+
+    /// Signs the account in and answers when that is done: the person has up to five minutes in
+    /// the browser the app opens.
+    fn account_connect(&self, id: &str) -> Result<Value, ApiError> {
+        let controller = self.controller()?;
+        Self::account_view(&controller, id)?;
+        let account = controller.connect_account(id, &AtomicBool::new(false))?;
+        to_json(&Self::account_info(&controller, &account))
+    }
+
+    fn account_remove(&self, id: &str) -> Result<Value, ApiError> {
+        let controller = self.controller()?;
+        Self::account_view(&controller, id)?;
+        let removed = controller.remove_account(id)?;
+        to_json(&reply::AccountRemoved {
+            id: removed.account.id,
+            locations: removed
+                .locations
+                .iter()
+                .map(|location| location.to_string_lossy().into_owned())
+                .collect(),
+            forgotten: u64::try_from(removed.forgotten).unwrap_or(u64::MAX),
+        })
+    }
+
+    fn account_browse(&self, id: &str, under: Option<&Path>) -> Result<Value, ApiError> {
+        let controller = self.controller()?;
+        let view = Self::account_view(&controller, id)?;
+        if let Some(under) = under {
+            require_absolute(under)?;
+            if !sys::is_under(under, &view.account.root()) {
+                return Err(ApiError::bad_request(format!(
+                    "{} is not in the account {}",
+                    under.display(),
+                    view.account.label
+                )));
+            }
+        }
+        let folders = controller
+            .browse_cloud(id, under)?
+            .into_iter()
+            .map(|path| reply::FolderInfo {
+                name: path.file_name().map_or_else(
+                    || path.to_string_lossy().into_owned(),
+                    |name| name.to_string_lossy().into_owned(),
+                ),
+                path: path.to_string_lossy().into_owned(),
+            })
+            .collect();
+        to_json(&reply::Folders { folders })
     }
 
     /// What [`Local`] says of the inventory, with the progress of the scan the controller runs (one
@@ -253,6 +364,16 @@ impl Handler for AppApi {
             Request::Status => self.status(),
             Request::SettingsSet { settings } => self.settings_set(&settings),
             Request::ExplorerScan { paths } => self.explorer_scan(paths),
+            Request::AccountsList => self.accounts_list(),
+            Request::AccountAdd {
+                provider,
+                label,
+                sign_in,
+                client_secret,
+            } => self.account_add(provider, label, sign_in, client_secret),
+            Request::AccountConnect { id } => self.account_connect(&id),
+            Request::AccountRemove { id } => self.account_remove(&id),
+            Request::AccountBrowse { id, under } => self.account_browse(&id, under.as_deref()),
             Request::ShowWindow => self.show_window(),
             Request::InventoryStatus => self.inventory_status(),
             Request::InventoryRescan => self.inventory_rescan(),
@@ -295,7 +416,7 @@ fn follow_download(model: &mut reply::Model, download: Model) {
 
 /// `path` is a full path to something that exists.
 fn exists(path: &Path) -> Result<(), ApiError> {
-    require_absolute(path)?;
+    require_on_this_pc(path)?;
     match path.try_exists() {
         Ok(true) => Ok(()),
         Ok(false) => Err(ApiError::not_found(format!(
@@ -309,6 +430,8 @@ fn exists(path: &Path) -> Result<(), ApiError> {
 #[cfg(test)]
 mod tests {
     use std::{fs, time::Instant};
+
+    use piikey::sources;
 
     use super::*;
     use crate::{
@@ -524,5 +647,203 @@ mod tests {
             follow_download(&mut model, idle);
             assert_eq!(model, local(), "nothing to add");
         }
+    }
+
+    /// A Google Drive account that signs in with a key file, which is there: connected without a
+    /// sign-in, and nothing of it is secret. It goes straight into the data folder, as another
+    /// process would put it.
+    fn add_google(dir: &TempDir, label: &str) -> Result<Account, String> {
+        let key_file = dir.0.join("key.json");
+        fs::write(&key_file, "{}").describe()?;
+        sources::add_account(
+            &dir.0,
+            Provider::GoogleDrive,
+            label,
+            SignIn::GoogleServiceAccount {
+                key_file,
+                users: vec!["jan@acme.nl".to_owned()],
+            },
+            None,
+        )
+        .describe()
+    }
+
+    #[test]
+    fn the_accounts_are_listed_as_the_controller_stands_and_added_through_it() -> Test {
+        let dir = TempDir::new()?;
+        let (api, controller) = api(&dir)?;
+        assert_eq!(ask(&api, Request::AccountsList)?, json!({"accounts": []}));
+
+        // One that another process added is found, and is connected.
+        let work = add_google(&dir, "Work")?;
+        let listed = ask(&api, Request::AccountsList)?;
+        assert_eq!(
+            listed["accounts"].as_array().map(Vec::len),
+            Some(1),
+            "{listed}"
+        );
+        assert_eq!(listed["accounts"][0]["id"], work.id.as_str());
+        assert_eq!(listed["accounts"][0]["path"], r"\\Google Drive\Work");
+        assert_eq!(listed["accounts"][0]["connected"], true);
+
+        let added = ask(
+            &api,
+            Request::AccountAdd {
+                provider: Provider::Dropbox,
+                label: "Personal".to_owned(),
+                sign_in: SignIn::DropboxDelegated {
+                    app_key: "key-1".to_owned(),
+                },
+                client_secret: None,
+            },
+        )?;
+        assert_eq!(added["label"], "Personal");
+        assert_eq!(added["connected"], false, "nobody has signed in yet");
+        assert_eq!(controller.accounts().len(), 2, "the app's own list follows");
+
+        let duplicate = Request::AccountAdd {
+            provider: Provider::Dropbox,
+            label: "personal".to_owned(),
+            sign_in: SignIn::DropboxDelegated {
+                app_key: "key-2".to_owned(),
+            },
+            client_secret: None,
+        };
+        let (code, message) = refused(&api, duplicate)?;
+        assert_eq!(code, "bad_request");
+        assert!(message.contains("already"), "{message}");
+        assert_eq!(controller.accounts().len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn an_account_is_signed_in_through_the_controller_and_an_unknown_id_is_not_found() -> Test {
+        let dir = TempDir::new()?;
+        let (api, _controller) = api(&dir)?;
+        let work = add_google(&dir, "Work")?;
+        let connected = ask(
+            &api,
+            Request::AccountConnect {
+                id: work.id.clone(),
+            },
+        )?;
+        assert_eq!(connected["id"], work.id.as_str());
+        assert_eq!(connected["connected"], true);
+        for request in [
+            Request::AccountConnect {
+                id: "0000000000000000".to_owned(),
+            },
+            Request::AccountRemove {
+                id: "0000000000000000".to_owned(),
+            },
+            Request::AccountBrowse {
+                id: "0000000000000000".to_owned(),
+                under: None,
+            },
+        ] {
+            let op = request.op();
+            assert_eq!(refused(&api, request)?.0, "not_found", "{op}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn removing_an_account_takes_its_locations_off_the_controllers_list() -> Test {
+        let dir = TempDir::new()?;
+        let (api, controller) = api(&dir)?;
+        let work = add_google(&dir, "Work")?;
+        let docs = PathBuf::from(r"\\Google Drive\Work\Docs");
+        let set = |root: &Path| {
+            ask(
+                &api,
+                Request::SettingsSet {
+                    settings: SettingsPatch {
+                        inventory_roots: Some(vec![root.to_path_buf()]),
+                        ..SettingsPatch::default()
+                    },
+                },
+            )
+        };
+        // A location of an account that is there is accepted, one of a stranger is not.
+        set(&docs)?;
+        assert_eq!(
+            controller.snapshot().policy.inventory_roots,
+            std::slice::from_ref(&docs)
+        );
+        let stranger = Request::SettingsSet {
+            settings: SettingsPatch {
+                inventory_roots: Some(vec![PathBuf::from(r"\\Google Drive\Nobody\Docs")]),
+                ..SettingsPatch::default()
+            },
+        };
+        let (code, message) = refused(&api, stranger)?;
+        assert_eq!(code, "bad_request");
+        assert!(message.contains("add the account first"), "{message}");
+        assert_eq!(
+            controller.snapshot().policy.inventory_roots,
+            std::slice::from_ref(&docs)
+        );
+
+        let removed = ask(
+            &api,
+            Request::AccountRemove {
+                id: work.id.clone(),
+            },
+        )?;
+        assert_eq!(
+            removed,
+            json!({"id": work.id, "locations": [docs.to_string_lossy()], "forgotten": 0})
+        );
+        assert!(controller.snapshot().policy.inventory_roots.is_empty());
+        assert!(controller.accounts().is_empty());
+        assert_eq!(ask(&api, Request::AccountsList)?, json!({"accounts": []}));
+        Ok(())
+    }
+
+    #[test]
+    fn browsing_stays_in_the_account_and_tells_what_the_service_says() -> Test {
+        let dir = TempDir::new()?;
+        let (api, _controller) = api(&dir)?;
+        let work = add_google(&dir, "Work")?;
+        let browse = |under: Option<&str>| {
+            refused(
+                &api,
+                Request::AccountBrowse {
+                    id: work.id.clone(),
+                    under: under.map(PathBuf::from),
+                },
+            )
+        };
+        // The stub has no cloud: what it says comes back as it is.
+        let (code, message) = browse(None)?;
+        assert_eq!(code, "bad_request");
+        assert!(message.contains("no cloud"), "{message}");
+        assert!(
+            browse(Some(r"\\Google Drive\Work\Docs"))?
+                .1
+                .contains("no cloud")
+        );
+        // Before the service is asked: a path that is not in the account.
+        for under in [r"\\Dropbox\Other\Docs", "Docs"] {
+            let (code, message) = browse(Some(under))?;
+            assert_eq!(code, "bad_request", "{under}");
+            assert!(!message.contains("no cloud"), "{under}: {message}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_explorer_scan_refuses_a_path_in_a_cloud_account() -> Test {
+        let dir = TempDir::new()?;
+        let (api, _controller) = api(&dir)?;
+        let (code, message) = refused(
+            &api,
+            Request::ExplorerScan {
+                paths: vec![PathBuf::from(r"\\Google Drive\Work\Docs")],
+            },
+        )?;
+        assert_eq!(code, "bad_request");
+        assert!(message.contains("cloud account"), "{message}");
+        Ok(())
     }
 }

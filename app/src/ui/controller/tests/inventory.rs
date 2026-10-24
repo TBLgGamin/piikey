@@ -7,7 +7,7 @@ use crate::ui::controller::FindingsEvent;
 use crate::ui::scanner::{Job, Kind, Request};
 
 /// A folder `docs` in `dir` with one file that holds an email address.
-fn docs(dir: &TempDir) -> Result<PathBuf, String> {
+pub(super) fn docs(dir: &TempDir) -> Result<PathBuf, String> {
     let folder = dir.0.join("docs");
     fs::create_dir(&folder).describe()?;
     fs::write(folder.join("a.txt"), "mail jan.jansen@acme.nl").describe()?;
@@ -25,7 +25,7 @@ fn drive_of(path: &Path) -> (String, PathBuf) {
 }
 
 /// The latest scan that asked to be shown, once it is over.
-fn shown(controller: &Controller) -> Result<Snapshot, String> {
+pub(super) fn shown(controller: &Controller) -> Result<Snapshot, String> {
     wait_for(controller, |s| {
         s.reveal.as_ref().is_some_and(|reveal| {
             matches!(reveal.state, RevealState::Done(_) | RevealState::Failed(_))
@@ -33,7 +33,7 @@ fn shown(controller: &Controller) -> Result<Snapshot, String> {
     })
 }
 
-fn summary_of(snapshot: &Snapshot) -> Result<ScanSummary, String> {
+pub(super) fn summary_of(snapshot: &Snapshot) -> Result<ScanSummary, String> {
     match snapshot.reveal.as_ref().map(|reveal| &reveal.state) {
         Some(RevealState::Done(summary)) => Ok(summary.clone()),
         other => Err(format!("the scan is not done: {other:?}")),
@@ -367,7 +367,7 @@ fn adding_a_location_adds_the_folder_and_scans_it_with_the_dialog() -> Test {
 
 /// What `read_findings` reports for `files` with at most `limit` values, until `go_on` (told how
 /// many reports there are) says stop.
-fn read_events(
+pub(super) fn read_events(
     controller: &Controller,
     files: &[PathBuf],
     limit: usize,
@@ -382,7 +382,7 @@ fn read_events(
 }
 
 /// The values the events report for `path`, and how the file ended: `None` while it did not.
-fn of_file(
+pub(super) fn of_file(
     events: &[FindingsEvent],
     path: &Path,
 ) -> (Vec<piikey::inventory::Finding>, Option<Result<(), String>>) {
@@ -682,7 +682,7 @@ fn the_tree_goes_down_the_real_folders_from_the_drive_and_a_place_counts_what_li
 }
 
 /// An entry as a scan would make it, for a file that is not on disk.
-fn entry_of(path: &Path, counts: &[(EntityKind, u32)]) -> piikey::inventory::Entry {
+pub(super) fn entry_of(path: &Path, counts: &[(EntityKind, u32)]) -> piikey::inventory::Entry {
     piikey::inventory::Entry {
         path: path.to_path_buf(),
         size: 1,

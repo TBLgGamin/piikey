@@ -7,17 +7,17 @@
 //! is for the logo and the icons of folders and files; the dashboards colour by type of personal
 //! data. Status is a glyph and words first, and a colour second.
 
-use piikey::detect::EntityKind;
+use piikey::{detect::EntityKind, sources::Provider};
 use windows_reactor::{
     Border, Brush, Button, ButtonStyle, Callback, Color, DateTime, FontIcon, FontWeight, Grid,
-    GridLength, HorizontalAlignment, HyperlinkButton, InfoBar, InfoBarSeverity, Orientation,
-    ProgressRing, ScrollViewer, StackPanel, TextBlock, TextWrapping, ThemeBrush, Thickness,
-    ToggleSwitch, VerticalAlignment, View, ViewContext,
+    GridLength, HorizontalAlignment, HyperlinkButton, Image, InfoBar, InfoBarSeverity, Orientation,
+    ProgressRing, ScrollViewer, StackPanel, Stretch, TextBlock, TextWrapping, ThemeBrush,
+    Thickness, ToggleSwitch, VerticalAlignment, View, ViewContext,
 };
 
 use crate::ui::{
-    activity,
-    controller::{Busy, Model, Severity, Snapshot},
+    activity, assets,
+    controller::{Busy, Model, NoticeAction, Severity, Snapshot},
     status::{Cause, Fix, Status, Tone},
     window::{MainWindow, Msg, Page},
 };
@@ -212,6 +212,31 @@ pub(super) fn place_glyph(is_dir: bool, size: f64, dark: bool) -> FontIcon {
         .foreground(Brush::Solid(brand(dark)))
 }
 
+/// The logo of a cloud provider, `size` px square, kept as the provider ships it (never
+/// recoloured, never stretched). `label` is the account's name when the icon stands for one: the
+/// pretend account of a debug build gets the cloud glyph in the brand colour instead (see
+/// [`assets::shows_logo`]). The provider's name is always written beside the icon.
+pub(super) fn provider_icon(
+    provider: Provider,
+    label: Option<&str>,
+    size: f64,
+    dark: bool,
+) -> View {
+    if label.is_some_and(|label| !assets::shows_logo(provider, label)) {
+        return FontIcon::new()
+            .glyph(assets::CLOUD_GLYPH)
+            .font_size(size * 0.9)
+            .foreground(Brush::Solid(brand(dark)))
+            .into();
+    }
+    Image::new()
+        .source_svg(assets::provider_logo(provider, dark))
+        .stretch(Stretch::Uniform)
+        .width(size)
+        .height(size)
+        .into()
+}
+
 // ---- Containers ----
 
 /// A card: the card colour, a one pixel stroke, rounded corners, room around the content.
@@ -330,7 +355,7 @@ pub(super) fn section_with(header: &str, actions: Vec<View>, rows: Vec<View>) ->
 /// not, so a switch is never nested in a button.
 #[derive(Debug)]
 pub(super) struct Row {
-    icon: Option<&'static str>,
+    lead: Option<Lead>,
     title: String,
     description: Option<String>,
     state: Option<String>,
@@ -338,10 +363,19 @@ pub(super) struct Row {
     click: Option<Callback<()>>,
 }
 
+/// What stands in front of a row's title.
+#[derive(Debug)]
+enum Lead {
+    /// A Segoe Fluent Icons glyph.
+    Glyph(&'static str),
+    /// Any view: a provider's logo.
+    View(View),
+}
+
 impl Row {
     pub(super) fn new(title: impl Into<String>) -> Self {
         Self {
-            icon: None,
+            lead: None,
             title: title.into(),
             description: None,
             state: None,
@@ -352,7 +386,13 @@ impl Row {
 
     /// A Segoe Fluent Icons glyph, 20 px, in front of the title.
     pub(super) fn icon(mut self, glyph: &'static str) -> Self {
-        self.icon = Some(glyph);
+        self.lead = Some(Lead::Glyph(glyph));
+        self
+    }
+
+    /// A view in front of the title instead of an icon: the logo of a provider, about 24 px.
+    pub(super) fn logo(mut self, logo: impl Into<View>) -> Self {
+        self.lead = Some(Lead::View(logo.into()));
         self
     }
 
@@ -383,7 +423,7 @@ impl Row {
     /// The row as a view. The texts of a row that is no button can be selected and copied.
     pub(super) fn build(self) -> View {
         let Self {
-            icon,
+            lead,
             title,
             description,
             state,
@@ -391,7 +431,7 @@ impl Row {
             click,
         } = self;
         let layout = row_layout(
-            icon,
+            lead,
             row_texts(&title, description, click.is_none()),
             row_trailing(state, control, click.is_some()),
         );
@@ -465,19 +505,26 @@ fn row_trailing(state: Option<String>, control: Option<View>, chevron: bool) -> 
     right
 }
 
-/// The grid of a row: its icon, its texts and what stands on the right.
-fn row_layout(icon: Option<&'static str>, texts: Vec<View>, right: Vec<View>) -> Grid {
+/// The grid of a row: its lead, its texts and what stands on the right.
+fn row_layout(lead: Option<Lead>, texts: Vec<View>, right: Vec<View>) -> Grid {
     let mut cells: Vec<View> = Vec::new();
     let mut columns: Vec<GridLength> = Vec::new();
-    if let Some(code) = icon {
+    if let Some(lead) = lead {
         columns.push(GridLength::Auto);
-        cells.push(
-            glyph(code, 20.0)
+        let gap = Thickness::new(0.0, 0.0, 16.0, 0.0);
+        cells.push(match lead {
+            Lead::Glyph(code) => glyph(code, 20.0)
                 .grid_column(0)
                 .vertical_alignment(VerticalAlignment::Center)
-                .margin(Thickness::new(0.0, 0.0, 16.0, 0.0))
+                .margin(gap)
                 .into(),
-        );
+            Lead::View(view) => StackPanel::new()
+                .grid_column(0)
+                .vertical_alignment(VerticalAlignment::Center)
+                .margin(gap)
+                .children([view])
+                .into(),
+        });
     }
     let text_column = i32::try_from(columns.len()).unwrap_or(0);
     columns.push(GridLength::STAR);
@@ -531,20 +578,38 @@ pub(super) fn dismissible(
         .into()
 }
 
-/// What the controller wants the user to read: a warning or an error, until closed.
+/// What the controller wants the user to read: a warning or an error, until closed, with the
+/// button that does what it asks for under it when it has one.
 pub(super) fn notice(snap: &Snapshot, context: Context<'_>) -> Option<View> {
     let notice = snap.notice.as_ref()?;
     let (title, severity) = match notice.severity {
         Severity::Warning => ("Heads up", InfoBarSeverity::Warning),
         Severity::Error => ("Something went wrong", InfoBarSeverity::Error),
     };
-    Some(dismissible(
-        title,
-        &notice.text,
-        severity,
-        Msg::DismissNotice,
-        context,
-    ))
+    let bar = dismissible(title, &notice.text, severity, Msg::DismissNotice, context);
+    Some(match &notice.action {
+        None => bar,
+        Some(action) => {
+            let label = match action {
+                NoticeAction::SignIn { account, provider } => {
+                    let name = snap
+                        .accounts
+                        .iter()
+                        .find(|view| view.account.id == *account)
+                        .map_or(provider.name(), |view| assets::provider_name(&view.account));
+                    format!("Sign in to {name}")
+                }
+            };
+            let button = Button::new()
+                .content(label)
+                .style(ButtonStyle::Accent)
+                .on_click(context.message(Msg::NoticeButton(action.clone())));
+            StackPanel::new()
+                .spacing(8.0)
+                .children((bar, button))
+                .into()
+        }
+    })
 }
 
 /// Why the last "Add" was refused, closable; nothing when it was not.

@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "piikey API",
-    "version": "0.3.0",
+    "version": "0.4.0",
     "summary": "One local JSON API for the piikey app, scripts and the command line.",
     "description": "piikey has one JSON API. The app serves it on a named pipe and, while the local HTTP API is switched on (Settings > Developer access), on a port of this PC. `piikey-cli` is a client of the same API, with one subcommand per operation; without the app it answers in its own process.\n\n**Getting started**\n\n1. Turn on **Local HTTP API** in Settings > Developer access. It listens on `127.0.0.1` only (loopback), on port 7980 unless you change it, and only while the switch is on.\n2. Get the token with `piikey-cli token`, or press **Copy token** in the same place. Send it as `Authorization: Bearer <token>`.\n3. Call an operation with `POST /v1/<op>` and the request's fields as a JSON body. The op is the one in the path: an `op` in the body is ignored. `GET /v1/status` also works.\n\n```powershell\n$token = piikey-cli token\n'{\"texts\":[\"mail jan@acme.nl\"]}' | curl.exe -s -H \"Authorization: Bearer $token\" --data-binary '@-' http://127.0.0.1:7980/v1/scan_text\n```\n\nIn PowerShell, plain `curl` is an alias of `Invoke-WebRequest`, so the examples use `curl.exe`, and they pass the JSON through stdin so that PowerShell does not mangle its quotes. The reply is the envelope: `{\"ok\":true,\"result\":{\"results\":[[{\"start\":5,\"end\":16,\"kind\":\"email\",\"value\":\"jan@acme.nl\"}]]}}`.\n\n**This specification.** `GET /v1/openapi.json` answers this specification as JSON, and it is the one call that needs no token. It is served only while the HTTP API is on, and it still refuses an `Origin` header. Postman, Insomnia and similar tools can import `http://127.0.0.1:7980/v1/openapi.json` (change the port if you changed it in Settings). Other methods get 405.\n\n**The hosted reference cannot send requests.** The page at https://tblggamin.github.io/piikey/ cannot call piikey on your PC, because piikey refuses every request that carries an `Origin` header, which is what a web page sends (403, token or not). Copy the examples into a terminal, or import the specification into a desktop tool.\n\n**Named pipe.** The app also serves the same operations on `\\\\.\\pipe\\piikey-<USERNAME>`, where characters other than letters, digits, `.`, `_` and `-` in the name become `_`. Only local clients can connect. A request is the bytes `P`, `2`, `0`, `0`, a `u32` little-endian length, then the request JSON with the op named in the body, for example `{\"op\":\"scan_text\",\"texts\":[\"mail jan@acme.nl\"]}`. The reply is a status byte (0 ok, 1 error), three zero bytes, a `u32` little-endian length and the envelope. Version 1 of the framing is no longer accepted.\n\n**The command line.** `piikey-cli` is a client of this same API: one subcommand per operation (`open` is `show_window`), and `--json` prints the result as the JSON shown here. It asks the app over the pipe first. Without the app it runs the operations in its own process (as `--local` does), except `protection`, `explorer_scan` and `show_window`, which answer `app_required`. Each operation below starts with its command line.\n\n## Connecting\n\n- **Base URL:** `http://127.0.0.1:7980`, loopback only. The port is the one set in Settings > Developer access, 7980 unless changed.\n- **Token:** every call except `GET /v1/openapi.json` needs the header `Authorization: Bearer <token>`, and is answered with 401 without it. `piikey-cli token` prints the token, and Settings > Developer access copies it.\n- **Web pages are refused:** a request with an `Origin` header comes from a web page and is answered with 403, token or not.\n- **Calls:** `POST /v1/<operation>` with the operation's fields as a JSON object, and `GET /v1/status`. The operation is the path's: an `op` in the body is ignored. An operation refuses fields it does not know, except the ones that take no fields at all. `GET /v1/openapi.json` answers this reference as OpenAPI 3.1, without a token.\n- **Named pipe:** the same operations go over `\\\\.\\pipe\\piikey-<USERNAME>` as JSON objects with the operation in an `op` field, for example `{\"op\":\"scan_text\",\"texts\":[\"a\"]}`. That is what `piikey-cli` uses.\n- **Paths** in a request are absolute, a drive or a share (`C:\\Users\\jan`, `\\\\server\\share`): a relative path is a `bad_request`. Offsets of text spans are UTF-8 byte offsets.\n- **Size:** a request body of more than 64 MiB is refused with 413.\n\n## Replies\n\nEvery reply is an envelope. A call that worked is answered with status 200 and `{\"ok\":true,\"result\":<value>}`; a call that failed with `{\"ok\":false,\"error\":{\"code\":\"<code>\",\"message\":\"...\"}}` and a status that depends on what failed:\n\n| Status | `code` | Meaning |\n|---|---|---|\n| 400 | `bad_request` | The request is wrong. |\n| 401 | `bad_request` | A token is required: there is no `Authorization: Bearer <token>` header, or the token is wrong. |\n| 403 | `bad_request` | The request has an `Origin` header: it comes from a web page, and no page may talk to piikey. |\n| 404 | `not_found` | There is no such op, file or record. |\n| 405 | `bad_request` | The method is not allowed for the path: an operation takes `POST` (`/v1/status` also `GET`), and `/v1/openapi.json` takes `GET` alone. |\n| 409 | `app_required` | The request needs the piikey app to be running. |\n| 409 | `busy` | What the request needs is in use. |\n| 413 | `bad_request` | The body is over 64 MiB. |\n| 500 | `io` | Reading or writing a file failed. |\n| 500 | `vault` | The vault could not be opened, read or written. |\n| 500 | `unsupported` | A file is in a format piikey cannot read. |\n| 500 | `model` | The detection model is missing or failed. |\n| 500 | `internal` | Something went wrong that the request did not cause. |",
     "license": {
@@ -42,6 +42,10 @@
     {
       "name": "Inventory",
       "description": "What the scans found in your locations: counts and paths, never the values."
+    },
+    {
+      "name": "Accounts",
+      "description": "The cloud accounts piikey may read."
     },
     {
       "name": "Settings",
@@ -358,7 +362,7 @@
           "Files"
         ],
         "summary": "Scan files",
-        "description": "Scans files and folders (recursively). With `record`, what was found is also kept in the inventory.\n\nCLI: `piikey-cli scan [--fail-on KINDS|any] [--no-record] [PATH...]`\n\nEvery path must be absolute (the CLI makes its arguments absolute for you). Folders are walked recursively and symbolic links are skipped. A file named twice, or inside a folder you also named, is scanned once.\n\nEach call reads every file again; the incremental rule that skips unchanged files belongs to `inventory_rescan`. The result holds counts per type, never the values.\n\nThe CLI's `--no-record` is `\"record\": false`. `piikey-cli scan --fail-on` exits 1 when a listed type is found, and 3 when a file could not be read.",
+        "description": "Scans files and folders on this PC (recursively). With `record`, what was found is also kept in the inventory. A path in a cloud account is refused: its folders are scanned as locations, by `inventory_rescan`.\n\nCLI: `piikey-cli scan [--fail-on KINDS|any] [--no-record] [PATH...]`\n\nEvery path must be absolute (the CLI makes its arguments absolute for you). Folders are walked recursively and symbolic links are skipped. A file named twice, or inside a folder you also named, is scanned once.\n\nA path in a cloud account (`\\\\Google Drive\\Work\\Docs`) is refused with `bad_request`: it is no file of this PC. The files of a cloud account are scanned through its locations, with `inventory_rescan`.\n\nEach call reads every file again; the incremental rule that skips unchanged files belongs to `inventory_rescan`. The result holds counts per type, never the values.\n\nThe CLI's `--no-record` is `\"record\": false`. `piikey-cli scan --fail-on` exits 1 when a listed type is found, and 3 when a file could not be read.",
         "operationId": "scan_files",
         "requestBody": {
           "required": true,
@@ -373,7 +377,7 @@
                     "items": {
                       "type": "string"
                     },
-                    "description": "The files and folders to scan, as absolute paths.",
+                    "description": "The files and folders to scan, as absolute paths on this PC.",
                     "examples": [
                       [
                         "C:\\Users\\jan\\Documents"
@@ -458,7 +462,7 @@
           "Files"
         ],
         "summary": "Mask files",
-        "description": "Masks files and folders into the folder `out`.\n\nCLI: `piikey-cli anonymize [--out DIR] [PATH...]` (with PATHs, `--out DIR` is required)\n\n`paths` and `out` must be absolute. Folders are walked recursively and each result keeps its place relative to the folder it was found under. Missing folders under `out` are created and a file already there is overwritten, but a result is never written over an input, and an `out` inside a folder you name is refused with `bad_request`.\n\nA result that is text (from a PDF, an image or a mail) is written as `<name>.txt`.\n\nOne file that cannot be read does not stop the others: it is listed under `failed`, and the CLI then exits 3. The files are processed in the app's own scan pool, which leaves half the cores to the PC.",
+        "description": "Masks files and folders on this PC into the folder `out`.\n\nCLI: `piikey-cli anonymize [--out DIR] [PATH...]` (with PATHs, `--out DIR` is required)\n\n`paths` and `out` must be absolute. Folders are walked recursively and each result keeps its place relative to the folder it was found under. Missing folders under `out` are created and a file already there is overwritten, but a result is never written over an input, and an `out` inside a folder you name is refused with `bad_request`.\n\nA path in a cloud account is refused with `bad_request`, in `paths` and in `out`: the files of a cloud account are only read, into memory, by the inventory's scan.\n\nA result that is text (from a PDF, an image or a mail) is written as `<name>.txt`.\n\nOne file that cannot be read does not stop the others: it is listed under `failed`, and the CLI then exits 3. The files are processed in the app's own scan pool, which leaves half the cores to the PC.",
         "operationId": "anonymize_files",
         "requestBody": {
           "required": true,
@@ -473,7 +477,7 @@
                     "items": {
                       "type": "string"
                     },
-                    "description": "The files and folders to mask, as absolute paths.",
+                    "description": "The files and folders to mask, as absolute paths on this PC.",
                     "examples": [
                       [
                         "C:\\Users\\jan\\Documents"
@@ -562,7 +566,7 @@
           "Files"
         ],
         "summary": "Restore files",
-        "description": "Restores files and folders into the folder `out`.\n\nCLI: `piikey-cli deanonymize [--tolerant] [--out DIR] [PATH...]` (with PATHs, `--out DIR` is required)\n\nThe same rules as `anonymize_files` for paths, `out`, results written as `.txt` and files that fail.\n\nWith `tolerant` a document is read one piece of text at a time, so typos and lone names are restored within each piece.",
+        "description": "Restores files and folders on this PC into the folder `out`.\n\nCLI: `piikey-cli deanonymize [--tolerant] [--out DIR] [PATH...]` (with PATHs, `--out DIR` is required)\n\nThe same rules as `anonymize_files` for paths, `out`, paths in a cloud account (refused), results written as `.txt` and files that fail.\n\nWith `tolerant` a document is read one piece of text at a time, so typos and lone names are restored within each piece.",
         "operationId": "deanonymize_files",
         "requestBody": {
           "required": true,
@@ -577,7 +581,7 @@
                     "items": {
                       "type": "string"
                     },
-                    "description": "The files and folders to restore, as absolute paths.",
+                    "description": "The files and folders to restore, as absolute paths on this PC.",
                     "examples": [
                       [
                         "C:\\Users\\jan\\Documents"
@@ -671,7 +675,7 @@
           "Subject search"
         ],
         "summary": "Search for a person",
-        "description": "Which files hold the given values (a name, a phone number, an email address, ...); an empty `paths` means the inventory's folders.\n\nCLI: `piikey-cli subject --value V [--value V ...] [PATH...]`\n\nA value matches a file as a whole word in any letter case, or as the same value spelled another way: `+31 6 1234 5678` and `+31612345678` match, `06 1234 5678` does not. Without `paths` it searches the inventory's locations, so with no locations there is nothing to search.\n\nFolders are walked recursively without following links. A blank value is a `bad_request`.\n\nThis operation is in the API and the CLI only; the app's window has no subject search.",
+        "description": "Which files hold the given values (a name, a phone number, an email address, ...); an empty `paths` means the inventory's folders on this PC (a folder of a cloud account is not searched).\n\nCLI: `piikey-cli subject --value V [--value V ...] [PATH...]`\n\nA value matches a file as a whole word in any letter case, or as the same value spelled another way: `+31 6 1234 5678` and `+31612345678` match, `06 1234 5678` does not. Without `paths` it searches the inventory's locations on this PC, so with no such location there is nothing to search; the folders of cloud accounts are not searched, and a path in a cloud account in `paths` is refused with `bad_request`.\n\nFolders are walked recursively without following links. A blank value is a `bad_request`.\n\nThis operation is in the API and the CLI only; the app's window has no subject search.",
         "operationId": "subject_search",
         "requestBody": {
           "required": true,
@@ -699,7 +703,7 @@
                     "items": {
                       "type": "string"
                     },
-                    "description": "The files and folders to look in, as absolute paths. Empty: the inventory's folders.",
+                    "description": "The files and folders to look in, as absolute paths on this PC. Empty: the inventory's folders on this PC.",
                     "default": []
                   }
                 },
@@ -1156,7 +1160,7 @@
           "Inventory"
         ],
         "summary": "Inventory status",
-        "description": "The inventory in numbers.\n\nCLI: `piikey-cli inventory status`\n\n`roots` is empty until a location has been added in the app or with `settings_set`. The inventory scans only when asked (`inventory_rescan`, `scan_files`, `explorer_scan`, the app's Scan button) and, for a location with Monitor on, when the app sees it change.\n\nWhile a scan runs, `scanning` says how far it is; poll this operation to follow `inventory_rescan` called from another client.",
+        "description": "The inventory in numbers.\n\nCLI: `piikey-cli inventory status`\n\n`roots` is empty until a location has been added in the app or with `settings_set`; a location is a folder on this PC or a folder of a cloud account (`\\\\Google Drive\\Work\\Docs`). The inventory scans only when asked (`inventory_rescan`, `scan_files`, `explorer_scan`, the app's Scan button) and, for a location with Monitor on, when the app sees it change (a cloud location asks its account what changed every 5 minutes).\n\nWhile a scan runs, `scanning` says how far it is; poll this operation to follow `inventory_rescan` called from another client.",
         "operationId": "inventory_status",
         "responses": {
           "200": {
@@ -1317,7 +1321,7 @@
           "Inventory"
         ],
         "summary": "Browse the tree",
-        "description": "The tiles of the inventory's tree at one level: what lies directly under `under`, or without it the drives and network shares that hold files with personal data (`C:`, with `C:\\` as the path).\n\nCLI: `piikey-cli inventory tree [--under PATH]`\n\nOne level per call, the node with the most values first. Take the `path` of a node whose `is_dir` is true and send it as `under` to open it; a drive's path is `C:\\`. `under` must be absolute.\n\nThe tree follows the computer's real folders, whichever location or scan a file came from.",
+        "description": "The tiles of the inventory's tree at one level: what lies directly under `under`, or without it the drives and network shares that hold files with personal data (`C:`, with `C:\\` as the path).\n\nCLI: `piikey-cli inventory tree [--under PATH]`\n\nOne level per call, the node with the most values first. Take the `path` of a node whose `is_dir` is true and send it as `under` to open it; a drive's path is `C:\\`. `under` must be absolute.\n\nThe tree follows the computer's real folders, whichever location or scan a file came from. The files of a cloud account are in it too: the account is listed beside the drives, and opens the same way.",
         "operationId": "inventory_tree",
         "requestBody": {
           "required": false,
@@ -1400,7 +1404,7 @@
           "Inventory"
         ],
         "summary": "Scan the locations",
-        "description": "Scans the inventory's folders (the locations it scans) now, and answers when the scan is over: the inventory scans only when it is asked to.\n\nCLI: `piikey-cli inventory rescan`\n\nIt scans the inventory's locations (`inventory_status` lists them) and answers when the scan is over, however long that takes: give your client a long timeout. With no locations there is nothing to scan.\n\nThe scan is incremental: a file whose size and write time match its entry is not read, and a changed file that turns out to hold the same content is not detected again.\n\nProgress is visible meanwhile in `inventory_status`.",
+        "description": "Scans the inventory's locations now (the folders on this PC and the folders of cloud accounts, in one run), and answers when the scan is over: the inventory scans only when it is asked to. A cloud location that cannot be read (its account has to sign in again, or the service cannot be reached) is an error, answered after the other locations were scanned.\n\nCLI: `piikey-cli inventory rescan`\n\nIt scans the inventory's locations (`inventory_status` lists them) and answers when the scan is over, however long that takes: give your client a long timeout. With no locations there is nothing to scan.\n\nThe folders on this PC are scanned first, then the folders of cloud accounts, in one run with one count of files. The scan is incremental: a file whose size and write time match its entry is not read, and a changed file that turns out to hold the same content is not detected again; a cloud location is asked what changed since its last scan (every 5 minutes, for a location with Monitor on, in the app) and a file is downloaded into memory, scanned and dropped.\n\nA cloud location that cannot be read (its account has to sign in again, or the service cannot be reached) does not stop the others. When the run is over the first failure is the error of the call, with a sentence that says what to do (`bad_request`, or `busy` when the service cannot be reached or asks piikey to slow down), and what was scanned stays in the inventory.\n\nProgress is visible meanwhile in `inventory_status`.",
         "operationId": "inventory_rescan",
         "responses": {
           "200": {
@@ -1617,7 +1621,7 @@
           "Settings"
         ],
         "summary": "Change the settings",
-        "description": "Changes the given settings, validated as a whole.\n\nCLI: `piikey-cli settings set KEY=VALUE...` (the keys are the `guard.cfg` keys, except `enabled`; a list key repeats, `site=a site=b`, and an empty value empties the list)\n\nThe body holds the fields under `settings`. A field you leave out is unchanged; a list you send replaces the whole list. The patch is checked as a whole: when one value is invalid, nothing changes and the error names it. A monitored folder must be one of the inventory's folders after the same patch.\n\nFolders must be absolute. `enabled` is refused: protection is switched with `protection`. The CLI's keys are singular (`site`, `program`, `disabled_kind`, `inventory_root`, `monitor_root`), the JSON fields plural (`sites`, `programs`, ...).\n\nIn the running app the change takes effect the way a click in Settings does (Explorer menu, highlight, inventory, HTTP API). Changing `http_api` or `http_port` answers first and then restarts the listener, so a new port applies from the next call.",
+        "description": "Changes the given settings, validated as a whole.\n\nCLI: `piikey-cli settings set KEY=VALUE...` (the keys are the `guard.cfg` keys, except `enabled`; a list key repeats, `site=a site=b`, and an empty value empties the list)\n\nThe body holds the fields under `settings`. A field you leave out is unchanged; a list you send replaces the whole list. The patch is checked as a whole: when one value is invalid, nothing changes and the error names it. A monitored folder must be one of the inventory's folders after the same patch.\n\nFolders must be absolute. A folder of a cloud account (a `path` from `account_browse`, such as `\\\\Google Drive\\Work\\Docs`) can be a location when its account has been added (`account_add`); a new location of an account that does not exist is refused with `bad_request`. `enabled` is refused: protection is switched with `protection`. The CLI's keys are singular (`site`, `program`, `disabled_kind`, `inventory_root`, `monitor_root`), the JSON fields plural (`sites`, `programs`, ...).\n\nIn the running app the change takes effect the way a click in Settings does (Explorer menu, highlight, inventory, HTTP API). Changing `http_api` or `http_port` answers first and then restarts the listener, so a new port applies from the next call.",
         "operationId": "settings_set",
         "requestBody": {
           "required": true,
@@ -1665,6 +1669,466 @@
                     },
                     "result": {
                       "$ref": "#/components/schemas/Policy"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "result"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/accounts_list": {
+      "post": {
+        "tags": [
+          "Accounts"
+        ],
+        "summary": "List the cloud accounts",
+        "description": "The cloud accounts piikey may read (Microsoft 365, `OneDrive`, Google Drive, Dropbox and Box), in the order they were added, each with how it signs in and whether it is connected.\n\nCLI: `piikey-cli account list`\n\nThe cloud accounts piikey may read, in the order they were added. `path` is the top of an account's folders: the path of every folder and file in it starts with it, and a location of the inventory is a path below it (see `account_browse`).\n\n`connected` says that piikey holds what it needs to read the account: a person has signed in, or the account's app has its secret or its key files. It does not say that the service still accepts it; a call to the account finds that out. `sign_in` shows how the account signs in and never holds a secret.\n\nNone of the account operations needs the app: the command line, run on its own, uses the same `sources.json` in the data folder. What to set up at each service (the app to register, the permissions to give it) is described in [docs/sources.md](https://github.com/TBLgGamin/piikey/blob/main/docs/sources.md) on GitHub.",
+        "operationId": "accounts_list",
+        "responses": {
+          "200": {
+            "description": "The call worked: `result` is what the operation answers with.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "The reply of a call that worked.",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "const": true,
+                      "description": "Always `true`."
+                    },
+                    "result": {
+                      "$ref": "#/components/schemas/Accounts"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "result"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/account_add": {
+      "post": {
+        "tags": [
+          "Accounts"
+        ],
+        "summary": "Add a cloud account",
+        "description": "Adds a cloud account. The settings keep what the account needs to sign in; the client secret, when its way to sign in has one, goes into the DPAPI-protected store of the data folder and never into the settings. This does not sign in: `account_connect` does, and the account's folders can be made locations of the inventory after that.\n\nCLI: `piikey-cli account add PROVIDER --label NAME [--mode MODE] [--tenant T] [--client-id ID] [--app-key KEY] [--key-file FILE] [--cert-file FILE] [--site URL ...] [--user EMAIL ...] [--enterprise-id ID | --user-id ID] [--client-secret-stdin]`\n\n`provider` is `microsoft365`, `onedrive`, `google_drive`, `dropbox` or `box`. The `mode` of `sign_in` is the way the account signs in, and each service has its own: `microsoft_delegated` (Microsoft 365 and OneDrive), `microsoft_app` and `microsoft_app_selected` (Microsoft 365), `google_delegated` and `google_service_account` (Google Drive), `dropbox_delegated` (Dropbox), `box_delegated` and `box_app` (Box). The fields each way takes are in the schema below; a field the way needs and that is empty is a `bad_request` that names it. The CLI's `--mode` can be left out for a service that has one way.\n\nThis adds the account and does not sign in: a way with a browser (`microsoft_delegated`, `google_delegated`, `dropbox_delegated`, `box_delegated`) needs `account_connect` before piikey can read anything, and `connected` is `false` until then.\n\n`client_secret` is required for `google_delegated`, `box_delegated`, `box_app`, and for `microsoft_app` and `microsoft_app_selected` with the `secret` credential; for the other ways it is ignored. It goes into the DPAPI-protected store in the data folder, never into the settings, and no reply or log holds it. The CLI reads it from stdin (`--client-secret-stdin`), so it never shows in a process list.\n\nThe `label` is the name of the account, unique among the accounts of its service, and a part of the paths of its folders, so it cannot hold `\\ / : * ? \" < > |`. Where to find what each service asks for is described in [docs/sources.md](https://github.com/TBLgGamin/piikey/blob/main/docs/sources.md) on GitHub.",
+        "operationId": "account_add",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "provider": {
+                    "$ref": "#/components/schemas/Provider",
+                    "description": "The cloud service.",
+                    "examples": [
+                      "dropbox"
+                    ]
+                  },
+                  "label": {
+                    "type": "string",
+                    "description": "The name the account goes by, unique among the accounts of its service: a legal file name, since it is a part of the paths of the account's folders.",
+                    "examples": [
+                      "Work"
+                    ]
+                  },
+                  "sign_in": {
+                    "$ref": "#/components/schemas/SignIn",
+                    "description": "How the account signs in, with what that way needs. `mode` says which way it is.",
+                    "examples": [
+                      {
+                        "mode": "dropbox_delegated",
+                        "app_key": "abc123"
+                      }
+                    ]
+                  },
+                  "client_secret": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "description": "The client secret, for a way to sign in that has one (`microsoft_app` and `microsoft_app_selected` with a `secret` credential, `google_delegated`, `box_delegated`, `box_app`). It is required for those and ignored for the others.",
+                    "examples": [
+                      "s3cret-value"
+                    ]
+                  }
+                },
+                "required": [
+                  "provider",
+                  "label",
+                  "sign_in"
+                ]
+              },
+              "example": {
+                "provider": "dropbox",
+                "label": "Work",
+                "sign_in": {
+                  "mode": "dropbox_delegated",
+                  "app_key": "abc123"
+                },
+                "client_secret": "s3cret-value"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The call worked: `result` is what the operation answers with.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "The reply of a call that worked.",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "const": true,
+                      "description": "Always `true`."
+                    },
+                    "result": {
+                      "$ref": "#/components/schemas/AccountInfo"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "result"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/account_connect": {
+      "post": {
+        "tags": [
+          "Accounts"
+        ],
+        "summary": "Sign in to a cloud account",
+        "description": "Signs an account in and answers when that is done. A way to sign in with a browser (`microsoft_delegated`, `google_delegated`, `dropbox_delegated`, `box_delegated`) opens the browser, or `piikey-cli` run on its own prints the address to open, and waits up to 5 minutes for the person to finish. An app that holds its own credentials is asked for access once, which shows that the credentials work.\n\nCLI: `piikey-cli account connect ID`\n\nSigns the account in and answers when that is done, so give your client a long timeout: it can take 5 minutes. For a way with a browser the app opens the browser; `piikey-cli`, run on its own, prints the address on stderr for you to open. It waits at most 5 minutes for the person to finish. A sign-in that is refused or not finished in time is a `bad_request` that says so, and a service that cannot be reached is `busy`.\n\nFor an app that holds its own credentials (a certificate, a client secret or a key file) there is no browser: piikey asks the service for access once, which shows that the credentials work.\n\nAn `id` that no account has is `not_found`.",
+        "operationId": "account_connect",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "description": "The account's id, as `accounts_list` shows it.",
+                    "examples": [
+                      "3f9c2a7d41b8e605"
+                    ]
+                  }
+                },
+                "required": [
+                  "id"
+                ]
+              },
+              "example": {
+                "id": "3f9c2a7d41b8e605"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The call worked: `result` is what the operation answers with.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "The reply of a call that worked.",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "const": true,
+                      "description": "Always `true`."
+                    },
+                    "result": {
+                      "$ref": "#/components/schemas/AccountInfo"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "result"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/account_remove": {
+      "post": {
+        "tags": [
+          "Accounts"
+        ],
+        "summary": "Remove a cloud account",
+        "description": "Removes an account: its locations come off the list of the inventory (and so are no longer monitored), the inventory forgets its files, and its secrets, settings and the places piikey had reached in its change feeds are deleted. Nothing in the account itself changes.\n\nCLI: `piikey-cli account remove ID --yes`\n\nThe account's locations come off the list of the inventory (so they are no longer monitored), the inventory forgets its files, and its secrets, settings and the places piikey had reached in its change feeds are deleted, in that order. `locations` lists the locations that came off and `forgotten` counts the files the inventory forgot. Nothing in the account itself changes. Add the account again and scan to get the files back in the inventory.\n\nThe CLI asks for `--yes`; the API does not. An `id` that no account has is `not_found`.",
+        "operationId": "account_remove",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "description": "The account's id, as `accounts_list` shows it.",
+                    "examples": [
+                      "3f9c2a7d41b8e605"
+                    ]
+                  }
+                },
+                "required": [
+                  "id"
+                ]
+              },
+              "example": {
+                "id": "3f9c2a7d41b8e605"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The call worked: `result` is what the operation answers with.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "The reply of a call that worked.",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "const": true,
+                      "description": "Always `true`."
+                    },
+                    "result": {
+                      "$ref": "#/components/schemas/AccountRemoved"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "result"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/account_browse": {
+      "post": {
+        "tags": [
+          "Accounts"
+        ],
+        "summary": "Browse a cloud account",
+        "description": "The folders directly in `under`, a path of the account, or without it the top of the account (its drives, sites or \"My Drive\"): what a location of the inventory is picked from.\n\nCLI: `piikey-cli account browse ID [--under PATH]`\n\nWithout `under` the answer is the top of the account: its drives, sites or \"My Drive\", whichever the service has. Send the `path` of one of the folders as `under` to open it. The `path` of a folder is what a location of the inventory is made of: give it to `settings_set` (`inventory_roots`) once the account has been added.\n\nAn `under` that is not a path of this account is a `bad_request`, and so is a folder that is no longer there, with a sentence that says what to do. The call waits on the service, so an account that has not been signed in (`account_connect`) fails with a sentence to sign in. An `id` that no account has is `not_found`.",
+        "operationId": "account_browse",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "description": "The account's id, as `accounts_list` shows it.",
+                    "examples": [
+                      "3f9c2a7d41b8e605"
+                    ]
+                  },
+                  "under": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "description": "The folder to look in, a path from an earlier answer. Without it: the top of the account.",
+                    "examples": [
+                      "\\\\Dropbox\\Work"
+                    ]
+                  }
+                },
+                "required": [
+                  "id"
+                ]
+              },
+              "example": {
+                "id": "3f9c2a7d41b8e605",
+                "under": "\\\\Dropbox\\Work"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The call worked: `result` is what the operation answers with.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "The reply of a call that worked.",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "const": true,
+                      "description": "Always `true`."
+                    },
+                    "result": {
+                      "$ref": "#/components/schemas/Folders"
                     }
                   },
                   "required": [
@@ -2483,6 +2947,168 @@
       }
     },
     "schemas": {
+      "AccountInfo": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The account's id (16 hexadecimal digits), which never changes: the other account operations take it."
+          },
+          "provider": {
+            "$ref": "#/components/schemas/Provider",
+            "description": "The cloud service."
+          },
+          "label": {
+            "type": "string",
+            "description": "The name the account goes by, unique among the accounts of its service. It is the second part of the paths of the account's folders."
+          },
+          "sign_in": {
+            "$ref": "#/components/schemas/SignIn",
+            "description": "How the account signs in, with what that way needs (no secret)."
+          },
+          "path": {
+            "type": "string",
+            "description": "The path of the account's top, `\\\\<service>\\<name>`: the start of the path of every folder and file in it, and what a location of the inventory is picked below."
+          },
+          "connected": {
+            "type": "boolean",
+            "description": "Whether piikey has what it needs to read the account: a person has signed in, or the app has its secret or its key files. It says nothing about whether the service still accepts it."
+          }
+        },
+        "required": [
+          "id",
+          "provider",
+          "label",
+          "sign_in",
+          "path",
+          "connected"
+        ],
+        "description": "One cloud account, in the reply to `account_add` and `account_connect` and in the list `accounts_list` answers. It holds no secret: a client secret is kept DPAPI-protected in the data folder, a key stays in its file."
+      },
+      "AccountRemoved": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The id of the account that was removed."
+          },
+          "locations": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The locations of the inventory that were taken off the list, because they were in the account."
+          },
+          "forgotten": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "description": "How many files of the account the inventory forgot."
+          }
+        },
+        "required": [
+          "id",
+          "locations",
+          "forgotten"
+        ],
+        "description": "`account_remove`: what went with the account."
+      },
+      "Accounts": {
+        "type": "object",
+        "properties": {
+          "accounts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AccountInfo"
+            },
+            "description": "The accounts, in the order they were added."
+          }
+        },
+        "required": [
+          "accounts"
+        ],
+        "description": "`accounts_list`: the cloud accounts piikey may read, in the order they were added."
+      },
+      "BoxSubject": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "enterprise"
+              },
+              "id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "id"
+            ],
+            "description": "The whole enterprise, by its enterprise id."
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "user"
+              },
+              "id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "id"
+            ],
+            "description": "One user, by user id."
+          }
+        ],
+        "description": "Whom a Box app acts as when it signs in with its client credentials."
+      },
+      "Credential": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "secret"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "description": "A client secret. The secret itself is kept by the token store, not in the settings."
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "certificate"
+              },
+              "key_file": {
+                "type": "string",
+                "description": "The private key, PEM (`BEGIN PRIVATE KEY` or `BEGIN RSA PRIVATE KEY`, not encrypted)."
+              },
+              "cert_file": {
+                "type": "string",
+                "description": "The certificate that was uploaded to the app registration, PEM."
+              }
+            },
+            "required": [
+              "type",
+              "key_file",
+              "cert_file"
+            ],
+            "description": "A certificate: the app signs a short-lived assertion with its private key (RS256). The files are PEM files that stay where the user keeps them."
+          }
+        ],
+        "description": "How an app registration proves who it is when no user signs in."
+      },
       "Device": {
         "description": "What the loaded model runs on.",
         "type": "string",
@@ -2688,6 +3314,40 @@
           "error"
         ],
         "additionalProperties": false
+      },
+      "FolderInfo": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "The folder's path, which a location of the inventory can be and the next `account_browse` can look under."
+          },
+          "name": {
+            "type": "string",
+            "description": "The folder's name: the last part of its path."
+          }
+        },
+        "required": [
+          "path",
+          "name"
+        ],
+        "description": "A folder of a cloud account, in the reply to `account_browse`."
+      },
+      "Folders": {
+        "type": "object",
+        "properties": {
+          "folders": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FolderInfo"
+            },
+            "description": "The folders, in the order the service lists them."
+          }
+        },
+        "required": [
+          "folders"
+        ],
+        "description": "`account_browse`: the folders directly in one folder of an account, or the top of the account."
       },
       "Forgotten": {
         "type": "object",
@@ -3075,6 +3735,24 @@
         ],
         "description": "`protection`: how protection stands after the switch. Only the app answers it."
       },
+      "Provider": {
+        "description": "A cloud service whose folders piikey can scan.",
+        "type": "string",
+        "enum": [
+          "microsoft365",
+          "onedrive",
+          "google_drive",
+          "dropbox",
+          "box"
+        ],
+        "x-enumDescriptions": {
+          "microsoft365": "`SharePoint` and `OneDrive` for Business, through Microsoft Graph.",
+          "onedrive": "A personal Microsoft account's `OneDrive`, through Microsoft Graph.",
+          "google_drive": "Google Drive, through the Drive API.",
+          "dropbox": "Dropbox.",
+          "box": "Box."
+        }
+      },
       "Record": {
         "type": "object",
         "properties": {
@@ -3262,6 +3940,185 @@
           }
         },
         "description": "A partial update of the settings, as `settings_set` carries it.\n\nEvery field that is present replaces the saved one, the others stay. All values are validated like typed input, and nothing changes if any of them is invalid. A field that is absent is not written, so a patch serialized and read back is the same patch."
+      },
+      "SignIn": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "mode": {
+                "type": "string",
+                "const": "microsoft_delegated"
+              },
+              "tenant": {
+                "type": "string"
+              },
+              "client_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "mode",
+              "tenant",
+              "client_id"
+            ],
+            "description": "A person signs in with a browser (authorization code with PKCE; a public client). `tenant` is a tenant id, a domain, `organizations` (any work or school account) or `consumers` (personal accounts, for `OneDrive`)."
+          },
+          {
+            "type": "object",
+            "properties": {
+              "mode": {
+                "type": "string",
+                "const": "microsoft_app"
+              },
+              "tenant": {
+                "type": "string"
+              },
+              "client_id": {
+                "type": "string"
+              },
+              "credential": {
+                "$ref": "#/components/schemas/Credential"
+              }
+            },
+            "required": [
+              "mode",
+              "tenant",
+              "client_id",
+              "credential"
+            ],
+            "description": "An app registration reads for the whole tenant (client credentials; the application permissions `Sites.Read.All` and `Files.Read.All`, with administrator consent)."
+          },
+          {
+            "type": "object",
+            "properties": {
+              "mode": {
+                "type": "string",
+                "const": "microsoft_app_selected"
+              },
+              "tenant": {
+                "type": "string"
+              },
+              "client_id": {
+                "type": "string"
+              },
+              "credential": {
+                "$ref": "#/components/schemas/Credential"
+              },
+              "sites": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "mode",
+              "tenant",
+              "client_id",
+              "credential",
+              "sites"
+            ],
+            "description": "An app registration that may read only the sites an administrator granted it (the application permission `Sites.Selected`). `sites` lists them, by URL such as `https://contoso.sharepoint.com/sites/Finance`: the service cannot list them for the app."
+          },
+          {
+            "type": "object",
+            "properties": {
+              "mode": {
+                "type": "string",
+                "const": "google_delegated"
+              },
+              "client_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "mode",
+              "client_id"
+            ],
+            "description": "A person signs in with a browser, with the user's own OAuth client (an installed-app client; its secret is kept by the token store)."
+          },
+          {
+            "type": "object",
+            "properties": {
+              "mode": {
+                "type": "string",
+                "const": "google_service_account"
+              },
+              "key_file": {
+                "type": "string"
+              },
+              "users": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "mode",
+              "key_file",
+              "users"
+            ],
+            "description": "A Google Workspace service account with domain-wide delegation: it reads the Drive of each of `users` (email addresses) as that user. `key_file` is the JSON key file Google issued."
+          },
+          {
+            "type": "object",
+            "properties": {
+              "mode": {
+                "type": "string",
+                "const": "dropbox_delegated"
+              },
+              "app_key": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "mode",
+              "app_key"
+            ],
+            "description": "A person signs in with a browser (authorization code with PKCE and refresh tokens). `app_key` is the Dropbox app's key."
+          },
+          {
+            "type": "object",
+            "properties": {
+              "mode": {
+                "type": "string",
+                "const": "box_delegated"
+              },
+              "client_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "mode",
+              "client_id"
+            ],
+            "description": "A person signs in with a browser (authorization code; Box requires a client secret, kept by the token store)."
+          },
+          {
+            "type": "object",
+            "properties": {
+              "mode": {
+                "type": "string",
+                "const": "box_app"
+              },
+              "client_id": {
+                "type": "string"
+              },
+              "subject": {
+                "$ref": "#/components/schemas/BoxSubject"
+              }
+            },
+            "required": [
+              "mode",
+              "client_id",
+              "subject"
+            ],
+            "description": "A Box app reads as `subject` (client credentials grant; its secret is kept by the token store)."
+          }
+        ],
+        "description": "How an account signs in, with what that way needs. The settings hold no secret: a client secret is given to the token store, a key stays in its file."
       },
       "Span": {
         "type": "object",

@@ -1,7 +1,8 @@
 //! The work queue of the scan thread. First what a removed location leaves behind is forgotten,
 //! then the scans somebody asked for run in the order they were asked, and then what monitoring
-//! has seen change in the monitored locations. Nothing is scanned that nobody asked for, and
-//! nothing on a timer.
+//! has seen change in the monitored locations: the reports of the file system for the folders
+//! on this PC, and the poll of the cloud locations, which no file system reports on. Nothing is
+//! scanned that nobody asked for, and nothing on a timer but that poll.
 //!
 //! Removing a location ([`Scanner::withdraw`]) breaks off at once: what waits under it is
 //! dropped, the scan that runs under it stops within the file it is in and goes on without that
@@ -12,7 +13,7 @@
 //! that shows progress; this is only the queue and its rules, so they are tested without a thread.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     mem,
     path::{Path, PathBuf},
     sync::{
@@ -36,10 +37,13 @@ pub struct Request {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Changes {
     /// Everything may have changed (monitoring just started, or events were lost): look at all
-    /// of it.
+    /// of it, and ask every monitored cloud location what changed.
     pub everything: bool,
     /// The paths that were reported, and whether each is fresh: see [`Touched`].
     touched: BTreeMap<PathBuf, bool>,
+    /// The monitored cloud locations to ask what changed in. Nothing reports their changes, so
+    /// a timer asks: see [`Changes::polled`].
+    clouds: BTreeSet<PathBuf>,
 }
 
 impl Changes {
@@ -47,7 +51,7 @@ impl Changes {
     pub fn everything() -> Self {
         Self {
             everything: true,
-            touched: BTreeMap::new(),
+            ..Self::default()
         }
     }
 
@@ -60,8 +64,17 @@ impl Changes {
         changes
     }
 
+    /// These monitored cloud locations, to be asked what changed in them. The system reports
+    /// nothing of a cloud location, so what asks is a timer.
+    pub fn polled(roots: impl IntoIterator<Item = PathBuf>) -> Self {
+        Self {
+            clouds: roots.into_iter().collect(),
+            ..Self::default()
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
-        !self.everything && self.touched.is_empty()
+        !self.everything && self.touched.is_empty() && self.clouds.is_empty()
     }
 
     /// The paths that were reported.
@@ -69,20 +82,28 @@ impl Changes {
         self.touched.keys()
     }
 
-    /// Drops what was reported under `folder`.
+    /// The cloud locations to ask what changed in.
+    pub fn clouds(&self) -> impl Iterator<Item = &PathBuf> {
+        self.clouds.iter()
+    }
+
+    /// Drops what was reported or asked for under `folder`.
     fn drop_under(&mut self, folder: &Path) {
         self.touched.retain(|path, _| !sys::is_under(path, folder));
+        self.clouds.retain(|root| !sys::is_under(root, folder));
     }
 
     /// Adds `other`. A path reported twice is fresh when either said so; with everything to be
-    /// looked at, single paths say nothing more.
+    /// looked at, single paths and locations say nothing more.
     pub fn merge(&mut self, other: Self) {
         self.everything |= other.everything;
         for (path, fresh) in other.touched {
             *self.touched.entry(path).or_insert(false) |= fresh;
         }
+        self.clouds.extend(other.clouds);
         if self.everything {
             self.touched.clear();
+            self.clouds.clear();
         }
     }
 
@@ -123,7 +144,9 @@ impl Kind {
                 let mut rest = changes.clone();
                 rest.drop_under(folder);
                 // A scan of everything reads the locations when it starts: it has to start again.
-                let less = changes.everything || rest.touched.len() != changes.touched.len();
+                let less = changes.everything
+                    || rest.touched.len() != changes.touched.len()
+                    || rest.clouds.len() != changes.clouds.len();
                 (Self::Watch(rest), less)
             }
             Self::Forget { .. } => (self.clone(), false),
@@ -721,6 +744,134 @@ mod tests {
         let running = run(&mut scanner.lock())?;
         scanner.withdraw(Path::new(r"C:\a"));
         assert!(!running.cancelled(), "another folder");
+        assert!(!scanner.done(&running));
+        Ok(())
+    }
+
+    fn polled(roots: &[&str]) -> Changes {
+        Changes::polled(roots.iter().map(PathBuf::from))
+    }
+
+    /// The cloud locations a scan of what monitoring saw is to ask, as text.
+    fn asking(changes: &Changes) -> Vec<String> {
+        changes
+            .clouds()
+            .map(|root| root.display().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_poll_of_the_cloud_locations_is_work_and_merges_with_what_waits() -> Result<(), String> {
+        assert!(!polled(&[r"\\Dropbox\work"]).is_empty());
+        assert!(polled(&[]).is_empty(), "no location to ask, nothing to do");
+        let scanner = Scanner::default();
+        scanner.changed(polled(&[r"\\Dropbox\a", r"\\Dropbox\b"]));
+        scanner.changed(polled(&[r"\\Dropbox\b", r"\\Dropbox\c"]));
+        scanner.changed(changes(&[("w", true)]));
+        let job = run(&mut scanner.lock())?;
+        let Kind::Watch(merged) = &job.kind else {
+            return Err("what the watch saw is one scan".to_owned());
+        };
+        assert_eq!(
+            asking(merged),
+            [r"\\Dropbox\a", r"\\Dropbox\b", r"\\Dropbox\c"]
+        );
+        assert_eq!(merged.list(), [touched("w", true)]);
+
+        // With everything to be looked at, every cloud location is asked anyway.
+        scanner.changed(polled(&[r"\\Dropbox\a"]));
+        scanner.changed(Changes::everything());
+        scanner.changed(polled(&[r"\\Dropbox\b"]));
+        let all = run(&mut scanner.lock())?;
+        assert_eq!(all.kind, Kind::Watch(Changes::everything()));
+        Ok(())
+    }
+
+    #[test]
+    fn a_poll_waits_to_be_run_like_what_the_file_system_reported() -> Result<(), String> {
+        let scanner = Scanner::default();
+        assert!(scanner.idle());
+        scanner.changed(polled(&[r"\\Dropbox\a"]));
+        assert!(!scanner.idle());
+        let job = scanner.next().ok_or("a poll was queued")?;
+        assert_eq!(job.kind, Kind::Watch(polled(&[r"\\Dropbox\a"])));
+        scanner.done(&job);
+        assert!(
+            scanner.idle(),
+            "a poll that ran to the end is not run again"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_request_stops_a_poll_which_goes_on_afterwards() -> Result<(), String> {
+        let scanner = Scanner::default();
+        scanner.changed(polled(&[r"\\Dropbox\a"]));
+        let polling = run(&mut scanner.lock())?;
+        scanner.ask(request("x"));
+        assert!(polling.cancelled(), "the user waits: the poll yields");
+        let mut jobs = scanner.lock();
+        assert!(jobs.finish(&polling), "what it had still to ask waits");
+        let asked = run(&mut jobs)?;
+        assert_eq!(asked.kind, Kind::Asked(request("x")));
+        jobs.finish(&asked);
+        assert_eq!(
+            run(&mut jobs)?.kind,
+            Kind::Watch(polled(&[r"\\Dropbox\a"])),
+            "the poll starts again after the request"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stopping_monitoring_drops_the_polls_and_stops_the_one_that_runs_for_good()
+    -> Result<(), String> {
+        let scanner = Scanner::default();
+        scanner.changed(polled(&[r"\\Dropbox\a"]));
+        let polling = run(&mut scanner.lock())?;
+        scanner.changed(polled(&[r"\\Dropbox\b"]));
+        scanner.stop_watch();
+        assert!(polling.cancelled());
+        let mut jobs = scanner.lock();
+        assert!(!jobs.finish(&polling), "it is not started again");
+        assert!(
+            matches!(jobs.pick(), Pick::Wait),
+            "nor is the poll that was queued behind it"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn removing_a_cloud_location_drops_its_poll_and_breaks_off_the_one_that_runs()
+    -> Result<(), String> {
+        let scanner = Scanner::default();
+        scanner.changed(polled(&[r"\\Dropbox\work\a", r"\\Dropbox\work\b"]));
+        let running = run(&mut scanner.lock())?;
+        scanner.changed(polled(&[r"\\Dropbox\work\a"]));
+        assert!(scanner.withdraw(Path::new(r"\\Dropbox\work\a")).is_empty());
+        assert!(running.cancelled(), "the poll that asks it stops at once");
+        assert!(scanner.done(&running), "and the rest of it waits to run");
+        let mut jobs = scanner.lock();
+        assert!(matches!(run(&mut jobs)?.kind, Kind::Forget { .. }));
+        assert_eq!(
+            run(&mut jobs)?.kind,
+            Kind::Watch(polled(&[r"\\Dropbox\work\b"])),
+            "the other location is still asked, the removed one is not"
+        );
+        assert!(
+            matches!(jobs.pick(), Pick::Wait),
+            "what was queued for the removed location is gone"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn removing_a_cloud_location_leaves_the_poll_of_the_others_alone() -> Result<(), String> {
+        let scanner = Scanner::default();
+        scanner.changed(polled(&[r"\\Dropbox\work\b"]));
+        let running = run(&mut scanner.lock())?;
+        scanner.withdraw(Path::new(r"\\Dropbox\work\a"));
+        assert!(!running.cancelled(), "another location");
         assert!(!scanner.done(&running));
         Ok(())
     }
