@@ -39,15 +39,24 @@ zeroize.workspace = true
 # thread while no window is open (`ui/mod.rs`, `Ticker`): `Application` has no cross-thread
 # handle and no timer, and the reactor's own dispatcher is private. The feature only adds test
 # hooks next to it (a recording adapter, more event payloads); the real adapter is unchanged.
-windows-reactor = { git = "https://github.com/microsoft/windows-rs", rev = "20f6de7473ebb2761a19a73dcc2c25ac9499db6e", features = ["test"] }
+# From the fork TBLgGamin/windows-rs: microsoft/windows-rs at 20f6de7 plus three fixes (closing a
+# window with a dialog open panicked in the adapter's drop; a list's selection was set before the
+# items the same update adds, which WinUI refused, and the app ended; an ItemsRepeater's rows were
+# only as wide as their content). Back to microsoft/windows-rs once it has them.
+windows-reactor = { git = "https://github.com/TBLgGamin/windows-rs", rev = "94cf8318655e5ac66a7475833b0c9516ec0f7ccc", features = ["test"] }
 serde_json.workspace = true
 # Reads the Windows light/dark app setting (HKCU Personalize) with a safe registry API.
 winreg = "0.56.0"
+# The Store build's startup task and how it was started (`startup.rs`), through WinRT's safe
+# bindings; the root crate already builds this version.
+windows = { version = "0.62.2", features = ["ApplicationModel", "ApplicationModel_Activation", "Foundation"] }
 # Reads the focused text field of protected sites (what the user types) through Windows UI
 # Automation, behind a safe wrapper: raw `windows` UIA calls are `unsafe` and `unsafe` is forbidden.
 # Uses windows 0.62.2, the version the root crate already builds.
 # Default features: the crate does not build with fewer (its feature gates are incomplete).
-uiautomation = "0.25.1"
+# `event` (no extra crate) compiles the safe event-handler registration: PowerPoint shows its slide
+# area to a UI Automation client only once that client has registered a handler.
+uiautomation = { version = "0.25.1", features = ["event"] }
 # What the user pastes: clipboard sequence number and text, safe API, no other dependencies.
 clipboard-win = "5.4.1"
 # Finds the captured values in outgoing requests; already built for the root crate.
@@ -62,12 +71,21 @@ global-hotkey = "0.7.0"
 # Scans of files run on a pool of half the cores (`ui/controller/inventory.rs`), so the PC stays responsive;
 # the root crate already depends on it.
 rayon.workspace = true
+# The watch (`ui/watcher.rs`): file-system change notifications for the folders the user asks to be
+# watched, so a change is scanned when it happens and nothing polls. The Windows call behind it
+# (`ReadDirectoryChangesW`) is `unsafe` to make and `unsafe` is forbidden here, so a crate wraps it.
+# `default-features = false` leaves out the macOS backend; on Windows it adds `notify-types` and a
+# newer `windows-sys`, and uses `walkdir` and `log` as the rest of the build does.
+notify = { version = "8.2.0", default-features = false }
+# The Browse buttons of Inventory and Watch: the Windows folder and file pickers. The reactor has no
+# picker, and the shell's `IFileOpenDialog` is COM, `unsafe` to call, so a crate wraps it.
+rfd = { version = "0.17.2", default-features = false }
 
 [build-dependencies]
 # Embeds assets/piikey.ico as the exe icon resource (icon only: the manifest comes from windows-reactor-setup).
 embed-resource.workspace = true
 # Stages a private Windows App SDK runtime so no runtime install is needed.
-windows-reactor-setup = { git = "https://github.com/microsoft/windows-rs", rev = "20f6de7473ebb2761a19a73dcc2c25ac9499db6e" }
+windows-reactor-setup = { git = "https://github.com/TBLgGamin/windows-rs", rev = "94cf8318655e5ac66a7475833b0c9516ec0f7ccc" }
 
 [lints]
 workspace = true

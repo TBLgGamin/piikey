@@ -13,7 +13,7 @@ use std::{
 };
 
 use super::{
-    desktop::{Clip, Desktop, Field, Focus},
+    desktop::{Clip, Desktop, Field, Focus, Value},
     sink::{Sink, Store},
     uia::Uia,
     watcher::Watcher,
@@ -395,6 +395,14 @@ impl Desktop for Watched<'_> {
         self.timed(|desktop| desktop.bounds())
     }
 
+    fn places(&mut self, values: &[Value]) -> Vec<Rect> {
+        self.timed(|desktop| desktop.places(values))
+    }
+
+    fn still_at(&mut self, rect: Rect) -> bool {
+        self.timed(|desktop| desktop.still_at(rect))
+    }
+
     fn clipboard_seq(&mut self) -> Option<NonZeroU32> {
         self.timed(|desktop| desktop.clipboard_seq())
     }
@@ -424,16 +432,16 @@ impl Sink for Gate<'_> {
         }
     }
 
-    fn holds_pii(&self, text: &str) -> Option<bool> {
+    fn values(&self, text: &str) -> Option<Vec<Value>> {
         self.control
             .is_current(self.id)
-            .then(|| self.store.holds_pii(text))
+            .then(|| self.store.values(text))
             .flatten()
     }
 
-    fn show(&self, field: Rect, mark: Mark) {
+    fn show(&self, rects: &[Rect], mark: Mark) {
         if self.control.is_current(self.id) {
-            self.store.show(field, mark);
+            self.store.show(rects, mark);
         }
     }
 
@@ -535,6 +543,14 @@ mod tests {
 
         fn bounds(&mut self) -> Option<Rect> {
             None
+        }
+
+        fn places(&mut self, _values: &[Value]) -> Vec<Rect> {
+            Vec::new()
+        }
+
+        fn still_at(&mut self, _rect: Rect) -> bool {
+            false
         }
 
         fn clipboard_seq(&mut self) -> Option<NonZeroU32> {

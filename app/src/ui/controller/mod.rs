@@ -1,5 +1,5 @@
-//! App state behind the UI: start and stop, certificate, settings, keyed values, the PII inventory
-//! and the scans that fill it.
+//! App state behind the UI: start and stop, certificate, settings, the vault's values, the inventory
+//! and the scans that fill it, and the watch.
 //!
 //! Everything that can block (`certutil`, CA files, binding the proxy, `WinINET`, settings and vault
 //! I/O) runs on one worker thread, in submission order. The window and the tray only submit
@@ -13,7 +13,9 @@
 //! - [`settings`]: following the settings with what runs because of them.
 //! - [`model`]: the detection model's download, load and release.
 //! - [`keyed`]: the vault's values, where they went, and the activity feed.
-//! - [`inventory`]: the PII inventory, its scans and the scan thread.
+//! - [`inventory`]: the inventory, its scans and the scan thread, the views of both inventories
+//!   and the findings of the files a result names.
+//! - [`watch`]: the folders the user asked to be watched, and what is done with their changes.
 //! - [`edit`]: the edits of the settings, applied to a [`Policy`].
 //!
 //! Lock order: nothing else is locked while a `Shared` lock is held, and `Shared` is never locked
@@ -27,6 +29,7 @@ mod protection;
 mod settings;
 #[cfg(test)]
 mod tests;
+mod watch;
 
 use std::{
     path::{Path, PathBuf},
@@ -42,8 +45,8 @@ use std::{
 use piikey::{
     api::EngineSource,
     engine::Engine,
-    inventory::{Inventory, Progress, Totals},
-    policy::{Highlight, Policy, SettingsPatch},
+    inventory::{Inventory, Progress, Reading, Totals},
+    policy::{Policy, SettingsPatch},
 };
 
 use super::{activity::Activity, scanner::Scanner};
@@ -55,10 +58,15 @@ use crate::{
 
 pub use self::{
     edit::{Edit, apply_edit},
-    inventory::{InventoryView, Reveal},
-    keyed::{Keyed, KeyedPage, KeyedQuery, Period, RECENT, Sent},
+    inventory::{FindingFiles, FindingsEvent, Reveal, RevealState, Store},
+    keyed::{Keyed, KeyedPage, KeyedQuery, Period, Sent},
     model::Model,
+    watch::{Change, FolderStatus, Started, Watch, WatchedFolder},
 };
+#[cfg(test)]
+pub use self::{inventory::FindingFile, keyed::RECENT};
+/// What a scan found, added up: the summary a [`Reveal`] carries once its scan is done.
+pub use piikey::inventory::Summary as ScanSummary;
 
 /// How long a quitting app waits for a command that is still running.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
@@ -88,8 +96,11 @@ pub trait Backend: Send + Sync + 'static {
     fn save_policy(&self, policy: &Policy) -> Res<()>;
     /// Opens the engine over the vault.
     fn open_engine(&self) -> Res<Engine>;
-    /// Opens the PII inventory: which files hold personal data, never the values.
+    /// Opens the inventory: which files hold personal data, never the values.
     fn open_inventory(&self) -> Res<Inventory>;
+    /// Opens the watch's inventory: the same, for the folders the watch keeps an eye on, in a
+    /// file of its own.
+    fn open_watch(&self) -> Res<Inventory>;
     /// The saved activity feed; empty when there is none or it cannot be read.
     fn load_activity(&self) -> Activity;
     /// Persists the activity feed, as [`Activity::to_text`] wrote it.
@@ -102,16 +113,27 @@ pub trait Backend: Send + Sync + 'static {
     fn load_model(&self) -> Res<()>;
     /// Frees the detection model's memory.
     fn release_model(&self);
+    /// How long the detection model stays in memory after a scan or a read of findings ends and
+    /// nothing else needs it: what follows a scan is mostly a look at what it found, which reads
+    /// the same texts again, so the model that is still there (with what it learned of them)
+    /// answers at once. Nothing to wait for unless the backend says so.
+    fn model_idle(&self) -> Duration {
+        Duration::ZERO
+    }
     /// The token the local HTTP API asks for, made on first use; with `rotate`, a new one that
     /// replaces it.
     fn token(&self, rotate: bool) -> Res<String>;
     /// Starts the local HTTP API on `127.0.0.1:port`, asking for `token`.
     fn start_http(&self, port: u16, token: String) -> Res<Box<dyn Running>>;
-    /// Adds or removes "Scan for PII" in Explorer's right-click menu.
+    /// Adds or removes "Scan for personal data" in Explorer's right-click menu.
     fn set_explorer_menu(&self, on: bool) -> Res<()>;
     /// Registers (`on`) or gives back the shortcut of the highlight, Ctrl+Alt+P. The error says
     /// why not, in words for the user: another program may have the shortcut.
     fn set_hotkey(&self, shared: &Shared, on: bool) -> Res<()>;
+    /// Starts watching `folders`, below them too, and sends every change in them to `changes`.
+    /// A folder that cannot be watched is named in the answer with why, and the others are
+    /// watched all the same. Stopping what is returned ends the watch and drops `changes`.
+    fn start_watch(&self, folders: &[PathBuf], changes: Sender<Change>) -> Res<Started>;
 }
 
 /// A started proxy or capture.
@@ -180,22 +202,31 @@ pub struct Snapshot {
     /// Proxies issued so far: vault records.
     pub issued: u64,
     pub policy: Policy,
-    /// The [`RECENT`] most recently sent values, filled up with the newest records.
+    /// The `RECENT` most recently sent values, filled up with the newest records.
     pub recent: Vec<Keyed>,
     /// The latest masking or restoring this session.
     pub last_activity: Option<Sent>,
     /// The detection model's download state.
     pub model: Model,
-    /// Files scanned and files to scan, while a scan runs: the inventory's or Explorer's.
+    /// Files scanned and files to scan, while the inventory scans: the Scan button's scan or one
+    /// somebody asked for (Explorer's, "Scan this"). The watch's scan is [`Watch::scanning`].
     pub scan: Option<(u64, u64)>,
-    /// The latest request to show the result of a scan in the window.
+    /// The files that scan is reading now, and what each is busy with.
+    pub scan_reading: Vec<Reading>,
+    /// The latest scan somebody asked to see the result of, from queued to done: the window
+    /// comes forward and shows a dialog for it. It stays until a newer request replaces it.
     pub reveal: Option<Reveal>,
     /// Files in the inventory that hold personal data, and the values found in them.
     pub inventory_totals: (u64, u64),
+    /// The watch: its folders, what it scans and what it found.
+    pub watch: Watch,
     /// The local HTTP API is listening.
     pub http: bool,
     /// The highlight is paused: in Always mode its shortcut pauses and resumes it.
     pub highlight_paused: bool,
+    /// How many times something asked for the window to come forward (a second start of the
+    /// app, `piikey-cli open`), 0 before the first: see [`Controller::request_window`].
+    pub show: u64,
 }
 
 /// What the application thread watches while no window is open: what the tray icon shows, and
@@ -207,8 +238,10 @@ pub struct Tray {
     pub on: bool,
     /// See [`Snapshot::highlight_paused`].
     pub highlight_paused: bool,
-    /// The number of the latest request to show a scan, 0 before the first: [`Reveal::seq`].
+    /// The number of the latest scan that asked to be shown, 0 before the first: [`Reveal::seq`].
     pub reveal: u64,
+    /// How many times something asked for the window to come forward: [`Snapshot::show`].
+    pub show: u64,
 }
 
 /// Work for the worker thread.
@@ -230,22 +263,27 @@ pub enum Command {
     /// Go on without the detection model.
     SkipModel,
     /// Bring everything in line with the saved settings: the Explorer menu, the local API, the
-    /// inventory, the highlight and the detection model. Run once, after launch.
+    /// watch, the highlight and the detection model. Run once, after launch.
     Startup,
     /// Apply these settings together (the API's `settings_set`).
     Settings(SettingsPatch),
-    /// Scan the watched folders again now.
-    Rescan,
-    /// Scan these files and folders into the inventory, as Explorer's "Scan for PII" does. With
-    /// `reveal` the window comes forward with the result.
+    /// Scan the inventory's folders (its locations) now: what the Scan button does.
+    ScanAll,
+    /// Scan these files and folders into the inventory, as Explorer's "Scan for personal data"
+    /// and "Scan this" do. With `reveal` the window comes forward and shows the result in a
+    /// dialog, from the moment the scan is queued.
     ScanFiles {
         paths: Vec<PathBuf>,
         reveal: bool,
     },
+    /// Add a folder to the inventory's locations, and scan it with the dialog. A path that is no
+    /// folder is refused with a notice, and nothing is scanned.
+    AddLocation(PathBuf),
+    /// Stop the scan that was asked to be shown as this reveal (its dialog was closed while it
+    /// waited or ran): it is dropped from the queue, or broken off where it is.
+    StopScan(u64),
     /// Remove the vault records whose value or stand-in is one of these.
     Forget(Vec<String>),
-    /// Remove every vault record; the key stays.
-    WipeVault,
     /// Start the local API again: its token changed.
     RestartHttp,
 }
@@ -277,11 +315,18 @@ struct State {
     http: Option<Box<dyn Running>>,
     model: Model,
     fetch: Fetch,
-    /// How far the scan that runs now has got.
+    /// How far the scan of the inventory that runs now has got.
     scan: Option<Arc<Progress>>,
     /// See [`Snapshot::reveal`].
     reveal: Option<Reveal>,
+    /// See [`Snapshot::show`].
+    show: u64,
     inventory_totals: Totals,
+    /// What the controller keeps of the watch.
+    watch: watch::WatchState,
+    /// How many reads of the findings of files are running: the detection model is wanted while
+    /// there are any.
+    findings: usize,
 }
 
 /// The model download's flags.
@@ -299,14 +344,18 @@ pub struct Controller {
     backend: Box<dyn Backend>,
     vault_path: PathBuf,
     inventory: Arc<Inventory>,
+    /// The watch's inventory: its own file, shared with nothing of the inventory above.
+    watch_store: Arc<Inventory>,
     state: Mutex<State>,
     changed: Condvar,
     commands: Mutex<Option<Sender<Command>>>,
     events: Sender<Event>,
     /// What the scan thread works through.
     scanner: Arc<Scanner>,
-    /// One load or release of the detection model at a time.
-    model_sync: Mutex<()>,
+    /// One load or release of the detection model at a time, and when it may go after a scan.
+    model_sync: Mutex<model::Hold>,
+    /// This controller, for a thread that comes back to it later.
+    me: Weak<Controller>,
     /// The pool the scans run in, made when first needed, see [`Controller::in_scan_pool`]; `None`
     /// when the system would not start its threads.
     pool: LazyLock<Option<rayon::ThreadPool>>,
@@ -328,7 +377,7 @@ impl Controller {
     /// settings back (so the user keeps internet meanwhile) and a saved "on" waits for the
     /// download to finish.
     ///
-    /// The other saved features (the Explorer menu, the local API, the inventory, the highlight)
+    /// The other saved features (the Explorer menu, the local API, the watch, the highlight)
     /// start with [`Command::Startup`], which the caller submits once what they serve exists.
     ///
     /// # Errors
@@ -353,12 +402,15 @@ impl Controller {
             .open_engine()
             .map_err(|error| format!("could not open the vault {}: {error}", vault_path.display()))
             .and_then(|engine| {
-                backend
+                let inventory = backend
                     .open_inventory()
-                    .map(|inventory| (engine, inventory))
-                    .map_err(|error| format!("could not open the PII inventory: {error}"))
+                    .map_err(|error| format!("could not open the inventory: {error}"))?;
+                let watch = backend
+                    .open_watch()
+                    .map_err(|error| format!("could not open what the watch found: {error}"))?;
+                Ok((engine, inventory, watch))
             });
-        let (engine, inventory) = match opened {
+        let (engine, inventory, watch) = match opened {
             Ok(opened) => opened,
             Err(mut message) => {
                 // No app will start, so nothing else would give Windows its settings back.
@@ -369,7 +421,9 @@ impl Controller {
                 return Err(message);
             }
         };
-        let controller = Self::new(backend, vault_path, policy, engine, inventory, notice)?;
+        let controller = Self::new(
+            backend, vault_path, policy, engine, inventory, watch, notice,
+        )?;
         controller.submit(Command::Refresh);
         if !installed {
             controller.update(|state| {
@@ -400,6 +454,7 @@ impl Controller {
         mut policy: Policy,
         engine: Engine,
         inventory: Inventory,
+        watch: Inventory,
         notice: Option<Notice>,
     ) -> Res<Arc<Self>> {
         policy.enabled = false;
@@ -420,11 +475,18 @@ impl Controller {
         let activity = backend.load_activity();
         let inventory = Arc::new(inventory);
         let inventory_totals = inventory.totals();
-        let controller = Arc::new(Self {
+        let watch_store = Arc::new(watch);
+        let watch_state = watch::WatchState {
+            totals: watch_store.totals(),
+            ..watch::WatchState::default()
+        };
+        let controller = Arc::new_cyclic(|me| Self {
+            me: me.clone(),
             shared,
             backend,
             vault_path,
             inventory,
+            watch_store,
             state: Mutex::new(State {
                 version: 0,
                 enabled: false,
@@ -446,13 +508,16 @@ impl Controller {
                 fetch: Fetch::default(),
                 scan: None,
                 reveal: None,
+                show: 0,
                 inventory_totals,
+                watch: watch_state,
+                findings: 0,
             }),
             changed: Condvar::new(),
             commands: Mutex::new(Some(command_tx)),
             events: event_tx,
             scanner: Arc::new(Scanner::default()),
-            model_sync: Mutex::new(()),
+            model_sync: Mutex::new(model::Hold::default()),
             pool: LazyLock::new(inventory::scan_pool),
         });
         // A pause of the highlight is on the tray's tooltip: the window follows it like any change.
@@ -480,11 +545,18 @@ impl Controller {
         &self.vault_path
     }
 
+    /// What capture and the highlight overlay read their mode from. The overlay starts with it, so
+    /// whatever draws an outline (the highlight, "Open at this place") passes this one.
+    pub(crate) fn purpose(&self) -> Arc<crate::proxy::Purpose> {
+        Arc::clone(&self.shared.purpose)
+    }
+
     /// Copies the state out for rendering.
     pub fn snapshot(&self) -> Snapshot {
         // The policy first: `Shared` locks are never taken while the state mutex is held.
         let policy = self.policy();
         let state = self.lock();
+        let watch = state.watch.view(&policy);
         Snapshot {
             version: state.version,
             enabled: state.enabled,
@@ -503,11 +575,18 @@ impl Controller {
                     progress.total.load(Ordering::Relaxed),
                 )
             }),
+            scan_reading: state
+                .scan
+                .as_ref()
+                .map(|progress| progress.reading())
+                .unwrap_or_default(),
             reveal: state.reveal.clone(),
+            show: state.show,
             inventory_totals: (
                 state.inventory_totals.files_with_pii,
                 state.inventory_totals.hits,
             ),
+            watch,
             http: state.http.is_some(),
             highlight_paused: self.shared.purpose.paused(),
         }
@@ -554,11 +633,12 @@ impl Controller {
         self.tray().on
     }
 
-    /// Whether something works in the background: protection, the highlight, the inventory or the
-    /// local API. The app then stays in the tray when its window closes.
+    /// Whether closing the window leaves the app in the tray: the user's setting
+    /// ([`Policy::background`]). Protection, the highlight, the watch and the local API keep
+    /// working then; without it closing the window quits the app. Whether there is a tray icon
+    /// to open the window from is the caller's to know.
     pub fn runs_in_background(&self) -> bool {
-        let policy = self.policy();
-        policy.highlight != Highlight::Off || policy.inventory || policy.http_api || self.is_on()
+        self.policy().background
     }
 
     /// Whether the last check found the certificate installed.
@@ -576,6 +656,12 @@ impl Controller {
         self.update(|state| state.notice = Some(notice));
     }
 
+    /// Asks for the window to come forward, opening it if it is closed: what a second start of
+    /// the app asks of the one that runs. The app thread sees [`Tray::show`] grow.
+    pub fn request_window(&self) {
+        self.update(|state| state.show += 1);
+    }
+
     /// Whether the highlight is paused: in Always mode its shortcut pauses and resumes it.
     pub fn highlight_paused(&self) -> bool {
         self.shared.purpose.paused()
@@ -589,6 +675,7 @@ impl Controller {
             on: state.enabled || state.busy == Some(Busy::Starting),
             highlight_paused: paused,
             reveal: state.reveal.as_ref().map_or(0, |reveal| reveal.seq),
+            show: state.show,
         }
     }
 
@@ -623,6 +710,7 @@ impl Controller {
         self.update(|state| state.closing = true);
         self.wait_idle(SHUTDOWN_WAIT);
         self.stop_scans();
+        self.stop_watching();
         let (enabled, proxy, capture, http) = self.update(|state| {
             let enabled = state.enabled;
             state.enabled = false;
@@ -708,17 +796,20 @@ impl Controller {
                 Command::SetEnabled(false) => self.stop(None),
                 Command::Resume => self.resume(),
                 Command::InstallCertificate => self.install(),
-                Command::Edit(edit) => self.edit(&edit),
+                Command::Edit(edit) => {
+                    self.edit(&edit);
+                }
                 Command::Fatal(reason) => self.stop(Some(reason)),
                 Command::Refresh => self.refresh(),
                 Command::FetchModel => self.refetch(),
                 Command::SkipModel => self.skip_model(),
                 Command::Startup => self.startup(),
                 Command::Settings(patch) => self.settings(&patch),
-                Command::Rescan => self.rescan(),
+                Command::ScanAll => self.scan_all(),
                 Command::ScanFiles { paths, reveal } => self.ask_scan(paths, reveal),
+                Command::AddLocation(path) => self.add_location(path),
+                Command::StopScan(seq) => self.stop_scan(seq),
                 Command::Forget(values) => self.forget(&values),
-                Command::WipeVault => self.wipe(),
                 Command::RestartHttp => self.restart_http(),
             }
         }

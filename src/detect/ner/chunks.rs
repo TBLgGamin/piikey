@@ -6,15 +6,19 @@ use std::ops::Range;
 use super::gate::{key, worth_running};
 use crate::detect::Span;
 
-/// Longest text the model reads in one piece. A longer one is cut after a whitespace.
-const CHUNK_BYTES: usize = 256 << 10;
+/// Longest text the model reads in one piece. A longer one is cut after a whitespace. A piece is
+/// what a caller that follows the model waits for before it can stop it (a scan whose dialog was
+/// closed, a findings view that went away): some 16,000 tokens, two or three seconds.
+const CHUNK_BYTES: usize = 64 << 10;
 
 /// A run of this many bytes without whitespace is data, not prose: the model never reads it.
 const BLOB_BYTES: usize = 1024;
 
 /// Text the model reads at a time, in a call with more: it keeps the tokens of one group in
-/// memory, not of all texts of the call.
-pub(super) const GROUP_BYTES: usize = 1 << 20;
+/// memory, not of all texts of the call, and a caller that is shown what the model found (see
+/// [`Detector::detect_batch_steps`](crate::detect::Detector::detect_batch_steps)) gets it a group
+/// at a time: one chunk of a long text, which the model takes seconds to read, not minutes.
+pub(super) const GROUP_BYTES: usize = CHUNK_BYTES;
 
 /// One text to run: a text of the batch, or a piece of a long one.
 pub(super) struct Job<'a> {

@@ -20,8 +20,8 @@ use crate::{
     },
 };
 
-/// Keyed values the Home page lists.
-pub const RECENT: usize = 8;
+/// Swaps the Overview page lists as the recent ones.
+pub const RECENT: usize = 5;
 
 /// The activity feed is written at most this often while traffic flows, and at shutdown.
 const FEED_SAVE_EVERY: Duration = Duration::from_secs(30);
@@ -46,7 +46,7 @@ pub struct Keyed {
     pub sent: Option<Sent>,
 }
 
-/// How far back the Keyed values page looks, by when a value was last sent.
+/// How far back the Vault page looks, by when a value was last sent.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Period {
     #[default]
@@ -79,7 +79,7 @@ impl Period {
     }
 }
 
-/// What the Keyed values page asks for.
+/// What the Vault page asks for.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct KeyedQuery {
     /// Matched, ignoring case, against the value, its stand-in, the site and the program.
@@ -124,7 +124,7 @@ impl KeyedPage {
     }
 }
 
-/// The vault's part of the Home page.
+/// The vault's part of the Overview page.
 #[derive(Default)]
 pub(super) struct VaultSummary {
     issued: u64,
@@ -169,7 +169,7 @@ impl Controller {
     }
 
     /// The vault lost records outside the controller (the API removed them): what was typed may
-    /// hold their values, and the numbers of Home are old.
+    /// hold their values, and the numbers of Overview are old.
     pub fn vault_changed(&self) {
         self.shared.typed.clear();
         self.submit(Command::Refresh);
@@ -203,15 +203,7 @@ impl Controller {
         self.vault_lost();
     }
 
-    /// Removes every vault record.
-    pub(super) fn wipe(&self) {
-        if let Err(error) = self.engine().wipe() {
-            self.notify(Notice::error(format!("Could not wipe the vault: {error}")));
-        }
-        self.vault_lost();
-    }
-
-    /// What was typed may hold values the vault no longer knows, and the numbers of Home are old.
+    /// What was typed may hold values the vault no longer knows, and the numbers of Overview are old.
     fn vault_lost(&self) {
         self.shared.typed.clear();
         self.refresh();
@@ -240,7 +232,7 @@ impl Controller {
         });
     }
 
-    /// The vault's numbers for the Home page, and its list: the most recently sent values, filled
+    /// The vault's numbers for the Overview page, and its list: the most recently sent values, filled
     /// up with the newest records. Takes the state lock briefly, so never call it holding it.
     pub(super) fn vault_summary(&self) -> VaultSummary {
         self.reading(|view, activity| VaultSummary {
@@ -266,7 +258,7 @@ impl Controller {
                     state.feed_dirty = true;
                     state.last_activity = Some(shown(host, exe.as_deref(), now, now));
                 });
-                // After recording: the Home list starts with what was just sent.
+                // After recording: the Overview list starts with what was just sent.
                 let summary = self.vault_summary();
                 self.update(|state| summary.apply(state));
             }

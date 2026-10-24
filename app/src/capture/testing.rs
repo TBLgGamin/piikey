@@ -15,7 +15,7 @@ use piikey::{
 };
 
 use super::{
-    desktop::{Clip, Desktop, Field, Focus},
+    desktop::{Clip, Desktop, Field, Focus, Value},
     sink::{Sink, Store},
 };
 use crate::{
@@ -57,6 +57,13 @@ pub(super) struct Fake {
     pub(super) clipboard_reads: usize,
     pub(super) field_calls: usize,
     pub(super) bounds_calls: usize,
+    /// What `places` answers: a rectangle for each line of each value that is in view.
+    pub(super) placed: Vec<Rect>,
+    /// The text has scrolled: the first value is no longer where `places` said.
+    pub(super) scrolled: bool,
+    /// The values every `places` call was asked about.
+    pub(super) asked_values: Vec<Vec<Value>>,
+    pub(super) still_calls: usize,
 }
 
 impl Fake {
@@ -119,6 +126,16 @@ impl Desktop for Fake {
         self.field.as_ref().map(|&(rect, _)| rect)
     }
 
+    fn places(&mut self, values: &[Value]) -> Vec<Rect> {
+        self.asked_values.push(values.to_vec());
+        self.placed.clone()
+    }
+
+    fn still_at(&mut self, _rect: Rect) -> bool {
+        self.still_calls += 1;
+        !self.scrolled
+    }
+
     fn clipboard_seq(&mut self) -> Option<NonZeroU32> {
         self.seq
     }
@@ -141,6 +158,8 @@ pub(super) struct Log {
     store: Option<Arc<Shared>>,
     /// Texts checked for personal data.
     pub(super) scans: Cell<usize>,
+    /// The next this many checks cannot tell.
+    pub(super) unsure: Cell<usize>,
 }
 
 impl Log {
@@ -165,13 +184,17 @@ impl Sink for Log {
         self.lines.borrow_mut().push("flush".to_owned());
     }
 
-    fn holds_pii(&self, text: &str) -> Option<bool> {
+    fn values(&self, text: &str) -> Option<Vec<Value>> {
         self.scans.set(self.scans.get() + 1);
-        Store(self.store.as_ref()?).holds_pii(text)
+        if self.unsure.get() > 0 {
+            self.unsure.set(self.unsure.get() - 1);
+            return None;
+        }
+        Store(self.store.as_ref()?).values(text)
     }
 
-    fn show(&self, field: Rect, mark: Mark) {
-        self.lines.borrow_mut().push(show(mark, field));
+    fn show(&self, rects: &[Rect], mark: Mark) {
+        self.lines.borrow_mut().push(shows(mark, rects));
     }
 
     fn hide(&self) {
@@ -179,12 +202,23 @@ impl Sink for Log {
     }
 }
 
-/// What [`Log`] writes for an outline.
+/// What [`Log`] writes for outlines: the colour, then each rectangle as `(left,top,right,bottom)`.
+pub(super) fn shows(mark: Mark, rects: &[Rect]) -> String {
+    let places: Vec<String> = rects
+        .iter()
+        .map(|rect| {
+            format!(
+                "({},{},{},{})",
+                rect.left, rect.top, rect.right, rect.bottom
+            )
+        })
+        .collect();
+    format!("show {mark:?} {}", places.join(" "))
+}
+
+/// What [`Log`] writes for the outline of one rectangle.
 pub(super) fn show(mark: Mark, field: Rect) -> String {
-    format!(
-        "show {mark:?} ({},{},{},{})",
-        field.left, field.top, field.right, field.bottom
-    )
+    shows(mark, &[field])
 }
 
 /// A purpose that only outlines, the way `mode` says: no protection.

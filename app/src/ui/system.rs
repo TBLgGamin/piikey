@@ -5,6 +5,7 @@ use std::{
     cell::RefCell,
     path::PathBuf,
     sync::{Arc, OnceLock, mpsc::Sender},
+    time::Duration,
 };
 
 use piikey::{
@@ -23,7 +24,8 @@ use piikey::{
 use super::{
     activity::Activity,
     assets,
-    controller::{Backend, Running},
+    controller::{Backend, Change, Running, Started},
+    watcher,
 };
 use crate::{
     Describe, Res, ca,
@@ -36,11 +38,16 @@ use crate::{
 /// The activity feed, next to the settings; see [`super::activity`].
 const ACTIVITY_FILE: &str = "activity.cfg";
 
+/// How long the detection model stays in memory after a scan or a read of findings, when nothing
+/// else needs it: long enough to look at what a scan found, which reads the same texts again
+/// (the model remembers its answers for them), and to read the findings of another file.
+const MODEL_IDLE: Duration = Duration::from_mins(2);
+
 /// Talks to the machine.
 pub struct System {
     /// The vault the engine opens.
     pub vault: PathBuf,
-    /// The detection model; loaded while protection, the highlight, the inventory or a scan needs it.
+    /// The detection model; loaded while protection, the highlight, the watch or a scan needs it.
     pub ner: NerDetector,
     /// Where the model files live.
     pub model_dir: PathBuf,
@@ -93,6 +100,15 @@ impl Backend for System {
         Inventory::open(&path).map_err(|error| format!("{}: {error}", path.display()))
     }
 
+    fn open_watch(&self) -> Res<Inventory> {
+        let path = Inventory::watch_path().describe()?;
+        Inventory::open(&path).map_err(|error| format!("{}: {error}", path.display()))
+    }
+
+    fn start_watch(&self, folders: &[PathBuf], changes: Sender<Change>) -> Res<Started> {
+        watcher::start(folders, changes)
+    }
+
     fn model_installed(&self) -> bool {
         files::is_installed(&self.model_dir)
     }
@@ -112,6 +128,10 @@ impl Backend for System {
 
     fn release_model(&self) {
         self.ner.release();
+    }
+
+    fn model_idle(&self) -> Duration {
+        MODEL_IDLE
     }
 
     fn token(&self, rotate: bool) -> Res<String> {

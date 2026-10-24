@@ -40,7 +40,7 @@
         <virtualization:ExcludedKey>HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\RunOnce</virtualization:ExcludedKey>
         <!-- The local CA in the user's Root store (app/src/ca.rs, certutil -user). -->
         <virtualization:ExcludedKey>HKEY_CURRENT_USER\Software\Microsoft\SystemCertificates\Root</virtualization:ExcludedKey>
-        <!-- The Explorer verb "Scan for PII" (app/src/shell.rs). -->
+        <!-- The Explorer verb "Scan for personal data" (app/src/shell.rs). -->
         <virtualization:ExcludedKey>HKEY_CURRENT_USER\Software\Classes\*\shell\piikey.scan</virtualization:ExcludedKey>
         <virtualization:ExcludedKey>HKEY_CURRENT_USER\Software\Classes\Directory\shell\piikey.scan</virtualization:ExcludedKey>
         <virtualization:ExcludedKey>HKEY_CURRENT_USER\Software\Classes\Directory\Background\shell\piikey.scan</virtualization:ExcludedKey>
@@ -87,6 +87,12 @@
             <desktop:ExecutionAlias Alias="piikey.exe" />
           </uap3:AppExecutionAlias>
         </uap3:Extension>
+        <!-- "Start piikey when I sign in" (app/src/startup.rs). Off until the user switches it on in
+             piikey (Settings > General) or under Settings > Apps > Startup. Windows starts the exe
+             without arguments; startup.rs reads the activation kind to start in the tray. -->
+        <desktop:Extension Category="windows.startupTask" Executable="piikey.exe" EntryPoint="Windows.FullTrustApplication">
+          <desktop:StartupTask TaskId="piikeyStartup" Enabled="false" DisplayName="piikey" />
+        </desktop:Extension>
       </Extensions>
     </Application>
 

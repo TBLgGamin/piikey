@@ -11,7 +11,7 @@ use piikey::{
 use crate::Res;
 
 /// A change to the settings, one control of the Settings page at a time: the site and program
-/// lists, the kinds that are masked and the features.
+/// lists, the kinds that are masked, the folders and the features.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Edit {
     Site {
@@ -29,19 +29,23 @@ pub enum Edit {
     },
     /// When the field in focus is outlined if it holds personal data.
     Highlight(Highlight),
-    /// Whether Explorer's right-click menu offers "Scan for PII".
+    /// Whether Explorer's right-click menu offers "Scan for personal data".
     ExplorerMenu(bool),
-    /// Whether the inventory scans the watched folders in the background. Switching it on with
-    /// no folder chosen watches the usual ones.
-    Inventory(bool),
-    /// A folder the inventory watches; `on` adds it. A path that is no folder is refused.
+    /// Whether closing the window leaves piikey running in the tray. Without, closing the window
+    /// quits piikey.
+    Background(bool),
+    /// A folder the inventory scans when asked (one of its locations); `on` adds it, `off`
+    /// takes it off. A path that is no folder is refused. There is no location until the user
+    /// adds one.
     InventoryRoot {
         path: PathBuf,
         on: bool,
     },
-    /// A folder or file the inventory leaves out, with everything below it; `on` adds it. What
-    /// the inventory knows about it is forgotten.
-    InventoryExclude {
+    /// Whether the watch keeps an eye on its folders.
+    Watch(bool),
+    /// A folder the watch keeps an eye on; `on` adds it, `off` takes it off. A path that is no
+    /// folder is refused.
+    WatchFolder {
         path: PathBuf,
         on: bool,
     },
@@ -68,7 +72,7 @@ pub fn apply_edit(policy: &mut Policy, edit: &Edit) -> Res<bool> {
         Edit::Program { exe, on: true } => {
             let parsed = Policy::parse_program(exe).ok_or_else(|| {
                 format!(
-                    "\"{}\" is not a program name. Use a name such as chrome.exe.",
+                    "\"{}\" is not an app name. Use a name such as chrome.exe.",
                     exe.trim()
                 )
             })?;
@@ -85,22 +89,10 @@ pub fn apply_edit(policy: &mut Policy, edit: &Edit) -> Res<bool> {
         }
         Edit::Highlight(mode) => Ok(set(&mut policy.highlight, *mode)),
         Edit::ExplorerMenu(on) => Ok(set(&mut policy.explorer_menu, *on)),
-        Edit::Inventory(on) => {
-            let mut changed = set(&mut policy.inventory, *on);
-            if *on && policy.inventory_roots.is_empty() {
-                // From now on the usual folders are a choice, kept while the inventory is off.
-                let usual = policy.inventory_roots_or_default();
-                changed |= !usual.is_empty();
-                policy.inventory_roots = usual;
-            }
-            Ok(changed)
-        }
-        Edit::InventoryRoot { path, on } => {
-            folder_edit(&mut policy.inventory_roots, path, *on, true)
-        }
-        Edit::InventoryExclude { path, on } => {
-            folder_edit(&mut policy.inventory_exclude, path, *on, false)
-        }
+        Edit::Background(on) => Ok(set(&mut policy.background, *on)),
+        Edit::InventoryRoot { path, on } => folder_edit(&mut policy.inventory_roots, path, *on),
+        Edit::Watch(on) => Ok(set(&mut policy.watch, *on)),
+        Edit::WatchFolder { path, on } => folder_edit(&mut policy.watch_folders, path, *on),
         Edit::HttpApi(on) => Ok(set(&mut policy.http_api, *on)),
     }
 }
@@ -131,13 +123,15 @@ fn set<T: PartialEq>(slot: &mut T, value: T) -> bool {
     }
 }
 
-/// Adds `path` to a list of folders, or takes it off; whether the list changed. With `existing`
-/// an added path must be a folder that exists.
-fn folder_edit(list: &mut Vec<PathBuf>, path: &Path, on: bool, existing: bool) -> Res<bool> {
+/// Adds `path` to a list of folders, or takes it off; whether the list changed. An added path
+/// must be a folder that exists.
+fn folder_edit(list: &mut Vec<PathBuf>, path: &Path, on: bool) -> Res<bool> {
     if !on {
-        return Ok(remove(list, path));
+        let before = list.len();
+        list.retain(|item| !same_folder(item, path));
+        return Ok(list.len() != before);
     }
-    if existing && !path.is_dir() {
+    if !path.is_dir() {
         return Err(format!("Not a folder: {}", path.display()));
     }
     let folder = Policy::parse_folder(&path.to_string_lossy()).ok_or_else(|| {

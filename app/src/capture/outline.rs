@@ -1,19 +1,34 @@
-//! [`Outline`]: when the field in focus is outlined, and in which colour.
+//! [`Outline`]: when the field in focus is outlined, around what, and in which colour.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use piikey::policy::Highlight;
 
 use super::{
     FLASH_FOR, SETTLE, SHOW_FOR,
-    desktop::{Desktop, Field},
+    desktop::{Desktop, Field, Value},
     sink::Sink,
 };
-use crate::{highlight::Mark, proxy::Purpose};
+use crate::{
+    highlight::{Mark, Rect},
+    proxy::Purpose,
+};
 
 /// Bytes of a field that are checked for personal data; a field with more is checked as far as
 /// that, as [`Typed`](crate::proxy::Typed) keeps no more of a text either.
 const MAX_SCAN: usize = 256 << 10;
+/// Looks in a row that find no field to outline before the outline goes: the focus or the field
+/// can be unreadable for a moment while an app redraws, and the outline would blink.
+const MISSES: u8 = 3;
+/// How often a check that could not tell is tried again, and how many times in all.
+const RETRY_CHECK: Duration = Duration::from_millis(250);
+const TRIES: u8 = 5;
+/// How long a field whose text control could not say where its values are is outlined whole
+/// before that is asked again.
+const RETRY_PLACE: Duration = Duration::from_secs(2);
+/// How long outlines that were just found are taken as they are, before they are checked against
+/// the text again: a check is a few calls into the other program at every look.
+const TRUST: Duration = Duration::from_millis(400);
 
 /// The part of `text` that is checked for personal data.
 fn checked(text: &str) -> &str {
@@ -22,15 +37,21 @@ fn checked(text: &str) -> &str {
 
 /// What the loop knows about the outline of the field in focus.
 pub(super) struct Outline {
-    /// What the field held when it was last looked at; only [`Highlight::Always`] reads it at every
-    /// look.
-    text: String,
-    /// When `text` last changed, until it has been checked.
-    changed: Option<Instant>,
-    /// Whether the field held personal data when it was last checked.
-    pii: bool,
+    /// What the field held when it was last looked at; `None` before the first look at the
+    /// element. Only [`Highlight::Always`] reads it at every look.
+    text: Option<String>,
+    /// When `text` is next checked for personal data; `None` while no check is due.
+    due: Option<Instant>,
+    /// How many checks in a row could not tell.
+    unsure: u8,
+    /// The personal data the field held when it was last checked.
+    values: Vec<Value>,
+    /// Where the outlines of `values` went last.
+    placed: Option<Placed>,
     /// The outline that is up.
     up: Option<Up>,
+    /// Looks in a row that found no field.
+    missed: u8,
     /// Presses of the shortcut taken in so far.
     presses: u64,
 }
@@ -43,13 +64,50 @@ struct Up {
     until: Option<Instant>,
 }
 
+/// Where the outlines of the values of a field went, and for which place of the field.
+struct Placed {
+    /// A rectangle around each line of each value; or the field itself, when its text control
+    /// could not say where the values are.
+    rects: Vec<Rect>,
+    /// Where the field was then.
+    field: Rect,
+    /// The rectangles are around the values; else they are the field.
+    exact: bool,
+    /// When the text control was asked.
+    at: Instant,
+}
+
+impl Placed {
+    /// The rectangles for the field as it is now, as long as they still hold for it: a field that
+    /// moved takes its values along, one that changed size lays its text out again. `None` when
+    /// the text control is to be asked again.
+    fn follow(&self, field: Rect, now: Instant) -> Option<Vec<Rect>> {
+        if !self.exact {
+            // The whole field is outlined where it is, and asked about again after a while.
+            let asked_lately = now.saturating_duration_since(self.at) < RETRY_PLACE;
+            return asked_lately.then(|| vec![field]);
+        }
+        if (field.width(), field.height()) != (self.field.width(), self.field.height()) {
+            return None;
+        }
+        let (dx, dy) = (
+            field.left.saturating_sub(self.field.left),
+            field.top.saturating_sub(self.field.top),
+        );
+        Some(self.rects.iter().map(|rect| rect.shifted(dx, dy)).collect())
+    }
+}
+
 impl Outline {
     pub(super) fn new(presses: u64) -> Self {
         Self {
-            text: String::new(),
-            changed: None,
-            pii: false,
+            text: None,
+            due: None,
+            unsure: 0,
+            values: Vec::new(),
+            placed: None,
             up: None,
+            missed: 0,
             presses,
         }
     }
@@ -75,9 +133,12 @@ impl Outline {
 
     /// Takes the outline away and forgets what was known of the field.
     pub(super) fn end(&mut self, sink: &impl Sink) {
-        self.text.clear();
-        self.changed = None;
-        self.pii = false;
+        self.text = None;
+        self.due = None;
+        self.unsure = 0;
+        self.values.clear();
+        self.placed = None;
+        self.missed = 0;
         if self.up.take().is_some() {
             sink.hide();
         }
@@ -85,12 +146,14 @@ impl Outline {
 
     /// Brings the outline of the field in focus up to date.
     ///
-    /// - [`Highlight::Always`]: the field is checked once its text has been still for [`SETTLE`]
-    ///   and outlined while it holds personal data. The shortcut pauses this and brings it back.
-    /// - [`Highlight::Hotkey`]: the shortcut checks the field and outlines it for [`SHOW_FOR`], or
-    ///   flashes it green for [`FLASH_FOR`] when it holds none; pressed again, the outline goes.
+    /// - [`Highlight::Always`]: the field is checked as soon as it is first looked at, and again
+    ///   once its text has been still for [`SETTLE`] after a change, and the personal data in it
+    ///   is outlined while it holds any. The shortcut pauses this and brings it back.
+    /// - [`Highlight::Hotkey`]: the shortcut checks the field and outlines its personal data for
+    ///   [`SHOW_FOR`], or flashes the field green for [`FLASH_FOR`] when it holds none; pressed
+    ///   again, the outlines go.
     ///
-    /// The outline is shown again at every look, so that it follows a window that moves.
+    /// The outlines are shown again at every look, so that they follow a window that moves.
     pub(super) fn look(
         &mut self,
         now: Instant,
@@ -105,6 +168,15 @@ impl Outline {
             Highlight::Off => {}
             Highlight::Always => self.always(now, odd, desktop, sink, purpose),
             Highlight::Hotkey => self.hotkey(now, odd, desktop, sink),
+        }
+    }
+
+    /// A look that found no field to outline: the outline stays for [`MISSES`] looks, and goes
+    /// after them.
+    fn miss(&mut self, sink: &impl Sink) {
+        self.missed = self.missed.saturating_add(1);
+        if self.missed >= MISSES {
+            self.end(sink);
         }
     }
 
@@ -125,35 +197,102 @@ impl Outline {
             return;
         }
         let Some(Field { rect, text }) = desktop.field() else {
-            self.end(sink);
+            self.miss(sink);
             return;
         };
-        if text != self.text {
-            self.text = text;
-            self.changed = Some(now);
+        self.missed = 0;
+        self.read(now, text);
+        self.check(now, sink);
+        if self.values.is_empty() {
+            if self.up.take().is_some() {
+                sink.hide();
+            }
+            return;
         }
-        if self.text.trim().is_empty() {
-            self.changed = None;
-            self.pii = false;
-        } else if self
-            .changed
-            .is_some_and(|at| now.saturating_duration_since(at) >= SETTLE)
-        {
-            self.changed = None;
-            // A check that failed keeps the verdict of the last one.
-            if let Some(found) = sink.holds_pii(checked(&self.text)) {
-                self.pii = found;
+        self.draw(now, rect, Mark::Pii, None, desktop, sink);
+    }
+
+    /// Takes the text of the field in. A field met for the first time is checked at once, as
+    /// nothing is being typed in it; one that changes is checked once it has been still.
+    fn read(&mut self, now: Instant, text: String) {
+        if self.text.as_deref() == Some(text.as_str()) {
+            return;
+        }
+        let first = self.text.is_none();
+        self.text = Some(text);
+        self.unsure = 0;
+        self.due = Some(if first { now } else { now + SETTLE });
+    }
+
+    /// Checks the text for personal data when that is due. A check that cannot tell keeps the
+    /// verdict of the last one and is tried again a few times.
+    fn check(&mut self, now: Instant, sink: &impl Sink) {
+        let Some(text) = self.text.as_deref() else {
+            return;
+        };
+        if text.trim().is_empty() {
+            self.due = None;
+            self.values.clear();
+            self.placed = None;
+            return;
+        }
+        if self.due.is_none_or(|at| now < at) {
+            return;
+        }
+        self.due = None;
+        if let Some(values) = sink.values(checked(text)) {
+            self.unsure = 0;
+            if values != self.values {
+                self.values = values;
+                self.placed = None;
+            }
+        } else {
+            self.unsure = self.unsure.saturating_add(1);
+            if self.unsure < TRIES {
+                self.due = Some(now + RETRY_CHECK);
             }
         }
-        if self.pii {
-            sink.show(rect, Mark::Pii);
-            self.up = Some(Up {
-                mark: Mark::Pii,
-                until: None,
-            });
-        } else if self.up.take().is_some() {
-            sink.hide();
+    }
+
+    /// Outlines the values of the field, which is at `field` now, in the colour of `mark`; `until`
+    /// is when the outline goes by itself, if it does.
+    fn draw(
+        &mut self,
+        now: Instant,
+        field: Rect,
+        mark: Mark,
+        until: Option<Instant>,
+        desktop: &mut impl Desktop,
+        sink: &impl Sink,
+    ) {
+        let rects = self.rects(now, field, desktop);
+        sink.show(&rects, mark);
+        self.up = Some(Up { mark, until });
+    }
+
+    /// Where the outlines of the values go: where they were found, moved with the field, and for
+    /// a moment after that taken as they are; later they are kept while the first value is still
+    /// there (the text may have scrolled); else the text control is asked, and when it cannot say,
+    /// the field is what is outlined.
+    fn rects(&mut self, now: Instant, field: Rect, desktop: &mut impl Desktop) -> Vec<Rect> {
+        if let Some(placed) = &self.placed
+            && let Some(rects) = placed.follow(field, now)
+            && (!placed.exact
+                || now.saturating_duration_since(placed.at) < TRUST
+                || rects.first().is_some_and(|&first| desktop.still_at(first)))
+        {
+            return rects;
         }
+        let rects = desktop.places(&self.values);
+        let exact = !rects.is_empty();
+        let rects = if exact { rects } else { vec![field] };
+        self.placed = Some(Placed {
+            rects: rects.clone(),
+            field,
+            exact,
+            at: now,
+        });
+        rects
     }
 
     fn hotkey(&mut self, now: Instant, odd: bool, desktop: &mut impl Desktop, sink: &impl Sink) {
@@ -166,16 +305,21 @@ impl Outline {
             let Some(Field { rect, text }) = desktop.field() else {
                 return;
             };
-            let (mark, stays) = match sink.holds_pii(checked(&text)) {
-                Some(true) => (Mark::Pii, SHOW_FOR),
-                Some(false) => (Mark::Clean, FLASH_FOR),
-                None => return,
+            let Some(values) = sink.values(checked(&text)) else {
+                return;
             };
-            sink.show(rect, mark);
-            self.up = Some(Up {
-                mark,
-                until: Some(now + stays),
-            });
+            self.missed = 0;
+            if values.is_empty() {
+                sink.show(&[rect], Mark::Clean);
+                self.up = Some(Up {
+                    mark: Mark::Clean,
+                    until: Some(now + FLASH_FOR),
+                });
+                return;
+            }
+            self.values = values;
+            self.placed = None;
+            self.draw(now, rect, Mark::Pii, Some(now + SHOW_FOR), desktop, sink);
             return;
         }
         let Some((mark, until)) = self.up.as_ref().map(|up| (up.mark, up.until)) else {
@@ -183,10 +327,17 @@ impl Outline {
         };
         if until.is_some_and(|end| now >= end) {
             self.end(sink);
-        } else if let Some(rect) = desktop.bounds() {
-            sink.show(rect, mark);
+            return;
+        }
+        let Some(rect) = desktop.bounds() else {
+            self.miss(sink);
+            return;
+        };
+        self.missed = 0;
+        if mark == Mark::Pii {
+            self.draw(now, rect, mark, until, desktop, sink);
         } else {
-            self.end(sink);
+            sink.show(&[rect], mark);
         }
     }
 }
@@ -232,17 +383,11 @@ mod tests {
         let start = Instant::now();
         desktop.shows(FIELD, EMAIL);
         watcher.tick(start, &mut desktop, &log);
-        watcher.tick(after(start, 299), &mut desktop, &log);
-        assert_eq!(log.take(), Vec::<String>::new(), "the text is settling");
-        assert_eq!(
-            desktop.asked,
-            [true, true],
-            "the value comes with the focus"
-        );
-        watcher.tick(after(start, 300), &mut desktop, &log);
+        // A field met for the first time is checked at once: nothing is being typed in it.
         assert_eq!(log.take(), std::slice::from_ref(&outline));
+        assert_eq!(desktop.asked, [true], "the value comes with the focus");
         // It is shown again at every look, because windows move, but checked once.
-        watcher.tick(after(start, 400), &mut desktop, &log);
+        watcher.tick(after(start, 100), &mut desktop, &log);
         assert_eq!(log.take(), std::slice::from_ref(&outline));
         assert_eq!(log.scans.get(), 1);
         assert_eq!(watcher.period(), FAST);
@@ -261,6 +406,28 @@ mod tests {
         // Nothing more is said while the field holds nothing.
         watcher.tick(after(start, 1_000), &mut desktop, &log);
         assert_eq!(log.take(), Vec::<String>::new());
+        Ok(())
+    }
+
+    #[test]
+    fn a_change_is_checked_once_the_text_has_been_still() -> Result<(), String> {
+        let (shared, _dir) = shared("settle")?;
+        let (mut desktop, log) = (Fake::on(1, false), Log::with(&shared));
+        let mut watcher = Watcher::new(lamp(Highlight::Always));
+        let start = Instant::now();
+        // An empty box is seen and has nothing to check.
+        desktop.shows(FIELD, "");
+        watcher.tick(start, &mut desktop, &log);
+        assert_eq!(log.scans.get(), 0);
+        // The text arrives; it has to be still for 300 ms first.
+        desktop.shows(FIELD, EMAIL);
+        watcher.tick(after(start, 100), &mut desktop, &log);
+        watcher.tick(after(start, 399), &mut desktop, &log);
+        assert_eq!(log.take(), Vec::<String>::new(), "the text is settling");
+        assert_eq!(log.scans.get(), 0);
+        watcher.tick(after(start, 400), &mut desktop, &log);
+        assert_eq!(log.take(), [show(Mark::Pii, FIELD)]);
+        assert_eq!(log.scans.get(), 1);
         Ok(())
     }
 
@@ -402,7 +569,10 @@ mod tests {
                 lines.last() == Some(&show(Mark::Pii, FIELD)),
                 "{mode:?}: {lines:?}"
             );
+            // To an element that holds no field: a button. One that holds the same words would be
+            // outlined at once, as a field met for the first time is.
             desktop.moves_to(2, false);
+            desktop.field = None;
             watcher.tick(after(start, 400), &mut desktop, &log);
             assert_eq!(log.take(), ["hide"], "{mode:?}");
             desktop.focus = None;
@@ -428,7 +598,6 @@ mod tests {
         let start = Instant::now();
         desktop.shows(FIELD, EMAIL);
         watcher.tick(start, &mut desktop, &log);
-        watcher.tick(after(start, 300), &mut desktop, &log);
         assert_eq!(log.take(), [show(Mark::Pii, FIELD)]);
 
         purpose.press();
@@ -449,11 +618,9 @@ mod tests {
         assert_eq!(changes.load(Ordering::Acquire), 2);
         assert_eq!(
             log.take(),
-            Vec::<String>::new(),
-            "the field is checked again"
+            [show(Mark::Pii, FIELD)],
+            "the field is checked again, and outlined at once"
         );
-        watcher.tick(after(start, 1_300), &mut desktop, &log);
-        assert_eq!(log.take(), [show(Mark::Pii, FIELD)]);
         Ok(())
     }
 
@@ -466,7 +633,6 @@ mod tests {
         let start = Instant::now();
         desktop.shows(FIELD, EMAIL);
         watcher.tick(start, &mut desktop, &log);
-        watcher.tick(after(start, 300), &mut desktop, &log);
         assert_eq!(log.take(), [show(Mark::Pii, FIELD)]);
         purpose.set_highlight(Highlight::Off);
         watcher.tick(after(start, 400), &mut desktop, &log);
@@ -497,13 +663,17 @@ mod tests {
         }
         assert_eq!(log.take(), Vec::<String>::new());
         assert_eq!(log.scans.get(), 0);
-        // It becomes one, is outlined, and stops being one.
+        // It becomes one and is outlined at once.
         desktop.shows(FIELD, EMAIL);
         watcher.tick(after(start, 1_000), &mut desktop, &log);
-        watcher.tick(after(start, 1_300), &mut desktop, &log);
         assert_eq!(log.take(), [show(Mark::Pii, FIELD)]);
+        // Unreadable for a moment, as an app that redraws can be: the outline stays.
         desktop.field = None;
-        watcher.tick(after(start, 1_400), &mut desktop, &log);
+        watcher.tick(after(start, 1_100), &mut desktop, &log);
+        watcher.tick(after(start, 1_200), &mut desktop, &log);
+        assert_eq!(log.take(), Vec::<String>::new());
+        // It stays that way: it stops being a field and the outline goes.
+        watcher.tick(after(start, 1_300), &mut desktop, &log);
         assert_eq!(log.take(), ["hide"]);
         Ok(())
     }
@@ -534,5 +704,269 @@ mod tests {
         let part = checked(&text);
         assert!(part.len() <= MAX_SCAN && MAX_SCAN - part.len() < 4);
         assert_eq!(checked("kort"), "kort");
+    }
+
+    /// Two pieces of personal data in one text.
+    const TWO: &str = "mail jan.jansen@acme.nl en NL91ABNA0417164300";
+    /// Where a text control says they are, in the field `FIELD`.
+    const EMAIL_AT: Rect = Rect {
+        left: 140,
+        top: 208,
+        right: 280,
+        bottom: 232,
+    };
+    const IBAN_AT: Rect = Rect {
+        left: 300,
+        top: 208,
+        right: 420,
+        bottom: 232,
+    };
+
+    fn value(text: &str) -> Value {
+        Value {
+            text: text.to_owned(),
+            nth: 0,
+        }
+    }
+
+    /// What [`Log`] writes for these outlines.
+    fn shows(rects: &[Rect]) -> String {
+        crate::capture::testing::shows(Mark::Pii, rects)
+    }
+
+    #[test]
+    fn the_values_are_outlined_and_not_the_field() -> Result<(), String> {
+        let (shared, _dir) = shared("values")?;
+        let (mut desktop, log) = (Fake::on(1, false), Log::with(&shared));
+        let mut watcher = Watcher::new(lamp(Highlight::Always));
+        desktop.shows(FIELD, TWO);
+        desktop.placed = vec![EMAIL_AT, IBAN_AT];
+        let start = Instant::now();
+        watcher.tick(start, &mut desktop, &log);
+        assert_eq!(log.take(), [shows(&[EMAIL_AT, IBAN_AT])]);
+        assert_eq!(
+            desktop.asked_values,
+            [vec![
+                value("jan.jansen@acme.nl"),
+                value("NL91ABNA0417164300")
+            ]]
+        );
+        // Asked once: the same outlines are shown again at every look.
+        watcher.tick(after(start, 100), &mut desktop, &log);
+        assert_eq!(log.take(), [shows(&[EMAIL_AT, IBAN_AT])]);
+        assert_eq!(desktop.asked_values.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_value_that_goes_takes_its_outline_with_it() -> Result<(), String> {
+        let (shared, _dir) = shared("goes")?;
+        let (mut desktop, log) = (Fake::on(1, false), Log::with(&shared));
+        let mut watcher = Watcher::new(lamp(Highlight::Always));
+        desktop.shows(FIELD, TWO);
+        desktop.placed = vec![EMAIL_AT, IBAN_AT];
+        let start = Instant::now();
+        watcher.tick(start, &mut desktop, &log);
+        // The email is deleted; once the text has settled only the IBAN is outlined.
+        desktop.shows(FIELD, "mail en NL91ABNA0417164300");
+        desktop.placed = vec![IBAN_AT];
+        watcher.tick(after(start, 500), &mut desktop, &log);
+        watcher.tick(after(start, 799), &mut desktop, &log);
+        assert_eq!(
+            log.take()
+                .iter()
+                .filter(|line| **line == shows(&[EMAIL_AT, IBAN_AT]))
+                .count(),
+            3,
+            "the old verdict stays up while the text settles"
+        );
+        watcher.tick(after(start, 800), &mut desktop, &log);
+        assert_eq!(log.take(), [shows(&[IBAN_AT])]);
+        assert_eq!(
+            desktop.asked_values.last(),
+            Some(&vec![value("NL91ABNA0417164300")])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_text_control_that_cannot_say_gets_the_whole_field_and_is_asked_again_later()
+    -> Result<(), String> {
+        let (shared, _dir) = shared("whole")?;
+        let (mut desktop, log) = (Fake::on(1, false), Log::with(&shared));
+        let mut watcher = Watcher::new(lamp(Highlight::Always));
+        desktop.shows(FIELD, EMAIL);
+        let start = Instant::now();
+        watcher.tick(start, &mut desktop, &log);
+        assert_eq!(log.take(), [show(Mark::Pii, FIELD)]);
+        watcher.tick(after(start, 1_900), &mut desktop, &log);
+        assert_eq!(desktop.asked_values.len(), 1, "not asked at every look");
+        // The control may have been busy: it is asked again after a while.
+        desktop.placed = vec![EMAIL_AT];
+        watcher.tick(after(start, 2_000), &mut desktop, &log);
+        assert_eq!(desktop.asked_values.len(), 2);
+        assert_eq!(log.take(), [show(Mark::Pii, FIELD), shows(&[EMAIL_AT])]);
+        Ok(())
+    }
+
+    #[test]
+    fn the_outlines_follow_a_window_that_moves_without_measuring_again() -> Result<(), String> {
+        let (shared, _dir) = shared("moves")?;
+        let (mut desktop, log) = (Fake::on(1, false), Log::with(&shared));
+        let mut watcher = Watcher::new(lamp(Highlight::Always));
+        desktop.shows(FIELD, EMAIL);
+        desktop.placed = vec![EMAIL_AT];
+        let start = Instant::now();
+        watcher.tick(start, &mut desktop, &log);
+        // The window moves 60 across and 30 down, and keeps its size.
+        desktop.shows(FIELD.shifted(60, 30), EMAIL);
+        watcher.tick(after(start, 100), &mut desktop, &log);
+        watcher.tick(after(start, 500), &mut desktop, &log);
+        let moved = shows(&[EMAIL_AT.shifted(60, 30)]);
+        assert_eq!(log.take(), [shows(&[EMAIL_AT]), moved.clone(), moved]);
+        assert_eq!(desktop.asked_values.len(), 1, "no new measurement");
+        // Just placed: taken as it is; later the value is looked for where it should be.
+        assert_eq!(desktop.still_calls, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_field_that_changes_size_is_placed_again() -> Result<(), String> {
+        let (shared, _dir) = shared("resize")?;
+        let (mut desktop, log) = (Fake::on(1, false), Log::with(&shared));
+        let mut watcher = Watcher::new(lamp(Highlight::Always));
+        desktop.shows(FIELD, EMAIL);
+        desktop.placed = vec![EMAIL_AT];
+        let start = Instant::now();
+        watcher.tick(start, &mut desktop, &log);
+        // The text lays itself out again in a field that is wider.
+        let wider = Rect {
+            right: FIELD.right + 200,
+            ..FIELD
+        };
+        let again = EMAIL_AT.shifted(0, -20);
+        desktop.shows(wider, EMAIL);
+        desktop.placed = vec![again];
+        watcher.tick(after(start, 100), &mut desktop, &log);
+        assert_eq!(log.take(), [shows(&[EMAIL_AT]), shows(&[again])]);
+        assert_eq!(desktop.asked_values.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn text_that_scrolled_away_is_placed_again() -> Result<(), String> {
+        let (shared, _dir) = shared("scroll")?;
+        let (mut desktop, log) = (Fake::on(1, false), Log::with(&shared));
+        let mut watcher = Watcher::new(lamp(Highlight::Always));
+        desktop.shows(FIELD, EMAIL);
+        desktop.placed = vec![EMAIL_AT];
+        let start = Instant::now();
+        watcher.tick(start, &mut desktop, &log);
+        let scrolled = EMAIL_AT.shifted(0, -50);
+        desktop.scrolled = true;
+        desktop.placed = vec![scrolled];
+        watcher.tick(after(start, 100), &mut desktop, &log);
+        assert_eq!(desktop.asked_values.len(), 1, "just placed: taken as it is");
+        watcher.tick(after(start, 500), &mut desktop, &log);
+        assert_eq!(desktop.asked_values.len(), 2);
+        assert_eq!(
+            log.take(),
+            [shows(&[EMAIL_AT]), shows(&[EMAIL_AT]), shows(&[scrolled])]
+        );
+        // Placed again, and checked again at the look after: it is where it should be.
+        desktop.scrolled = false;
+        watcher.tick(after(start, 1_000), &mut desktop, &log);
+        assert_eq!(log.take(), [shows(&[scrolled])]);
+        assert_eq!(desktop.asked_values.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn a_check_that_cannot_tell_is_tried_again_and_in_the_end_given_up() -> Result<(), String> {
+        let (shared, _dir) = shared("unsure")?;
+        let (mut desktop, log) = (Fake::on(1, false), Log::with(&shared));
+        let mut watcher = Watcher::new(lamp(Highlight::Always));
+        desktop.shows(FIELD, EMAIL);
+        log.unsure.set(2);
+        let start = Instant::now();
+        watcher.tick(start, &mut desktop, &log);
+        watcher.tick(after(start, 100), &mut desktop, &log);
+        assert_eq!((log.scans.get(), log.take()), (1, Vec::<String>::new()));
+        watcher.tick(after(start, 250), &mut desktop, &log);
+        assert_eq!(log.scans.get(), 2, "tried again after a moment");
+        watcher.tick(after(start, 500), &mut desktop, &log);
+        assert_eq!(log.take(), [show(Mark::Pii, FIELD)], "and it could tell");
+
+        // Never able to tell: a few tries, then no more until the text changes.
+        let (mut desktop, log) = (Fake::on(1, false), Log::with(&shared));
+        let mut watcher = Watcher::new(lamp(Highlight::Always));
+        desktop.shows(FIELD, EMAIL);
+        log.unsure.set(usize::MAX);
+        for step in 0..40 {
+            watcher.tick(after(start, step * 250), &mut desktop, &log);
+        }
+        assert_eq!(log.scans.get(), usize::from(TRIES));
+        assert_eq!(log.take(), Vec::<String>::new());
+        desktop.shows(FIELD, "mail jan.jansen@acme.nl nog eens");
+        log.unsure.set(0);
+        watcher.tick(after(start, 10_000), &mut desktop, &log);
+        watcher.tick(after(start, 10_300), &mut desktop, &log);
+        assert_eq!(log.take(), [show(Mark::Pii, FIELD)]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_focus_that_cannot_be_read_for_a_moment_does_not_make_the_outline_blink()
+    -> Result<(), String> {
+        let (shared, _dir) = shared("blink")?;
+        let (mut desktop, log) = (Fake::on(1, false), Log::with(&shared));
+        let mut watcher = Watcher::new(lamp(Highlight::Always));
+        desktop.shows(FIELD, EMAIL);
+        let start = Instant::now();
+        watcher.tick(start, &mut desktop, &log);
+        assert_eq!(log.take(), [show(Mark::Pii, FIELD)]);
+        // Two looks find nothing; the element and its verdict are kept.
+        let focus = desktop.focus.take();
+        watcher.tick(after(start, 100), &mut desktop, &log);
+        watcher.tick(after(start, 200), &mut desktop, &log);
+        assert_eq!(log.take(), Vec::<String>::new(), "nothing is hidden");
+        desktop.focus = focus;
+        watcher.tick(after(start, 300), &mut desktop, &log);
+        assert_eq!(log.take(), [show(Mark::Pii, FIELD)], "back as it was");
+        assert_eq!(log.scans.get(), 1, "the field was not checked again");
+        // The third look in a row is the end of it.
+        desktop.focus = None;
+        for step in 4..7 {
+            watcher.tick(after(start, step * 100), &mut desktop, &log);
+        }
+        assert_eq!(log.take(), ["hide"]);
+        Ok(())
+    }
+
+    #[test]
+    fn the_shortcut_outlines_the_values_and_they_follow_the_window() -> Result<(), String> {
+        let (shared, _dir) = shared("hotkey-values")?;
+        let purpose = lamp(Highlight::Hotkey);
+        let (mut desktop, log) = (Fake::on(1, false), Log::with(&shared));
+        let mut watcher = Watcher::new(Arc::clone(&purpose));
+        desktop.shows(FIELD, TWO);
+        desktop.placed = vec![EMAIL_AT, IBAN_AT];
+        purpose.press();
+        let start = Instant::now();
+        watcher.tick(start, &mut desktop, &log);
+        assert_eq!(log.take(), [shows(&[EMAIL_AT, IBAN_AT])]);
+        // The window moves: its bounds are read, the values are not looked for again.
+        desktop.shows(FIELD.shifted(10, 20), TWO);
+        watcher.tick(after(start, 100), &mut desktop, &log);
+        assert_eq!(
+            log.take(),
+            [shows(&[EMAIL_AT.shifted(10, 20), IBAN_AT.shifted(10, 20)])]
+        );
+        assert_eq!(desktop.asked_values.len(), 1);
+        assert_eq!((desktop.field_calls, log.scans.get()), (1, 1));
+        // They stay for ten seconds.
+        watcher.tick(after(start, 10_000), &mut desktop, &log);
+        assert_eq!(log.take(), ["hide"]);
+        Ok(())
     }
 }

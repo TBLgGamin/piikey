@@ -297,20 +297,19 @@ fn forgetting_and_exporting_report_counts() {
 #[test]
 fn the_inventory_status_is_a_list_of_facts() {
     let value = json!({
-        "enabled": true, "roots": [r"C:\Docs", r"C:\Desk"], "files": 120,
+        "roots": [r"C:\Docs", r"C:\Desk"], "files": 120,
         "files_with_pii": 4, "hits": 17, "scanning": {"done": 10, "total": 50}
     });
     assert_eq!(
         out_of(&View::InventoryStatus, &value),
-        "inventory           on\n\
-         folders             C:\\Docs, C:\\Desk\n\
+        "folders             C:\\Docs, C:\\Desk\n\
          files               120\n\
          with personal data  4\n\
          values found        17\n\
          scan                running, 10 of 50 files\n"
     );
     let idle = json!({
-        "enabled": false, "roots": [], "files": 0, "files_with_pii": 0, "hits": 0, "scanning": null
+        "roots": [], "files": 0, "files_with_pii": 0, "hits": 0, "scanning": null
     });
     let text = out_of(&View::InventoryStatus, &idle);
     assert!(text.contains("folders             none\n"), "{text}");
@@ -318,6 +317,11 @@ fn the_inventory_status_is_a_list_of_facts() {
         text.ends_with("scan                not running\n"),
         "{text}"
     );
+    // A reply of a version that still had the switch is read all the same.
+    let old = json!({
+        "enabled": true, "roots": [], "files": 0, "files_with_pii": 0, "hits": 0, "scanning": null
+    });
+    assert!(out_of(&View::InventoryStatus, &old).starts_with("folders"));
 }
 
 #[test]
@@ -341,16 +345,16 @@ fn inventory_entries_and_nodes_are_tables() {
         "no files with personal data in the inventory\n"
     );
     let nodes = json!({"nodes": [
-        {"path": r"C:\Docs", "name": "Docs", "is_dir": true, "hits": 30, "files": 4, "counts": {"email": 30}},
+        {"path": r"C:\", "name": "C:", "is_dir": true, "hits": 32, "files": 5, "counts": {"email": 30, "iban": 2}},
         {"path": r"C:\Docs\a.txt", "name": "a.txt", "is_dir": false, "hits": 2, "files": 1, "counts": {"iban": 2}},
-        {"path": "", "name": "Other scans", "is_dir": true, "hits": 1, "files": 1, "counts": {"phone": 1}}
+        {"path": r"\\nas\share\", "name": r"\\nas\share", "is_dir": true, "hits": 1, "files": 1, "counts": {"phone": 1}}
     ]});
     assert_eq!(
         out_of(&View::Nodes, &nodes),
-        "HITS  FILES  FOUND      PATH\n\
-         \x20 30      4  email: 30  C:\\Docs\\\n\
-         \x20  2      1  iban: 2    C:\\Docs\\a.txt\n\
-         \x20  1      1  phone: 1   Other scans\n"
+        "HITS  FILES  FOUND               PATH\n\
+         \x20 32      5  email: 30, iban: 2  C:\\\n\
+         \x20  2      1  iban: 2             C:\\Docs\\a.txt\n\
+         \x20  1      1  phone: 1            \\\\nas\\share\\\n"
     );
     assert_eq!(
         out_of(&View::Nodes, &json!({"nodes": []})),
@@ -361,23 +365,25 @@ fn inventory_entries_and_nodes_are_tables() {
 #[test]
 fn settings_are_shown_as_the_keys_that_set_them() {
     let value = json!({
-        "enabled": true, "highlight": "hotkey", "explorer_menu": true, "inventory": false,
-        "http_api": false, "http_port": 7980, "sites": ["chatgpt.com", "claude.ai"],
+        "enabled": true, "highlight": "hotkey", "explorer_menu": true, "background": false,
+        "watch": true, "http_api": false, "http_port": 7980, "sites": ["chatgpt.com", "claude.ai"],
         "programs": ["chrome.exe"], "disabled_kinds": ["email"],
-        "inventory_roots": [r"C:\Docs"], "inventory_exclude": []
+        "inventory_roots": [r"C:\Docs"], "watch_folders": [r"C:\Inbox"]
     });
     assert_eq!(
         out_of(&View::Settings, &value),
         "highlight=hotkey\n\
          explorer_menu=true\n\
-         inventory=false\n\
+         background=false\n\
+         watch=true\n\
          http_api=false\n\
          http_port=7980\n\
          site=chatgpt.com\n\
          site=claude.ai\n\
          program=chrome.exe\n\
          disabled_kind=email\n\
-         inventory_root=C:\\Docs\n"
+         inventory_root=C:\\Docs\n\
+         watch_folder=C:\\Inbox\n"
     );
 }
 
@@ -415,7 +421,7 @@ fn the_model_and_the_status() {
 
     let status = json!({
         "app": false, "protection": null, "version": "0.1.0", "vault_records": 1,
-        "model": ready, "highlight": "always", "explorer_menu": true, "inventory": false,
+        "model": ready, "highlight": "always", "explorer_menu": true, "watch": false,
         "http_api": true
     });
     assert_eq!(
@@ -427,12 +433,12 @@ fn the_model_and_the_status() {
          model          ready (hybrid)\n\
          highlight      always\n\
          explorer menu  on\n\
-         inventory      off\n\
+         watch          off\n\
          HTTP API       on\n"
     );
     let running = json!({
         "app": true, "protection": true, "version": "0.1.0", "vault_records": 0,
-        "model": missing, "highlight": "off", "explorer_menu": false, "inventory": true,
+        "model": missing, "highlight": "off", "explorer_menu": false, "watch": true,
         "http_api": false
     });
     let text = out_of(&View::Status, &running);

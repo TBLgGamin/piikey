@@ -1,25 +1,38 @@
 //! Following the settings: an edit or the API's patch is saved, becomes the live policy, and what
-//! depends on it (the engine's kinds, the Explorer menu, the local API, the inventory, the
-//! highlight and the detection model) is brought in line.
+//! depends on it (the engine's kinds, the Explorer menu, the local API, the watch, the highlight
+//! and the detection model) is brought in line.
 
-use std::sync::{Arc, PoisonError};
+use std::{
+    path::PathBuf,
+    sync::{Arc, PoisonError},
+};
 
-use piikey::policy::{Highlight, Policy, SettingsPatch};
+use piikey::{
+    policy::{Highlight, Policy, SettingsPatch},
+    sys,
+};
 
-use super::{Controller, Edit, Notice, apply_edit};
+use super::{Controller, Edit, Notice, Store, apply_edit};
+
+/// Whether the watch has something to keep an eye on.
+fn watching(policy: &Policy) -> bool {
+    policy.watch && !policy.watch_folders.is_empty()
+}
 
 impl Controller {
-    pub(super) fn edit(self: &Arc<Self>, edit: &Edit) {
+    /// Applies one edit of the settings; `false` when it was refused or could not be saved (the
+    /// notice says why), `true` when it was applied or changed nothing.
+    pub(super) fn edit(self: &Arc<Self>, edit: &Edit) -> bool {
         let mut policy = self.policy();
         match apply_edit(&mut policy, edit) {
             Ok(true) => {}
-            Ok(false) => return,
+            Ok(false) => return true,
             Err(error) => {
                 self.notify(Notice::error(error));
-                return;
+                return false;
             }
         }
-        self.commit(&policy);
+        self.commit(&policy)
     }
 
     /// Applies the settings the API sent, as a whole: a patch with a bad value changes nothing.
@@ -35,20 +48,21 @@ impl Controller {
         }
     }
 
-    /// Saves `policy` and makes it the live settings.
-    fn commit(self: &Arc<Self>, policy: &Policy) {
+    /// Saves `policy` and makes it the live settings; `false` when it could not be saved.
+    pub(super) fn commit(self: &Arc<Self>, policy: &Policy) -> bool {
         let old = self.policy();
         // Everything that can fail happens before the live state changes, so a failure leaves
         // the old settings fully in place.
         if let Err(error) = self.backend.save_policy(policy) {
             self.notify(Notice::error(format!("Could not save settings: {error}")));
-            return;
+            return false;
         }
         self.adopt_policy(&old, policy);
+        true
     }
 
     /// Makes `new` the live settings and brings in line what depends on them, for what changed
-    /// from `old`: the engine's kinds, the Explorer menu, the local API, the inventory, the
+    /// from `old`: the engine's kinds, the Explorer menu, the local API, the watch, the
     /// highlight and the detection model.
     fn adopt_policy(self: &Arc<Self>, old: &Policy, new: &Policy) {
         self.engine().set_enabled(new.enabled_kinds());
@@ -63,19 +77,41 @@ impl Controller {
         if (new.http_api, new.http_port) != (old.http_api, old.http_port) {
             self.sync_http();
         }
-        if new.inventory != old.inventory
-            || new.inventory_roots != old.inventory_roots
-            || new.inventory_exclude != old.inventory_exclude
-        {
-            self.sync_inventory(old, new);
+        self.withdraw_removed(Store::Inventory, &old.inventory_roots, &new.inventory_roots);
+        if (new.watch, &new.watch_folders) != (old.watch, &old.watch_folders) {
+            self.sync_watch(old, new);
         }
         if new.highlight != old.highlight {
             self.sync_highlight(new.highlight);
         }
-        if new.highlight != old.highlight || new.inventory != old.inventory {
+        if new.highlight != old.highlight || watching(new) != watching(old) {
             self.sync_model();
         }
         self.update(|_| {});
+    }
+
+    /// Breaks off whatever scans the folders of `store` that `now` no longer lists, and forgets
+    /// what they held once that scan has saved (see [`Scanner::withdraw`]).
+    ///
+    /// [`Scanner::withdraw`]: crate::ui::scanner::Scanner::withdraw
+    pub(super) fn withdraw_removed(
+        self: &Arc<Self>,
+        store: Store,
+        before: &[PathBuf],
+        now: &[PathBuf],
+    ) {
+        let mut any = false;
+        for folder in before
+            .iter()
+            .filter(|folder| !now.iter().any(|kept| sys::same_path(kept, folder)))
+        {
+            let dropped = self.scanner.withdraw(store, folder);
+            self.reveals_stopped(&dropped);
+            any = true;
+        }
+        if any {
+            self.ensure_scanner();
+        }
     }
 
     /// Starts what the saved settings ask for, as if the user had just switched each on.
@@ -84,7 +120,7 @@ impl Controller {
         let off = Policy {
             highlight: Highlight::Off,
             explorer_menu: false,
-            inventory: false,
+            watch: false,
             http_api: false,
             ..policy.clone()
         };

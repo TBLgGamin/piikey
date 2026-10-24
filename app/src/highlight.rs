@@ -1,12 +1,14 @@
-//! The live highlight: an outline around the text field in focus when it holds personal data, and
-//! the Ctrl+Alt+P shortcut that asks for it.
+//! The live highlight: an outline around each piece of personal data in the text field in focus,
+//! and the Ctrl+Alt+P shortcut that asks for it.
 //!
-//! Capture (`crate::capture`) is the one reader of the focused field. It decides when an outline is
-//! due and tells the [`Overlay`] where: [`Overlay::show`] with the field's rectangle on the screen,
-//! [`Overlay::hide`] when it is gone. The overlay draws four thin bars around the rectangle: windows
-//! that stay on top of everything, take no clicks and no focus, in the brand colour of the theme
-//! (green for the flash that says a field holds nothing). Nothing is drawn inside the field and
-//! nothing about its text reaches this module.
+//! Capture (`crate::capture`) is the one reader of the focused field. It decides when outlines are
+//! due and tells the [`Overlay`] where: [`Overlay::show`] with the rectangles of the values on the
+//! screen (or the field's own, when its text control cannot say where a value is),
+//! [`Overlay::hide`] when they are gone. "Open at this place" draws the same way
+//! ([`Overlay::flash`]); both find the rectangles with `crate::uia_text`. The overlay draws four
+//! thin bars around each rectangle: windows that stay on top of everything, take no clicks and no
+//! focus, in the brand colour of the theme (green for the flash that says a field holds nothing).
+//! Nothing is drawn inside the rectangle and nothing about the text reaches this module.
 //!
 //! `windows-reactor` has no such window and raw Win32 calls are `unsafe`, which is forbidden here,
 //! so winit makes the windows and softbuffer fills them. winit allows one event loop per process
@@ -14,8 +16,12 @@
 //! and it is never started again. The shortcut is registered on that same thread (a Win32 message
 //! loop must run on the thread that owns the hotkey window) by `global-hotkey`.
 //!
-//! Capture says where the outline goes every time it looks at the focus. A request that is not
-//! repeated within [`STALE`] therefore means capture stopped, stalled or died, and the outline goes.
+//! Capture says where the outlines go every time it looks at the focus. A request that is not
+//! repeated within [`STALE`] therefore means capture stopped, stalled or died, and the outlines go.
+//!
+//! [`Overlay::flash`] is for outlines that nothing asks for again, such as the one that shows
+//! where "Open at this place" put a value: they stay for the time they are given and go by
+//! themselves.
 
 use std::{
     num::NonZeroU32,
@@ -49,11 +55,20 @@ const THICK: i32 = 3;
 /// Pixels from a field to the far side of its outline.
 const EDGE: i32 = GAP + THICK;
 /// The smallest and the largest side of what counts as a text field, in pixels: Windows reports
-/// zero-sized and screen-sized rectangles for elements that are not on screen.
+/// zero-sized and screen-sized rectangles for elements that are not on screen. The text of a value
+/// can be smaller than a field, down to [`MIN_TEXT_SIDE`].
 const MIN_SIDE: i32 = 8;
+const MIN_TEXT_SIDE: i32 = 2;
 const MAX_SIDE: i32 = 16_384;
 /// The largest coordinate of such a rectangle; Windows parks hidden windows near -32000.
 const MAX_COORD: u32 = 100_000;
+/// The bars of one outline: top, bottom, left, right.
+const BARS: usize = 4;
+/// The most outlines at once. Each is [`BARS`] windows, made when first needed.
+const MAX_OUTLINES: usize = 8;
+/// Where a bar waits while it is made: Windows parks hidden windows near here, and nothing is
+/// there to see.
+const PARKED: i32 = -32_000;
 /// How long an outline stays without capture asking for it again.
 const STALE: Duration = Duration::from_secs(3);
 /// How long [`Overlay::set_hotkey`] waits for the overlay thread.
@@ -77,10 +92,14 @@ impl Rect {
     /// The rectangle of a text field; `None` for one that cannot be a field in view: empty, a
     /// sliver, bigger than any screen, or far off it.
     pub(crate) fn field(left: i32, top: i32, right: i32, bottom: i32) -> Option<Self> {
+        Self::sized(left, top, right, bottom, MIN_SIDE)
+    }
+
+    /// The rectangle if no side is shorter than `least` or longer than [`MAX_SIDE`] and all four
+    /// edges are within [`MAX_COORD`] of the origin.
+    fn sized(left: i32, top: i32, right: i32, bottom: i32, least: i32) -> Option<Self> {
         let sides = [right.checked_sub(left)?, bottom.checked_sub(top)?];
-        let plausible = sides
-            .iter()
-            .all(|side| (MIN_SIDE..=MAX_SIDE).contains(side))
+        let plausible = sides.iter().all(|side| (least..=MAX_SIDE).contains(side))
             && [left, top, right, bottom]
                 .iter()
                 .all(|coordinate| coordinate.unsigned_abs() <= MAX_COORD);
@@ -90,6 +109,33 @@ impl Rect {
             right,
             bottom,
         })
+    }
+
+    /// The rectangle of the text of a value, which can be small: a short value in small type is
+    /// not eight pixels wide. `None` for one that cannot be in view: empty, a hair, bigger than any
+    /// screen, or far off it.
+    pub(crate) fn text(left: i32, top: i32, right: i32, bottom: i32) -> Option<Self> {
+        Self::sized(left, top, right, bottom, MIN_TEXT_SIDE)
+    }
+
+    /// How far it reaches across.
+    pub(crate) fn width(self) -> i32 {
+        self.right.saturating_sub(self.left)
+    }
+
+    /// How far it reaches down.
+    pub(crate) fn height(self) -> i32 {
+        self.bottom.saturating_sub(self.top)
+    }
+
+    /// The same rectangle `dx` pixels further across and `dy` further down.
+    pub(crate) fn shifted(self, dx: i32, dy: i32) -> Self {
+        Self {
+            left: self.left.saturating_add(dx),
+            top: self.top.saturating_add(dy),
+            right: self.right.saturating_add(dx),
+            bottom: self.bottom.saturating_add(dy),
+        }
     }
 
     fn intersects(self, other: Self) -> bool {
@@ -133,7 +179,7 @@ struct Place {
 /// other and leave [`GAP`] pixels around the field. Bars that would lie outside `screen` are moved
 /// onto it and cut to fit, so a field that fills its window still gets an outline, on its edge.
 /// `None` when the field is not on the screen at all.
-fn outline(field: Rect, screen: Option<Rect>) -> Option<[Place; 4]> {
+fn outline(field: Rect, screen: Option<Rect>) -> Option<[Place; BARS]> {
     // A screen without an area tells nothing.
     let screen = screen.filter(|screen| screen.right > screen.left && screen.bottom > screen.top);
     if screen.is_some_and(|screen| !field.intersects(screen)) {
@@ -153,7 +199,7 @@ fn outline(field: Rect, screen: Option<Rect>) -> Option<[Place; 4]> {
         y: 0,
         width: 1,
         height: 1,
-    }; 4];
+    }; BARS];
     for (place, (x, y, width, height)) in places.iter_mut().zip(bars) {
         let (x, y, width, height) = match screen {
             Some(screen) => {
@@ -178,11 +224,26 @@ fn outline(field: Rect, screen: Option<Rect>) -> Option<[Place; 4]> {
     Some(places)
 }
 
+/// The outlines of `fields`, each its own four bars, for the ones that are on `screen`, and no more
+/// than [`MAX_OUTLINES`] of them: more would be a screen full of frames.
+fn outlines(fields: &[Rect], screen: Option<Rect>) -> Vec<[Place; BARS]> {
+    fields
+        .iter()
+        .filter_map(|&field| outline(field, screen))
+        .take(MAX_OUTLINES)
+        .collect()
+}
+
 /// What the capture thread and the thread that registers the shortcut ask of the overlay thread.
 enum Cmd {
     Show {
-        field: Rect,
+        fields: Vec<Rect>,
         mark: Mark,
+    },
+    Flash {
+        fields: Vec<Rect>,
+        mark: Mark,
+        how_long: Duration,
     },
     Hide,
     Hotkey {
@@ -240,10 +301,26 @@ impl Overlay {
         }
     }
 
-    /// Outlines `field` in the colour of `mark`; the same request again keeps the outline up.
-    pub(crate) fn show(&self, field: Rect, mark: Mark) {
+    /// Outlines each of `fields` in the colour of `mark`; the same request again keeps the outlines
+    /// up.
+    pub(crate) fn show(&self, fields: &[Rect], mark: Mark) {
         // An overlay that is gone shows nothing: capture goes on without it.
-        let _ = self.events.send_event(Cmd::Show { field, mark });
+        let _ = self.events.send_event(Cmd::Show {
+            fields: fields.to_vec(),
+            mark,
+        });
+    }
+
+    /// Outlines each of `fields` in the colour of `mark` for `how_long`, then takes the outlines
+    /// away by themselves: for an outline that nothing asks for again, such as the one that shows
+    /// where a value was found. Other outlines, or [`Overlay::hide`], replace it sooner.
+    pub(crate) fn flash(&self, fields: &[Rect], mark: Mark, how_long: Duration) {
+        // An overlay that is gone shows nothing.
+        let _ = self.events.send_event(Cmd::Flash {
+            fields: fields.to_vec(),
+            mark,
+            how_long,
+        });
     }
 
     /// Takes the outline away.
@@ -310,8 +387,8 @@ struct Bars {
     /// Answers [`Overlay::start`] once the windows exist.
     ready: Option<Ready>,
     windows: Option<Windows>,
-    /// The outline that is up, and when capture last asked for it.
-    shown: Option<(Rect, Mark, Instant)>,
+    /// The outlines that are up, and when they go unless they are asked for again.
+    shown: Option<Shown>,
     hotkey: Option<Hotkey>,
 }
 
@@ -343,7 +420,12 @@ impl ApplicationHandler<Cmd> for Bars {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, cmd: Cmd) {
         match cmd {
-            Cmd::Show { field, mark } => self.show(event_loop, field, mark),
+            Cmd::Show { fields, mark } => self.show(event_loop, &fields, mark, STALE),
+            Cmd::Flash {
+                fields,
+                mark,
+                how_long,
+            } => self.show(event_loop, &fields, mark, how_long),
             Cmd::Hide => self.hide(),
             Cmd::Hotkey { on, answer } => {
                 let _ = answer.send(self.set_hotkey(on));
@@ -352,62 +434,94 @@ impl ApplicationHandler<Cmd> for Bars {
     }
 
     fn window_event(&mut self, _: &ActiveEventLoop, window: WindowId, event: WindowEvent) {
-        // Windows asks a window to draw itself again when it was covered or moved.
-        if event == WindowEvent::RedrawRequested
-            && let Some(windows) = &mut self.windows
-            && let Some(bar) = windows
+        let Some(bar) = self.windows.as_mut().and_then(|windows| {
+            windows
                 .bars
                 .iter_mut()
                 .find(|bar| bar.window.id() == window)
-            && let Some(color) = bar.color
-        {
-            bar.paint(color);
+        }) else {
+            return;
+        };
+        match event {
+            // Windows asks a window to draw itself again when it was covered or moved.
+            WindowEvent::RedrawRequested => {
+                if let Some(color) = bar.color {
+                    bar.paint(color);
+                }
+            }
+            // A bar put on a monitor of another scale than the one it was on is resized by Windows
+            // to the new scale, and moved by winit to keep it on that monitor: it keeps the size and
+            // the place it was given, which are in physical pixels already.
+            WindowEvent::ScaleFactorChanged {
+                mut inner_size_writer,
+                ..
+            } => {
+                if let Some(place) = bar.place {
+                    let _ = inner_size_writer
+                        .request_inner_size(PhysicalSize::new(place.width, place.height));
+                }
+            }
+            WindowEvent::Moved(at) => bar.keep_place(at),
+            _ => {}
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        match self.shown {
-            Some((_, _, asked)) if asked.elapsed() >= STALE => {
+        match due(
+            self.shown.as_ref().map(|shown| shown.hide_at),
+            Instant::now(),
+        ) {
+            Due::Now => {
                 self.hide();
                 event_loop.set_control_flow(ControlFlow::Wait);
             }
-            Some((_, _, asked)) => {
-                event_loop.set_control_flow(ControlFlow::WaitUntil(asked + STALE));
-            }
-            None => event_loop.set_control_flow(ControlFlow::Wait),
+            Due::At(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
+            Due::Nothing => event_loop.set_control_flow(ControlFlow::Wait),
         }
     }
 }
 
 impl Bars {
-    fn show(&mut self, event_loop: &ActiveEventLoop, field: Rect, mark: Mark) {
-        let now = Instant::now();
-        if let Some((shown, marked, asked)) = &mut self.shown
-            && *shown == field
-            && *marked == mark
-        {
-            *asked = now;
+    /// Outlines `fields`, each of its own, and takes the outlines away `stays` from now, unless
+    /// they are asked for again.
+    fn show(&mut self, event_loop: &ActiveEventLoop, fields: &[Rect], mark: Mark, stays: Duration) {
+        let hide_at = deadline(Instant::now(), stays);
+        if refresh(&mut self.shown, fields, mark, hide_at) {
             return;
         }
         let Some(windows) = &mut self.windows else {
             return;
         };
-        let Some(places) = outline(field, screen(event_loop)) else {
+        let places = outlines(fields, screen(event_loop));
+        if places.is_empty() {
             self.hide();
             return;
-        };
-        let color = color(mark, system_dark());
-        for (bar, place) in windows.bars.iter_mut().zip(places) {
-            bar.put(place, color);
         }
-        self.shown = Some((field, mark, now));
+        // An outline there are no bars for is left out: the bars that exist are drawn.
+        let _ = windows.grow(event_loop, places.len());
+        let color = color(mark, system_dark());
+        let mut drawn = 0;
+        for (bars, places) in windows.bars.chunks_exact_mut(BARS).zip(&places) {
+            for (bar, place) in bars.iter_mut().zip(places) {
+                bar.put(*place, color);
+            }
+            drawn += 1;
+        }
+        // The outlines that are no more go away.
+        for bar in windows.bars.iter_mut().skip(drawn * BARS) {
+            bar.place = None;
+            bar.window.set_visible(false);
+        }
+        self.shown = Some(Shown {
+            fields: fields.to_vec(),
+            mark,
+            hide_at,
+        });
     }
 
     fn hide(&mut self) {
-        if let Some(windows) = &self.windows {
-            for bar in &windows.bars {
-                bar.window.set_visible(false);
-            }
+        if let Some(windows) = &mut self.windows {
+            windows.hide();
         }
         self.shown = None;
     }
@@ -448,6 +562,55 @@ impl Bars {
     }
 }
 
+/// When an outline that is asked for at `now` to stay `stays` goes. A time that cannot be added
+/// ends the outline at once.
+fn deadline(now: Instant, stays: Duration) -> Instant {
+    now.checked_add(stays).unwrap_or(now)
+}
+
+/// The outlines that are up: where, in which colour, and when they go unless they are asked for
+/// again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Shown {
+    fields: Vec<Rect>,
+    mark: Mark,
+    hide_at: Instant,
+}
+
+/// Keeps the outlines that are up when they are the ones asked for: `fields` in the colour of
+/// `mark`. Their end moves to `hide_at` then, and the answer is `true`; `false` when `shown` is no
+/// outline or other ones, which are then to be drawn.
+fn refresh(shown: &mut Option<Shown>, fields: &[Rect], mark: Mark, hide_at: Instant) -> bool {
+    if let Some(up) = shown
+        && up.mark == mark
+        && up.fields == fields
+    {
+        up.hide_at = hide_at;
+        return true;
+    }
+    false
+}
+
+/// What the overlay thread does about the outline that is up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Due {
+    /// None is up.
+    Nothing,
+    /// Its time is up.
+    Now,
+    /// It goes at this time.
+    At(Instant),
+}
+
+/// What is due for an outline that goes at `hide_at`, seen at `now`.
+fn due(hide_at: Option<Instant>, now: Instant) -> Due {
+    match hide_at {
+        None => Due::Nothing,
+        Some(at) if at <= now => Due::Now,
+        Some(at) => Due::At(at),
+    }
+}
+
 /// All the screens as one rectangle; `None` when Windows reports none.
 fn screen(event_loop: &ActiveEventLoop) -> Option<Rect> {
     event_loop
@@ -473,19 +636,22 @@ fn screen(event_loop: &ActiveEventLoop) -> Option<Rect> {
         })
 }
 
-/// The four bars, and the hidden window that owns them. An owned window is not on the taskbar and
-/// not in Alt+Tab, which four slivers would otherwise be.
+/// The bars of every outline, [`BARS`] to an outline, and the hidden window that owns them. An
+/// owned window is not on the taskbar and not in Alt+Tab, which slivers would otherwise be. The
+/// bars of one outline are made at the start, the others when an outline first needs them.
 struct Windows {
     bars: Vec<Bar>,
+    context: Context<OwnedDisplayHandle>,
+    owner: HWND,
     // Dropped last: the bars are owned by it.
-    _owner: Window,
+    _window: Window,
 }
 
 impl Windows {
     fn create(event_loop: &ActiveEventLoop) -> Res<Self> {
         let context = Context::new(event_loop.owned_display_handle())
             .map_err(|error| format!("no display: {error}"))?;
-        let owner = event_loop
+        let window = event_loop
             .create_window(
                 Window::default_attributes()
                     .with_title("piikey highlight")
@@ -498,14 +664,32 @@ impl Windows {
                     .with_inner_size(PhysicalSize::new(1, 1)),
             )
             .map_err(|error| format!("cannot make a window: {error}"))?;
-        let handle = owner_handle(&owner)?;
-        let bars = (0..4)
-            .map(|_| Bar::create(event_loop, &context, handle))
-            .collect::<Res<Vec<_>>>()?;
-        Ok(Self {
-            bars,
-            _owner: owner,
-        })
+        let owner = owner_handle(&window)?;
+        let mut windows = Self {
+            bars: Vec::new(),
+            context,
+            owner,
+            _window: window,
+        };
+        windows.grow(event_loop, 1)?;
+        Ok(windows)
+    }
+
+    /// Makes bars until there are enough for `outlines` outlines.
+    fn grow(&mut self, event_loop: &ActiveEventLoop, outlines: usize) -> Res<()> {
+        while self.bars.len() < outlines * BARS {
+            let bar = Bar::create(event_loop, &self.context, self.owner)?;
+            self.bars.push(bar);
+        }
+        Ok(())
+    }
+
+    /// Hides every bar.
+    fn hide(&mut self) {
+        for bar in &mut self.bars {
+            bar.place = None;
+            bar.window.set_visible(false);
+        }
     }
 }
 
@@ -527,6 +711,11 @@ struct Bar {
     surface: Surface<OwnedDisplayHandle, Rc<Window>>,
     /// What it was last filled with.
     color: Option<u32>,
+    /// Where it was put, while it is shown.
+    place: Option<Place>,
+    /// How often it was put back since it was put there: a window Windows will not leave there is
+    /// left alone after a few tries.
+    corrected: u8,
 }
 
 impl Bar {
@@ -548,6 +737,9 @@ impl Bar {
                         .with_visible(false)
                         .with_drag_and_drop(false)
                         .with_owner_window(owner)
+                        // Made, filled and made click-through while shown once: far from the
+                        // screen, so that no dot shows at its corner meanwhile.
+                        .with_position(PhysicalPosition::new(PARKED, PARKED))
                         // Windows would keep a sliver at its minimum size otherwise.
                         .with_min_inner_size(PhysicalSize::new(1, 1))
                         .with_inner_size(PhysicalSize::new(THICK.unsigned_abs(), THICK.unsigned_abs())),
@@ -560,6 +752,8 @@ impl Bar {
             window,
             surface,
             color: None,
+            place: None,
+            corrected: 0,
         };
         // A window that takes no clicks is layered, and a layered window draws nothing that was
         // not shown first: make it click-through once it is on screen and has been filled.
@@ -575,6 +769,8 @@ impl Bar {
 
     /// Moves the bar to `place`, fills it with `color` and shows it.
     fn put(&mut self, place: Place, color: u32) {
+        self.place = Some(place);
+        self.corrected = 0;
         self.window
             .set_outer_position(PhysicalPosition::new(place.x, place.y));
         let _ = self
@@ -582,6 +778,24 @@ impl Bar {
             .request_inner_size(PhysicalSize::new(place.width, place.height));
         self.paint(color);
         self.window.set_visible(true);
+    }
+
+    /// The bar was moved to `at`: back to its place if that is not where it was put, and its size
+    /// as well (a move onto a monitor of another scale changes both).
+    fn keep_place(&mut self, at: PhysicalPosition<i32>) {
+        const MOST: u8 = 3;
+        let Some(place) = self.place else {
+            return;
+        };
+        if (at.x, at.y) == (place.x, place.y) || self.corrected >= MOST {
+            return;
+        }
+        self.corrected += 1;
+        self.window
+            .set_outer_position(PhysicalPosition::new(place.x, place.y));
+        let _ = self
+            .window
+            .request_inner_size(PhysicalSize::new(place.width, place.height));
     }
 
     fn paint(&mut self, color: u32) {
@@ -698,5 +912,98 @@ mod tests {
         // Nothing to compare with: the outline goes where the field is.
         assert!(outline(rect(2000, 100, 2600, 140), None).is_some());
         Ok(())
+    }
+
+    #[test]
+    fn an_outline_goes_when_its_time_is_up() {
+        let now = Instant::now();
+        let later = now + Duration::from_secs(2);
+        assert_eq!(due(None, now), Due::Nothing);
+        assert_eq!(due(Some(later), now), Due::At(later));
+        // Reaching its time is enough, and so is being past it.
+        assert_eq!(due(Some(later), later), Due::Now);
+        assert_eq!(due(Some(now), later), Due::Now);
+    }
+
+    #[test]
+    fn the_same_outlines_again_only_move_their_end() {
+        let now = Instant::now();
+        let later = now + STALE;
+        let fields = [rect(10, 20, 300, 60), rect(40, 80, 90, 100)];
+        let mut shown = None;
+        // Nothing is up: there is nothing to keep.
+        assert!(!refresh(&mut shown, &fields, Mark::Pii, now));
+        assert_eq!(shown, None);
+
+        let up = Shown {
+            fields: fields.to_vec(),
+            mark: Mark::Pii,
+            hide_at: now,
+        };
+        shown = Some(up.clone());
+        assert!(refresh(&mut shown, &fields, Mark::Pii, later));
+        let moved = Shown {
+            hide_at: later,
+            ..up
+        };
+        assert_eq!(shown, Some(moved.clone()));
+
+        // Another place, one outline more or fewer, or another mark is another outline: it has to
+        // be drawn, so nothing is kept and nothing changes here.
+        let mut other = fields;
+        other[1].right += 1;
+        assert!(!refresh(&mut shown, &other, Mark::Pii, now));
+        assert!(!refresh(&mut shown, &fields[..1], Mark::Pii, now));
+        assert!(!refresh(&mut shown, &fields, Mark::Clean, now));
+        assert_eq!(shown, Some(moved));
+    }
+
+    #[test]
+    fn every_place_gets_an_outline_of_its_own_up_to_the_most_there_are_bars_for() {
+        let screen = rect(0, 0, 1920, 1080);
+        let places: Vec<Rect> = (0..12)
+            .map(|n| rect(100, 100 + 60 * n, 300, 130 + 60 * n))
+            .collect();
+        assert_eq!(outlines(&places[..3], Some(screen)).len(), 3);
+        assert_eq!(outlines(&places, Some(screen)).len(), MAX_OUTLINES);
+        // One that is not on the screen is left out, and does not count against the most.
+        let off = rect(3000, 100, 3200, 130);
+        assert_eq!(
+            outlines(&[places[0], off, places[1]], Some(screen)).len(),
+            2
+        );
+        let mut with_off = vec![off; 3];
+        with_off.extend_from_slice(&places);
+        assert_eq!(outlines(&with_off, Some(screen)).len(), MAX_OUTLINES);
+        assert!(outlines(&[off], Some(screen)).is_empty());
+        assert!(outlines(&[], Some(screen)).is_empty());
+    }
+
+    #[test]
+    fn the_text_of_a_value_may_be_small_but_not_nothing() {
+        // A short value in small type: well under the eight pixels that a field needs.
+        assert!(Rect::text(100, 200, 112, 214).is_some());
+        assert!(Rect::text(100, 200, 103, 203).is_some());
+        for (name, found) in [
+            ("empty", Rect::text(10, 10, 10, 10)),
+            ("a hair", Rect::text(10, 10, 500, 11)),
+            ("inside out", Rect::text(500, 240, 100, 200)),
+            ("bigger than any screen", Rect::text(0, 0, 20_000, 900)),
+            ("parked far off", Rect::text(-200_000, 0, -199_990, 14)),
+        ] {
+            assert_eq!(found, None, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_flash_and_a_show_each_end_after_their_own_time() {
+        let now = Instant::now();
+        assert_eq!(deadline(now, STALE), now + STALE);
+        assert_eq!(
+            deadline(now, Duration::from_secs(2)),
+            now + Duration::from_secs(2)
+        );
+        // A time that cannot be added ends the outline at once instead of panicking.
+        assert_eq!(deadline(now, Duration::MAX), now);
     }
 }

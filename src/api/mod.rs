@@ -152,13 +152,15 @@ pub enum Request {
         #[serde(default)]
         offset: usize,
     },
-    /// The treemap's tiles at one level: what lies directly under `under`, or the watched
-    /// folders without it. Result: [`reply::Nodes`].
+    /// The tiles of the inventory's tree at one level: what lies directly under `under`, or
+    /// without it the drives and network shares that hold files with personal data (`C:`, with
+    /// `C:\` as the path). Result: [`reply::Nodes`].
     InventoryTree {
         #[serde(skip_serializing_if = "Option::is_none")]
         under: Option<PathBuf>,
     },
-    /// Scans the inventory's folders now. Result: the inventory's
+    /// Scans the inventory's folders (the locations it scans) now, and answers when the scan is
+    /// over: the inventory scans only when it is asked to. Result: the inventory's
     /// [`Totals`](crate::inventory::Totals).
     InventoryRescan,
     /// Writes the inventory's findings to a new file `path`. Result: [`reply::Reported`].
@@ -189,14 +191,18 @@ pub enum Request {
     /// Switches protection (masking what goes to the protected sites and programs) on or off.
     /// Needs the app. Result: [`reply::Protection`].
     Protection { on: bool },
-    /// Scans files and folders as Explorer's "Scan for PII" does and shows the result in the
-    /// app. Needs the app. Result: `{}`.
+    /// Scans files and folders into the inventory as Explorer's "Scan for personal data" does,
+    /// and shows the result in a dialog in the app's window, which opens if it is hidden. Needs
+    /// the app. Answers when the scan is queued, not when it is over. Result: `{}`.
     ExplorerScan { paths: Vec<PathBuf> },
+    /// Brings the app's window forward, opening it when it is closed. What a second start of
+    /// `piikey.exe` asks of the app that runs. Needs the app. Result: `{}`.
+    ShowWindow,
 }
 
 impl Request {
     /// The names of all ops, as they are spelled in `op` and in HTTP paths.
-    pub const OPS: [&'static str; 25] = [
+    pub const OPS: [&'static str; 26] = [
         "scan_text",
         "anonymize",
         "deanonymize",
@@ -222,6 +228,7 @@ impl Request {
         "status",
         "protection",
         "explorer_scan",
+        "show_window",
     ];
 
     /// This request's op, one of [`Request::OPS`].
@@ -253,6 +260,7 @@ impl Request {
             Self::Status => "status",
             Self::Protection { .. } => "protection",
             Self::ExplorerScan { .. } => "explorer_scan",
+            Self::ShowWindow => "show_window",
         }
     }
 }
@@ -626,6 +634,7 @@ mod tests {
             Request::ExplorerScan {
                 paths: vec![path()],
             },
+            Request::ShowWindow,
         ]
     }
 

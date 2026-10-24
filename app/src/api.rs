@@ -150,6 +150,12 @@ impl AppApi {
         Ok(json!({}))
     }
 
+    /// Asks the app thread to bring the window forward.
+    fn show_window(&self) -> Result<Value, ApiError> {
+        self.controller()?.request_window();
+        Ok(json!({}))
+    }
+
     /// What [`Local`] says of the inventory, with the progress of the scan the controller runs:
     /// the app's scans are its own, not [`Local`]'s.
     fn inventory_status(&self) -> Result<Value, ApiError> {
@@ -165,7 +171,7 @@ impl AppApi {
     /// Scans the watched folders now and answers when the scan is over.
     fn inventory_rescan(&self) -> Result<Value, ApiError> {
         let controller = self.controller()?;
-        controller.submit(Command::Rescan);
+        controller.submit(Command::ScanAll);
         // The command has queued the scan once the controller is idle.
         if !controller.wait_idle(WAIT) {
             return Err(ApiError::busy("piikey is still starting the scan"));
@@ -246,6 +252,7 @@ impl Handler for AppApi {
             Request::Status => self.status(),
             Request::SettingsSet { settings } => self.settings_set(&settings),
             Request::ExplorerScan { paths } => self.explorer_scan(paths),
+            Request::ShowWindow => self.show_window(),
             Request::InventoryStatus => self.inventory_status(),
             Request::InventoryRescan => self.inventory_rescan(),
             Request::ModelStatus => self.model_status(),
@@ -305,7 +312,10 @@ mod tests {
     use super::*;
     use crate::{
         Describe,
-        ui::testing::{TempDir, stub_controller},
+        ui::{
+            controller::RevealState,
+            testing::{TempDir, stub_controller},
+        },
     };
 
     type Test = Result<(), String>;
@@ -398,15 +408,37 @@ mod tests {
         assert_eq!(ask(&api, scan(vec![file.clone()]))?, json!({}));
         let deadline = Instant::now() + Duration::from_secs(20);
         let reveal = loop {
-            if let Some(reveal) = controller.reveal() {
+            if let Some(reveal) = controller.snapshot().reveal
+                && matches!(reveal.state, RevealState::Done(_) | RevealState::Failed(_))
+            {
                 break reveal;
             }
             if Instant::now() > deadline {
-                return Err("the scan never asked to be shown".to_owned());
+                return Err("the scan never ended".to_owned());
             }
             std::thread::sleep(Duration::from_millis(10));
         };
-        assert_eq!(reveal.select, Some(file));
+        assert_eq!(reveal.select, Some(file.clone()));
+        assert_eq!(reveal.paths, [file]);
+        let RevealState::Done(summary) = reveal.state else {
+            return Err(format!("the scan failed: {:?}", reveal.state));
+        };
+        assert_eq!(
+            (summary.files, summary.files_with_data, summary.hits),
+            (1, 1, 1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn show_window_asks_the_application_thread_for_the_window() -> Test {
+        let dir = TempDir::new()?;
+        let (api, controller) = api(&dir)?;
+        assert_eq!(controller.tray().show, 0);
+        assert_eq!(ask(&api, Request::ShowWindow)?, json!({}));
+        assert_eq!(ask(&api, Request::ShowWindow)?, json!({}));
+        assert_eq!(controller.tray().show, 2);
+        assert_eq!(controller.snapshot().show, 2);
         Ok(())
     }
 
@@ -424,7 +456,7 @@ mod tests {
         ask(&api, Request::SettingsSet { settings: patch })?;
         // What the app holds, not what a file on this PC says: the stub saves nothing.
         let status = ask(&api, Request::InventoryStatus)?;
-        assert_eq!(status["enabled"], false);
+        assert!(status.get("enabled").is_none(), "no switch: {status}");
         assert_eq!(status["roots"], json!([docs.to_string_lossy()]));
         assert_eq!(status["files"], 0);
         assert_eq!(status["scanning"], Value::Null);

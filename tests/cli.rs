@@ -400,6 +400,10 @@ fn a_command_that_cannot_be_done_exits_three_with_the_reason() -> TestResult {
     assert_eq!(got.code, Some(3), "{}", got.err);
     let error: Value = serde_json::from_str(&got.out)?;
     assert_eq!(error["code"], "app_required");
+    let got = sandbox.run(&["--json", "open"], "")?;
+    assert_eq!(got.code, Some(3), "{}", got.err);
+    let error: Value = serde_json::from_str(&got.out)?;
+    assert_eq!(error["code"], "app_required");
     // Text that is no text.
     let mut child = sandbox
         .cli()
@@ -420,12 +424,16 @@ fn a_command_that_cannot_be_done_exits_three_with_the_reason() -> TestResult {
 #[test]
 fn the_settings_are_kept_and_decide_what_is_looked_for() -> TestResult {
     let sandbox = Sandbox::new()?;
+    let inbox = sandbox.dir.join("inbox");
+    let inbox = inbox.to_string_lossy().into_owned();
     let set = sandbox.json(
         &[
             "settings",
             "set",
             "highlight=always",
-            "inventory=true",
+            "watch=true",
+            "background=false",
+            &format!("watch_folder={inbox}"),
             "site=chatgpt.com",
             "site=*.openai.com",
             "http_port=7999",
@@ -434,9 +442,18 @@ fn the_settings_are_kept_and_decide_what_is_looked_for() -> TestResult {
     )?;
     assert_eq!(set["highlight"], "always");
     let got = sandbox.json(&["settings", "get"], "")?;
-    assert_eq!(got["inventory"], true);
+    assert_eq!(got["watch"], true);
+    assert_eq!(got["background"], false);
+    assert_eq!(got["watch_folders"][0], inbox);
+    assert!(got.get("inventory").is_none(), "{got}");
+    assert!(got.get("inventory_exclude").is_none(), "{got}");
     assert_eq!(got["http_port"], 7999);
     assert_eq!(got["sites"][1], "*.openai.com");
+    // The inventory's switch and its exclusions are gone.
+    for gone in ["inventory=true", r"inventory_exclude=C:\Private"] {
+        let refused = sandbox.run(&["settings", "set", "--local", gone], "")?;
+        assert_eq!(refused.code, Some(2), "{gone}: {}", refused.err);
+    }
     // A value the settings refuse changes nothing.
     let refused = sandbox.run(&["settings", "set", "--local", "site=not a site"], "")?;
     assert_eq!(refused.code, Some(3), "{}", refused.err);

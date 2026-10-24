@@ -52,12 +52,11 @@ mod session;
 mod windows;
 
 pub use fetch::fetch;
-
 use std::{
     cmp::Reverse,
     collections::HashMap,
     fmt,
-    ops::Range,
+    ops::{ControlFlow, Range},
     path::PathBuf,
     sync::{
         Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
@@ -76,8 +75,14 @@ use self::{
     session::{Lane, Loaded, Runner},
     windows::{Input, Window, absorb, windows_of},
 };
-use super::{Detector, KindSet, Mode, Span, overlaps};
+use super::{Detector, KindSet, Mode, Span, Step, overlaps};
 use crate::{Error, Result};
+
+/// What the model found in one text, once it is known.
+type Answer = Option<Arc<[RawSpan]>>;
+
+/// What [`NerDetector::find_with`] tells: the jobs that have an answer now, and the answers.
+type Answered<'a> = dyn FnMut(&[usize], &[Answer]) -> ControlFlow<()> + 'a;
 
 /// Where the model runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,7 +268,7 @@ impl Detector for NerDetector {
         if jobs.is_empty() {
             return spans;
         }
-        let found = self.find(&jobs);
+        let found = self.find_with(&jobs, &mut |_, _| ControlFlow::Continue(()));
         for (job, raw) in jobs.iter().zip(&found) {
             spans[job.text].extend(
                 raw.iter()
@@ -280,25 +285,96 @@ impl Detector for NerDetector {
         }
         spans
     }
+
+    /// As [`Detector::detect_batch`], but a step for the texts the cache knew, and one for each
+    /// group of texts the model has read, so that a caller gets the first names while the model is
+    /// still at the rest (its cost is in proportion to the text: some 0.15 ms for each token).
+    fn detect_batch_steps(
+        &self,
+        texts: &[&str],
+        mode: Mode,
+        wanted: KindSet,
+        taken: &[Vec<Span>],
+        step: &mut dyn FnMut(Step) -> ControlFlow<()>,
+    ) {
+        let jobs = if mode == Mode::Deanonymize || !wanted.intersects(MODEL_KINDS) {
+            Vec::new()
+        } else {
+            plan(texts, taken)
+        };
+        if jobs.is_empty() {
+            let _ = step(Step {
+                spans: vec![Vec::new(); texts.len()],
+                more: None,
+            });
+            return;
+        }
+        let total: usize = jobs.iter().map(|job| job.chunk.len()).sum();
+        let (mut done, mut answered_jobs) = (0, 0);
+        self.find_with(&jobs, &mut |answered, found| {
+            let mut spans: Vec<Vec<Span>> = vec![Vec::new(); texts.len()];
+            for &i in answered {
+                let job = &jobs[i];
+                done += job.chunk.len();
+                if let Some(raw) = &found[i] {
+                    spans[job.text].extend(raw.iter().filter(|r| wanted.contains(r.kind)).map(
+                        |r| Span {
+                            start: job.base + r.start as usize,
+                            end: job.base + r.end as usize,
+                            kind: r.kind,
+                        },
+                    ));
+                }
+            }
+            answered_jobs += answered.len();
+            for (own, claimed) in spans.iter_mut().zip(taken) {
+                own.retain(|span| !overlaps(claimed, span));
+            }
+            step(Step {
+                spans,
+                more: (answered_jobs < jobs.len()).then_some((done, total)),
+            })
+        });
+    }
 }
 
 impl NerDetector {
-    /// What the model finds in each job's text: from the cache, else from the model.
-    fn find(&self, jobs: &[Job<'_>]) -> Vec<Arc<[RawSpan]>> {
+    /// What the model finds in each job's text: from the cache, else from the model. `answered`
+    /// is told which jobs have their answers, with the answers (by job): first the ones the cache
+    /// had, then, after each group of texts the model reads, the ones in it, and the jobs with
+    /// the same text as one of them. It ends the work by breaking, and the jobs not answered then
+    /// have no spans.
+    fn find_with(&self, jobs: &[Job<'_>], answered: &mut Answered<'_>) -> Vec<Arc<[RawSpan]>> {
         let mut found: Vec<Option<Arc<[RawSpan]>>> = {
             let cache = lock(&self.inner.cache);
             jobs.iter().map(|job| cache.get(&job.key)).collect()
         };
-        // Equal texts in one call run once.
+        let known: Vec<usize> = (0..jobs.len()).filter(|&i| found[i].is_some()).collect();
+        let mut flow = if known.is_empty() {
+            ControlFlow::Continue(())
+        } else {
+            answered(&known, &found)
+        };
+        // Equal texts in one call run once: the first of them runs, the others take its answer.
         let mut first_of: HashMap<[u8; 32], usize> = HashMap::new();
+        let mut twins: HashMap<usize, Vec<usize>> = HashMap::new();
         let mut misses: Vec<usize> = Vec::new();
         for (i, job) in jobs.iter().enumerate() {
-            if found[i].is_none() && *first_of.entry(job.key).or_insert(i) == i {
+            if found[i].is_some() {
+                continue;
+            }
+            let first = *first_of.entry(job.key).or_insert(i);
+            if first == i {
                 misses.push(i);
+            } else {
+                twins.entry(first).or_default().push(i);
             }
         }
         let sizes: Vec<usize> = misses.iter().map(|&i| jobs[i].chunk.len()).collect();
         for group in groups(&sizes, GROUP_BYTES) {
+            if flow.is_break() {
+                break;
+            }
             // A failure in an earlier group leaves nothing to run on.
             let Some(loaded) = self.ready() else {
                 break;
@@ -306,20 +382,26 @@ impl NerDetector {
             let members = &misses[group];
             let texts: Vec<&str> = members.iter().map(|&i| jobs[i].chunk).collect();
             let computed = self.compute(&loaded, &texts);
-            let mut cache = lock(&self.inner.cache);
-            for (&i, spans) in members.iter().zip(computed) {
-                if let Some(spans) = spans {
+            let mut now: Vec<usize> = Vec::new();
+            {
+                let mut cache = lock(&self.inner.cache);
+                for (&i, spans) in members.iter().zip(computed) {
+                    let Some(spans) = spans else {
+                        continue;
+                    };
                     // Two calls that ran the same text meanwhile end with the first answer.
-                    found[i] = Some(cache.insert(jobs[i].key, spans.into()));
+                    let answer = cache.insert(jobs[i].key, spans.into());
+                    for &twin in twins.get(&i).into_iter().flatten() {
+                        found[twin] = Some(Arc::clone(&answer));
+                        now.push(twin);
+                    }
+                    found[i] = Some(answer);
+                    now.push(i);
                 }
             }
-        }
-        for (i, job) in jobs.iter().enumerate() {
-            if found[i].is_none()
-                && let Some(&first) = first_of.get(&job.key)
-            {
-                let shared = found[first].clone();
-                found[i] = shared;
+            if !now.is_empty() {
+                now.sort_unstable();
+                flow = answered(&now, &found);
             }
         }
         found
@@ -814,6 +896,128 @@ mod tests {
         });
         assert_eq!(one, expected(&first));
         assert_eq!(two, expected(&second));
+        Ok(())
+    }
+
+    // --- steps ----------------------------------------------------------------------------
+
+    /// What `detect_batch_steps` reports for `texts`, one entry per step, until `stop_after`
+    /// steps have come.
+    fn steps_of(ner: &NerDetector, texts: &[String], stop_after: usize) -> Vec<Step> {
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let mut steps = Vec::new();
+        ner.detect_batch_steps(&refs, Mode::Anonymize, KindSet::ALL, &[], &mut |step| {
+            steps.push(step);
+            if steps.len() >= stop_after {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        });
+        steps
+    }
+
+    /// What the spans of all `steps` come to, per text.
+    fn together(steps: &[Step], texts: usize) -> Vec<Vec<Span>> {
+        let mut all: Vec<Vec<Span>> = vec![Vec::new(); texts];
+        for step in steps {
+            for (mine, spans) in all.iter_mut().zip(&step.spans) {
+                mine.extend(spans.iter().copied());
+            }
+        }
+        for spans in &mut all {
+            spans.sort_by_key(|span| span.start);
+        }
+        all
+    }
+
+    #[test]
+    fn the_model_reports_a_group_of_texts_at_a_time_and_the_steps_are_what_one_call_finds()
+    -> Result<()> {
+        let (cpu, seen) = Fake::new(Duration::ZERO);
+        let ner = detector(cpu, None)?;
+        // Some 90 KB: more than a group (64 KiB) holds, less than two.
+        let texts = texts_of(2_500, "a");
+        let steps = steps_of(&ner, &texts, usize::MAX);
+        assert_eq!(steps.len(), 2, "two groups, two steps");
+        // The first says how far the model has got of the text it reads; the last says that nothing
+        // follows.
+        let total: usize = texts.iter().map(String::len).sum();
+        let Some((done, of)) = steps[0].more else {
+            return Err(Error::Model("the first step says nothing follows".into()));
+        };
+        assert!(0 < done && done < of && of == total, "{done} of {of}");
+        assert_eq!(steps[1].more, None);
+        assert_eq!(together(&steps, texts.len()), expected(&texts));
+        assert_eq!(seen.windows(), texts.len());
+        Ok(())
+    }
+
+    #[test]
+    fn what_the_cache_knows_is_the_first_step_and_costs_no_run() -> Result<()> {
+        let (cpu, seen) = Fake::new(Duration::ZERO);
+        let ner = detector(cpu, None)?;
+        // Fewer than the cache keeps (8192), and no more than one group holds (some 50 KB).
+        let texts = texts_of(1_500, "a");
+        assert_eq!(detect_all(&ner, &texts), expected(&texts));
+        let runs = seen.runs();
+        let steps = steps_of(&ner, &texts, usize::MAX);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].more, None);
+        assert_eq!(together(&steps, texts.len()), expected(&texts));
+        assert_eq!(seen.runs(), runs, "the model did not run again");
+        Ok(())
+    }
+
+    #[test]
+    fn a_stop_ends_the_model_after_the_group_it_is_in() -> Result<()> {
+        let (cpu, seen) = Fake::new(Duration::ZERO);
+        let ner = detector(cpu, None)?;
+        let texts = texts_of(10_000, "a");
+        let steps = steps_of(&ner, &texts, 1);
+        assert_eq!(steps.len(), 1);
+        assert!(steps[0].more.is_some());
+        assert!(
+            0 < seen.windows() && seen.windows() < texts.len(),
+            "{}",
+            seen.windows()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn texts_that_are_equal_run_once_and_are_answered_together() -> Result<()> {
+        let (cpu, seen) = Fake::new(Duration::ZERO);
+        let ner = detector(cpu, None)?;
+        let mut texts = texts_of(3, "t");
+        texts.push(texts[0].clone());
+        texts.push(texts[0].clone());
+        let steps = steps_of(&ner, &texts, usize::MAX);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(together(&steps, texts.len()), expected(&texts));
+        assert_eq!(seen.windows(), 3, "the repeats were not run");
+        Ok(())
+    }
+
+    #[test]
+    fn with_nothing_for_the_model_to_read_the_one_step_is_empty() -> Result<()> {
+        let (cpu, seen) = Fake::new(Duration::ZERO);
+        let ner = detector(cpu, None)?;
+        let texts = ["ik ben het".to_owned()];
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let mut steps = Vec::new();
+        ner.detect_batch_steps(&refs, Mode::Deanonymize, KindSet::ALL, &[], &mut |step| {
+            steps.push(step);
+            ControlFlow::Continue(())
+        });
+        assert_eq!(
+            steps,
+            [Step {
+                spans: vec![Vec::new()],
+                more: None
+            }]
+        );
+        assert_eq!(seen.runs(), 0);
         Ok(())
     }
 

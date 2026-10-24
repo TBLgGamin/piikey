@@ -1,11 +1,20 @@
-//! The PII inventory: which files in the folders the user watches hold personal data, and how
-//! much of it. A scan keeps, for each file, how many values of each kind the detector found,
-//! never the values: the inventory is no more sensitive than a list of file names and numbers.
+//! The PII inventory: which files hold personal data, and how much of it. A scan keeps, for each
+//! file, how many values of each kind the detector found, never the values: the inventory is no
+//! more sensitive than a list of file names and numbers. What a file holds, value by value, is
+//! only ever shown when somebody asks for it ([`findings`]), and never stored.
 //!
 //! It is stored beside the vault as `inventory.jsonl`, one JSON object per file:
-//! `{"path","size","modified","scanned","status","error"?,"counts":{"email":3,..}}`. `size`
-//! and `modified` (the write time as a Windows `FILETIME`) say whether a file changed since it
-//! was scanned, so a rescan reads only what is new or different.
+//! `{"path","size","modified","scanned","status","error"?,"hash"?,"counts":{"email":3,..}}`.
+//! `size` and `modified` (the write time as a Windows `FILETIME`) say whether a file changed
+//! since it was scanned, so a scan reads only what is new or different. `hash` is a fingerprint
+//! of the contents ([`ContentHash`]): a file whose write time changed but whose contents did not
+//! (a sync client, a save that changed nothing) is read, recognised by it, and not detected
+//! again. A line without a `hash` (written before it existed) is as good as any other: that file
+//! is detected again the next time it changes, and gets one.
+//!
+//! The watch keeps a second inventory in `watch.jsonl`, in the same format, for the folders it
+//! keeps an eye on: it is another [`Inventory`] over another file, with its own locks, and
+//! shares nothing with the first.
 //!
 //! The detector reads what [`Engine::enabled`] says, and the inventory keeps what it found at the
 //! time: changing the kinds does not rescan files that did not change.
@@ -28,6 +37,7 @@ use std::{
     hash::{DefaultHasher, Hasher},
     io::{self, BufWriter, Read, Write},
     mem,
+    ops::Bound,
     os::windows::fs::MetadataExt,
     path::{Component, Path, PathBuf},
     sync::{
@@ -40,6 +50,7 @@ use std::{
 use rayon::prelude::*;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
+pub use crate::formats::{Busy, Finding, Location, Report};
 use crate::{
     Error, Result,
     detect::EntityKind,
@@ -56,6 +67,8 @@ pub const MAX_FILE: u64 = 64 << 20;
 
 /// The inventory's file name in the data folder.
 const FILE_NAME: &str = "inventory.jsonl";
+/// The watch's inventory: the same format, another file.
+const WATCH_FILE_NAME: &str = "watch.jsonl";
 /// Files a scan hands to the thread pool at once; the scan can be stopped between two chunks.
 const CHUNK: usize = 64;
 /// A scan saves the inventory when this many entries are unsaved, but not more often than
@@ -76,8 +89,6 @@ const SKIPPED_DIRS: [&str; 6] = [
 ];
 /// `FILE_ATTRIBUTE_HIDDEN` and `_SYSTEM`: not the user's files.
 const HIDDEN_OR_SYSTEM: u32 = 0x2 | 0x4;
-/// What a node that stands for entries under no watched folder is called.
-const OTHER: &str = "Other scans";
 
 /// What a scan found out about one file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +105,70 @@ pub struct Entry {
     /// What was found, by kind, the most first. Empty unless `status` is [`Status::Ok`], and
     /// for a file with nothing in it.
     pub counts: Vec<(EntityKind, u32)>,
+    /// A fingerprint of the contents the scan read. `None` for a file that was not read (too
+    /// large, unreadable) and for an entry written before it was kept. It is never in what the
+    /// API and the report say.
+    pub hash: Option<ContentHash>,
+}
+
+/// A fingerprint of what a file holds: the first 128 bits of its BLAKE3 hash. Files with the
+/// same contents have the same fingerprint, so a file whose write time changed but whose
+/// contents did not is recognised by it, and not detected again. It says nothing of what the
+/// contents are.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ContentHash([u8; 16]);
+
+impl ContentHash {
+    /// The fingerprint of `bytes`.
+    #[must_use]
+    pub fn of(bytes: &[u8]) -> Self {
+        let hash = blake3::hash(bytes);
+        let mut head = [0; 16];
+        head.copy_from_slice(&hash.as_bytes()[..16]);
+        Self(head)
+    }
+
+    /// Reads the 32 hexadecimal digits [`fmt::Display`] writes; `None` for anything else.
+    fn parse(text: &str) -> Option<Self> {
+        if text.len() != 32 {
+            return None;
+        }
+        let mut head = [0_u8; 16];
+        for (byte, pair) in head.iter_mut().zip(text.as_bytes().chunks_exact(2)) {
+            let &[high, low] = pair else {
+                return None;
+            };
+            *byte = hex_digit(high)? << 4 | hex_digit(low)?;
+        }
+        Some(Self(head))
+    }
+}
+
+fn hex_digit(digit: u8) -> Option<u8> {
+    match digit {
+        b'0'..=b'9' => Some(digit - b'0'),
+        b'a'..=b'f' => Some(digit - b'a' + 10),
+        b'A'..=b'F' => Some(digit - b'A' + 10),
+        _ => None,
+    }
+}
+
+impl fmt::Display for ContentHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
+    }
+}
+
+impl fmt::Debug for ContentHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ContentHash({self})")
+    }
+}
+
+impl Serialize for ContentHash {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
 }
 
 /// How far a file got in a scan.
@@ -138,16 +213,20 @@ impl Entry {
     /// that cannot be read is an entry with a [`Status::Failed`], not an error.
     #[must_use]
     pub fn scan(engine: &Engine, path: &Path) -> Self {
+        let failed = |why: String| Self {
+            path: path.to_path_buf(),
+            size: 0,
+            modified: 0,
+            scanned: unix_now(),
+            status: Status::Failed(why),
+            counts: Vec::new(),
+            hash: None,
+        };
         match fs::metadata(path) {
-            Ok(meta) => scan_file(engine, path, &meta),
-            Err(err) => Self {
-                path: path.to_path_buf(),
-                size: 0,
-                modified: 0,
-                scanned: unix_now(),
-                status: Status::Failed(err.to_string()),
-                counts: Vec::new(),
-            },
+            // Nobody follows this scan, so nothing stops it.
+            Ok(meta) => scan_file(engine, path, &meta, None, &|_| true)
+                .unwrap_or_else(|| failed("the scan was stopped".to_owned())),
+            Err(err) => failed(err.to_string()),
         }
     }
 
@@ -158,12 +237,13 @@ impl Entry {
     }
 }
 
-/// A folder or a file of the treemap: what lies under it, added up.
+/// A folder or a file of the tree: what lies under it, added up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Node {
-    /// Empty for the node that stands for the scans outside every watched folder.
+    /// Where it is. For a volume at the top of the tree, its root (`C:\`).
     pub path: PathBuf,
-    /// The last component of `path`, for display.
+    /// The last component of `path`, for display. A volume is called what Explorer calls it:
+    /// the drive (`C:`) or the share (`\\server\share`).
     pub name: String,
     pub is_dir: bool,
     /// Values found in the files under it.
@@ -174,6 +254,87 @@ pub struct Node {
     pub counts: Vec<(EntityKind, u32)>,
 }
 
+impl Node {
+    /// The kind there is most of under it: what colours it. `None` for a node with nothing.
+    #[must_use]
+    pub fn dominant(&self) -> Option<EntityKind> {
+        self.counts.first().map(|&(kind, _)| kind)
+    }
+}
+
+/// One file that holds personal data, as a tile of the treemap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tile {
+    pub path: PathBuf,
+    /// The file's size in bytes.
+    pub size: u64,
+    /// Values found in it.
+    pub hits: u64,
+    /// By kind, the most first.
+    pub counts: Vec<(EntityKind, u32)>,
+}
+
+impl Tile {
+    /// The kind there is most of in it: what colours the tile.
+    #[must_use]
+    pub fn dominant(&self) -> Option<EntityKind> {
+        self.counts.first().map(|&(kind, _)| kind)
+    }
+}
+
+/// What [`Inventory::tiles`] gives: the files with the most, and what all the others add up to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Tiles {
+    /// The files with the most values first, at most as many as were asked for.
+    pub tiles: Vec<Tile>,
+    /// The files that did not make it into `tiles`, added up.
+    pub rest: Rest,
+}
+
+/// Files added up: what is left of a list that was cut short.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Rest {
+    pub files: u32,
+    pub hits: u64,
+    /// By kind, the most first.
+    pub counts: Vec<(EntityKind, u32)>,
+}
+
+/// How much there is of one kind, for the legend of the treemap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TypeTotal {
+    pub kind: EntityKind,
+    /// Values of the kind found.
+    pub hits: u64,
+    /// Files that hold any.
+    pub files: u32,
+}
+
+/// What the inventory holds at and under some paths, added up: the answer to "what did that
+/// scan find".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Summary {
+    /// Files the inventory knows there.
+    pub files: u64,
+    /// Of those, the ones that hold personal data.
+    pub files_with_data: u64,
+    /// Values found, of every kind.
+    pub hits: u64,
+    /// By kind, the most first.
+    pub counts: Vec<(EntityKind, u32)>,
+    /// Files that could not be read, are too large, or are no format piikey reads.
+    pub unread: u64,
+}
+
+/// A path the file system said changed: what [`Inventory::refresh`] looks at again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Touched {
+    pub path: PathBuf,
+    /// It was created, or renamed to this name. A folder that is fresh is walked: what moved
+    /// into it with it never said so itself.
+    pub fresh: bool,
+}
+
 /// What a running scan has done; read it from another thread to show progress.
 #[derive(Debug, Default)]
 pub struct Progress {
@@ -182,6 +343,52 @@ pub struct Progress {
     /// Files this scan has to scan: the new and the changed ones. Known once the folders were
     /// walked, 0 before.
     pub total: AtomicU64,
+    /// The files being read now (several at once, one per worker of the pool) and what each is
+    /// busy with, in the order they were started.
+    reading: Mutex<Vec<Reading>>,
+}
+
+/// A file a scan is reading now, and what it is busy with: `None` while it is read and the
+/// patterns run, which takes no time worth showing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reading {
+    pub path: PathBuf,
+    pub busy: Option<Busy>,
+}
+
+impl Progress {
+    /// The files being read now, the first started first.
+    #[must_use]
+    pub fn reading(&self) -> Vec<Reading> {
+        self.reading
+            .lock()
+            .map(|reading| reading.clone())
+            .unwrap_or_default()
+    }
+
+    fn begin(&self, path: &Path) {
+        if let Ok(mut reading) = self.reading.lock() {
+            reading.push(Reading {
+                path: path.to_path_buf(),
+                busy: None,
+            });
+        }
+    }
+
+    fn busy(&self, path: &Path, busy: Busy) {
+        if let Ok(mut reading) = self.reading.lock()
+            && let Some(file) = reading.iter_mut().find(|file| file.path == path)
+        {
+            file.busy = Some(busy);
+        }
+    }
+
+    fn end(&self, path: &Path) {
+        if let Ok(mut reading) = self.reading.lock() {
+            reading.retain(|file| file.path != path);
+        }
+        self.done.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// The inventory in numbers.
@@ -252,6 +459,15 @@ impl Inventory {
     /// `VaultPathUnavailable` when `LOCALAPPDATA` is unset; `Io` when the folder cannot be made.
     pub fn default_path() -> Result<PathBuf> {
         Ok(sys::data_dir()?.join(FILE_NAME))
+    }
+
+    /// `%LOCALAPPDATA%\piikey\watch.jsonl`: the inventory of the watch, which is no part of the
+    /// one at [`Inventory::default_path`].
+    ///
+    /// # Errors
+    /// `VaultPathUnavailable` when `LOCALAPPDATA` is unset; `Io` when the folder cannot be made.
+    pub fn watch_path() -> Result<PathBuf> {
+        Ok(sys::data_dir()?.join(WATCH_FILE_NAME))
     }
 
     /// The inventory saved at `path`. A missing file is an empty inventory; a line that is not
@@ -381,15 +597,21 @@ impl Inventory {
     /// Scans the files under `paths` and updates the inventory: new and changed files are read,
     /// the others are left as they are (a file whose size and write time equal what was stored,
     /// whatever came of it, but for a file that could not be read: that is read again). Entries
-    /// under `paths` whose files are gone, or that lie under `exclude`, are dropped.
+    /// under `paths` whose files are gone are dropped.
     ///
-    /// The walk leaves out `exclude`, `AppData`, `node_modules`, `.git`, `target`, the recycle
-    /// bin, hidden and system files, and files that are online only (reading them would
-    /// download them), so what a folder of the user's holds is what is scanned. Files over
-    /// [`MAX_FILE`] are recorded as too large. Work goes in chunks on the rayon pool the caller
-    /// runs in, which is how the app keeps a scan to half the cores; `progress` is updated as
-    /// files finish, and `cancel` is looked at between files, so a scan stops within the file
-    /// it is in. A cancelled scan saves what it did and drops nothing.
+    /// A file that is read because its size or write time changed is fingerprinted first
+    /// ([`ContentHash`]): when the fingerprint equals the one stored, the contents are the same
+    /// and the detector does not run again; what was found stays, and the file's new size and
+    /// write time are recorded, so the next scan does not read it. A file that changed for real
+    /// is detected again.
+    ///
+    /// The walk leaves out `AppData`, `node_modules`, `.git`, `target`, the recycle bin, hidden
+    /// and system files, and files that are online only (reading them would download them), so
+    /// what a folder of the user's holds is what is scanned. Files over [`MAX_FILE`] are
+    /// recorded as too large. Work goes in chunks on the rayon pool the caller runs in, which
+    /// is how the app keeps a scan to half the cores; `progress` is updated as files finish, and
+    /// `cancel` is looked at between files, so a scan stops within the file it is in. A
+    /// cancelled scan saves what it did and drops nothing.
     ///
     /// The scan starts from the saved file, so what another process (the CLI, when this is the
     /// app) scanned since this one last looked is not read again. Hold [`Inventory::lock_scan`]
@@ -402,28 +624,95 @@ impl Inventory {
         &self,
         engine: &Engine,
         paths: &[PathBuf],
-        exclude: &[PathBuf],
         progress: &Progress,
         cancel: &AtomicBool,
     ) -> Result<()> {
         progress.done.store(0, Ordering::Relaxed);
         progress.total.store(0, Ordering::Relaxed);
         let walked = files::walk(paths, &|path, meta| {
-            cancel.load(Ordering::Relaxed) || unwanted(path, meta, exclude)
+            cancel.load(Ordering::Relaxed) || unwanted(path, meta)
         });
+        self.scan_walked(engine, &walked, paths, progress, cancel)
+    }
+
+    /// Brings the inventory up to date with `touched`, the paths the file system said changed
+    /// below `roots` (the folders a watch keeps an eye on): what a crawl of `roots` would leave
+    /// out is left out here too. A path that is gone is forgotten, with what lay below it. A
+    /// file is scanned the way [`Inventory::scan_paths`] scans one, so one that was only touched
+    /// is not detected again. A folder is walked when it is [fresh](Touched::fresh), and
+    /// otherwise left alone: a folder is reported changed whenever something in it is, and what
+    /// is in it reports itself.
+    ///
+    /// A folder that is a root itself, and a root that does not exist (a disk that is
+    /// unplugged), drop nothing. `progress` and `cancel` are as for [`Inventory::scan_paths`].
+    ///
+    /// # Errors
+    /// `Io` when the inventory cannot be read or saved; `Busy` as for [`Inventory::save`].
+    pub fn refresh(
+        &self,
+        engine: &Engine,
+        roots: &[PathBuf],
+        touched: &[Touched],
+        progress: &Progress,
+        cancel: &AtomicBool,
+    ) -> Result<()> {
+        progress.done.store(0, Ordering::Relaxed);
+        progress.total.store(0, Ordering::Relaxed);
+        let mut known = HashMap::new();
+        let mut gone: Vec<PathBuf> = Vec::new();
+        let mut folders: Vec<PathBuf> = Vec::new();
+        let mut walked: Vec<(PathBuf, Metadata)> = Vec::new();
+        for Touched { path, fresh } in touched {
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            match reach(roots, path, &mut known) {
+                Reach::Gone(top) => gone.push(top),
+                Reach::File(meta) => walked.push((path.clone(), meta)),
+                Reach::Folder if *fresh => folders.push(path.clone()),
+                Reach::Folder | Reach::Skipped => {}
+            }
+        }
+        if !gone.is_empty() {
+            gone.sort_unstable();
+            gone.dedup();
+            self.forget_gone(&gone)?;
+        }
+        walked.extend(files::walk(&folders, &|path, meta| {
+            cancel.load(Ordering::Relaxed) || unwanted(path, meta)
+        }));
+        // A file that was reported and also lies in a folder that was walked is one file.
+        walked.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        walked.dedup_by(|a, b| a.0 == b.0);
+        self.scan_walked(engine, &walked, &folders, progress, cancel)
+    }
+
+    /// What follows a walk: reads the files of `walked` that are new or changed, and, unless
+    /// cancelled, drops the entries under `drop_under` whose files were not found and are gone.
+    fn scan_walked(
+        &self,
+        engine: &Engine,
+        walked: &[(PathBuf, Metadata)],
+        drop_under: &[PathBuf],
+        progress: &Progress,
+        cancel: &AtomicBool,
+    ) -> Result<()> {
         if cancel.load(Ordering::Relaxed) {
             return Ok(());
         }
         // After the walk, which can take minutes: the file may have changed in the meantime.
         self.sync()?;
-        let pending: Vec<&(PathBuf, Metadata)> = {
+        let pending: Vec<(&(PathBuf, Metadata), Option<Prior>)> = {
             let state = self.read();
             walked
                 .iter()
-                .filter(|(path, meta)| {
-                    !state.entries.get(path).is_some_and(|known| {
+                .filter_map(|found| {
+                    let (path, meta) = found;
+                    let known = state.entries.get(path);
+                    let unchanged = known.is_some_and(|known| {
                         known.size == meta.len() && known.modified == meta.last_write_time()
-                    })
+                    });
+                    (!unchanged).then(|| (found, known.and_then(Prior::of)))
                 })
                 .collect()
         };
@@ -439,13 +728,20 @@ impl Inventory {
             }
             let scanned: Vec<Entry> = chunk
                 .par_iter()
-                .filter_map(|(path, meta)| {
+                .filter_map(|(found, prior)| {
                     if cancel.load(Ordering::Relaxed) {
                         return None;
                     }
-                    let entry = scan_file(engine, path, meta);
-                    progress.done.fetch_add(1, Ordering::Relaxed);
-                    Some(entry)
+                    let (path, meta) = found;
+                    progress.begin(path);
+                    let follow = |busy: Busy| {
+                        progress.busy(path, busy);
+                        !cancel.load(Ordering::Relaxed)
+                    };
+                    let entry = scan_file(engine, path, meta, prior.as_ref(), &follow);
+                    progress.end(path);
+                    // A file the scan was stopped in is not known whole: it keeps what it had.
+                    entry
                 })
                 .collect();
             self.insert(scanned);
@@ -455,7 +751,7 @@ impl Inventory {
             }
         }
         if !cancel.load(Ordering::Relaxed) {
-            self.drop_stale(paths, exclude, &walked);
+            self.drop_stale(drop_under, walked);
         }
         if self.unsaved() > 0 {
             self.save()?;
@@ -486,14 +782,16 @@ impl Inventory {
     }
 
     /// Drops the entries under `roots` that a complete walk of them did not find and that are
-    /// gone from disk, and the ones under `exclude`. An entry that the walk found spelled in
-    /// another letter case (the folder was chosen again in that case, or a file was renamed in
-    /// case) is the same file: the scan has just recorded it as the walk spelled it, and the
-    /// old spelling goes.
+    /// gone from disk. An entry that the walk found spelled in another letter case (the folder
+    /// was chosen again in that case, or a file was renamed in case) is the same file: the scan
+    /// has just recorded it as the walk spelled it, and the old spelling goes.
     ///
     /// A root that does not exist (a disk that is unplugged) drops nothing, and neither does a
     /// file that exists but was not walked (a folder that could not be listed this time).
-    fn drop_stale(&self, roots: &[PathBuf], exclude: &[PathBuf], walked: &[(PathBuf, Metadata)]) {
+    fn drop_stale(&self, roots: &[PathBuf], walked: &[(PathBuf, Metadata)]) {
+        if roots.is_empty() {
+            return;
+        }
         let present: HashSet<&Path> = walked.iter().map(|(path, _)| path.as_path()).collect();
         let roots: Vec<&PathBuf> = roots
             .iter()
@@ -517,11 +815,7 @@ impl Inventory {
         // The file system is asked outside the lock.
         let stale: Vec<PathBuf> = candidates
             .into_iter()
-            .filter(|path| {
-                is_excluded(path, exclude)
-                    || respelled.contains(&sys::path_key(path))
-                    || is_gone(path)
-            })
+            .filter(|path| respelled.contains(&sys::path_key(path)) || is_gone(path))
             .collect();
         let mut held = self.write();
         for path in stale {
@@ -550,6 +844,31 @@ impl Inventory {
             });
             let removed = before - entries.len();
             (removed, removed > 0)
+        })
+    }
+
+    /// Forgets what is stored at and under each of `gone`, paths the file system said no longer
+    /// exist, and saves. The paths are spelled as the entries are (a watch hears of them in the
+    /// spelling of the folder it watches), which keeps this to a lookup for each, however many
+    /// there are; [`Inventory::forget_under`] ignores letter case and looks at every entry.
+    fn forget_gone(&self, gone: &[PathBuf]) -> Result<()> {
+        self.update(SAVE_WAIT, |state| {
+            let State { entries, changed } = state;
+            let mut removed = false;
+            for path in gone {
+                let below: Vec<PathBuf> = entries
+                    .range::<Path, _>((Bound::Included(path.as_path()), Bound::Unbounded))
+                    .map(|(key, _)| key)
+                    .take_while(|key| key.starts_with(path))
+                    .cloned()
+                    .collect();
+                for key in below {
+                    entries.remove(&key);
+                    changed.insert(key);
+                    removed = true;
+                }
+            }
+            ((), removed)
         })
     }
 
@@ -593,24 +912,149 @@ impl Inventory {
         totals
     }
 
-    /// The tiles of the treemap at one level, the one with the most values first. Only files
-    /// that hold personal data count.
+    /// The entry stored for the file at `path`, if the inventory has one.
+    #[must_use]
+    pub fn entry(&self, path: &Path) -> Option<Entry> {
+        let state = self.read();
+        state
+            .entries
+            .get(path)
+            .or_else(|| {
+                state
+                    .entries
+                    .values()
+                    .find(|entry| sys::same_path(&entry.path, path))
+            })
+            .cloned()
+    }
+
+    /// The files at and under `under` (all for `None`) that hold personal data, as tiles of the
+    /// treemap: the `limit` with the most values first (ties by path), and the others added up.
+    #[must_use]
+    pub fn tiles(&self, under: Option<&Path>, limit: usize) -> Tiles {
+        let state = self.read();
+        let mut held: Vec<(u64, &Entry)> = state
+            .entries
+            .values()
+            .filter(|entry| under.is_none_or(|under| sys::is_under(&entry.path, under)))
+            .map(|entry| (entry.hits(), entry))
+            .filter(|&(hits, _)| hits > 0)
+            .collect();
+        held.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.path.cmp(&b.1.path)));
+        let mut tiles = Vec::with_capacity(held.len().min(limit));
+        let mut rest = Tally::new(PathBuf::new(), String::new());
+        for (index, (hits, entry)) in held.into_iter().enumerate() {
+            if index < limit {
+                tiles.push(Tile {
+                    path: entry.path.clone(),
+                    size: entry.size,
+                    hits,
+                    counts: entry.counts.clone(),
+                });
+            } else {
+                rest.add(entry, false);
+            }
+        }
+        let rest = rest.finish();
+        Tiles {
+            tiles,
+            rest: Rest {
+                files: rest.files,
+                hits: rest.hits,
+                counts: rest.counts,
+            },
+        }
+    }
+
+    /// How much there is of each kind at and under `under` (all for `None`), the one with the
+    /// most first: the legend of the treemap. Only kinds that occur are listed.
+    #[must_use]
+    pub fn type_totals(&self, under: Option<&Path>) -> Vec<TypeTotal> {
+        let state = self.read();
+        let mut per_kind: BTreeMap<EntityKind, (u64, u32)> = BTreeMap::new();
+        for entry in state
+            .entries
+            .values()
+            .filter(|entry| under.is_none_or(|under| sys::is_under(&entry.path, under)))
+        {
+            for &(kind, n) in &entry.counts {
+                let total = per_kind.entry(kind).or_default();
+                total.0 += u64::from(n);
+                total.1 = total.1.saturating_add(1);
+            }
+        }
+        let mut totals: Vec<TypeTotal> = per_kind
+            .into_iter()
+            .map(|(kind, (hits, files))| TypeTotal { kind, hits, files })
+            .collect();
+        totals.sort_by_key(|total| (Reverse(total.hits), total.kind));
+        totals
+    }
+
+    /// What the inventory holds at and under each of `under`, added up; a file under more than
+    /// one of them counts once.
+    #[must_use]
+    pub fn summary(&self, under: &[PathBuf]) -> Summary {
+        let state = self.read();
+        let mut summary = Summary::default();
+        let mut per_kind: BTreeMap<EntityKind, u32> = BTreeMap::new();
+        for entry in state
+            .entries
+            .values()
+            .filter(|entry| under.iter().any(|under| sys::is_under(&entry.path, under)))
+        {
+            summary.files += 1;
+            let hits = entry.hits();
+            if hits > 0 {
+                summary.files_with_data += 1;
+                summary.hits += hits;
+            }
+            if !matches!(entry.status, Status::Ok) {
+                summary.unread += 1;
+            }
+            for &(kind, n) in &entry.counts {
+                let total = per_kind.entry(kind).or_insert(0);
+                *total = total.saturating_add(n);
+            }
+        }
+        summary.counts = ranked(per_kind);
+        summary
+    }
+
+    /// The nodes of the tree at one level, the one with the most values first. Only files that
+    /// hold personal data count.
     ///
     /// With `under`, the entries below it, grouped by the next component of their path: a
     /// folder node for what lies deeper, a file node for a file in `under` itself. Without,
-    /// one folder node per watched folder in `roots` that has entries; entries under none of
-    /// them make one more node, with an empty `path` and the name "Other scans". Of nested
-    /// roots the deepest one takes an entry.
+    /// the top of the tree: one node for each volume that holds entries, a drive (`C:`) or a
+    /// share (`\\server\share`), with the root of the volume as its path (`C:\`). Below a volume
+    /// lie its real folders and files, spelled as the first entry under them spells them.
     #[must_use]
-    pub fn children(&self, under: Option<&Path>, roots: &[PathBuf]) -> Vec<Node> {
+    pub fn children(&self, under: Option<&Path>) -> Vec<Node> {
         let state = self.read();
         let held = state.entries.values().filter(|entry| entry.hits() > 0);
-        let mut nodes = match under {
-            Some(under) => below(held, under),
-            None => top_level(held, roots),
-        };
+        let mut nodes = below(held, under);
         nodes.sort_by(|a, b| b.hits.cmp(&a.hits).then_with(|| a.name.cmp(&b.name)));
         nodes
+    }
+
+    /// The node of the tree at `path`, any folder or file of it: what lies at and under it,
+    /// added up, with the path as it was given. `None` when no file there holds personal data.
+    #[must_use]
+    pub fn node(&self, path: &Path) -> Option<Node> {
+        let state = self.read();
+        let depth = path.components().count();
+        let mut tally: Option<Tally> = None;
+        for entry in state
+            .entries
+            .values()
+            .filter(|entry| entry.hits() > 0 && sys::is_under(&entry.path, path))
+        {
+            tally
+                .get_or_insert_with(|| Tally::new(path.to_path_buf(), name_of(path)))
+                .add(entry, entry.path.components().count() > depth);
+        }
+        tally.map(Tally::finish)
     }
 
     /// Writes the entries at and under `under` (all for `None`) that hold personal data, or
@@ -684,9 +1128,39 @@ impl Inventory {
     }
 }
 
-/// Reads and scans one file, or says why not.
-fn scan_file(engine: &Engine, path: &Path, meta: &Metadata) -> Entry {
+/// What a file that changed was known as: enough to skip detecting it again when its contents
+/// turn out to be the same.
+struct Prior {
+    hash: ContentHash,
+    status: Status,
+    counts: Vec<(EntityKind, u32)>,
+}
+
+impl Prior {
+    /// What `entry` knew of its file; `None` when it cannot stand for it: it has no fingerprint,
+    /// or it is a failure that must be tried again (no write time is on record, see
+    /// [`Entry::modified`]).
+    fn of(entry: &Entry) -> Option<Self> {
+        let hash = entry.hash.filter(|_| entry.modified != 0)?;
+        Some(Self {
+            hash,
+            status: entry.status.clone(),
+            counts: entry.counts.clone(),
+        })
+    }
+}
+
+/// Reads and scans one file, or says why not. `prior` is what the file was known as before it
+/// changed: when its contents are the same, that stands and the detector does not run.
+fn scan_file(
+    engine: &Engine,
+    path: &Path,
+    meta: &Metadata,
+    prior: Option<&Prior>,
+    follow: &(dyn Fn(Busy) -> bool + Sync),
+) -> Option<Entry> {
     let mut modified = meta.last_write_time();
+    let mut hash = None;
     let (status, counts) = if meta.len() > MAX_FILE {
         (Status::TooLarge, Vec::new())
     } else {
@@ -699,29 +1173,72 @@ fn scan_file(engine: &Engine, path: &Path, meta: &Metadata) -> Entry {
                 modified = 0;
                 (Status::Failed(err.to_string()), Vec::new())
             }
-            Ok(Some(bytes)) => match formats::scan(engine, &bytes, false) {
-                Ok(scanned) => (Status::Ok, tally(&scanned.found)),
-                Err(Error::UnsupportedFormat(_)) => (Status::Unsupported, Vec::new()),
-                Err(err) => {
-                    // A damaged file fails the same way again, so it waits for a change. The
-                    // vault, the model or a lock failing says nothing about the file: the
-                    // next scan tries it again, as for a file that could not be read.
-                    if !err.is_unreadable() {
-                        modified = 0;
-                    }
-                    (Status::Failed(err.to_string()), Vec::new())
+            Ok(Some(bytes)) => {
+                let seen = ContentHash::of(&bytes);
+                hash = Some(seen);
+                match prior.filter(|prior| prior.hash == seen) {
+                    Some(prior) => (prior.status.clone(), prior.counts.clone()),
+                    None => detect(engine, &bytes, &mut modified, follow)?,
                 }
-            },
+            }
         }
     };
-    Entry {
+    Some(Entry {
         path: path.to_path_buf(),
         size: meta.len(),
         modified,
         scanned: unix_now(),
         status,
         counts,
-    }
+        hash,
+    })
+}
+
+/// What the detector makes of the contents of a file, `follow` told what it is busy with; `None`
+/// when `follow` stopped it. A failure that says nothing about the file sets `modified` to 0, so
+/// the next scan tries the file again.
+fn detect(
+    engine: &Engine,
+    bytes: &[u8],
+    modified: &mut u64,
+    follow: &(dyn Fn(Busy) -> bool + Sync),
+) -> Option<(Status, Vec<(EntityKind, u32)>)> {
+    Some(match formats::scan_with(engine, bytes, follow) {
+        Ok(Some(scanned)) => (Status::Ok, tally(&scanned.found)),
+        Ok(None) => return None,
+        Err(Error::UnsupportedFormat(_)) => (Status::Unsupported, Vec::new()),
+        Err(err) => {
+            // A damaged file fails the same way again, so it waits for a change. The vault, the
+            // model or a lock failing says nothing about the file: the next scan tries it
+            // again, as for a file that could not be read.
+            if !err.is_unreadable() {
+                *modified = 0;
+            }
+            (Status::Failed(err.to_string()), Vec::new())
+        }
+    })
+}
+
+/// Reads the file at `path` now and reports what the detector finds in it to `report`, each value
+/// with the text around it, as it is found (see [`formats::findings`]: what patterns find
+/// first, in reading order, then what the model finds, with what the read is busy with in
+/// between). It is for showing to the person who asked: nothing is stored, and the values go
+/// nowhere else. Each finding says where it stands in the file when the format has a place to
+/// name (a line and column, a page, a cell, a slide, a paragraph: see [`Location`]). `report`
+/// answers whether to go on, and may be called from several threads.
+///
+/// # Errors
+/// `Io` when the file cannot be read; `UnsupportedFormat` when it is a format piikey does not
+/// read, or bigger than [`MAX_FILE`]; the errors of reading the format.
+pub fn findings(
+    engine: &Engine,
+    path: &Path,
+    report: &(dyn Fn(Report) -> bool + Sync),
+) -> Result<()> {
+    let bytes = read_capped(path)
+        .map_err(|err| io_context(&err, "read", path))?
+        .ok_or(Error::UnsupportedFormat("the file is too large to be read"))?;
+    formats::findings(engine, &bytes, report)
 }
 
 /// The contents of the file at `path`, or `None` when it is bigger than [`MAX_FILE`]. The size
@@ -791,9 +1308,9 @@ fn unix_now() -> u64 {
         .map_or(0, |since| since.as_secs())
 }
 
-/// Whether a walk leaves `path` out: hidden, system or online-only things, the folders nothing
-/// of the user's lives in, and what the user excluded.
-fn unwanted(path: &Path, meta: &Metadata, exclude: &[PathBuf]) -> bool {
+/// Whether a walk leaves `path` out: hidden, system or online-only things, and the folders
+/// nothing of the user's lives in.
+fn unwanted(path: &Path, meta: &Metadata) -> bool {
     meta.file_attributes() & HIDDEN_OR_SYSTEM != 0
         || files::is_online_only(meta)
         || (meta.is_dir()
@@ -802,21 +1319,104 @@ fn unwanted(path: &Path, meta: &Metadata, exclude: &[PathBuf]) -> bool {
                     .iter()
                     .any(|skipped| name.eq_ignore_ascii_case(skipped))
             }))
-        || is_excluded(path, exclude)
 }
 
-fn is_excluded(path: &Path, exclude: &[PathBuf]) -> bool {
-    exclude.iter().any(|excluded| sys::is_under(path, excluded))
+/// Whether `error` says the file or a folder above it is not there.
+fn not_there(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+    )
 }
 
 /// Whether `path` is gone from the disk: no such file, or no such folder above it.
 fn is_gone(path: &Path) -> bool {
-    fs::symlink_metadata(path).is_err_and(|err| {
-        matches!(
-            err.kind(),
-            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-        )
-    })
+    fs::symlink_metadata(path).is_err_and(|err| not_there(&err))
+}
+
+/// What a crawl of the watched folders would make of a path the file system reported changed.
+enum Reach {
+    /// Not for a crawl to look at: outside every root, a root itself, hidden, a link, below
+    /// something a crawl leaves out, or not to be told.
+    Skipped,
+    /// Gone, from this path down: the topmost folder or file on the way to the path that is not
+    /// there any more.
+    Gone(PathBuf),
+    File(Metadata),
+    Folder,
+}
+
+/// What was found out about a folder on the way to a path, which holds for everything below it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Way {
+    Open,
+    Skipped,
+    Missing,
+}
+
+/// Walks from the root that holds `path` down to it, the way a crawl does: asking the file
+/// system about each folder on the way, once (`known` remembers the answers between calls), and
+/// leaving out what a crawl leaves out.
+fn reach(roots: &[PathBuf], path: &Path, known: &mut HashMap<PathBuf, Way>) -> Reach {
+    let Some(root) = roots
+        .iter()
+        .filter(|root| sys::is_under(path, root))
+        .max_by_key(|root| root.components().count())
+    else {
+        return Reach::Skipped;
+    };
+    let (start, total) = (root.components().count(), path.components().count());
+    // A root that is not there (a disk that is unplugged) says nothing about what was in it,
+    // and the root itself is no file of a crawl.
+    let root_there = *known.entry(root.clone()).or_insert_with(|| {
+        if fs::metadata(root).is_ok() {
+            Way::Open
+        } else {
+            Way::Skipped
+        }
+    });
+    if total == start || root_there != Way::Open {
+        return Reach::Skipped;
+    }
+    let mut here: PathBuf = path.components().take(start).collect();
+    for (index, part) in path.components().enumerate().skip(start) {
+        here.push(part);
+        let last = index + 1 == total;
+        if !last {
+            match known.get(&here) {
+                Some(Way::Open) => continue,
+                Some(Way::Skipped) => return Reach::Skipped,
+                Some(Way::Missing) => return Reach::Gone(here),
+                None => {}
+            }
+        }
+        let meta = match fs::symlink_metadata(&here) {
+            Ok(meta) => meta,
+            Err(err) if not_there(&err) => {
+                known.insert(here.clone(), Way::Missing);
+                return Reach::Gone(here);
+            }
+            Err(_) => return Reach::Skipped,
+        };
+        if meta.file_type().is_symlink() || unwanted(&here, &meta) {
+            known.insert(here, Way::Skipped);
+            return Reach::Skipped;
+        }
+        if last {
+            return if meta.is_dir() {
+                Reach::Folder
+            } else if meta.is_file() {
+                Reach::File(meta)
+            } else {
+                Reach::Skipped
+            };
+        }
+        if !meta.is_dir() {
+            return Reach::Skipped;
+        }
+        known.insert(here.clone(), Way::Open);
+    }
+    Reach::Skipped
 }
 
 /// `name` in lowercase, in `into`.
@@ -825,17 +1425,18 @@ fn lowercase_into(name: &OsStr, into: &mut String) {
     into.extend(name.to_string_lossy().chars().flat_map(char::to_lowercase));
 }
 
-/// What a watched folder is called: its last component, or all of it for a drive.
-fn folder_name(root: &Path) -> String {
-    root.file_name().map_or_else(
-        || root.display().to_string(),
-        |name| name.to_string_lossy().into_owned(),
-    )
+/// What a node at `path` is called: its last component, or for a drive or a share, its name.
+fn name_of(path: &Path) -> String {
+    path.file_name()
+        .or_else(|| path.components().next().map(Component::as_os_str))
+        .map_or_else(String::new, |name| name.to_string_lossy().into_owned())
 }
 
-/// The component of `path` right below `base`, and whether something lies below that (it is a
-/// folder), or `None` when `path` is not below `base`.
-fn child_of<'a>(path: &'a Path, base: &[Component<'_>]) -> Option<(Component<'a>, bool)> {
+/// The component of `path` right below `base`, how many components of `path` lead to it, and
+/// whether something lies below that (it is a folder); `None` when `path` is not below `base`.
+/// Below nothing (an empty `base`) lie the volumes, and a drive or a share takes its root along:
+/// the two are one step.
+fn child_of<'a>(path: &'a Path, base: &[Component<'_>]) -> Option<(Component<'a>, usize, bool)> {
     let mut components = path.components();
     for want in base {
         if !components
@@ -846,18 +1447,32 @@ fn child_of<'a>(path: &'a Path, base: &[Component<'_>]) -> Option<(Component<'a>
         }
     }
     let next = components.next()?;
-    Some((next, components.next().is_some()))
+    let step = if base.is_empty() {
+        sys::volume_len(path).max(1)
+    } else {
+        1
+    };
+    for _ in 1..step {
+        components.next();
+    }
+    Some((next, base.len() + step, components.next().is_some()))
 }
 
 /// The nodes one level below `under`, one for each next component of the paths of `entries`: a
-/// folder node for what lies deeper, a file node for a file in `under` itself. A node is spelled
+/// folder node for what lies deeper, a file node for a file in `under` itself. Without `under`
+/// the level is the volumes, a drive or a share with its root being one step. A node is spelled
 /// as the first entry under it spells it.
-fn below<'a>(entries: impl Iterator<Item = &'a Entry>, under: &Path) -> Vec<Node> {
-    let base: Vec<Component<'_>> = under.components().collect();
+fn below<'a>(entries: impl Iterator<Item = &'a Entry>, under: Option<&Path>) -> Vec<Node> {
+    let mut base: Vec<Component<'_>> =
+        under.map_or_else(Vec::new, |under| under.components().collect());
+    // A drive named without its root (`C:`) is the drive, as it is for `sys::is_under`.
+    if matches!(base.as_slice(), [Component::Prefix(_)]) {
+        base.push(Component::RootDir);
+    }
     let mut tallies: HashMap<String, Tally> = HashMap::new();
     let mut key = String::new();
     for entry in entries {
-        let Some((next, deeper)) = child_of(&entry.path, &base) else {
+        let Some((next, taken, deeper)) = child_of(&entry.path, &base) else {
             continue;
         };
         lowercase_into(next.as_os_str(), &mut key);
@@ -865,43 +1480,13 @@ fn below<'a>(entries: impl Iterator<Item = &'a Entry>, under: &Path) -> Vec<Node
             tally.add(entry, deeper);
             continue;
         }
-        let path: PathBuf = entry.path.components().take(base.len() + 1).collect();
+        let path: PathBuf = entry.path.components().take(taken).collect();
         let name = next.as_os_str().to_string_lossy().into_owned();
         let mut tally = Tally::new(path, name);
         tally.add(entry, deeper);
         tallies.insert(key.clone(), tally);
     }
     tallies.into_values().map(Tally::finish).collect()
-}
-
-/// The top nodes: one for each watched folder in `roots` that holds any of `entries`, and one
-/// with an empty path for the entries under none of them. Of nested roots the deepest one
-/// takes an entry.
-fn top_level<'a>(entries: impl Iterator<Item = &'a Entry>, roots: &[PathBuf]) -> Vec<Node> {
-    let mut tops: Vec<(&PathBuf, usize, Option<Tally>)> = roots
-        .iter()
-        .map(|root| (root, root.components().count(), None))
-        .collect();
-    let mut other: Option<Tally> = None;
-    for entry in entries {
-        let deepest = tops
-            .iter_mut()
-            .filter(|(root, ..)| sys::is_under(&entry.path, root))
-            .max_by_key(|(_, depth, _)| *depth);
-        let tally = match deepest {
-            Some((root, _, held)) => {
-                let root = *root;
-                held.get_or_insert_with(|| Tally::new(root.clone(), folder_name(root)))
-            }
-            None => other.get_or_insert_with(|| Tally::new(PathBuf::new(), OTHER.to_owned())),
-        };
-        tally.add(entry, true);
-    }
-    tops.into_iter()
-        .filter_map(|(_, _, held)| held)
-        .chain(other)
-        .map(Tally::finish)
-        .collect()
 }
 
 /// A node being added up.
@@ -942,8 +1527,9 @@ impl Tally {
     }
 }
 
-/// An entry as it is written and read: to the file (without `hits`, which the counts give), and
-/// to the API and the report (with `hits`, which is ignored when read back).
+/// An entry as it is written and read: to the file (with its `hash`, without `hits`, which the
+/// counts give), and to the API and the report (with `hits`, without `hash`: a fingerprint of a
+/// file is the inventory's own business). `hits` is ignored when read back.
 #[derive(Serialize, Deserialize)]
 struct Row<'a> {
     path: Cow<'a, str>,
@@ -955,12 +1541,27 @@ struct Row<'a> {
     error: Option<Cow<'a, str>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     hits: Option<u64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "read_hash"
+    )]
+    hash: Option<ContentHash>,
     #[serde(default)]
     counts: Counts<'a>,
 }
 
+/// A fingerprint as it is written; one that is not 32 hexadecimal digits is no fingerprint (the
+/// file is read again), and not a reason to lose the entry.
+fn read_hash<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<ContentHash>, D::Error> {
+    Ok(Option::<String>::deserialize(deserializer)?.and_then(|text| ContentHash::parse(&text)))
+}
+
 impl<'a> Row<'a> {
-    fn of(entry: &'a Entry, with_hits: bool) -> Self {
+    /// `for_api` writes `hits` and no `hash`; the file has the `hash` and no `hits`.
+    fn of(entry: &'a Entry, for_api: bool) -> Self {
         Self {
             path: entry.path.to_string_lossy(),
             size: entry.size,
@@ -968,7 +1569,8 @@ impl<'a> Row<'a> {
             scanned: entry.scanned,
             status: Cow::Borrowed(entry.status.as_str()),
             error: entry.status.error().map(Cow::Borrowed),
-            hits: with_hits.then(|| entry.hits()),
+            hits: for_api.then(|| entry.hits()),
+            hash: entry.hash.filter(|_| !for_api),
             counts: Counts(Cow::Borrowed(&entry.counts)),
         }
     }
@@ -989,6 +1591,7 @@ impl<'a> Row<'a> {
             scanned: self.scanned,
             status,
             counts: self.counts.0.into_owned(),
+            hash: self.hash,
         })
     }
 }
@@ -1103,12 +1706,40 @@ mod tests {
     use std::{os::windows::fs::OpenOptionsExt, sync::atomic::AtomicUsize};
 
     use super::*;
-    use crate::detect::EntityKind::{Email, Iban, Phone};
+    use crate::detect::{
+        EntityKind::{Email, Iban, Phone},
+        KindSet,
+    };
 
     type Res<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
     const EMAIL: &str = "jan.jansen@acme.nl";
     const IBAN: &str = "NL91ABNA0417164300";
+
+    #[test]
+    fn progress_lists_the_files_being_read_with_what_each_is_busy_with() {
+        let progress = Progress::default();
+        let (a, b) = (Path::new(r"C:\a.pdf"), Path::new(r"C:\b.txt"));
+        progress.begin(a);
+        progress.begin(b);
+        progress.busy(a, Busy::Pages { done: 2, total: 9 });
+        assert_eq!(
+            progress.reading(),
+            [
+                Reading {
+                    path: a.to_path_buf(),
+                    busy: Some(Busy::Pages { done: 2, total: 9 })
+                },
+                Reading {
+                    path: b.to_path_buf(),
+                    busy: None
+                },
+            ]
+        );
+        progress.end(a);
+        assert_eq!(progress.reading().len(), 1);
+        assert_eq!(progress.done.load(Ordering::Relaxed), 1);
+    }
 
     /// Temp directory removed on drop.
     struct TempDir(PathBuf);
@@ -1151,15 +1782,10 @@ mod tests {
         fs::write(path, bytes)
     }
 
-    /// A scan with nothing excluded and no cancel; the progress it made.
-    fn scan(
-        inv: &Inventory,
-        engine: &Engine,
-        paths: &[PathBuf],
-        exclude: &[PathBuf],
-    ) -> Result<Progress> {
+    /// A scan with no cancel; the progress it made.
+    fn scan(inv: &Inventory, engine: &Engine, paths: &[PathBuf]) -> Result<Progress> {
         let progress = Progress::default();
-        inv.scan_paths(engine, paths, exclude, &progress, &AtomicBool::new(false))?;
+        inv.scan_paths(engine, paths, &progress, &AtomicBool::new(false))?;
         Ok(progress)
     }
 
@@ -1182,6 +1808,7 @@ mod tests {
             scanned: 1_700_000_000,
             status: Status::Ok,
             counts: counts.to_vec(),
+            hash: None,
         }
     }
 
@@ -1195,7 +1822,7 @@ mod tests {
         put(&a, &format!("mail {EMAIL} and {IBAN}"))?;
         put(&b, "nothing to see")?;
 
-        let first = scan(&inv, &engine, std::slice::from_ref(&root), &[])?;
+        let first = scan(&inv, &engine, std::slice::from_ref(&root))?;
         assert_eq!(first.total.load(Ordering::Relaxed), 2);
         assert_eq!(first.done.load(Ordering::Relaxed), 2);
         assert_eq!(
@@ -1210,7 +1837,7 @@ mod tests {
         );
 
         // Unchanged: nothing is read again.
-        let second = scan(&inv, &engine, std::slice::from_ref(&root), &[])?;
+        let second = scan(&inv, &engine, std::slice::from_ref(&root))?;
         assert_eq!(second.total.load(Ordering::Relaxed), 0);
 
         // Another content of the same size and write time still counts as unchanged: the
@@ -1221,19 +1848,19 @@ mod tests {
             .write(true)
             .open(&a)?
             .set_modified(written)?;
-        let third = scan(&inv, &engine, std::slice::from_ref(&root), &[])?;
+        let third = scan(&inv, &engine, std::slice::from_ref(&root))?;
         assert_eq!(third.total.load(Ordering::Relaxed), 0);
         assert_eq!(counts_of(&inv, &a).map(|c| c.len()), Some(2));
 
         // A different size is a change.
         put(&a, &format!("{EMAIL} {EMAIL}"))?;
-        let fourth = scan(&inv, &engine, std::slice::from_ref(&root), &[])?;
+        let fourth = scan(&inv, &engine, std::slice::from_ref(&root))?;
         assert_eq!(fourth.total.load(Ordering::Relaxed), 1);
         assert_eq!(counts_of(&inv, &a), Some(BTreeMap::from([(Email, 2)])));
 
         // A file that is gone is dropped, and the inventory survives a restart.
         fs::remove_file(&b)?;
-        scan(&inv, &engine, std::slice::from_ref(&root), &[])?;
+        scan(&inv, &engine, std::slice::from_ref(&root))?;
         assert_eq!(stored(&inv), std::slice::from_ref(&a));
         assert_eq!(stored(&tmp.inventory()?), std::slice::from_ref(&a));
         Ok(())
@@ -1251,7 +1878,7 @@ mod tests {
         big.set_len(MAX_FILE + 1)?;
         drop(big);
 
-        let progress = scan(&inv, &engine, std::slice::from_ref(&root), &[])?;
+        let progress = scan(&inv, &engine, std::slice::from_ref(&root))?;
         assert_eq!(progress.done.load(Ordering::Relaxed), 4);
         let status = |name: &str| {
             inv.read()
@@ -1265,21 +1892,21 @@ mod tests {
         assert!(matches!(status("broken.zip"), Some(Status::Failed(_))));
 
         // Nothing changed, so nothing is read again, the failure included.
-        let again = scan(&inv, &engine, std::slice::from_ref(&root), &[])?;
+        let again = scan(&inv, &engine, std::slice::from_ref(&root))?;
         assert_eq!(again.total.load(Ordering::Relaxed), 0);
         // A file that changed is read again.
         put(
             &root.join("broken.zip"),
             "now it is text with jan.jansen@acme.nl",
         )?;
-        let changed = scan(&inv, &engine, std::slice::from_ref(&root), &[])?;
+        let changed = scan(&inv, &engine, std::slice::from_ref(&root))?;
         assert_eq!(changed.total.load(Ordering::Relaxed), 1);
         assert_eq!(status("broken.zip"), Some(Status::Ok));
         Ok(())
     }
 
     #[test]
-    fn caches_hidden_files_and_the_excluded_are_left_out_and_dropped() -> Res {
+    fn caches_and_hidden_files_are_left_out_and_dropped() -> Res {
         let tmp = TempDir::new()?;
         let (engine, inv) = (tmp.engine()?, tmp.inventory()?);
         let root = tmp.0.join("docs");
@@ -1298,7 +1925,7 @@ mod tests {
         let attrib = sys::run_system_tool("attrib.exe", &["+h", hidden_path.as_ref()])?;
         assert!(attrib.status.success(), "attrib failed");
 
-        scan(&inv, &engine, std::slice::from_ref(&root), &[])?;
+        scan(&inv, &engine, std::slice::from_ref(&root))?;
         let names = |inv: &Inventory| -> Vec<PathBuf> {
             stored(inv)
                 .into_iter()
@@ -1313,10 +1940,10 @@ mod tests {
             ]
         );
 
-        // Excluding a folder drops what is stored under it, in any letter case.
-        let excluded = root.join("KEEP");
-        scan(&inv, &engine, std::slice::from_ref(&root), &[excluded])?;
-        assert_eq!(names(&inv), [Path::new("skipme").join("z.txt")]);
+        // What lay in a folder that is gone from the disk goes with it.
+        fs::remove_dir_all(root.join("skipme"))?;
+        scan(&inv, &engine, std::slice::from_ref(&root))?;
+        assert_eq!(names(&inv), [Path::new("keep").join("a.txt")]);
         Ok(())
     }
 
@@ -1333,7 +1960,6 @@ mod tests {
         inv.scan_paths(
             &engine,
             std::slice::from_ref(&root),
-            &[],
             &progress,
             &AtomicBool::new(true),
         )?;
@@ -1344,11 +1970,11 @@ mod tests {
         );
 
         // The root of `old.txt` does not exist: its entries stay for when the disk is back.
-        scan(&inv, &engine, &[root.clone(), tmp.0.join("unplugged")], &[])?;
+        scan(&inv, &engine, &[root.clone(), tmp.0.join("unplugged")])?;
         assert_eq!(stored(&inv), [root.join("a.txt"), gone]);
         // A root that exists says what is gone from it.
         put(&tmp.0.join("unplugged").join("new.txt"), "x")?;
-        scan(&inv, &engine, &[tmp.0.join("unplugged")], &[])?;
+        scan(&inv, &engine, &[tmp.0.join("unplugged")])?;
         assert_eq!(
             stored(&inv),
             [root.join("a.txt"), tmp.0.join("unplugged").join("new.txt")]
@@ -1362,7 +1988,7 @@ mod tests {
         let (engine, inv) = (tmp.engine()?, tmp.inventory()?);
         let file = tmp.0.join("node_modules").join("x.txt");
         put(&file, EMAIL)?;
-        scan(&inv, &engine, std::slice::from_ref(&file), &[])?;
+        scan(&inv, &engine, std::slice::from_ref(&file))?;
         assert_eq!(counts_of(&inv, &file), Some(BTreeMap::from([(Email, 1)])));
         let entry = Entry::scan(&engine, &file);
         assert_eq!(entry.hits(), 1);
@@ -1370,6 +1996,18 @@ mod tests {
         let missing = Entry::scan(&engine, &tmp.0.join("nope.txt"));
         assert!(matches!(missing.status, Status::Failed(_)));
         Ok(())
+    }
+
+    /// What a level of the tree lists, as `(name, is_dir, hits, files)`.
+    fn listed(nodes: Vec<Node>) -> Vec<(String, bool, u64, u32)> {
+        nodes
+            .into_iter()
+            .map(|n| (n.name, n.is_dir, n.hits, n.files))
+            .collect()
+    }
+
+    fn row(name: &str, is_dir: bool, hits: u64, files: u32) -> (String, bool, u64, u32) {
+        (name.to_owned(), is_dir, hits, files)
     }
 
     #[test]
@@ -1382,72 +2020,176 @@ mod tests {
             entry(r"C:\Users\jan\Documents\work\deep\c.txt", &[(Email, 1)]),
             entry(r"C:\Users\jan\Documents\clean.txt", &[]),
             entry(r"C:\Users\jan\Desktop\d.txt", &[(Email, 2)]),
-            entry(r"D:\elsewhere\e.txt", &[(Email, 1)]),
         ])?;
-        let roots = [
-            PathBuf::from(r"C:\Users\jan\Documents"),
-            PathBuf::from(r"C:\Users\jan\Desktop"),
-            PathBuf::from(r"C:\Users\jan\Pictures"),
-        ];
-        let summary = |nodes: Vec<Node>| -> Vec<(String, bool, u64, u32)> {
-            nodes
-                .into_iter()
-                .map(|n| (n.name, n.is_dir, n.hits, n.files))
-                .collect()
-        };
+        let jan = Path::new(r"C:\Users\jan");
+        let documents = jan.join("Documents");
 
-        let top = inv.children(None, &roots);
+        let level = inv.children(Some(jan));
         assert_eq!(
-            summary(top.clone()),
-            [
-                ("Documents".to_owned(), true, 10, 3),
-                ("Desktop".to_owned(), true, 2, 1),
-                (OTHER.to_owned(), true, 1, 1),
-            ]
+            listed(level.clone()),
+            [row("Documents", true, 10, 3), row("Desktop", true, 2, 1)]
         );
-        assert_eq!(top[0].path, roots[0], "a folder node carries its root");
-        assert!(
-            top[2].path.as_os_str().is_empty(),
-            "the virtual node has no path"
-        );
-        assert_eq!(top[0].counts, [(Phone, 5), (Email, 4), (Iban, 1)]);
-
-        let documents = inv.children(Some(&roots[0]), &roots);
+        assert_eq!(level[0].path, documents, "a folder node carries its path");
+        assert_eq!(level[0].counts, [(Phone, 5), (Email, 4), (Iban, 1)]);
         assert_eq!(
-            summary(documents),
-            [
-                ("work".to_owned(), true, 6, 2),
-                ("a.docx".to_owned(), false, 4, 1)
-            ]
+            listed(inv.children(Some(&documents))),
+            [row("work", true, 6, 2), row("a.docx", false, 4, 1)]
         );
-        let work = inv.children(Some(&roots[0].join("work")), &roots);
         assert_eq!(
-            summary(work),
-            [
-                ("b.xlsx".to_owned(), false, 5, 1),
-                ("deep".to_owned(), true, 1, 1)
-            ]
+            listed(inv.children(Some(&documents.join("work")))),
+            [row("b.xlsx", false, 5, 1), row("deep", true, 1, 1)]
         );
         // Letter case does not matter, and the nodes keep the stored spelling.
-        let shouted = inv.children(Some(Path::new(r"c:\USERS\jan\documents")), &roots);
+        let shouted = inv.children(Some(Path::new(r"c:\USERS\jan\documents")));
         assert_eq!(shouted.len(), 2);
         assert_eq!(shouted[0].path, Path::new(r"C:\Users\jan\Documents\work"));
-        // A file has nothing below it.
+        // A file has nothing below it, and neither has a file that holds nothing.
         assert!(
-            inv.children(Some(Path::new(r"C:\Users\jan\Desktop\d.txt")), &roots)
+            inv.children(Some(Path::new(r"C:\Users\jan\Desktop\d.txt")))
                 .is_empty()
         );
+        assert!(inv.children(Some(&documents.join("clean.txt"))).is_empty());
+        Ok(())
+    }
 
-        // Of nested roots the deepest takes the entry.
-        let nested = [roots[0].clone(), roots[0].join("work")];
+    #[test]
+    fn the_top_of_the_tree_is_the_drives_and_shares_that_hold_entries() -> Res {
+        let tmp = TempDir::new()?;
+        let inv = tmp.inventory()?;
+        inv.record(vec![
+            entry(r"C:\Users\jan\a.txt", &[(Email, 3)]),
+            // The same drive and folders, spelled otherwise.
+            entry(r"c:\users\JAN\b.txt", &[(Phone, 1)]),
+            entry(r"C:\clean.txt", &[]),
+            entry(r"C:\top.txt", &[(Iban, 1)]),
+            entry(r"D:\Backup\c.txt", &[(Email, 2)]),
+            entry(r"\\nas\share\docs\d.txt", &[(Email, 5)]),
+            entry(r"\\NAS\Share\e.txt", &[(Phone, 1)]),
+            entry(r"\\nas\other\f.txt", &[(Iban, 1)]),
+            // A drive that holds nothing is not listed.
+            entry(r"E:\empty\g.txt", &[]),
+        ])?;
+
+        let top = inv.children(None);
+        let names: Vec<String> = top.iter().map(|node| node.name.to_lowercase()).collect();
+        assert_eq!(names, [r"\\nas\share", "c:", "d:", r"\\nas\other"]);
+        // Every volume is a folder, and the files of both spellings of a drive count once.
+        let counts: Vec<(u64, u32, bool)> = top
+            .iter()
+            .map(|node| (node.hits, node.files, node.is_dir))
+            .collect();
         assert_eq!(
-            summary(inv.children(None, &nested)),
+            counts,
+            [(6, 2, true), (5, 3, true), (2, 1, true), (1, 1, true)]
+        );
+        // A volume is called as Explorer calls it and its path is its root; a spelling is the
+        // one of the first entry under it.
+        assert_eq!(top[0].name, r"\\NAS\Share");
+        assert_eq!(top[0].path, Path::new(r"\\NAS\Share\"));
+        assert_eq!(
+            (top[1].name.as_str(), top[1].path.as_path()),
+            ("C:", Path::new(r"C:\"))
+        );
+        assert_eq!(
+            (top[2].name.as_str(), top[2].path.as_path()),
+            ("D:", Path::new(r"D:\"))
+        );
+
+        // Below a drive lie its folders and files, however the drive is asked for.
+        for drive in [r"C:\", r"c:\", "C:", "c:"] {
+            assert_eq!(
+                listed(inv.children(Some(Path::new(drive)))),
+                [row("Users", true, 4, 2), row("top.txt", false, 1, 1)],
+                "{drive}"
+            );
+        }
+        // And below a share, whatever case or ending the name has.
+        for share in [r"\\nas\share\", r"\\nas\share", r"\\NAS\SHARE\"] {
+            assert_eq!(
+                listed(inv.children(Some(Path::new(share)))),
+                [row("docs", true, 5, 1), row("e.txt", false, 1, 1)],
+                "{share}"
+            );
+        }
+        assert_eq!(
+            listed(inv.children(Some(Path::new(r"D:\")))),
+            [row("Backup", true, 2, 1)]
+        );
+        assert!(inv.children(Some(Path::new(r"E:\"))).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_path_that_names_no_drive_still_has_a_top() -> Res {
+        let tmp = TempDir::new()?;
+        let inv = tmp.inventory()?;
+        inv.record(vec![
+            entry(r"\rooted\a.txt", &[(Email, 2)]),
+            entry(r"rel\b.txt", &[(Email, 1)]),
+            entry(r"C:\c.txt", &[(Email, 1)]),
+        ])?;
+        let top = inv.children(None);
+        assert_eq!(
+            listed(top.clone()),
             [
-                ("work".to_owned(), true, 6, 2),
-                ("Documents".to_owned(), true, 4, 1),
-                (OTHER.to_owned(), true, 3, 2),
+                row(r"\", true, 2, 1),
+                row("C:", true, 1, 1),
+                row("rel", true, 1, 1)
             ]
         );
+        assert_eq!(top[0].path, Path::new(r"\"));
+        assert_eq!(top[2].path, Path::new("rel"));
+        assert_eq!(
+            listed(inv.children(Some(Path::new("rel")))),
+            [row("b.txt", false, 1, 1)]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_node_of_a_path_adds_up_what_lies_at_and_under_it() -> Res {
+        let tmp = TempDir::new()?;
+        let inv = tmp.inventory()?;
+        inv.record(vec![
+            entry(r"C:\Users\jan\Documents\a.docx", &[(Email, 3), (Iban, 1)]),
+            entry(r"C:\Users\jan\Documents\work\b.xlsx", &[(Phone, 5)]),
+            entry(r"C:\Users\jan\Documents\clean.txt", &[]),
+            entry(r"C:\Users\jan\Desktop\d.txt", &[(Email, 2)]),
+            entry(r"D:\Backup\e.txt", &[(Email, 1)]),
+        ])?;
+        let node = |path: &str| {
+            inv.node(Path::new(path))
+                .map(|n| (n.name, n.is_dir, n.hits, n.files))
+        };
+        let some = |name: &str, is_dir, hits, files| Some(row(name, is_dir, hits, files));
+        // A folder, in the spelling it is asked for; folders inside one another each count what
+        // lies in them.
+        assert_eq!(
+            node(r"c:\users\JAN\documents"),
+            some("documents", true, 9, 2)
+        );
+        assert_eq!(
+            node(r"C:\Users\jan\Documents\work"),
+            some("work", true, 5, 1)
+        );
+        // A file is a node with nothing below it.
+        assert_eq!(
+            node(r"C:\Users\jan\Desktop\d.txt"),
+            some("d.txt", false, 2, 1)
+        );
+        // A drive is called as the top of the tree calls it.
+        assert_eq!(node(r"C:\"), some("C:", true, 11, 3));
+        // Nothing found there: no node.
+        assert_eq!(node(r"C:\Users\jan\Documents\clean.txt"), None);
+        assert_eq!(node(r"E:\"), None);
+
+        // It is what the listing of the parent says of the folder.
+        let listed = inv
+            .children(Some(Path::new(r"C:\Users\jan")))
+            .into_iter()
+            .find(|node| node.name == "Documents")
+            .ok_or("not listed")?;
+        assert_eq!(inv.node(&listed.path), Some(listed));
         Ok(())
     }
 
@@ -1672,12 +2414,12 @@ mod tests {
             .write(true)
             .share_mode(0)
             .open(&file)?;
-        scan(&inv, &engine, std::slice::from_ref(&root), &[])?;
+        scan(&inv, &engine, std::slice::from_ref(&root))?;
         let failed = inv.entries(Some(&file), 0);
         assert!(matches!(failed[0].status, Status::Failed(_)), "{failed:?}");
 
         drop(held);
-        let again = scan(&inv, &engine, std::slice::from_ref(&root), &[])?;
+        let again = scan(&inv, &engine, std::slice::from_ref(&root))?;
         assert_eq!(again.total.load(Ordering::Relaxed), 1);
         assert_eq!(counts_of(&inv, &file), Some(BTreeMap::from([(Email, 1)])));
         Ok(())
@@ -1690,11 +2432,11 @@ mod tests {
         let root = tmp.0.join("docs");
         put(&root.join("a.txt"), EMAIL)?;
         put(&root.join("sub").join("b.txt"), IBAN)?;
-        scan(&inv, &engine, std::slice::from_ref(&root), &[])?;
+        scan(&inv, &engine, std::slice::from_ref(&root))?;
 
         // The same folder spelled otherwise holds the same files, with one entry each.
         let shouted = tmp.0.join("DOCS");
-        scan(&inv, &engine, std::slice::from_ref(&shouted), &[])?;
+        scan(&inv, &engine, std::slice::from_ref(&shouted))?;
         let kept = stored(&inv);
         assert_eq!(kept.len(), 2, "{kept:?}");
         assert!(
@@ -1704,7 +2446,7 @@ mod tests {
 
         // So does a file renamed in letter case only.
         fs::rename(shouted.join("a.txt"), shouted.join("A.TXT"))?;
-        scan(&inv, &engine, std::slice::from_ref(&shouted), &[])?;
+        scan(&inv, &engine, std::slice::from_ref(&shouted))?;
         let kept = stored(&inv);
         assert_eq!(kept.len(), 2, "{kept:?}");
         assert!(kept.contains(&shouted.join("A.TXT")), "{kept:?}");
@@ -1725,7 +2467,10 @@ mod tests {
         // A folder listing gives the size a file had when it was last closed: one that is
         // being written can be far bigger by the time it is read.
         let listed = fs::metadata(&small)?;
-        assert_eq!(scan_file(&engine, &big, &listed).status, Status::TooLarge);
+        assert_eq!(
+            scan_file(&engine, &big, &listed, None, &|_| true).map(|entry| entry.status),
+            Some(Status::TooLarge)
+        );
         assert_eq!(read_capped(&small)?.as_deref(), Some(&b"tiny"[..]));
         assert_eq!(read_capped(&big)?, None);
         Ok(())
@@ -1781,10 +2526,10 @@ mod tests {
         put(&root.join("b.txt"), IBAN)?;
         let (app, cli) = (tmp.inventory()?, tmp.inventory()?);
 
-        let first = scan(&cli, &engine, std::slice::from_ref(&root), &[])?;
+        let first = scan(&cli, &engine, std::slice::from_ref(&root))?;
         assert_eq!(first.total.load(Ordering::Relaxed), 2);
         // The app opened the inventory before that, and has not seen it.
-        let second = scan(&app, &engine, std::slice::from_ref(&root), &[])?;
+        let second = scan(&app, &engine, std::slice::from_ref(&root))?;
         assert_eq!(second.total.load(Ordering::Relaxed), 0);
         assert_eq!(stored(&app).len(), 2);
         Ok(())
@@ -1910,7 +2655,7 @@ mod tests {
         put(&root.join("a.txt"), EMAIL)?;
         put(&root.join("sub").join("b.txt"), IBAN)?;
 
-        let progress = scan(&inv, &engine, &[root, tmp.0.join("DOCS")], &[])?;
+        let progress = scan(&inv, &engine, &[root, tmp.0.join("DOCS")])?;
         assert_eq!(progress.total.load(Ordering::Relaxed), 2);
         assert_eq!(stored(&inv).len(), 2, "{:?}", stored(&inv));
         assert_eq!(inv.totals().hits, 2);
@@ -1968,6 +2713,670 @@ mod tests {
             inv.report(None, ExportFormat::Csv, &mut Full),
             Err(Error::Io(_))
         ));
+        Ok(())
+    }
+
+    /// Sets the write time of `path`.
+    fn set_written(path: &Path, when: SystemTime) -> io::Result<()> {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)?
+            .set_modified(when)
+    }
+
+    fn written(path: &Path) -> io::Result<SystemTime> {
+        fs::metadata(path)?.modified()
+    }
+
+    fn after_a_minute() -> SystemTime {
+        SystemTime::now() + Duration::from_mins(1)
+    }
+
+    #[test]
+    fn an_unchanged_file_is_not_read_again() -> Res {
+        let tmp = TempDir::new()?;
+        let (engine, inv) = (tmp.engine()?, tmp.inventory()?);
+        let root = tmp.0.join("docs");
+        let file = root.join("a.txt");
+        put(&file, EMAIL)?;
+        scan(&inv, &engine, std::slice::from_ref(&root))?;
+        let before = inv.entry(&file).ok_or("not scanned")?;
+        assert_eq!(before.status, Status::Ok);
+
+        // Another program holds the file and shares it with nobody: reading it would fail now,
+        // and the entry would say so.
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(&file)?;
+        let again = scan(&inv, &engine, std::slice::from_ref(&root))?;
+        drop(held);
+        assert_eq!(
+            again.total.load(Ordering::Relaxed),
+            0,
+            "its size and write time are what they were"
+        );
+        assert_eq!(inv.entry(&file), Some(before), "nothing about it changed");
+        Ok(())
+    }
+
+    #[test]
+    fn a_touched_file_is_fingerprinted_and_detected_again_only_when_its_contents_changed() -> Res {
+        let tmp = TempDir::new()?;
+        let (engine, inv) = (tmp.engine()?, tmp.inventory()?);
+        let root = tmp.0.join("docs");
+        let file = root.join("a.txt");
+        put(&file, &format!("mail {EMAIL}"))?;
+        scan(&inv, &engine, std::slice::from_ref(&root))?;
+        let first = inv.entry(&file).ok_or("not scanned")?;
+        assert_eq!(first.counts, [(Email, 1)]);
+        let hash = first.hash.ok_or("the scan kept no fingerprint")?;
+
+        // From now on the detector finds nothing: whether it was asked shows in the counts.
+        engine.set_enabled(KindSet::EMPTY);
+
+        // Touched, not changed: the file is read and recognised, and the detector does not run.
+        let later = after_a_minute();
+        set_written(&file, later)?;
+        let touched = scan(&inv, &engine, std::slice::from_ref(&root))?;
+        assert_eq!(touched.total.load(Ordering::Relaxed), 1, "it was read");
+        assert_eq!(touched.done.load(Ordering::Relaxed), 1);
+        let second = inv.entry(&file).ok_or("lost")?;
+        assert_eq!(
+            second.counts,
+            [(Email, 1)],
+            "found before, not detected again"
+        );
+        assert_eq!(second.status, Status::Ok);
+        assert_eq!(second.hash, Some(hash));
+        assert_ne!(
+            second.modified, first.modified,
+            "the new write time is kept"
+        );
+        assert_eq!(second.size, first.size);
+
+        // So the next scan has nothing to read.
+        let quiet = scan(&inv, &engine, std::slice::from_ref(&root))?;
+        assert_eq!(quiet.total.load(Ordering::Relaxed), 0);
+
+        // Other contents, the same size: detected again, and the fingerprint is the new one.
+        put(&file, &format!("mail {}", "x".repeat(EMAIL.len())))?;
+        assert_ne!(written(&file)?, later);
+        let changed = scan(&inv, &engine, std::slice::from_ref(&root))?;
+        assert_eq!(changed.total.load(Ordering::Relaxed), 1);
+        let third = inv.entry(&file).ok_or("lost")?;
+        assert!(
+            third.counts.is_empty(),
+            "the detector ran, and finds nothing"
+        );
+        assert_ne!(third.hash, Some(hash));
+        Ok(())
+    }
+
+    #[test]
+    fn a_touched_file_that_failed_for_good_is_not_parsed_again_but_one_that_must_be_retried_is()
+    -> Res {
+        let tmp = TempDir::new()?;
+        let (engine, inv) = (tmp.engine()?, tmp.inventory()?);
+        let root = tmp.0.join("docs");
+        let broken = root.join("broken.zip");
+        put_bytes(&broken, b"PK\x03\x04 not really a zip")?;
+        scan(&inv, &engine, std::slice::from_ref(&root))?;
+        let first = inv.entry(&broken).ok_or("not scanned")?;
+        assert!(matches!(first.status, Status::Failed(_)));
+        assert_ne!(first.modified, 0, "a damaged file waits for a change");
+        assert!(first.hash.is_some());
+
+        // Touched: the same damage, not parsed again.
+        set_written(&broken, after_a_minute())?;
+        let touched = scan(&inv, &engine, std::slice::from_ref(&root))?;
+        assert_eq!(touched.total.load(Ordering::Relaxed), 1);
+        let second = inv.entry(&broken).ok_or("lost")?;
+        assert_eq!(second.status, first.status);
+        assert_eq!(second.hash, first.hash);
+
+        // A failure that said nothing about the file (no write time on record) is never taken
+        // for what the file is: its fingerprint does not stand in for a result.
+        let mut retry = second.clone();
+        retry.modified = 0;
+        retry.status = Status::Failed("the model failed".to_owned());
+        inv.record(vec![retry])?;
+        put(&broken, "plain text with jan.jansen@acme.nl")?;
+        scan(&inv, &engine, std::slice::from_ref(&root))?;
+        assert_eq!(inv.entry(&broken).map(|e| e.status), Some(Status::Ok));
+        Ok(())
+    }
+
+    #[test]
+    fn a_record_without_a_fingerprint_loads_and_is_detected_again_when_it_changes() -> Res {
+        let tmp = TempDir::new()?;
+        let (engine, inv) = (tmp.engine()?, tmp.inventory()?);
+        let root = tmp.0.join("docs");
+        let file = root.join("old.txt");
+        put(&file, &format!("mail {EMAIL}"))?;
+        scan(&inv, &engine, std::slice::from_ref(&root))?;
+        let scanned = inv.entry(&file).ok_or("not scanned")?;
+
+        // The line as a version without fingerprints wrote it.
+        let line = format!(
+            r#"{{"path":{},"size":{},"modified":{},"scanned":{},"status":"ok","counts":{{"email":1}}}}"#,
+            serde_json::to_string(&file.to_string_lossy())?,
+            scanned.size,
+            scanned.modified,
+            scanned.scanned
+        );
+        let saved = tmp.0.join("old.jsonl");
+        fs::write(&saved, format!("{line}\n"))?;
+        let old = Inventory::open(&saved)?;
+        let loaded = old.entry(&file).ok_or("the record did not load")?;
+        assert_eq!(
+            (loaded.hash, loaded.counts.as_slice()),
+            (None, &[(Email, 1)][..])
+        );
+
+        // Unchanged: tolerated, and not read.
+        engine.set_enabled(KindSet::EMPTY);
+        let unchanged = scan(&old, &engine, std::slice::from_ref(&root))?;
+        assert_eq!(unchanged.total.load(Ordering::Relaxed), 0);
+        assert_eq!(old.entry(&file).map(|e| e.hash), Some(None));
+
+        // Touched: there is no fingerprint to compare the contents with, so the detector runs
+        // (and finds nothing now), and the entry has a fingerprint from then on.
+        set_written(&file, after_a_minute())?;
+        scan(&old, &engine, std::slice::from_ref(&root))?;
+        let now = old.entry(&file).ok_or("lost")?;
+        assert!(now.counts.is_empty());
+        assert!(now.hash.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn a_fingerprint_that_is_none_is_ignored_and_the_record_kept() {
+        let hex = "00112233445566778899aabbccddeeff";
+        let line = |hash: &str| {
+            format!(
+                r#"{{"path":"C:\\a.txt","size":1,"modified":2,"scanned":3,"status":"ok","hash":{hash},"counts":{{"email":1}}}}"#
+            )
+        };
+        let hash_of = |text: String| -> Option<Option<ContentHash>> {
+            parse(text.as_bytes())
+                .get(Path::new(r"C:\a.txt"))
+                .map(|entry| entry.hash)
+        };
+        let good = hash_of(line(&format!("\"{hex}\"")));
+        assert_eq!(
+            good.flatten().map(|hash| hash.to_string()).as_deref(),
+            Some(hex)
+        );
+        let upper = hash_of(line(&format!("\"{}\"", hex.to_uppercase())));
+        assert_eq!(upper, good, "letter case of the digits does not matter");
+        for bad in [
+            "\"\"",
+            "\"not a fingerprint\"",
+            "\"00112233445566778899aabbccddee\"",
+            "\"00112233445566778899aabbccddeeff00\"",
+            "\"0011223344556677889\u{e9}aabbccddeeff\"",
+            "null",
+        ] {
+            assert_eq!(hash_of(line(bad)), Some(None), "{bad}: the record is kept");
+        }
+        assert_eq!(hash_of(String::new()), None);
+    }
+
+    #[test]
+    fn the_fingerprint_is_in_the_file_and_not_in_what_the_api_and_the_report_say() -> Res {
+        let tmp = TempDir::new()?;
+        let (engine, inv) = (tmp.engine()?, tmp.inventory()?);
+        let root = tmp.0.join("docs");
+        let file = root.join("a.txt");
+        put(&file, EMAIL)?;
+        scan(&inv, &engine, std::slice::from_ref(&root))?;
+        let entry = inv.entry(&file).ok_or("not scanned")?;
+        let hash = entry.hash.ok_or("no fingerprint")?.to_string();
+        assert_eq!(hash.len(), 32);
+
+        let saved = fs::read_to_string(tmp.0.join("inventory.jsonl"))?;
+        assert!(saved.contains(&format!("\"hash\":\"{hash}\"")), "{saved}");
+        assert!(!saved.contains("\"hits\""));
+        let again = tmp.inventory()?;
+        assert_eq!(
+            again.entry(&file),
+            Some(entry.clone()),
+            "it comes back with the entry"
+        );
+
+        let shown = serde_json::to_value(&entry)?;
+        assert!(shown.get("hash").is_none(), "{shown}");
+        assert_eq!(shown["hits"], 1);
+        let mut json = Vec::new();
+        inv.report(None, ExportFormat::Json, &mut json)?;
+        let mut csv = Vec::new();
+        inv.report(None, ExportFormat::Csv, &mut csv)?;
+        for report in [json, csv] {
+            assert!(!String::from_utf8(report)?.contains(&hash));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_watch_keeps_an_inventory_of_its_own() -> Res {
+        assert_ne!(FILE_NAME, WATCH_FILE_NAME);
+        let tmp = TempDir::new()?;
+        let engine = tmp.engine()?;
+        let main = tmp.inventory()?;
+        let watch = Inventory::open(&tmp.0.join(WATCH_FILE_NAME))?;
+        let root = tmp.0.join("docs");
+        put(&root.join("a.txt"), EMAIL)?;
+
+        // Two scans at once: each inventory has its own scan lock, and its own file.
+        let (_main_scan, _watch_scan) = (main.lock_scan()?, watch.lock_scan()?);
+        scan(&watch, &engine, std::slice::from_ref(&root))?;
+        assert_eq!(watch.totals().files, 1);
+        assert_eq!(
+            main.totals().files,
+            0,
+            "the watch added nothing to the inventory"
+        );
+        assert!(tmp.0.join(WATCH_FILE_NAME).is_file());
+        assert!(!tmp.0.join(FILE_NAME).exists());
+
+        scan(&main, &engine, std::slice::from_ref(&root))?;
+        main.forget_under(&root)?;
+        assert_eq!(main.totals().files, 0);
+        assert_eq!(
+            watch.totals().files,
+            1,
+            "forgetting in the inventory leaves the watch"
+        );
+        assert_eq!(
+            Inventory::open(&tmp.0.join(WATCH_FILE_NAME))?
+                .totals()
+                .files,
+            1
+        );
+        Ok(())
+    }
+
+    /// A watch of `root`: what `refresh` is given, for the roots in `roots`.
+    fn refresh(
+        inv: &Inventory,
+        engine: &Engine,
+        roots: &[&Path],
+        touched: &[(&Path, bool)],
+    ) -> Result<Progress> {
+        let roots: Vec<PathBuf> = roots.iter().map(|root| root.to_path_buf()).collect();
+        let touched: Vec<Touched> = touched
+            .iter()
+            .map(|&(path, fresh)| Touched {
+                path: path.to_path_buf(),
+                fresh,
+            })
+            .collect();
+        let progress = Progress::default();
+        inv.refresh(engine, &roots, &touched, &progress, &AtomicBool::new(false))?;
+        Ok(progress)
+    }
+
+    #[test]
+    fn a_refresh_scans_what_was_touched_and_forgets_what_is_gone() -> Res {
+        let tmp = TempDir::new()?;
+        let (engine, inv) = (tmp.engine()?, tmp.inventory()?);
+        let root = tmp.0.join("watched");
+        let a = root.join("a.txt");
+        let b = root.join("sub").join("b.txt");
+        put(&a, EMAIL)?;
+        put(&b, IBAN)?;
+
+        // Only what was named is looked at.
+        let first = refresh(&inv, &engine, &[&root], &[(&a, true)])?;
+        assert_eq!(first.total.load(Ordering::Relaxed), 1);
+        assert_eq!(stored(&inv), std::slice::from_ref(&a));
+        refresh(&inv, &engine, &[&root], &[(&b, false)])?;
+        assert_eq!(stored(&inv), [a.clone(), b.clone()]);
+
+        // Reported twice, or again after nothing changed: nothing is read.
+        let quiet = refresh(
+            &inv,
+            &engine,
+            &[&root],
+            &[(&a, false), (&a, true), (&b, false)],
+        )?;
+        assert_eq!(quiet.total.load(Ordering::Relaxed), 0);
+
+        // A file that is gone is forgotten, and so is everything below a folder that is.
+        fs::remove_file(&a)?;
+        refresh(&inv, &engine, &[&root], &[(&a, false)])?;
+        assert_eq!(stored(&inv), std::slice::from_ref(&b));
+        put(&root.join("sub").join("c.txt"), EMAIL)?;
+        refresh(
+            &inv,
+            &engine,
+            &[&root],
+            &[(&root.join("sub").join("c.txt"), true)],
+        )?;
+        assert_eq!(stored(&inv).len(), 2);
+        fs::remove_dir_all(root.join("sub"))?;
+        refresh(
+            &inv,
+            &engine,
+            &[&root],
+            &[(&b, false), (&root.join("sub").join("c.txt"), false)],
+        )?;
+        assert!(stored(&inv).is_empty(), "{:?}", stored(&inv));
+        assert!(
+            tmp.inventory()?.entries(None, 0).is_empty(),
+            "and it was saved"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_refresh_walks_a_folder_only_when_it_is_fresh_and_leaves_out_what_a_crawl_would() -> Res {
+        let tmp = TempDir::new()?;
+        let (engine, inv) = (tmp.engine()?, tmp.inventory()?);
+        let root = tmp.0.join("watched");
+        put(&root.join("keep.txt"), "nothing")?;
+        let moved = root.join("moved");
+        put(&moved.join("m1.txt"), EMAIL)?;
+        put(&moved.join("deep").join("m2.txt"), EMAIL)?;
+
+        // A folder is reported whenever something in it changes: that says nothing of what is
+        // in it, which reports itself.
+        refresh(&inv, &engine, &[&root], &[(&moved, false), (&root, false)])?;
+        assert!(stored(&inv).is_empty());
+        // One that was just created or renamed to is walked, and so is what lies in it.
+        refresh(&inv, &engine, &[&root], &[(&moved, true)])?;
+        assert_eq!(
+            stored(&inv),
+            [moved.join("deep").join("m2.txt"), moved.join("m1.txt")]
+        );
+
+        // What a crawl leaves out: folders nothing of the user's lives in, hidden files, what is
+        // outside every root.
+        let skipped = root.join("node_modules").join("x.txt");
+        let hidden = root.join("hidden.txt");
+        let outside = tmp.0.join("elsewhere.txt");
+        for file in [&skipped, &hidden, &outside] {
+            put(file, EMAIL)?;
+        }
+        let hidden_path = hidden.to_string_lossy();
+        let attrib = sys::run_system_tool("attrib.exe", &["+h", hidden_path.as_ref()])?;
+        assert!(attrib.status.success(), "attrib failed");
+        let before = stored(&inv);
+        refresh(
+            &inv,
+            &engine,
+            &[&root],
+            &[
+                (&skipped, true),
+                (&hidden, true),
+                (&outside, true),
+                (&root.join("node_modules"), true),
+            ],
+        )?;
+        assert_eq!(stored(&inv), before);
+        Ok(())
+    }
+
+    #[test]
+    fn a_refresh_of_a_root_that_is_not_there_drops_nothing() -> Res {
+        let tmp = TempDir::new()?;
+        let (engine, inv) = (tmp.engine()?, tmp.inventory()?);
+        let gone = tmp.0.join("unplugged").join("old.txt");
+        inv.record(vec![entry(&gone.to_string_lossy(), &[(Email, 1)])])?;
+        let root = tmp.0.join("unplugged");
+        refresh(&inv, &engine, &[&root], &[(&gone, false), (&root, false)])?;
+        assert_eq!(
+            stored(&inv),
+            std::slice::from_ref(&gone),
+            "the disk may only be unplugged"
+        );
+        // The same file with a root that is there: it is gone.
+        fs::create_dir_all(&root)?;
+        refresh(&inv, &engine, &[&root], &[(&gone, false)])?;
+        assert!(stored(&inv).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_refresh_of_a_touched_file_does_not_detect_it_again() -> Res {
+        let tmp = TempDir::new()?;
+        let (engine, inv) = (tmp.engine()?, tmp.inventory()?);
+        let root = tmp.0.join("watched");
+        let file = root.join("a.txt");
+        put(&file, EMAIL)?;
+        refresh(&inv, &engine, &[&root], &[(&file, true)])?;
+        engine.set_enabled(KindSet::EMPTY);
+        set_written(&file, after_a_minute())?;
+        let touched = refresh(&inv, &engine, &[&root], &[(&file, false)])?;
+        assert_eq!(touched.total.load(Ordering::Relaxed), 1);
+        assert_eq!(counts_of(&inv, &file), Some(BTreeMap::from([(Email, 1)])));
+        Ok(())
+    }
+
+    #[test]
+    fn a_cancelled_refresh_does_nothing() -> Res {
+        let tmp = TempDir::new()?;
+        let (engine, inv) = (tmp.engine()?, tmp.inventory()?);
+        let root = tmp.0.join("watched");
+        let file = root.join("a.txt");
+        put(&file, EMAIL)?;
+        let touched = [Touched {
+            path: file,
+            fresh: true,
+        }];
+        inv.refresh(
+            &engine,
+            std::slice::from_ref(&root),
+            &touched,
+            &Progress::default(),
+            &AtomicBool::new(true),
+        )?;
+        assert!(stored(&inv).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn tiles_list_the_files_with_the_most_first_and_add_up_the_rest() -> Res {
+        let tmp = TempDir::new()?;
+        let inv = tmp.inventory()?;
+        inv.record(vec![
+            entry(r"C:\r\a.txt", &[(Email, 5)]),
+            entry(r"C:\r\sub\b.txt", &[(Phone, 3), (Email, 1)]),
+            entry(r"C:\r\sub\c.txt", &[(Iban, 3)]),
+            entry(r"C:\r\sub\clean.txt", &[]),
+            entry(r"C:\other\d.txt", &[(Email, 2)]),
+        ])?;
+
+        let all = inv.tiles(None, 3);
+        let listed: Vec<(&Path, u64, Option<EntityKind>)> = all
+            .tiles
+            .iter()
+            .map(|tile| (tile.path.as_path(), tile.hits, tile.dominant()))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                (Path::new(r"C:\r\a.txt"), 5, Some(Email)),
+                (Path::new(r"C:\r\sub\b.txt"), 4, Some(Phone)),
+                (Path::new(r"C:\r\sub\c.txt"), 3, Some(Iban)),
+            ]
+        );
+        assert_eq!(all.tiles[0].size, 1);
+        assert_eq!(
+            all.rest,
+            Rest {
+                files: 1,
+                hits: 2,
+                counts: vec![(Email, 2)]
+            }
+        );
+
+        // Under a folder, case aside; ties go by path; nothing is left over.
+        let sub = inv.tiles(Some(Path::new(r"c:\R\SUB")), 10);
+        assert_eq!(
+            sub.tiles.iter().map(|t| t.path.clone()).collect::<Vec<_>>(),
+            [
+                PathBuf::from(r"C:\r\sub\b.txt"),
+                PathBuf::from(r"C:\r\sub\c.txt")
+            ]
+        );
+        assert_eq!(sub.rest, Rest::default());
+
+        // Everything beyond the limit is in the rest.
+        let none = inv.tiles(None, 0);
+        assert!(none.tiles.is_empty());
+        assert_eq!((none.rest.files, none.rest.hits), (4, 14));
+        // Equal counts go by kind.
+        assert_eq!(none.rest.counts, [(Email, 8), (Iban, 3), (Phone, 3)]);
+        assert_eq!(
+            inv.tiles(Some(Path::new(r"D:\nothing")), 5),
+            Tiles::default()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_legend_adds_up_each_kind_and_counts_its_files() -> Res {
+        let tmp = TempDir::new()?;
+        let inv = tmp.inventory()?;
+        inv.record(vec![
+            entry(r"C:\r\a.txt", &[(Email, 5)]),
+            entry(r"C:\r\sub\b.txt", &[(Phone, 3), (Email, 1)]),
+            entry(r"C:\r\sub\clean.txt", &[]),
+            entry(r"C:\other\d.txt", &[(Email, 2), (Iban, 2)]),
+        ])?;
+        let total = |kind, hits, files| TypeTotal { kind, hits, files };
+        assert_eq!(
+            inv.type_totals(None),
+            [total(Email, 8, 3), total(Phone, 3, 1), total(Iban, 2, 1)]
+        );
+        assert_eq!(
+            inv.type_totals(Some(Path::new(r"C:\r"))),
+            [total(Email, 6, 2), total(Phone, 3, 1)]
+        );
+        assert!(inv.type_totals(Some(Path::new(r"E:\none"))).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn the_entry_of_a_file_is_found_in_any_letter_case() -> Res {
+        let tmp = TempDir::new()?;
+        let inv = tmp.inventory()?;
+        inv.record(vec![entry(r"C:\r\A.txt", &[(Email, 1)])])?;
+        assert_eq!(
+            inv.entry(Path::new(r"C:\r\A.txt")).map(|e| e.hits()),
+            Some(1)
+        );
+        assert_eq!(
+            inv.entry(Path::new(r"c:\R\a.TXT")).map(|e| e.hits()),
+            Some(1)
+        );
+        assert_eq!(inv.entry(Path::new(r"C:\r")), None);
+        assert_eq!(inv.entry(Path::new(r"C:\r\b.txt")), None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_node_and_a_tile_are_coloured_by_the_kind_there_is_most_of() {
+        let node = Node {
+            path: PathBuf::from(r"C:\r"),
+            name: "r".to_owned(),
+            is_dir: true,
+            hits: 4,
+            files: 1,
+            counts: vec![(Phone, 3), (Email, 1)],
+        };
+        assert_eq!(node.dominant(), Some(Phone));
+        let empty = Node {
+            counts: Vec::new(),
+            ..node
+        };
+        assert_eq!(empty.dominant(), None);
+    }
+
+    /// Everything `findings` reports for the file at `path`.
+    fn all_findings(engine: &Engine, path: &Path) -> Result<Vec<Finding>> {
+        let found = std::sync::Mutex::new(Vec::new());
+        findings(engine, path, &|report| {
+            if let Report::Found(list) = report {
+                found
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend(list);
+            }
+            true
+        })?;
+        Ok(found
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
+    }
+
+    #[test]
+    fn findings_show_each_value_with_its_surroundings_and_keep_nothing() -> Res {
+        let tmp = TempDir::new()?;
+        let engine = tmp.engine()?;
+        let file = tmp.0.join("letter.txt");
+        put(
+            &file,
+            &format!(
+                "Dear Jan,\n\nplease  send the invoice to {EMAIL}\nbefore Friday, or pay {IBAN}."
+            ),
+        )?;
+        let listing = || -> io::Result<Vec<String>> {
+            let mut names = Vec::new();
+            for entry in fs::read_dir(&tmp.0)? {
+                names.push(entry?.file_name().to_string_lossy().into_owned());
+            }
+            names.sort();
+            Ok(names)
+        };
+        let before = listing()?;
+
+        let found = all_findings(&engine, &file)?;
+        let kinds: Vec<EntityKind> = found.iter().map(|finding| finding.kind).collect();
+        assert_eq!(kinds, [Email, Iban], "{found:?}");
+        let email = &found[0];
+        assert_eq!(&*email.value, EMAIL);
+        // Where each stands in the file: the third line, after the 28 characters before it, and
+        // the fourth line, after 22.
+        let at = |line, column| Some(Location::Line { line, column });
+        assert_eq!(email.location, at(3, 29));
+        assert_eq!(
+            &*email.snippet,
+            "Dear Jan, please send the invoice to jan.jansen@acme.nl before Friday, or pay NL91ABNA041716430…"
+        );
+        assert_eq!(&*found[1].value, IBAN);
+        assert_eq!(found[1].location, at(4, 23));
+        assert!(found[1].snippet.contains("or pay NL91ABNA0417164300."));
+
+        // Nothing was written: not the inventory, not a file of any kind. The values are in the
+        // answer, and nowhere else (a `Debug` of it shows the kinds only).
+        assert_eq!(listing()?, before);
+        assert!(!tmp.0.join(FILE_NAME).exists());
+        assert!(!format!("{found:?}").contains("jansen"));
+        assert_eq!(engine.vault().read()?.record_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn findings_of_a_file_that_cannot_be_read_say_why() -> Res {
+        let tmp = TempDir::new()?;
+        let engine = tmp.engine()?;
+        let missing = findings(&engine, &tmp.0.join("nope.txt"), &|_| true);
+        assert!(matches!(missing, Err(Error::Io(_))), "{missing:?}");
+        let big = tmp.0.join("big.dat");
+        let file = File::create(&big)?;
+        file.set_len(MAX_FILE + 1)?;
+        drop(file);
+        assert!(matches!(
+            findings(&engine, &big, &|_| true),
+            Err(Error::UnsupportedFormat(_))
+        ));
+        let broken = tmp.0.join("broken.zip");
+        put_bytes(&broken, b"PK\x03\x04 not really a zip")?;
+        assert!(findings(&engine, &broken, &|_| true).is_err());
         Ok(())
     }
 }

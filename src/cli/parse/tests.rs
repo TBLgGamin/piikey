@@ -399,7 +399,7 @@ fn settings_get_and_set() {
         "set",
         "--out",
         "x",
-        "inventory=true"
+        "watch=true"
     ]));
     assert!(invalid_value(&["settings", "set"]));
 }
@@ -409,7 +409,8 @@ fn settings_set_reads_scalars() {
     let got = patch(&[
         "highlight=always",
         "explorer_menu=false",
-        "inventory=TRUE",
+        "background=false",
+        "watch=TRUE",
         "http_api=true",
         "http_port=8080",
     ]);
@@ -418,14 +419,16 @@ fn settings_set_reads_scalars() {
         SettingsPatch {
             highlight: Some(Highlight::Always),
             explorer_menu: Some(false),
-            inventory: Some(true),
+            background: Some(false),
+            watch: Some(true),
             http_api: Some(true),
             http_port: Some(8080),
             ..SettingsPatch::default()
         }
     );
     // What is not named stays as it is.
-    assert_eq!(patch(&["inventory=false"]).http_port, None);
+    assert_eq!(patch(&["watch=false"]).http_port, None);
+    assert_eq!(patch(&["watch=false"]).background, None);
     // The last one wins.
     assert_eq!(patch(&["http_port=1", "http_port=2"]).http_port, Some(2));
 }
@@ -439,7 +442,7 @@ fn settings_set_collects_list_keys() {
         "disabled_kind=email",
         "disabled_kind=iban",
         r"inventory_root=C:\Users\jan\Documents",
-        r"inventory_exclude=C:\Users\jan\Documents\Private",
+        r"watch_folder=C:\Users\jan\Downloads",
     ]);
     assert_eq!(
         got,
@@ -448,7 +451,7 @@ fn settings_set_collects_list_keys() {
             programs: Some(strings(&["chrome.exe"])),
             disabled_kinds: Some(strings(&["email", "iban"])),
             inventory_roots: Some(paths(&[r"C:\Users\jan\Documents"])),
-            inventory_exclude: Some(paths(&[r"C:\Users\jan\Documents\Private"])),
+            watch_folders: Some(paths(&[r"C:\Users\jan\Downloads"])),
             ..SettingsPatch::default()
         }
     );
@@ -464,13 +467,21 @@ fn an_empty_list_value_empties_the_list() {
         Some(strings(&["a.nl"]))
     );
     // A list that is not mentioned is not touched.
-    assert_eq!(patch(&["inventory=true"]).sites, None);
+    assert_eq!(patch(&["watch=true"]).sites, None);
 }
 
 #[test]
 fn settings_set_rejects_what_is_not_a_setting() {
     assert!(invalid_value(&["settings", "set", "highlight=loud"]));
-    assert!(invalid_value(&["settings", "set", "inventory=maybe"]));
+    assert!(invalid_value(&["settings", "set", "watch=maybe"]));
+    assert!(invalid_value(&["settings", "set", "background=maybe"]));
+    // The inventory's switch and its exclusions are gone.
+    assert!(invalid_value(&["settings", "set", "inventory=true"]));
+    assert!(invalid_value(&[
+        "settings",
+        "set",
+        r"inventory_exclude=C:\Private"
+    ]));
     assert!(invalid_value(&["settings", "set", "http_port=70000"]));
     assert!(invalid_value(&["settings", "set", "http_port=0"]));
     assert!(invalid_value(&["settings", "set", "http_port=x"]));
@@ -489,7 +500,7 @@ fn settings_set_takes_every_key_of_the_settings_file_but_protection() {
         let value = match key {
             "highlight" => "off",
             "http_port" => "8080",
-            "explorer_menu" | "inventory" | "http_api" => "true",
+            "explorer_menu" | "background" | "watch" | "http_api" => "true",
             // The list keys: an empty value empties the list.
             _ => "",
         };
@@ -523,6 +534,8 @@ fn small_commands() {
     assert!(usage_error(&["protection"]));
     assert!(usage_error(&["protection", "maybe"]));
     assert!(usage_error(&["protection", "on", "off"]));
+    same(&request(&["open"]), &Request::ShowWindow);
+    assert!(usage_error(&["open", "now"]));
     assert!(usage_error(&["model"]));
     assert!(usage_error(&["model", "remove"]));
     assert!(usage_error(&["kinds", "email"]));
@@ -622,7 +635,7 @@ fn an_empty_path_is_a_mistake() {
 
 #[test]
 fn every_operation_but_the_explorer_one_has_a_command() {
-    let lines: [&[&str]; 25] = [
+    let lines: [&[&str]; 26] = [
         &["scan"],
         &["anonymize"],
         &["deanonymize"],
@@ -640,13 +653,14 @@ fn every_operation_but_the_explorer_one_has_a_command() {
         &["inventory", "rescan"],
         &["inventory", "report", "--out", "f"],
         &["settings", "get"],
-        &["settings", "set", "inventory=true"],
+        &["settings", "set", "watch=true"],
         &["kinds"],
         &["model", "status"],
         &["model", "download"],
         &["token"],
         &["status"],
         &["protection", "on"],
+        &["open"],
         &["serve"],
     ];
     let mut ops = BTreeSet::new();

@@ -1,7 +1,11 @@
 //! End-to-end tests: every format against a real engine and a temporary vault.
 //! Fixtures are built in code.
 
-use std::io::{Cursor, Read, Write};
+use std::{
+    fmt::Write as _,
+    io::{Cursor, Read, Write},
+    sync::{Mutex, PoisonError},
+};
 
 use cfb::CompoundFile;
 use lopdf::{
@@ -10,10 +14,13 @@ use lopdf::{
 };
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
-use super::{Format, Output, Scanned, msg, package, process, restore, same_text, scan, sniff};
+use super::{
+    Busy, Finding, Format, Location, Output, Report, Scanned, finding, msg, package, process,
+    restore, same_text, scan, sniff,
+};
 use crate::{
     Error,
-    detect::{EntityKind, Mode},
+    detect::{EntityKind, Mode, Span},
     engine::Engine,
     restore::Restorer,
 };
@@ -30,6 +37,30 @@ fn engine() -> Res<Engine> {
     Ok(Engine::open(
         &crate::testing::temp_dir("formats").join("vault.pkv"),
     )?)
+}
+
+/// What a read of the findings of `bytes` reports, in the order it reports it.
+fn reports(engine: &Engine, bytes: &[u8]) -> crate::Result<Vec<Report>> {
+    let seen = Mutex::new(Vec::new());
+    super::findings(engine, bytes, &|report| {
+        seen.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(report);
+        true
+    })?;
+    Ok(seen.into_inner().unwrap_or_else(PoisonError::into_inner))
+}
+
+/// Every finding of `bytes`, in the order the read reports them.
+fn findings(engine: &Engine, bytes: &[u8]) -> crate::Result<Vec<Finding>> {
+    Ok(reports(engine, bytes)?
+        .into_iter()
+        .filter_map(|report| match report {
+            Report::Found(list) => Some(list),
+            Report::Busy(_) => None,
+        })
+        .flatten()
+        .collect())
 }
 
 /// `process` expecting a rewritten file.
@@ -161,6 +192,191 @@ fn xlsx() -> Res<Vec<u8>> {
     ])
 }
 
+/// The namespaces a presentation part names.
+const PRESENTATION_NS: &str = "xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" \
+     xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\" \
+     xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"";
+
+/// `<p:sp>` showing `text`.
+fn shape_with(text: &str) -> String {
+    format!("<p:sp><p:txBody><a:p><a:r><a:t>{text}</a:t></a:r></a:p></p:txBody></p:sp>")
+}
+
+/// A slide part with `shapes` in its shape tree.
+fn slide_of(shapes: &str) -> String {
+    format!(
+        "{XML_HEAD}<p:sld {PRESENTATION_NS}><p:cSld><p:spTree><p:nvGrpSpPr/><p:grpSpPr/>{shapes}\
+         </p:spTree></p:cSld></p:sld>"
+    )
+}
+
+/// A relationships part with these `(id, type, target)`.
+fn relationships_of(items: &[(&str, &str, &str)]) -> String {
+    let list = items
+        .iter()
+        .fold(String::new(), |mut list, (id, kind, target)| {
+            let _ = write!(
+                list,
+                "<Relationship Id=\"{id}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/{kind}\" Target=\"{target}\"/>"
+            );
+            list
+        });
+    format!(
+        "{XML_HEAD}<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">{list}</Relationships>"
+    )
+}
+
+/// A presentation of two slides whose parts are named the other way round: the slide that is
+/// shown first is `slide2.xml`. It has a picture and then a shape with the address, and notes
+/// with the IBAN. The slide that follows has a title and a table with the number in a cell. The
+/// layout, the properties and the notes carry values too.
+fn pptx() -> Res<Vec<u8>> {
+    let presentation = format!(
+        "{XML_HEAD}<p:presentation {PRESENTATION_NS}><p:sldMasterIdLst/><p:sldIdLst>\
+         <p:sldId id=\"256\" r:id=\"rId2\"/><p:sldId id=\"257\" r:id=\"rId1\"/></p:sldIdLst></p:presentation>"
+    );
+    let presentation_rels = relationships_of(&[
+        ("rId1", "slide", "slides/slide1.xml"),
+        ("rId2", "slide", "slides/slide2.xml"),
+        ("rId3", "slideMaster", "slideMasters/slideMaster1.xml"),
+    ]);
+    let second = slide_of(&format!(
+        "{}<p:graphicFrame><a:tbl><a:tr><a:tc><a:txBody><a:p><a:r><a:t>Bel {MOBILE}</a:t></a:r></a:p></a:txBody></a:tc></a:tr></a:tbl></p:graphicFrame>",
+        shape_with("Dag allemaal")
+    ));
+    let first = slide_of(&format!(
+        "<p:pic><p:nvPicPr/></p:pic>{}",
+        shape_with(&format!("Mail {EMAIL}"))
+    ));
+    let first_rels = relationships_of(&[
+        ("rId1", "slideLayout", "../slideLayouts/slideLayout1.xml"),
+        ("rId2", "notesSlide", "../notesSlides/notesSlide1.xml"),
+    ]);
+    let notes = slide_of(&shape_with(&format!("Betaal {IBAN}")));
+    let layout = slide_of(&shape_with(&format!("Vraag {EMAIL}")));
+    let core = format!(
+        "{XML_HEAD}<cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" \
+         xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:creator>{EMAIL}</dc:creator></cp:coreProperties>"
+    );
+    build_zip(&[
+        (
+            "[Content_Types].xml",
+            format!("{XML_HEAD}<Types/>").as_bytes(),
+            DEFLATED,
+        ),
+        ("ppt/presentation.xml", presentation.as_bytes(), DEFLATED),
+        (
+            "ppt/_rels/presentation.xml.rels",
+            presentation_rels.as_bytes(),
+            DEFLATED,
+        ),
+        ("ppt/slides/slide1.xml", second.as_bytes(), DEFLATED),
+        ("ppt/slides/slide2.xml", first.as_bytes(), DEFLATED),
+        (
+            "ppt/slides/_rels/slide2.xml.rels",
+            first_rels.as_bytes(),
+            DEFLATED,
+        ),
+        (
+            "ppt/notesSlides/notesSlide1.xml",
+            notes.as_bytes(),
+            DEFLATED,
+        ),
+        (
+            "ppt/slideLayouts/slideLayout1.xml",
+            layout.as_bytes(),
+            DEFLATED,
+        ),
+        ("docProps/core.xml", core.as_bytes(), DEFLATED),
+    ])
+}
+
+/// A document of five paragraphs over three pages as Word last laid it out, the fourth in the
+/// cell of a table, with the address in the second and the fifth, and a header and the
+/// properties that have it too.
+fn paged_docx() -> Res<Vec<u8>> {
+    let w = "xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"";
+    let document = format!(
+        "{XML_HEAD}<w:document {w}><w:body>\
+         <w:p><w:r><w:t>Zonder gegevens</w:t></w:r></w:p>\
+         <w:p><w:r><w:t>Mail {EMAIL}</w:t></w:r></w:p>\
+         <w:p><w:r><w:lastRenderedPageBreak/><w:t>Bel {MOBILE}</w:t></w:r></w:p>\
+         <w:tbl><w:tr><w:tc><w:p><w:r><w:t>IBAN {IBAN}</w:t></w:r></w:p></w:tc></w:tr></w:tbl>\
+         <w:p><w:r><w:lastRenderedPageBreak/><w:t>Nog eens {EMAIL}</w:t></w:r></w:p>\
+         </w:body></w:document>"
+    );
+    let header =
+        format!("{XML_HEAD}<w:hdr {w}><w:p><w:r><w:t>Contact {EMAIL}</w:t></w:r></w:p></w:hdr>");
+    let core = format!(
+        "{XML_HEAD}<cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" \
+         xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:creator>{EMAIL}</dc:creator></cp:coreProperties>"
+    );
+    build_zip(&[
+        (
+            "[Content_Types].xml",
+            format!("{XML_HEAD}<Types/>").as_bytes(),
+            DEFLATED,
+        ),
+        ("word/document.xml", document.as_bytes(), DEFLATED),
+        ("word/header1.xml", header.as_bytes(), DEFLATED),
+        ("docProps/core.xml", core.as_bytes(), DEFLATED),
+    ])
+}
+
+/// A workbook of two sheets, `Klanten` and `Q&A`, with personal data in shared strings, in an
+/// inline string, in the plain value of a cell and in a header, and `extra` entries as well. The
+/// workbook lists `Klanten` first, or `Q&A` first when `klanten_first` is false.
+fn workbook_with(klanten_first: bool, extra: &[(&str, &[u8], CompressionMethod)]) -> Res<Vec<u8>> {
+    let klanten = "<sheet name=\"Klanten\" sheetId=\"1\" r:id=\"rId1\"/>";
+    let questions = "<sheet name=\"Q&amp;A\" sheetId=\"2\" r:id=\"rId2\"/>";
+    let sheets = if klanten_first {
+        format!("{klanten}{questions}")
+    } else {
+        format!("{questions}{klanten}")
+    };
+    let book = format!(
+        "{XML_HEAD}<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" \
+         xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
+         <sheets>{sheets}</sheets></workbook>"
+    );
+    // One target relative to the workbook's folder, one from the root of the package.
+    let relations = format!(
+        "{XML_HEAD}<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+         <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/>\
+         <Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"/xl/worksheets/sheet2.xml\"/>\
+         <Relationship Id=\"rId3\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings\" Target=\"sharedStrings.xml\"/>\
+         </Relationships>"
+    );
+    // Strings 0 and 1 are shown by cells, 2 is plain text, and 3 is shown by none.
+    let shared = format!(
+        "{XML_HEAD}<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"5\" uniqueCount=\"4\">\
+         <si><r><t>jan.jansen@</t></r><r><rPr><b/></rPr><t>example.org</t></r></si>\
+         <si><t>{IBAN}</t></si><si><t>gewoon tekst</t></si><si><t>piet@example.com</t></si></sst>"
+    );
+    let first = format!(
+        "{XML_HEAD}<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData>\
+         <row r=\"1\"><c r=\"A1\" t=\"s\"><v>2</v></c><c r=\"B1\" t=\"s\"><v>0</v></c></row>\
+         <row r=\"3\"><c r=\"C3\" t=\"s\"><v>0</v></c><c r=\"D3\" t=\"inlineStr\"><is><t>{MOBILE}</t></is></c></row>\
+         </sheetData><headerFooter><oddHeader>lotte@example.net</oddHeader></headerFooter></worksheet>"
+    );
+    let second = format!(
+        "{XML_HEAD}<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData>\
+         <row r=\"7\"><c r=\"A7\" t=\"s\"><v>0</v></c><c r=\"B7\" t=\"s\"><v>1</v></c></row>\
+         <row r=\"9\"><c r=\"C9\" t=\"str\"><f>A7</f><v>kees@example.net</v></c></row>\
+         </sheetData></worksheet>"
+    );
+    let mut entries: Vec<(&str, &[u8], CompressionMethod)> = vec![
+        ("[Content_Types].xml", CONTENT_TYPES.as_bytes(), DEFLATED),
+        ("xl/workbook.xml", book.as_bytes(), DEFLATED),
+        ("xl/_rels/workbook.xml.rels", relations.as_bytes(), DEFLATED),
+        ("xl/sharedStrings.xml", shared.as_bytes(), DEFLATED),
+        ("xl/worksheets/sheet1.xml", first.as_bytes(), DEFLATED),
+        ("xl/worksheets/sheet2.xml", second.as_bytes(), DEFLATED),
+    ];
+    entries.extend_from_slice(extra);
+    build_zip(&entries)
+}
+
 const ODT_MIME: &[u8] = b"application/vnd.oasis.opendocument.text";
 
 fn odt() -> Res<Vec<u8>> {
@@ -185,6 +401,42 @@ fn odt() -> Res<Vec<u8>> {
         ("meta.xml", meta.as_bytes(), DEFLATED),
         ("Pictures/logo.bin", &noise(2048), DEFLATED),
         ("Thumbnails/thumbnail.png", &noise(1024), DEFLATED),
+    ])
+}
+
+const ODS_MIME: &[u8] = b"application/vnd.oasis.opendocument.spreadsheet";
+
+/// A spreadsheet of two sheets, `Klanten` and `Q&A`, whose cells use repeated rows and columns
+/// and a covered cell, with personal data in the cells and in the meta data.
+fn ods() -> Res<Vec<u8>> {
+    let content = format!(
+        "{XML_HEAD}<office:document-content xmlns:office=\"o\" xmlns:table=\"t\" xmlns:text=\"x\"><office:body><office:spreadsheet>\
+         <table:table table:name=\"Klanten\">\
+         <table:table-column table:number-columns-repeated=\"3\"/>\
+         <table:table-row table:number-rows-repeated=\"2\"><table:table-cell/></table:table-row>\
+         <table:table-row>\
+         <table:table-cell table:number-columns-repeated=\"2\"/>\
+         <table:table-cell><text:p>{EMAIL}</text:p></table:table-cell>\
+         <table:covered-table-cell/>\
+         <table:table-cell table:number-columns-repeated=\"3\"><text:p>{IBAN}</text:p></table:table-cell>\
+         </table:table-row>\
+         <table:table-row table:number-rows-repeated=\"3\"><table:table-cell><text:p>kees@example.net</text:p></table:table-cell></table:table-row>\
+         </table:table>\
+         <table:table table:name=\"Q&amp;A\"><table:table-row><table:table-cell><text:p>{MOBILE}</text:p></table:table-cell></table:table-row></table:table>\
+         </office:spreadsheet></office:body></office:document-content>"
+    );
+    let meta = format!(
+        "{XML_HEAD}<office:document-meta xmlns:office=\"o\" xmlns:dc=\"d\"><office:meta><dc:creator>{EMAIL}</dc:creator></office:meta></office:document-meta>"
+    );
+    build_zip(&[
+        ("mimetype", ODS_MIME, STORED),
+        (
+            "META-INF/manifest.xml",
+            format!("{XML_HEAD}<manifest/>").as_bytes(),
+            DEFLATED,
+        ),
+        ("content.xml", content.as_bytes(), DEFLATED),
+        ("meta.xml", meta.as_bytes(), DEFLATED),
     ])
 }
 
@@ -223,6 +475,23 @@ fn eml() -> Vec<u8> {
         blob = base64(&blob),
     );
     mail.into_bytes()
+}
+
+/// A message with a plain text body that holds the address of its header and a number.
+fn located_eml() -> Vec<u8> {
+    format!(
+        "From: Jan Jansen <{EMAIL}>\r\n\
+         To: Piet <piet@example.com>\r\n\
+         Subject: Offerte\r\n\
+         Date: Sat, 20 Nov 2021 14:22:01 -0800\r\n\
+         MIME-Version: 1.0\r\n\
+         Content-Type: text/plain; charset=\"utf-8\"\r\n\
+         \r\n\
+         Hallo,\r\n\
+         \r\n\
+         Bel me op {MOBILE} of mail {EMAIL}\r\n"
+    )
+    .into_bytes()
 }
 
 fn base64(bytes: &[u8]) -> String {
@@ -409,6 +678,11 @@ fn stream_bytes(compound: &[u8]) -> Res<u64> {
 }
 
 fn pdf(text: &str) -> Res<Vec<u8>> {
+    pdf_pages(&[text])
+}
+
+/// A PDF with a page for each of `texts`, each showing its text at the top.
+fn pdf_pages(texts: &[&str]) -> Res<Vec<u8>> {
     let mut doc = Document::with_version("1.5");
     let pages_id = doc.new_object_id();
     let mut font = Dictionary::new();
@@ -421,25 +695,28 @@ fn pdf(text: &str) -> Res<Vec<u8>> {
     let mut resources = Dictionary::new();
     resources.set("Font", fonts);
     let resources_id = doc.add_object(resources);
-    let content = Content {
-        operations: vec![
-            Operation::new("BT", vec![]),
-            Operation::new("Tf", vec!["F1".into(), 24.into()]),
-            Operation::new("Td", vec![50.into(), 700.into()]),
-            Operation::new("Tj", vec![Object::string_literal(text)]),
-            Operation::new("ET", vec![]),
-        ],
-    };
-    let content_id = doc.add_object(Stream::new(Dictionary::new(), content.encode()?));
-    let mut page = Dictionary::new();
-    page.set("Type", "Page");
-    page.set("Parent", pages_id);
-    page.set("Contents", content_id);
-    let first_page = doc.add_object(page);
+    let mut kids = Vec::new();
+    for &text in texts {
+        let content = Content {
+            operations: vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec!["F1".into(), 24.into()]),
+                Operation::new("Td", vec![50.into(), 700.into()]),
+                Operation::new("Tj", vec![Object::string_literal(text)]),
+                Operation::new("ET", vec![]),
+            ],
+        };
+        let content_id = doc.add_object(Stream::new(Dictionary::new(), content.encode()?));
+        let mut page = Dictionary::new();
+        page.set("Type", "Page");
+        page.set("Parent", pages_id);
+        page.set("Contents", content_id);
+        kids.push(Object::from(doc.add_object(page)));
+    }
     let mut pages = Dictionary::new();
     pages.set("Type", "Pages");
-    pages.set("Kids", vec![Object::from(first_page)]);
-    pages.set("Count", 1);
+    pages.set("Count", i64::try_from(kids.len())?);
+    pages.set("Kids", kids);
     pages.set("Resources", resources_id);
     pages.set("MediaBox", vec![0.into(), 0.into(), 595.into(), 842.into()]);
     doc.objects.insert(pages_id, Object::Dictionary(pages));
@@ -1497,5 +1774,625 @@ fn scanning_a_clean_file_finds_nothing_and_what_cannot_be_read_is_an_error() -> 
         scan(&engine, b"%PDF-1.7 this is not a pdf", false),
         Err(Error::Pdf(_))
     ));
+    Ok(())
+}
+
+/// The finding for the first occurrence of `value` in `text`, taken as an email.
+fn finding_of(text: &str, value: &str) -> Res<Finding> {
+    let start = text.find(value).ok_or("the value is not in the text")?;
+    let span = Span {
+        start,
+        end: start + value.len(),
+        kind: EntityKind::Email,
+    };
+    Ok(finding(text, &span))
+}
+
+#[test]
+fn a_finding_shows_the_value_with_the_text_around_it() -> Res {
+    let text = "Please send the invoice to jan.jansen@example.org before Friday.";
+    let one = finding_of(text, EMAIL)?;
+    assert_eq!(one.kind, EntityKind::Email);
+    assert_eq!(&*one.value, EMAIL);
+    assert_eq!(&*one.snippet, text, "short enough to show whole");
+
+    // The value alone, at either end of the text.
+    assert_eq!(&*finding_of(EMAIL, EMAIL)?.snippet, EMAIL);
+    let at_start = finding_of(&format!("{EMAIL} wrote this"), EMAIL)?;
+    assert_eq!(&*at_start.snippet, format!("{EMAIL} wrote this"));
+    Ok(())
+}
+
+#[test]
+fn a_finding_cuts_the_text_to_forty_characters_a_side_and_says_so() -> Res {
+    let before = "a".repeat(55);
+    let after = "b".repeat(55);
+    let one = finding_of(&format!("{before} {EMAIL} {after}"), EMAIL)?;
+    assert_eq!(
+        &*one.snippet,
+        format!("…{} {EMAIL} {}…", "a".repeat(39), "b".repeat(39))
+    );
+    // The same at the exact limit: forty characters on a side fit, a forty-first is cut.
+    let fits = finding_of(
+        &format!("{} {EMAIL} {}", "c".repeat(39), "d".repeat(39)),
+        EMAIL,
+    )?;
+    assert!(!fits.snippet.contains('…'), "{}", fits.snippet);
+    let cut = finding_of(
+        &format!("{} {EMAIL} {}", "c".repeat(41), "d".repeat(41)),
+        EMAIL,
+    )?;
+    assert!(cut.snippet.starts_with('…') && cut.snippet.ends_with('…'));
+    Ok(())
+}
+
+#[test]
+fn a_finding_collapses_white_space_and_never_cuts_a_character_in_two() -> Res {
+    let text = "Name:\r\n\t  Jan\n\n\nmail:\t jan.jansen@example.org \r\n\r\n ok";
+    let one = finding_of(text, EMAIL)?;
+    assert_eq!(&*one.snippet, "Name: Jan mail: jan.jansen@example.org ok");
+
+    // Multi-byte characters on both sides, and a value that holds a line break: the cut falls
+    // between characters, and the value reads as one line.
+    let wide = format!("{}é{EMAIL}é{}", "é".repeat(60), "\u{1f600}".repeat(60));
+    let one = finding_of(&wide, EMAIL)?;
+    assert_eq!(one.snippet.chars().filter(|&c| c == 'é').count(), 40 + 1);
+    assert!(one.snippet.starts_with('…') && one.snippet.ends_with('…'));
+    let broken = "see Jan\n  Jansen, thanks";
+    let span = Span {
+        start: 4,
+        end: 17,
+        kind: EntityKind::Person,
+    };
+    let one = finding(broken, &span);
+    assert_eq!(&*one.value, "Jan Jansen,");
+    assert_eq!(&*one.snippet, "see Jan Jansen, thanks");
+    Ok(())
+}
+
+#[test]
+fn a_long_value_is_kept_whole_and_shown_cut_in_its_snippet() {
+    let key = format!("-----BEGIN KEY-----{}", "k".repeat(400));
+    let span = Span {
+        start: 5,
+        end: 5 + key.len(),
+        kind: EntityKind::Secret,
+    };
+    let one = finding(&format!("key: {key} end"), &span);
+    // The value is whole; the snippet shows its first 120 characters, and says it goes on.
+    assert_eq!(&*one.value, key);
+    let shown: String = key.chars().take(120).collect();
+    assert!(
+        one.snippet.contains(&format!("{shown}\u{2026}")),
+        "{}",
+        one.snippet
+    );
+    assert!(one.snippet.chars().count() < 121 + 2 * 40 + 4);
+    // A run longer than any value a person reads is cut at 4,096 characters.
+    let huge = "k".repeat(super::MAX_VALUE + 10);
+    let span = Span {
+        start: 0,
+        end: huge.len(),
+        kind: EntityKind::Secret,
+    };
+    let one = finding(&huge, &span);
+    assert_eq!(one.value.chars().count(), super::MAX_VALUE + 1);
+    assert!(one.value.ends_with('\u{2026}'));
+}
+
+#[test]
+fn findings_list_what_a_scan_counts_in_reading_order_and_touch_nothing() -> Res {
+    let engine = engine()?;
+    let text = format!("Mail {EMAIL}, call {MOBILE}, pay {IBAN}, or mail {EMAIL} again.");
+    let listed = findings(&engine, text.as_bytes())?;
+    let scanned = scan(&engine, text.as_bytes(), false)?;
+    assert_eq!(
+        listed.len(),
+        scanned.found.len(),
+        "the same values a scan counts"
+    );
+    // In the order of the text, not grouped by kind: by kind the address comes first, then the
+    // IBAN, then the phone number.
+    let order = values_among(&listed, &[EMAIL, MOBILE, IBAN]);
+    assert_eq!(order, [EMAIL, MOBILE, IBAN, EMAIL]);
+    let emails: Vec<&str> = listed
+        .iter()
+        .filter(|one| one.kind == EntityKind::Email)
+        .map(|one| &*one.snippet)
+        .collect();
+    assert_eq!(emails.len(), 2);
+    assert!(emails[0].starts_with("Mail jan.jansen"));
+    assert!(emails[1].contains("or mail jan.jansen@example.org again."));
+    assert_eq!(records(&engine)?, 0, "nothing was issued");
+    assert!(findings(&engine, b"just words")?.is_empty());
+    assert!(matches!(
+        findings(&engine, &build_zip(&[("a.txt", b"hello", DEFLATED)])?),
+        Err(Error::UnsupportedFormat("zip archive"))
+    ));
+    Ok(())
+}
+
+#[test]
+fn findings_read_a_document_the_way_a_scan_does() -> Res {
+    let engine = engine()?;
+    let listed = findings(&engine, &pdf(&format!("mail {EMAIL}"))?)?;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(&*listed[0].value, EMAIL);
+    assert!(listed[0].snippet.contains(&format!("mail {EMAIL}")));
+    Ok(())
+}
+
+// -- where a finding stands ---------------------------------------------------------------
+
+/// The places of the findings that are exactly `value`, in reading order.
+fn places_of(listed: &[Finding], value: &str) -> Vec<Option<Location>> {
+    listed
+        .iter()
+        .filter(|one| &*one.value == value)
+        .map(|one| one.location.clone())
+        .collect()
+}
+
+/// The values of `listed`, in reading order, that are one of `of`.
+fn values_among<'a>(listed: &'a [Finding], of: &[&str]) -> Vec<&'a str> {
+    listed
+        .iter()
+        .map(|one| &*one.value)
+        .filter(|value| of.contains(value))
+        .collect()
+}
+
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the helper stands for the Option that a finding carries, so tests compare like with like"
+)]
+fn at_line(line: u32, column: u32) -> Option<Location> {
+    Some(Location::Line { line, column })
+}
+
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the helper stands for the Option that a finding carries, so tests compare like with like"
+)]
+fn in_cell(sheet: &str, cell: &str) -> Option<Location> {
+    Some(Location::Cell {
+        sheet: sheet.into(),
+        cell: cell.into(),
+    })
+}
+
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the helper stands for the Option that a finding carries, so tests compare like with like"
+)]
+fn on_slide(slide: u32, shape: Option<u32>) -> Option<Location> {
+    Some(Location::Slide { slide, shape })
+}
+
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the helper stands for the Option that a finding carries, so tests compare like with like"
+)]
+fn in_paragraph(paragraph: u32, page: Option<u32>) -> Option<Location> {
+    Some(Location::Paragraph { paragraph, page })
+}
+
+#[test]
+fn a_value_in_a_text_says_its_line_and_column() -> Res {
+    let engine = engine()?;
+    // Lines end at a line feed, at a carriage return and line feed, and at a lone carriage
+    // return; the line feed and carriage return before the number are two breaks.
+    let text = format!("Mail {EMAIL}\nsecond line\r\nMail {EMAIL}\rnog een\n\rBel {MOBILE}");
+    let listed = findings(&engine, text.as_bytes())?;
+    assert_eq!(places_of(&listed, EMAIL), [at_line(1, 6), at_line(3, 6)]);
+    assert_eq!(places_of(&listed, MOBILE), [at_line(6, 5)]);
+
+    // Characters of more than one byte and a tab each count as one column.
+    let wide = format!("Zoë 🙂\t{EMAIL}");
+    let listed = findings(&engine, wide.as_bytes())?;
+    assert_eq!(places_of(&listed, EMAIL), [at_line(1, 7)]);
+    Ok(())
+}
+
+#[test]
+fn the_line_and_column_are_those_of_the_decoded_text() -> Res {
+    let engine = engine()?;
+    // UTF-8 with a byte order mark: the mark is no column.
+    let mut utf8 = b"\xEF\xBB\xBF".to_vec();
+    utf8.extend(format!("Mail {EMAIL}").bytes());
+    assert_eq!(
+        places_of(&findings(&engine, &utf8)?, EMAIL),
+        [at_line(1, 6)]
+    );
+
+    // UTF-16 with a byte order mark, over two lines.
+    let mut utf16 = vec![0xFF, 0xFE];
+    utf16.extend(utf16le(&format!(
+        "Bel {MOBILE} of mail {EMAIL}\r\nMail {EMAIL}"
+    )));
+    let listed = findings(&engine, &utf16)?;
+    assert_eq!(places_of(&listed, MOBILE), [at_line(1, 5)]);
+    assert_eq!(places_of(&listed, EMAIL), [at_line(1, 28), at_line(2, 6)]);
+
+    // Windows-1252: a column is a character, not the bytes UTF-8 would spell it with.
+    let mut ansi = b"Caf\xE9 \x80 5, mail ".to_vec();
+    ansi.extend(EMAIL.as_bytes());
+    assert_eq!(
+        places_of(&findings(&engine, &ansi)?, EMAIL),
+        [at_line(1, 16)]
+    );
+    Ok(())
+}
+
+#[test]
+fn many_values_on_one_line_each_have_their_column() -> Res {
+    let engine = engine()?;
+    let pieces: Vec<String> = (0..3000).map(|i| format!("p{i}@example.org ")).collect();
+    let listed = findings(&engine, pieces.concat().as_bytes())?;
+    assert_eq!(listed.len(), pieces.len());
+    let mut column = 1;
+    for (one, piece) in listed.iter().zip(&pieces) {
+        assert_eq!(one.location, at_line(1, column), "{}", one.value);
+        column += u32::try_from(piece.chars().count())?;
+    }
+    Ok(())
+}
+
+#[test]
+fn a_value_in_a_pdf_says_its_page() -> Res {
+    let engine = engine()?;
+    let first = format!("mail {EMAIL}");
+    let third = format!("Rekening {IBAN}");
+    let pages = [
+        first.as_str(),
+        "geen gegevens op deze pagina",
+        third.as_str(),
+    ];
+    let listed = findings(&engine, &pdf_pages(&pages)?)?;
+    // The page without anything counts too.
+    assert_eq!(places_of(&listed, EMAIL), [Some(Location::Page(1))]);
+    assert_eq!(places_of(&listed, IBAN), [Some(Location::Page(3))]);
+    Ok(())
+}
+
+#[test]
+fn a_value_in_a_message_is_looked_up_in_its_file() -> Res {
+    let engine = engine()?;
+    let listed = findings(&engine, &located_eml())?;
+    // The address of the header is the first finding of it, so at the first place it is written
+    // in the file; the one in the body is the second.
+    assert_eq!(places_of(&listed, EMAIL), [at_line(1, 19), at_line(10, 34)]);
+    assert_eq!(places_of(&listed, "piet@example.com"), [at_line(2, 11)]);
+    assert_eq!(places_of(&listed, MOBILE), [at_line(10, 11)]);
+    Ok(())
+}
+
+#[test]
+fn a_value_in_an_encoded_body_or_in_an_attachment_has_no_place() -> Res {
+    let engine = engine()?;
+    let listed = findings(&engine, &eml())?;
+    assert_eq!(
+        places_of(&listed, EMAIL).into_iter().next().flatten(),
+        at_line(1, 19)
+    );
+    assert_eq!(places_of(&listed, "piet@example.com"), [at_line(2, 11)]);
+    // The number is in the base64 body only, and the IBAN in an attachment, which is a file of
+    // its own: the IBAN is in the clear in this one, all the same.
+    assert_eq!(places_of(&listed, MOBILE), [None]);
+    assert_eq!(places_of(&listed, IBAN), [None]);
+    // Headers, then bodies, then attachments.
+    let order = values_among(&listed, &["piet@example.com", MOBILE, IBAN]);
+    assert_eq!(order, ["piet@example.com", MOBILE, IBAN]);
+    Ok(())
+}
+
+#[test]
+fn a_value_in_a_workbook_says_its_sheet_and_cell() -> Res {
+    let engine = engine()?;
+    let listed = findings(&engine, &workbook_with(true, &[])?)?;
+    // A shared string shown by cells of both sheets is at the first of them, going through the
+    // sheets and then through the cells.
+    assert_eq!(places_of(&listed, EMAIL), [in_cell("Klanten", "B1")]);
+    // On the second sheet, whose name the workbook escapes.
+    assert_eq!(places_of(&listed, IBAN), [in_cell("Q&A", "B7")]);
+    // An inline string, and the plain value of a cell.
+    assert_eq!(places_of(&listed, MOBILE), [in_cell("Klanten", "D3")]);
+    assert_eq!(
+        places_of(&listed, "kees@example.net"),
+        [in_cell("Q&A", "C9")]
+    );
+    // A shared string that no cell shows, and a header.
+    assert_eq!(places_of(&listed, "piet@example.com"), [None]);
+    assert_eq!(places_of(&listed, "lotte@example.net"), [None]);
+    // Reading order: the shared strings, then each sheet.
+    let all = [
+        EMAIL,
+        IBAN,
+        MOBILE,
+        "piet@example.com",
+        "lotte@example.net",
+        "kees@example.net",
+    ];
+    assert_eq!(
+        values_among(&listed, &all),
+        [
+            EMAIL,
+            IBAN,
+            "piet@example.com",
+            MOBILE,
+            "lotte@example.net",
+            "kees@example.net"
+        ]
+    );
+
+    // The sheets go by the order the workbook lists them in, not by the order of their parts.
+    let listed = findings(&engine, &workbook_with(false, &[])?)?;
+    assert_eq!(places_of(&listed, EMAIL), [in_cell("Q&A", "A7")]);
+    assert_eq!(places_of(&listed, MOBILE), [in_cell("Klanten", "D3")]);
+    Ok(())
+}
+
+#[test]
+fn a_workbook_that_cannot_be_read_has_values_without_places_and_no_error() -> Res {
+    let engine = engine()?;
+    // This one has no workbook part to say what its sheets are.
+    let listed = findings(&engine, &xlsx()?)?;
+    assert!(listed.len() >= 3, "{listed:?}");
+    assert!(listed.iter().all(|one| one.location.is_none()));
+    Ok(())
+}
+
+#[test]
+fn a_value_in_an_opendocument_sheet_says_its_sheet_and_cell() -> Res {
+    let engine = engine()?;
+    let listed = findings(&engine, &ods()?)?;
+    // Counted over the repeated rows and columns, and the covered cell. The creator in the meta
+    // data is in no cell.
+    assert_eq!(places_of(&listed, EMAIL), [in_cell("Klanten", "C3"), None]);
+    assert_eq!(places_of(&listed, IBAN), [in_cell("Klanten", "E3")]);
+    assert_eq!(
+        places_of(&listed, "kees@example.net"),
+        [in_cell("Klanten", "A4")]
+    );
+    assert_eq!(places_of(&listed, MOBILE), [in_cell("Q&A", "A1")]);
+    Ok(())
+}
+
+#[test]
+fn what_an_embedded_package_holds_has_no_place() -> Res {
+    let engine = engine()?;
+    let inner = workbook_with(true, &[])?;
+    let outer = workbook_with(true, &[("xl/embeddings/Inner.xlsx", &inner, STORED)])?;
+    let listed = findings(&engine, &outer)?;
+    // The outer workbook comes first, with its cells, then the one it embeds, with none.
+    assert_eq!(places_of(&listed, EMAIL), [in_cell("Klanten", "B1"), None]);
+    assert_eq!(places_of(&listed, IBAN), [in_cell("Q&A", "B7"), None]);
+    assert_eq!(places_of(&listed, MOBILE), [in_cell("Klanten", "D3"), None]);
+    Ok(())
+}
+
+#[test]
+fn a_value_in_a_presentation_is_at_its_slide_and_shape() -> Res {
+    let engine = engine()?;
+    let listed = findings(&engine, &pptx()?)?;
+    // The slide that is shown first is `slide2.xml`: its picture is the first shape and the text
+    // with the address the second. The layout and the properties are on no slide.
+    assert_eq!(
+        places_of(&listed, EMAIL),
+        [on_slide(1, Some(2)), None, None],
+        "{listed:?}"
+    );
+    // The table is the second shape of the slide that follows it.
+    assert_eq!(places_of(&listed, MOBILE), [on_slide(2, Some(2))]);
+    // What the notes of the first slide say is a place of its own.
+    assert_eq!(places_of(&listed, IBAN), [Some(Location::Notes(1))]);
+    Ok(())
+}
+
+#[test]
+fn a_value_in_a_document_is_at_its_paragraph_and_page() -> Res {
+    let engine = engine()?;
+    let listed = findings(&engine, &paged_docx()?)?;
+    // The second and the fifth paragraph; the header and the properties are in no paragraph.
+    assert_eq!(
+        places_of(&listed, EMAIL),
+        [
+            in_paragraph(2, Some(1)),
+            in_paragraph(5, Some(3)),
+            None,
+            None
+        ]
+    );
+    assert_eq!(places_of(&listed, MOBILE), [in_paragraph(3, Some(2))]);
+    // The cell of a table holds a paragraph too.
+    assert_eq!(places_of(&listed, IBAN), [in_paragraph(4, Some(2))]);
+    // A document nobody laid out says nothing of its pages, and still has its paragraphs: the
+    // address is in the first one, and so is the number that Word split over two runs.
+    let plain = findings(&engine, &docx()?)?;
+    assert_eq!(places_of(&plain, PHONE), [in_paragraph(1, None)]);
+    assert_eq!(
+        places_of(&plain, EMAIL),
+        [in_paragraph(1, None), None, None]
+    );
+    Ok(())
+}
+
+#[test]
+fn open_documents_and_messages_without_places_have_none() -> Res {
+    let engine = engine()?;
+    for (name, bytes) in [("odt", odt()?), ("msg", msg()?)] {
+        let listed = findings(&engine, &bytes)?;
+        assert!(!listed.is_empty(), "{name}");
+        assert!(listed.iter().all(|one| one.location.is_none()), "{name}");
+    }
+    // In the paragraph the number comes before the address, and by kind it would come after.
+    let listed = findings(&engine, &docx()?)?;
+    let number = listed
+        .iter()
+        .position(|one| one.kind == EntityKind::Phone)
+        .ok_or("no number")?;
+    let address = listed
+        .iter()
+        .position(|one| one.kind == EntityKind::Email)
+        .ok_or("no address")?;
+    assert!(number < address, "{listed:?}");
+    Ok(())
+}
+
+#[test]
+fn asking_for_places_changes_nothing_a_scan_reports() -> Res {
+    let engine = engine()?;
+    let page = format!("mail {EMAIL}");
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("text", format!("Mail {EMAIL}\r\nBel {MOBILE}").into_bytes()),
+        ("docx", docx()?),
+        ("paged docx", paged_docx()?),
+        ("pptx", pptx()?),
+        ("workbook", workbook_with(true, &[])?),
+        ("ods", ods()?),
+        ("eml", eml()),
+        ("eml in plain text", located_eml()),
+        (
+            "pdf",
+            pdf_pages(&[page.as_str(), "geen gegevens op deze pagina"])?,
+        ),
+        ("msg", msg()?),
+    ];
+    for (name, bytes) in &cases {
+        let scanned = scan(&engine, bytes, false)?;
+        let listed = findings(&engine, bytes)?;
+        let counted: Vec<(EntityKind, &str)> = scanned
+            .found
+            .iter()
+            .map(|(kind, value)| (*kind, &**value))
+            .collect();
+        let shown: Vec<(EntityKind, &str)> =
+            listed.iter().map(|one| (one.kind, &*one.value)).collect();
+        assert_eq!(counted, shown, "{name}");
+    }
+    assert_eq!(records(&engine)?, 0);
+    Ok(())
+}
+
+// -- a read of findings that reports as it goes ------------------------------------
+
+/// Finds `Marieke de Vries` as a person: it stands in for the model, which reads after the
+/// patterns.
+#[derive(Debug)]
+struct Names;
+
+impl crate::detect::Detector for Names {
+    fn detect(&self, text: &str, _mode: Mode) -> Vec<Span> {
+        text.match_indices("Marieke de Vries")
+            .map(|(start, name)| Span {
+                start,
+                end: start + name.len(),
+                kind: EntityKind::Person,
+            })
+            .collect()
+    }
+}
+
+/// An engine whose detector is the patterns and then [`Names`].
+fn engine_with_names() -> Res<Engine> {
+    let detector = crate::detect::CompositeDetector(vec![
+        Box::new(crate::detect::RegexDetector::new()?),
+        Box::new(Names),
+    ]);
+    let vault =
+        crate::vault::Vault::open(&crate::testing::temp_dir("formats-names").join("vault.pkv"))?;
+    Ok(Engine::new(Box::new(detector), vault))
+}
+
+/// What a report is, in a word: `found <kinds>` or what the read is busy with.
+fn shape(report: &Report) -> String {
+    match report {
+        Report::Found(list) => {
+            let kinds: Vec<&str> = list.iter().map(|one| one.kind.as_str()).collect();
+            format!("found {}", kinds.join("+"))
+        }
+        Report::Busy(busy) => format!("{busy:?}"),
+    }
+}
+
+#[test]
+fn what_patterns_find_is_reported_before_what_the_model_finds_with_the_progress_between() -> Res {
+    let engine = engine_with_names()?;
+    let text = format!("Marieke de Vries mailt {EMAIL}\nen belt {MOBILE}");
+    let seen = reports(&engine, text.as_bytes())?;
+    let shapes: Vec<String> = seen.iter().map(shape).collect();
+    assert_eq!(
+        shapes,
+        [
+            "found email+phone".to_owned(),
+            format!("{:?}", Busy::Model { done: 0, total: 0 }),
+            "found person".to_owned(),
+        ]
+    );
+    // Each value knows its place, whichever step it came in.
+    let listed = findings(&engine, text.as_bytes())?;
+    assert_eq!(places_of(&listed, EMAIL), [at_line(1, 24)]);
+    assert_eq!(places_of(&listed, MOBILE), [at_line(2, 9)]);
+    assert_eq!(places_of(&listed, "Marieke de Vries"), [at_line(1, 1)]);
+    // What a scan counts is what the steps hold together.
+    let scanned = scan(&engine, text.as_bytes(), false)?;
+    let mut counted: Vec<(EntityKind, &str)> = scanned
+        .found
+        .iter()
+        .map(|(kind, value)| (*kind, &**value))
+        .collect();
+    let mut shown: Vec<(EntityKind, &str)> =
+        listed.iter().map(|one| (one.kind, &*one.value)).collect();
+    counted.sort();
+    shown.sort();
+    assert_eq!(counted, shown);
+    Ok(())
+}
+
+#[test]
+fn the_values_of_a_message_wait_for_the_whole_call_because_they_are_placed_together() -> Res {
+    let engine = engine_with_names()?;
+    let mail =
+        format!("From: Jan <{EMAIL}>\r\nSubject: Hallo\r\n\r\nMarieke de Vries belt {MOBILE}\r\n");
+    let seen = reports(&engine, mail.as_bytes())?;
+    // The progress of the model is still told, but every value comes in one report, once the
+    // call is done, each with the place it has in the file.
+    let shapes: Vec<String> = seen.iter().map(shape).collect();
+    assert_eq!(shapes.len(), 2, "{shapes:?}");
+    assert_eq!(
+        shapes[0],
+        format!("{:?}", Busy::Model { done: 0, total: 0 })
+    );
+    assert!(shapes[1].starts_with("found "), "{shapes:?}");
+    let listed = findings(&engine, mail.as_bytes())?;
+    assert_eq!(places_of(&listed, EMAIL), [at_line(1, 12)]);
+    assert_eq!(places_of(&listed, "Marieke de Vries"), [at_line(4, 1)]);
+    assert_eq!(places_of(&listed, MOBILE), [at_line(4, 23)]);
+    Ok(())
+}
+
+#[test]
+fn findings_come_in_reports_of_a_thousand_and_a_read_stops_when_its_reader_says_so() -> Res {
+    let engine = engine()?;
+    let many = (0..2_500).fold(String::new(), |mut all, i| {
+        let _ = writeln!(all, "p{i}@example.org");
+        all
+    });
+    let sizes: Vec<usize> = reports(&engine, many.as_bytes())?
+        .iter()
+        .filter_map(|report| match report {
+            Report::Found(list) => Some(list.len()),
+            Report::Busy(_) => None,
+        })
+        .collect();
+    assert_eq!(sizes, [1_000, 1_000, 500]);
+
+    // A reader that has had enough after the first report gets no second.
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    super::findings(&engine, many.as_bytes(), &|_| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        false
+    })?;
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     Ok(())
 }

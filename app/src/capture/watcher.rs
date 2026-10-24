@@ -19,12 +19,16 @@ use crate::proxy::Purpose;
 /// Looks at a clipboard change that another program held open, this many times before it is
 /// given up: a copy keeps the clipboard open for a moment while it is written.
 const CLIP_TRIES: u8 = 10;
+/// Looks in a row that find nothing readable in focus before the element is let go of.
+const LOST_AFTER: u8 = 3;
 
 /// What the loop knows about the field it is looking at, and when to hand its text on.
 pub(super) struct Watcher {
     purpose: Arc<Purpose>,
     /// The element that has the focus.
     focus: Option<Focus>,
+    /// Looks in a row that found nothing readable in focus.
+    lost: u8,
     /// That element is in a protected page or program: its text and the clipboard are read.
     protected: bool,
     /// What the field held when it was last read.
@@ -54,6 +58,7 @@ impl Watcher {
     pub(super) fn new(purpose: Arc<Purpose>) -> Self {
         Self {
             focus: None,
+            lost: 0,
             protected: false,
             text: String::new(),
             pushed: None,
@@ -98,12 +103,18 @@ impl Watcher {
         }
         // The value and the place of the element come with it when either use will read them.
         let Some(focus) = desktop.focus(self.protected || mode == Highlight::Always) else {
-            self.leave(sink);
+            // The focus can be unreadable for a moment while an app redraws: the element is let go
+            // of only when it stays so for a few looks, or the outline would blink.
+            self.lost = self.lost.saturating_add(1);
+            if self.lost >= LOST_AFTER {
+                self.leave(sink);
+            }
             // A press has nothing to outline now. It is taken in all the same: while it is not,
             // the worker does not wait for the next look, and would look again at once, and again.
             self.outline.take_presses(&self.purpose);
             return;
         };
+        self.lost = 0;
         if self.focus.as_ref() != Some(&focus) {
             self.leave(sink);
             self.protected = mask && !focus.password && desktop.protected();
@@ -134,6 +145,7 @@ impl Watcher {
     /// element is forgotten.
     fn leave(&mut self, sink: &impl Sink) {
         self.focus = None;
+        self.lost = 0;
         self.protected = false;
         self.text.clear();
         if self.pushed.take().is_some() {
@@ -371,13 +383,35 @@ mod tests {
         desktop.types("iban NL91ABNA0417164300");
         watcher.tick(start, &mut desktop, &log);
         desktop.focus = None;
-        watcher.tick(after(start, 100), &mut desktop, &log);
-        assert_eq!(log.take(), ["push iban NL91ABNA0417164300", "flush"]);
+        // Unreadable for a moment is not gone: the element is let go of at the third look.
+        for step in 1..LOST_AFTER {
+            watcher.tick(after(start, u64::from(step) * 100), &mut desktop, &log);
+        }
+        assert_eq!(log.take(), ["push iban NL91ABNA0417164300"]);
+        assert_eq!(watcher.period(), FAST);
+        watcher.tick(after(start, 300), &mut desktop, &log);
+        assert_eq!(log.take(), ["flush"]);
         assert_eq!(watcher.period(), SLOW);
         // Back on a protected element: decided afresh.
         desktop.moves_to(1, true);
-        watcher.tick(after(start, 200), &mut desktop, &log);
+        watcher.tick(after(start, 400), &mut desktop, &log);
         assert_eq!(desktop.protected_calls, 2);
+    }
+
+    #[test]
+    fn a_focus_that_comes_back_at_once_is_the_same_element() {
+        let (mut desktop, log, mut watcher) =
+            (Fake::on(1, true), Log::default(), Watcher::default());
+        let start = Instant::now();
+        desktop.types("iban NL91ABNA0417164300");
+        watcher.tick(start, &mut desktop, &log);
+        let focus = desktop.focus.take();
+        watcher.tick(after(start, 100), &mut desktop, &log);
+        desktop.focus = focus;
+        watcher.tick(after(start, 200), &mut desktop, &log);
+        // Nothing was flushed or decided again: the field was not left.
+        assert_eq!(log.take(), ["push iban NL91ABNA0417164300"]);
+        assert_eq!(desktop.protected_calls, 1);
     }
 
     #[test]
@@ -490,7 +524,11 @@ mod tests {
         desktop.shows(FIELD, EMAIL);
         let start = Instant::now();
         watcher.tick(start, &mut desktop, &log);
-        assert_eq!(log.take(), [format!("push {EMAIL}")]);
+        // The field is met for the first time: its text goes to the store and is checked at once.
+        assert_eq!(
+            log.take(),
+            [format!("push {EMAIL}"), show(Mark::Pii, FIELD)]
+        );
         watcher.tick(after(start, 300), &mut desktop, &log);
         assert_eq!(log.take(), ["flush".to_owned(), show(Mark::Pii, FIELD)]);
         assert_eq!(desktop.protected_calls, 1);

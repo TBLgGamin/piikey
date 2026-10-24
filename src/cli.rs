@@ -46,6 +46,7 @@ usage:
   piikey-cli inventory status | list [--under PATH] [--limit N] [--offset N] | tree [--under PATH] | rescan | report --out FILE [--format json|csv]
   piikey-cli settings get | settings set KEY=VALUE...      keys = guard.cfg keys; list keys repeat (site=a site=b)
   piikey-cli kinds | model status | model download | token [--rotate] | status | protection on|off
+  piikey-cli open      brings the running app's window forward (needs the app)
   piikey-cli serve [--http [--port N]] [--pipe NAME]
 global: --json  --local  --vault PATH  -h/--help  -V/--version
 
@@ -314,7 +315,8 @@ fn make_absolute(request: &mut Request) -> io::Result<()> {
         | Request::ModelDownload
         | Request::ApiToken { .. }
         | Request::Status
-        | Request::Protection { .. } => Ok(()),
+        | Request::Protection { .. }
+        | Request::ShowWindow => Ok(()),
     }
 }
 

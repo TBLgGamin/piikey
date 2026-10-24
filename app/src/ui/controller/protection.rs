@@ -14,7 +14,7 @@ impl Controller {
                 // The download turns the app on when it is done.
                 state.fetch.then_start = true;
                 state.notice = Some(Notice::warning(
-                    "piikey turns on as soon as the model has downloaded.",
+                    "Protection turns on as soon as the model has downloaded.",
                 ));
             }
             (downloading, state.enabled)
@@ -64,7 +64,7 @@ impl Controller {
         self.update(|state| state.cert = cert_of(installed));
         if !installed {
             return Err(Notice::warning(
-                "Install the piikey certificate first, then turn piikey on.",
+                "Install the piikey certificate first, then turn protection on.",
             ));
         }
         self.sync_model_with(true);
@@ -124,7 +124,7 @@ impl Controller {
         if let (Err(error), None) = (&restored, &reason) {
             self.update(|state| {
                 state.notice = Some(Notice::error(format!(
-                    "Could not restore the Windows proxy settings: {error}. piikey stays on."
+                    "Could not restore the Windows proxy settings: {error}. Protection stays on."
                 )));
             });
             return;
@@ -146,9 +146,9 @@ impl Controller {
         self.persist();
         if let Some(reason) = reason {
             let text = match restored {
-                Ok(()) => format!("piikey turned itself off: {reason}"),
+                Ok(()) => format!("Protection turned itself off: {reason}"),
                 Err(error) => format!(
-                    "piikey turned itself off: {reason}. Windows still points at the proxy: {error}"
+                    "Protection turned itself off: {reason}. Windows still points at the proxy: {error}"
                 ),
             };
             self.update(|state| state.notice = Some(Notice::error(text)));

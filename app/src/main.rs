@@ -10,8 +10,15 @@ mod ledger;
 mod process;
 mod proxy;
 mod shell;
+mod startup;
 mod sysproxy;
 mod ui;
+mod uia_text;
+
+use std::{
+    thread,
+    time::{Duration, Instant},
+};
 
 /// App-level result; errors are user-facing messages.
 pub type Res<T, E = String> = std::result::Result<T, E>;
@@ -55,13 +62,36 @@ fn main() {
             let result = if is(ui::SCAN_FLAG) {
                 ui::scan_from_explorer(&shell::scan_paths(args))
             } else {
-                ui::run()
+                launch(is(ui::BACKGROUND_FLAG) || startup::launched_at_sign_in())
             };
             if let Err(message) = result {
                 eprintln!("piikey: {message}");
                 ui::show_failure(&message);
                 std::process::exit(1);
             }
+        }
+    }
+}
+
+/// How long a start waits for an app that is still opening its pipe, and how often it asks again.
+const APP_WAIT: Duration = Duration::from_secs(5);
+const APP_RETRY: Duration = Duration::from_millis(250);
+
+/// Opens the app, or, when one runs for this Windows account, asks it to bring its window forward
+/// (a start at sign-in leaves it alone) and ends quietly. `hidden`: no window at start, the tray
+/// icon only.
+fn launch(hidden: bool) -> Res<()> {
+    let deadline = Instant::now() + APP_WAIT;
+    loop {
+        if startup::hand_over(hidden)? {
+            return Ok(());
+        }
+        match ui::run(hidden) {
+            // An app that is still starting has not opened its pipe yet: ask again.
+            Err(message) if message == ui::ALREADY_RUNNING && Instant::now() < deadline => {
+                thread::sleep(APP_RETRY);
+            }
+            result => return result,
         }
     }
 }

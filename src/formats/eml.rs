@@ -10,7 +10,9 @@ use std::{borrow::Cow, fmt::Write as _};
 
 use mail_parser::{Address, DateTime, MessageParser, MimeHeaders};
 
-use super::{MAX_DEPTH, Output, Pass, process_pass as process_any, same_text};
+use super::{
+    MAX_DEPTH, Output, Pass, places::Layout, process_pass as process_any, same_text, text,
+};
 use crate::{Error, Result};
 
 /// Shown for an attachment without a file name.
@@ -45,7 +47,8 @@ pub(super) enum Content<'a> {
     Message(Mail<'a>),
 }
 
-/// Renders an `.eml` message.
+/// Renders an `.eml` message. A scan that is asked for findings looks each value up again in the
+/// file, since the text it reads is a rendering: see [`Layout::Raw`].
 pub(super) fn process(pass: &Pass<'_>, bytes: &[u8], depth: u8) -> Result<Output> {
     let message = MessageParser::default()
         .parse(bytes)
@@ -70,7 +73,15 @@ pub(super) fn process(pass: &Pass<'_>, bytes: &[u8], depth: u8) -> Result<Output
             })
             .collect(),
     };
-    render(pass, depth, &mail)
+    // The rendering is not the file, so a value is looked for in the file itself: a message that
+    // is the file (not an attachment) whose bytes read as text.
+    let raw = if pass.wants_places(depth) {
+        text::decode(bytes).ok().map(|(decoded, _)| decoded)
+    } else {
+        None
+    };
+    let layout = raw.as_deref().map_or(Layout::Nowhere, Layout::Raw);
+    rendered(pass, &layout, depth, &mail).map(Output::Text)
 }
 
 /// `Name <address>`, or whichever of the two exists.
@@ -97,13 +108,16 @@ fn addresses(list: Option<&Address<'_>>) -> Vec<String> {
 /// One engine call covers the headers, the bodies and the attachment names
 /// (a file name can hold PII too). Each attachment is processed by its own
 /// recursive [`process_any`] call, and its already-transformed text is
-/// appended unchanged.
+/// appended unchanged. A message that is not an `.eml` file has no place of its own for what
+/// the engine finds in it.
 pub(super) fn render(pass: &Pass<'_>, depth: u8, mail: &Mail<'_>) -> Result<Output> {
-    rendered(pass, depth, mail).map(Output::Text)
+    rendered(pass, &Layout::Nowhere, depth, mail).map(Output::Text)
 }
 
-/// [`render`] for the message at `depth`, as text.
-fn rendered(pass: &Pass<'_>, depth: u8, mail: &Mail<'_>) -> Result<String> {
+/// [`render`] for the message at `depth`, as text. `layout` says where the headers, the bodies
+/// and the attachment names stand in the file; the attachments are read one level deeper, where
+/// nothing has a place.
+fn rendered(pass: &Pass<'_>, layout: &Layout<'_>, depth: u8, mail: &Mail<'_>) -> Result<String> {
     let mut head = String::new();
     for (label, list) in [
         ("From", &mail.from),
@@ -132,7 +146,7 @@ fn rendered(pass: &Pass<'_>, depth: u8, mail: &Mail<'_>) -> Result<String> {
 
     let mut texts = vec![head.as_str()];
     texts.extend(mail.attachments.iter().map(|a| a.name.as_str()));
-    let mut done = pass.run(&texts)?.into_iter();
+    let mut done = pass.run(layout, &texts)?.into_iter();
     let mut out = done.next().unwrap_or_default();
     // One after the other: a scan reports what it found in reading order.
     for (attachment, name) in mail.attachments.iter().zip(done) {
@@ -157,7 +171,7 @@ fn attachment_text(pass: &Pass<'_>, depth: u8, content: &Content<'_>) -> Result<
         Content::Message(_) if depth > MAX_DEPTH => {
             Err(Error::UnsupportedFormat("nesting too deep"))
         }
-        Content::Message(mail) => rendered(pass, depth, mail),
+        Content::Message(mail) => rendered(pass, &Layout::Nowhere, depth, mail),
     };
     match text {
         Err(e) if e.is_unreadable() => Ok(format!("[unsupported: {e}]")),

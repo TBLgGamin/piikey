@@ -19,7 +19,7 @@ use piikey::{
 
 use super::{
     activity::Activity,
-    controller::{Backend, Controller, Running},
+    controller::{Backend, Change, Controller, Running, Started},
 };
 use crate::{
     Describe, Res,
@@ -133,6 +133,10 @@ impl Backend for Stub {
         Inventory::open(&self.vault.with_file_name("inventory.jsonl")).describe()
     }
 
+    fn open_watch(&self) -> Res<Inventory> {
+        Inventory::open(&self.vault.with_file_name("watch.jsonl")).describe()
+    }
+
     fn load_activity(&self) -> Activity {
         Activity::default()
     }
@@ -170,6 +174,13 @@ impl Backend for Stub {
     fn set_hotkey(&self, _shared: &Shared, _on: bool) -> Res<()> {
         Ok(())
     }
+
+    fn start_watch(&self, _folders: &[PathBuf], _changes: Sender<Change>) -> Res<Started> {
+        Ok(Started {
+            running: Box::new(Nothing),
+            failed: Vec::new(),
+        })
+    }
 }
 
 /// A controller on a [`Stub`], its vault and inventory in `dir`, with the features that start on
@@ -187,10 +198,19 @@ pub fn stub_controller_with(dir: &TempDir, certificate: bool) -> Result<Arc<Cont
         certificate,
     };
     let inventory = stub.open_inventory()?;
+    let watch = stub.open_watch()?;
     let policy = Policy {
         highlight: Highlight::Off,
         explorer_menu: false,
         ..Policy::default()
     };
-    Controller::new(Box::new(stub), vault, policy, engine, inventory, None)
+    Controller::new(
+        Box::new(stub),
+        vault,
+        policy,
+        engine,
+        inventory,
+        watch,
+        None,
+    )
 }

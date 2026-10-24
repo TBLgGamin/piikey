@@ -3,6 +3,7 @@
 use std::{
     cmp::Reverse,
     collections::HashSet,
+    ops::ControlFlow,
     path::Path,
     sync::{
         Arc, PoisonError, RwLock,
@@ -16,7 +17,7 @@ use crate::{
     Error, Result,
     detect::{
         CompositeDetector, Detector, EntityKind, IssuedProxies, KindSet, Mode, NerDetector,
-        RegexDetector, Span, Words, overlaps,
+        RegexDetector, Span, Step, Words, overlaps,
     },
     proxy::watermark_ok,
     vault::{Vault, VaultView},
@@ -257,6 +258,46 @@ impl Engine {
             found.retain(|s| view.kind_of(&text[s.start..s.end]).is_none());
         }
         Ok(spans)
+    }
+
+    /// [`Engine::scan`] in steps: `step` is handed what the detector finds as it finds it, with
+    /// what a scan leaves out (the kinds that are off, the stand-ins the vault issued) left out
+    /// of it. The patterns come first and the model after, a group of texts at a time (see
+    /// [`Detector::detect_batch_steps`]), so a caller can show the first values while the model
+    /// still reads. Everything the steps hold together is what `scan` returns, as a sum and not
+    /// in order. `step` ends the scan by breaking. The vault is only read for the length of one
+    /// step, never while the model runs.
+    ///
+    /// # Errors
+    /// `Poisoned`.
+    pub fn scan_steps(
+        &self,
+        texts: &[&str],
+        mut step: impl FnMut(Step) -> ControlFlow<()>,
+    ) -> Result<()> {
+        let wanted = self.enabled();
+        let mut failure = None;
+        self.detector
+            .detect_batch_steps(texts, Mode::Anonymize, wanted, &[], &mut |mut found| {
+                if wanted != KindSet::ALL {
+                    for spans in &mut found.spans {
+                        spans.retain(|s| wanted.contains(s.kind));
+                    }
+                }
+                match self.vault.read() {
+                    Ok(view) => {
+                        for (text, spans) in texts.iter().zip(&mut found.spans) {
+                            spans.retain(|s| view.kind_of(&text[s.start..s.end]).is_none());
+                        }
+                    }
+                    Err(error) => {
+                        failure = Some(error);
+                        return ControlFlow::Break(());
+                    }
+                }
+                step(found)
+            });
+        failure.map_or(Ok(()), Err)
     }
 
     /// The stand-ins the vault issued that each of `texts` holds, as spans sorted by start and
@@ -665,13 +706,16 @@ mod tests {
         cmp::Reverse,
         collections::HashSet,
         fmt,
+        ops::ControlFlow,
         path::{Path, PathBuf},
         sync::{Arc, Mutex, PoisonError},
     };
 
     use super::{Engine, Replacement, Resent, merge};
     use crate::{
-        detect::{CompositeDetector, Detector, EntityKind, KindSet, Mode, RegexDetector, Span},
+        detect::{
+            CompositeDetector, Detector, EntityKind, KindSet, Mode, RegexDetector, Span, Step,
+        },
         proxy::{generate, watermark_ok},
         vault::Vault,
     };
@@ -906,6 +950,100 @@ mod tests {
         // What was masked is still reported where it stands in the clear.
         assert!(!scanned(&engine, &originals)?[0].is_empty());
         assert_eq!(engine.vault().read()?.record_count(), records);
+        Ok(())
+    }
+
+    /// What `scan_steps` hands over for `texts`, until `stop_after` steps have come.
+    fn stepped(engine: &Engine, texts: &[&str], stop_after: usize) -> crate::Result<Vec<Step>> {
+        let mut steps = Vec::new();
+        engine.scan_steps(texts, |step| {
+            steps.push(step);
+            if steps.len() >= stop_after {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })?;
+        Ok(steps)
+    }
+
+    /// The values of the spans of `steps`, `(kind, value)`, per text and in order of position.
+    fn step_values<'t>(steps: &[Step], texts: &[&'t str]) -> Vec<Vec<(EntityKind, &'t str)>> {
+        texts
+            .iter()
+            .enumerate()
+            .map(|(at, text)| {
+                let mut spans: Vec<Span> = steps
+                    .iter()
+                    .flat_map(|step| step.spans[at].iter().copied())
+                    .collect();
+                spans.sort_by_key(|span| span.start);
+                spans
+                    .into_iter()
+                    .map(|s| (s.kind, &text[s.start..s.end]))
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scan_in_steps_gives_the_patterns_first_and_the_rest_after_and_the_same_in_all()
+    -> crate::Result<()> {
+        let engine = engine_at(&temp_vault("steps"), Finds::people(&["Marieke de Vries"]))?;
+        let texts = [
+            CORPUS[2],
+            "Marieke de Vries woont hier, mail marieke@example.org",
+        ];
+        let steps = stepped(&engine, &texts, usize::MAX)?;
+        assert_eq!(steps.len(), 2, "the patterns, then the names");
+        assert_eq!(steps[0].more, Some((0, 0)));
+        assert_eq!(steps[1].more, None);
+        assert!(
+            steps[0]
+                .spans
+                .iter()
+                .flatten()
+                .all(|span| span.kind.is_patterned())
+        );
+        assert!(
+            steps[1]
+                .spans
+                .iter()
+                .flatten()
+                .all(|span| span.kind == EntityKind::Person)
+        );
+        assert_eq!(step_values(&steps, &texts), scanned(&engine, &texts)?);
+        assert_eq!(engine.vault().read()?.record_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn scan_in_steps_leaves_out_what_a_scan_leaves_out_and_stops_when_told() -> crate::Result<()> {
+        let engine = engine_at(
+            &temp_vault("steps-left-out"),
+            Finds::people(&["Marieke de Vries"]),
+        )?;
+        let originals = ["Marieke de Vries woont in Utrecht, mail marieke@example.org"];
+        // The kinds that are off.
+        engine.set_enabled(KindSet::ALL.without(EntityKind::Email));
+        let steps = stepped(&engine, &originals, usize::MAX)?;
+        assert_eq!(
+            step_values(&steps, &originals),
+            [[(EntityKind::Person, "Marieke de Vries")]]
+        );
+        engine.set_enabled(KindSet::ALL);
+        // The stand-ins the vault issued.
+        let masked = engine.run(Mode::Anonymize, &originals)?;
+        let masked: Vec<&str> = masked.iter().map(String::as_str).collect();
+        let steps = stepped(&engine, &masked, usize::MAX)?;
+        assert!(
+            steps
+                .iter()
+                .all(|step| step.spans.iter().all(Vec::is_empty))
+        );
+        // A stop after the first step is the end of it.
+        let steps = stepped(&engine, &originals, 1)?;
+        assert_eq!(steps.len(), 1);
         Ok(())
     }
 

@@ -1,4 +1,4 @@
-//! Opens files and folders in Windows Explorer: the Home treemap's "Open" and "Show in Explorer",
+//! Opens files and folders in Windows Explorer: the Inventory treemap's "Open" and "Show in Explorer",
 //! and the file an export or a masked copy has just written.
 //!
 //! Explorer is started from its full path under `SystemRoot`, never as a bare `explorer.exe` that

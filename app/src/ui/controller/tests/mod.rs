@@ -6,13 +6,14 @@ mod keyed;
 mod model;
 mod protection;
 mod settings;
+mod watch;
 
 use std::{
     fs,
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use piikey::detect::EntityKind;
+use piikey::{detect::EntityKind, policy::Highlight};
 
 use super::*;
 use crate::{Describe, ui::testing::TempDir};
@@ -36,6 +37,8 @@ fn quiet() -> Policy {
 struct Fake {
     calls: Calls,
     installed: AtomicBool,
+    /// How long the model stays after a scan: nothing, unless a test says so.
+    idle: Mutex<Duration>,
     fail_start: AtomicBool,
     fail_enable: AtomicBool,
     fail_capture: AtomicBool,
@@ -64,6 +67,12 @@ struct Fake {
     /// Runs once, at the next `load_model`: what happens meanwhile, to a scan that has just read
     /// the settings.
     on_load: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Where the fake watcher sends the changes it is told of, while the watch runs.
+    changes: Mutex<Option<Sender<Change>>>,
+    /// The folders the fake watcher cannot watch, and why.
+    watch_unavailable: Mutex<Vec<(PathBuf, String)>>,
+    /// The system would not make a watcher at all.
+    fail_watch: AtomicBool,
 }
 
 impl Fake {
@@ -82,6 +91,27 @@ impl Fake {
             .last()
             .cloned()
             .ok_or_else(|| "nothing was saved".to_owned())
+    }
+
+    /// The system reports `change` in a watched folder; an error when nothing watches.
+    fn report(&self, change: Change) -> Test {
+        let changes = self.changes.lock().unwrap_or_else(PoisonError::into_inner);
+        let sender = changes.as_ref().ok_or("nothing is watched")?;
+        sender.send(change).map_err(|error| error.to_string())
+    }
+}
+
+/// The watcher the fake starts: stopping it drops the sender, as the system's does.
+struct FakeWatch(Arc<Fake>);
+
+impl Running for FakeWatch {
+    fn stop(self: Box<Self>) {
+        log(&self.0.calls, "stop_watch");
+        self.0
+            .changes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
     }
 }
 
@@ -194,6 +224,10 @@ impl Backend for Arc<Fake> {
         Inventory::open(&self.vault.with_file_name("inventory.jsonl")).describe()
     }
 
+    fn open_watch(&self) -> Res<Inventory> {
+        Inventory::open(&self.vault.with_file_name("watch.jsonl")).describe()
+    }
+
     fn token(&self, _rotate: bool) -> Res<String> {
         Ok("test-token".to_owned())
     }
@@ -220,6 +254,23 @@ impl Backend for Arc<Fake> {
             return Err("Ctrl+Alt+P is used by another program".into());
         }
         Ok(())
+    }
+
+    fn start_watch(&self, folders: &[PathBuf], changes: Sender<Change>) -> Res<Started> {
+        log(&self.calls, &format!("start_watch({})", folders.len()));
+        if fails(&self.fail_watch) {
+            return Err("no watcher".into());
+        }
+        *self.changes.lock().unwrap_or_else(PoisonError::into_inner) = Some(changes);
+        let failed = self
+            .watch_unavailable
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        Ok(Started {
+            running: Box::new(FakeWatch(Arc::clone(self))),
+            failed,
+        })
     }
 
     fn model_installed(&self) -> bool {
@@ -256,6 +307,10 @@ impl Backend for Arc<Fake> {
         log(&self.calls, "release_model");
     }
 
+    fn model_idle(&self) -> Duration {
+        *self.idle.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn load_activity(&self) -> Activity {
         self.loaded_activity.clone()
     }
@@ -285,12 +340,14 @@ fn rig(installed: bool, policy: Policy) -> Result<Rig, String> {
     });
     let engine = Engine::open(&vault).describe()?;
     let inventory = fake.open_inventory()?;
+    let watch = fake.open_watch()?;
     let controller = Controller::new(
         Box::new(Arc::clone(&fake)),
         vault,
         policy,
         engine,
         inventory,
+        watch,
         None,
     )?;
     Ok(Rig {
