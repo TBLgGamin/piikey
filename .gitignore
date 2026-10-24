@@ -5,6 +5,7 @@
 
 # Local scratch (playground, experiments)
 /.tmp
+/scripts/local
 /start.bat
 /todo.txt
 *.diff

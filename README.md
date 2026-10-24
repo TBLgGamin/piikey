@@ -40,11 +40,12 @@ in four ways:
 - **Flag what you type.** The field you are typing in gets a purple outline when it holds personal
   data, in any app, so you see it before you send it.
 - **Map what you store.** Scan your folders, or any file or folder from Explorer's right-click menu,
-  and see which of them hold personal data, in a WinDirStat-style dashboard. Nothing is scanned
-  until you ask, and a rescan reads only what changed. A separate watch can keep an eye on folders
-  you pick.
-- **Manage what is kept.** Search the vault, forget values, export it, find every file that
-  mentions a person, and gate scripts and CI on personal data with the CLI and the API.
+  and see which of them hold personal data, in a WinDirStat-style dashboard. Open a file or a
+  folder to read the values themselves, with where each one sits (line, page or cell) and a
+  button that opens the file at that place. Nothing is scanned until you ask, and a rescan reads
+  only what changed. A separate watch can keep an eye on folders you pick.
+- **Manage what is kept.** Search the vault, forget values and export it. The CLI and the API
+  also find every file that mentions a person, and gate scripts and CI on personal data.
 
 Detection, the stand-ins and the vault that remembers them all stay on your machine.
 
@@ -54,7 +55,7 @@ back into your values by `piikey-cli deanonymize --tolerant`: the full names, th
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/overview-dark.png">
-  <img alt="piikey's Overview page: protection is on, with the one Turn off button, what piikey is doing (masking, highlighting, inventory, watch, vault, detection) and the latest swaps" src="docs/assets/screenshots/overview-light.png" width="900">
+  <img alt="piikey's Overview page: protection is off until the certificate is installed, with the Turn on button, what piikey is doing (Masking, Highlighting, Inventory, Watch, Vault, Detection) and the recent swaps, each value next to its stand-in" src="docs/assets/screenshots/overview-light.png" width="900">
 </picture>
 
 ## Features
@@ -70,23 +71,23 @@ back into your values by `piikey-cli deanonymize --tolerant`: the full names, th
   </tr>
   <tr>
     <td><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/icons/dark/explorer.svg"><img src="docs/assets/icons/light/explorer.svg" width="28" height="28" alt=""></picture></td>
-    <td><b>"Scan for personal data" in Explorer</b><br>Right-click a file or folder to see what personal data it holds.</td>
+    <td><b>"Scan for personal data" in Explorer</b><br>Right-click a file or folder (under Show more options on Windows 11) to see what personal data it holds. The result opens in piikey, with a progress bar for each file while it is read.</td>
   </tr>
   <tr>
     <td><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/icons/dark/inventory.svg"><img src="docs/assets/icons/light/inventory.svg" width="28" height="28" alt=""></picture></td>
-    <td><b>Inventory</b><br>Scan your folders and see where personal data is stored: a tree of your real folders from the drive down (<code>C:</code>, Users, ...) with bars by type, a legend of the types found, a treemap with a tile for every file, and details with actions per file: open, show in Explorer, show what was found, make a masked copy, export a report. Pick folders and files with Browse or drop them on the page. It scans only when you ask, and skips files that did not change.</td>
+    <td><b>Inventory</b><br>Scan your folders and see where personal data is stored, in a dashboard like a disk-usage viewer: a tree of your real folders from the drives down (<code>C:</code>, Users, ...) in Explorer's order with a bar by type on each row, a legend of the types found, a treemap with a tile for every file, and details with actions per file: open, show in Explorer, show what was found, make a masked copy. <b>Show what was found</b> lists every value with its type, the text around it and where it is (line, page, sheet and cell), searchable and filterable by type and file, and <b>Open at this place</b> jumps to it in the file. The values are read when you ask and never stored. Add folders and files with Browse or by dropping them on the page, and write a CSV with Export report. It scans only when you ask, and skips files that did not change.</td>
   </tr>
   <tr>
     <td><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/icons/dark/explorer.svg"><img src="docs/assets/icons/light/explorer.svg" width="28" height="28" alt=""></picture></td>
-    <td><b>Watch</b><br>Keeps an eye on folders you pick and looks at a file again a moment after it changes. It has its own switch and its own results, apart from the inventory.</td>
+    <td><b>Watch</b><br>Keeps an eye on folders you pick and looks at a file again a moment after it changes. It has its own switch, its own folder list (each folder says what it is doing) and its own dashboard, apart from the inventory.</td>
   </tr>
   <tr>
     <td><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/icons/dark/subject.svg"><img src="docs/assets/icons/light/subject.svg" width="28" height="28" alt=""></picture></td>
-    <td><b>Subject search</b><br>Finds every file that mentions a person's name, email or phone number, for access requests (DSAR).</td>
+    <td><b>Subject search</b><br>Finds every file that mentions a person's name, email or phone number, for access requests (DSAR). It is in the CLI (<code>piikey-cli subject</code>) and the API (<code>subject_search</code>), not in the app window.</td>
   </tr>
   <tr>
     <td><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/icons/dark/vault.svg"><img src="docs/assets/icons/light/vault.svg" width="28" height="28" alt=""></picture></td>
-    <td><b>An encrypted vault you control</b><br>Search it, export it, forget the values you tick. Forgetting rewrites the file, so the value is gone from disk (the API and the CLI can also wipe it). Records are sealed with XChaCha20-Poly1305 under a key that Windows DPAPI protects.</td>
+    <td><b>An encrypted vault you control</b><br>Search and filter it, export it to CSV, forget the values you tick. Forgetting rewrites the file, so the value is gone from disk (the API and the CLI can also wipe it). Records are sealed with XChaCha20-Poly1305 under a key that Windows DPAPI protects.</td>
   </tr>
   <tr>
     <td><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/icons/dark/api.svg"><img src="docs/assets/icons/light/api.svg" width="28" height="28" alt=""></picture></td>
@@ -162,29 +163,46 @@ keeps are described in [docs/how-it-works.md](docs/how-it-works.md).
 - **Overview** says in one sentence whether protection is on, and has the one Turn on / Turn off
   button. When something needs you, such as a certificate that is not installed, one message shows
   with its fix button. Below it, six rows say what piikey is doing (Masking, Highlighting,
-  Inventory, Watch, Vault, Detection; each opens its page), then the five latest swaps.
-- **Protection** holds the highlighting mode, the protected sites and the protected apps. The
-  certificate is installed from Overview.
+  Inventory, Watch, Vault, Detection; each opens its page), then the five most recent swaps, each
+  value next to its stand-in.
+- **Protection** holds the highlighting mode (off, always, or when you press Ctrl+Alt+P), the
+  protected sites and the protected apps. The certificate is installed from Overview.
 - **Inventory** is where you scan. It lists your locations (none until you add one) with what each
-  holds and a Remove button, which also breaks off a scan of it; the Scan button looks through them,
-  the box below scans one more folder or file,
-  and you can drop files and folders from Explorer onto the page. The dashboard shows a tree of
-  your real folders, from the drive down (This PC, `C:`, Users, ...) in Explorer's order, with bars by type, the types
-  found, a treemap of the files, and the details of what you select. A scan that you start from the
-  page, the box, a drop or Explorer ends in a result dialog. The inventory keeps counts, never the
-  values; "Show what was found" reads the files again and lists every value with search, type and
-  file filters, where it is (line, page or cell) and a button that opens the file at that place,
-  without storing anything.
-- **Watch** has its own switch, the folders it keeps an eye on (with what each is doing), a box to
-  add one, and the same dashboard, down the same real folders, for what it found. Nothing is
-  watched until you add a folder.
+  holds and a Remove button, which also breaks off a scan of it. The Scan button looks through
+  them; the box below scans one more folder or file, with Browse buttons for the Windows pickers,
+  and you can drop files and folders from Explorer onto the page.
+  - A scan that you start from the page, the box, a drop or Explorer ends in a **result dialog**:
+    while it runs, a bar for the whole scan and one for each file being read; afterwards how much
+    was found, by type, with Show what was found and Show in Inventory. Closing it while it runs
+    stops the scan.
+  - The **dashboard** is a tree of your real folders from the drives down (This PC, `C:`, Users,
+    ...) in Explorer's order, with a bar by type on each row and a breadcrumb to go back up; the
+    types found (pick one to show only that type); a treemap with a tile for every file; and the
+    details of what you select. For a file the details offer Open, Show in Explorer, Show what was
+    found and Make masked copy (next to the file; it never replaces one); for a folder, Show only
+    this folder, Show in Explorer and Show what was found. Export report writes what is on show as
+    a CSV file in Downloads.
+  - **What was found** (from the dialog or the details) takes the page's place, with a way back.
+    The inventory keeps counts, never values, so this reads the files again and lists every value
+    whole, as the files are read, with its type, the text around it, its file and where it is
+    (`line 12`, `page 3`, `Sheet1, cell B7`, `slide 4`). A search box matches the value, the type,
+    the file and the text around it; chips filter by type, with their counts; for a folder a list
+    narrows it to one file. **Open at this place** on each row opens the file at the value: VS
+    Code, Notepad++ and Sublime Text go to the line, other apps that Windows can read select the
+    value and outline it for two seconds, and the rest just open the file. The values stay in the
+    window only while the view is open; nothing is stored.
+- **Watch** has its own switch, the folders it keeps an eye on (each says what it is doing), a box
+  to add one (with a Browse button), and the same dashboard, down the same real folders, for what
+  it found. Nothing is watched until you add a folder.
 - **Vault** lists every value next to its stand-in, newest first, with search and filters by type,
-  site and time. Tick values (or Select all) and choose Forget to remove them; Export writes them
-  to a CSV file.
-- **Settings** is one scrolling page: General (Start piikey when I sign in, the Explorer menu entry,
-  and Keep piikey running in the tray when I close the window), Types of personal data, Developer
-  access (the local HTTP API and its token), Privacy & data and About. A row for the detection model
-  appears only when it was skipped or failed.
+  site and time. Tick values (or Select all) and choose Forget to remove them, after a
+  confirmation; Export writes them to a CSV file in Downloads, which holds the values themselves,
+  so keep it safe.
+- **Settings** is one scrolling page: General (Start piikey when I sign in, Scan for personal data
+  in Explorer, which adds the right-click entry, and Keep piikey running in the tray when I close
+  the window), Types of personal data, Developer access (the local HTTP API and its token),
+  Privacy & data (the data folder) and About. A row for the detection model appears only when it
+  was skipped or failed.
 
 The tray icon shows the same status as Overview (the key in grey while protection is off, the app
 icon while it is on, with an amber dot when it needs you). Its menu has Open piikey, Turn protection
@@ -230,6 +248,35 @@ piikey starts in the tray at sign-in without a window.
   <tr>
     <td><b>Watch</b>: the folders piikey keeps an eye on, and what it found in them when their files changed.</td>
     <td><b>Vault</b>: every value next to its stand-in, most recently swapped first, with search and filters by type, site and time, and Forget for the ticked ones.</td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/scanning-dark.png">
+        <img alt="A scan in progress: how many files are done, and a bar with its percentage for each file being read" src="docs/assets/screenshots/scanning-dark.png">
+      </picture>
+    </td>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/result-dark.png">
+        <img alt="The result of a scan: what was found by type, with Show what was found and Show in Inventory" src="docs/assets/screenshots/result-dark.png">
+      </picture>
+    </td>
+  </tr>
+  <tr>
+    <td><b>A scan</b> from the page, a drop or Explorer: a bar for each file being read. Close stops it.</td>
+    <td><b>Its result</b>: what was found, by type, and the way to the values.</td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/findings-dark.png">
+        <img alt="What was found: every value with its type, the text around it, its file and its place (line, page or cell), a search box, type chips and an Open at this place button on each row" src="docs/assets/screenshots/findings-light.png">
+      </picture>
+    </td>
+  </tr>
+  <tr>
+    <td colspan="2"><b>What was found</b>: every value of a file or folder, with search, type and file filters, where it is (line, page or cell) and a button that opens the file at that place. Nothing of it is stored.</td>
   </tr>
   <tr>
     <td colspan="2" align="center">
@@ -388,6 +435,10 @@ global: --json  --local  --vault PATH  -h/--help  -V/--version
 - With no path, `scan`, `anonymize` and `deanonymize` read UTF-8 text from stdin, and the last two
   write the result to stdout, as it came, line breaks and all. Give other encodings and documents
   as paths.
+- `subject` lists the files that mention the given values, each as a whole word in any letter case
+  or as the same value spelled another way (`+31 6 1234 5678` and `+31612345678` match). With no
+  PATH it searches the inventory's locations. Subject search is in the CLI and the API only; the
+  app window has no subject search.
 - `--json` prints the result as JSON, or an error as `{"code": ..., "message": ...}`; without it
   you get a table. Paths may be relative: the CLI makes them absolute, so the app answers for the
   same files.
@@ -459,9 +510,12 @@ Checks: `cargo fmt-check`, `cargo lint`, and `cargo test --all-targets`.
 
 - Everything runs locally. piikey makes one network call of its own: the model download from
   Hugging Face, which is checked with SHA-256.
-- Your values exist in one place only, the encrypted vault in `%LOCALAPPDATA%\piikey`. The list of
-  swaps on the Vault page keeps stand-ins, sites and times. The inventory and the watch keep paths,
-  counts per type and a fingerprint of each file's contents, never values.
+- Your values are kept in one place only, the encrypted vault in `%LOCALAPPDATA%\piikey`, apart
+  from what you export. The list of swaps on the Vault page keeps stand-ins, sites and times. The
+  inventory and the watch keep paths, counts per type and a fingerprint of each file's contents,
+  never values. What was found reads the files again when you ask and keeps the values in the
+  window only while it is open. Export writes the vault and the inventory report to Downloads; the
+  exported vault holds the values themselves, so keep it safe.
 - Masking and the highlight read the focused field only, never a password field, and the highlight
   stores nothing.
 - The HTTP API is off by default. When on, it listens on loopback only, needs a token and refuses

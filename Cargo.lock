@@ -565,9 +565,9 @@ dependencies = [
 
 [[package]]
 name = "clipboard-win"
-version = "5.4.1"
+version = "5.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bde03770d3df201d4fb868f2c9c59e66a3e4e2bd06692a0fe701e7103c7e84d4"
+checksum = "052af7878466feccda12ba7a6a67d019d712f296809559b47c12c8cc196d3a9a"
 dependencies = [
  "error-code",
 ]
@@ -780,9 +780,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.3"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03bb0e1cc970d482d121d9a1744999169b69a07470b3d644a7894e53fcaf4574"
+checksum = "38d28fb6aa7dd680b3ffd1a3e64e115c177bdba63c0ae7f9cd48129ff05c4fa0"
 dependencies = [
  "cmov",
 ]
@@ -4462,7 +4462,7 @@ dependencies = [
 [[package]]
 name = "windows-collections"
 version = "0.100.0"
-source = "git+https://github.com/TBLgGamin/windows-rs?rev=3830b01a36955806328716783f1ff23daeee65b5#3830b01a36955806328716783f1ff23daeee65b5"
+source = "git+https://github.com/TBLgGamin/windows-rs?rev=94cf8318655e5ac66a7475833b0c9516ec0f7ccc#94cf8318655e5ac66a7475833b0c9516ec0f7ccc"
 dependencies = [
  "windows-core 0.100.0",
 ]
@@ -4483,7 +4483,7 @@ dependencies = [
 [[package]]
 name = "windows-core"
 version = "0.100.0"
-source = "git+https://github.com/TBLgGamin/windows-rs?rev=3830b01a36955806328716783f1ff23daeee65b5#3830b01a36955806328716783f1ff23daeee65b5"
+source = "git+https://github.com/TBLgGamin/windows-rs?rev=94cf8318655e5ac66a7475833b0c9516ec0f7ccc#94cf8318655e5ac66a7475833b0c9516ec0f7ccc"
 dependencies = [
  "windows-link 0.100.0",
  "windows-result 0.100.0",
@@ -4515,7 +4515,7 @@ dependencies = [
 [[package]]
 name = "windows-future"
 version = "0.100.0"
-source = "git+https://github.com/TBLgGamin/windows-rs?rev=3830b01a36955806328716783f1ff23daeee65b5#3830b01a36955806328716783f1ff23daeee65b5"
+source = "git+https://github.com/TBLgGamin/windows-rs?rev=94cf8318655e5ac66a7475833b0c9516ec0f7ccc#94cf8318655e5ac66a7475833b0c9516ec0f7ccc"
 dependencies = [
  "windows-core 0.100.0",
  "windows-link 0.100.0",
@@ -4553,7 +4553,7 @@ checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
 [[package]]
 name = "windows-link"
 version = "0.100.0"
-source = "git+https://github.com/TBLgGamin/windows-rs?rev=3830b01a36955806328716783f1ff23daeee65b5#3830b01a36955806328716783f1ff23daeee65b5"
+source = "git+https://github.com/TBLgGamin/windows-rs?rev=94cf8318655e5ac66a7475833b0c9516ec0f7ccc#94cf8318655e5ac66a7475833b0c9516ec0f7ccc"
 
 [[package]]
 name = "windows-numerics"
@@ -4568,7 +4568,7 @@ dependencies = [
 [[package]]
 name = "windows-reactor"
 version = "0.100.0"
-source = "git+https://github.com/TBLgGamin/windows-rs?rev=3830b01a36955806328716783f1ff23daeee65b5#3830b01a36955806328716783f1ff23daeee65b5"
+source = "git+https://github.com/TBLgGamin/windows-rs?rev=94cf8318655e5ac66a7475833b0c9516ec0f7ccc#94cf8318655e5ac66a7475833b0c9516ec0f7ccc"
 dependencies = [
  "windows-collections 0.100.0",
  "windows-core 0.100.0",
@@ -4582,12 +4582,12 @@ dependencies = [
 [[package]]
 name = "windows-reactor-setup"
 version = "0.100.0"
-source = "git+https://github.com/TBLgGamin/windows-rs?rev=3830b01a36955806328716783f1ff23daeee65b5#3830b01a36955806328716783f1ff23daeee65b5"
+source = "git+https://github.com/TBLgGamin/windows-rs?rev=94cf8318655e5ac66a7475833b0c9516ec0f7ccc#94cf8318655e5ac66a7475833b0c9516ec0f7ccc"
 
 [[package]]
 name = "windows-reference"
 version = "0.100.0"
-source = "git+https://github.com/TBLgGamin/windows-rs?rev=3830b01a36955806328716783f1ff23daeee65b5#3830b01a36955806328716783f1ff23daeee65b5"
+source = "git+https://github.com/TBLgGamin/windows-rs?rev=94cf8318655e5ac66a7475833b0c9516ec0f7ccc#94cf8318655e5ac66a7475833b0c9516ec0f7ccc"
 dependencies = [
  "windows-core 0.100.0",
  "windows-time",
@@ -4605,7 +4605,7 @@ dependencies = [
 [[package]]
 name = "windows-result"
 version = "0.100.0"
-source = "git+https://github.com/TBLgGamin/windows-rs?rev=3830b01a36955806328716783f1ff23daeee65b5#3830b01a36955806328716783f1ff23daeee65b5"
+source = "git+https://github.com/TBLgGamin/windows-rs?rev=94cf8318655e5ac66a7475833b0c9516ec0f7ccc#94cf8318655e5ac66a7475833b0c9516ec0f7ccc"
 dependencies = [
  "windows-link 0.100.0",
 ]
@@ -4622,7 +4622,7 @@ dependencies = [
 [[package]]
 name = "windows-strings"
 version = "0.100.0"
-source = "git+https://github.com/TBLgGamin/windows-rs?rev=3830b01a36955806328716783f1ff23daeee65b5#3830b01a36955806328716783f1ff23daeee65b5"
+source = "git+https://github.com/TBLgGamin/windows-rs?rev=94cf8318655e5ac66a7475833b0c9516ec0f7ccc#94cf8318655e5ac66a7475833b0c9516ec0f7ccc"
 dependencies = [
  "windows-link 0.100.0",
 ]
@@ -4708,7 +4708,7 @@ dependencies = [
 [[package]]
 name = "windows-threading"
 version = "0.100.0"
-source = "git+https://github.com/TBLgGamin/windows-rs?rev=3830b01a36955806328716783f1ff23daeee65b5#3830b01a36955806328716783f1ff23daeee65b5"
+source = "git+https://github.com/TBLgGamin/windows-rs?rev=94cf8318655e5ac66a7475833b0c9516ec0f7ccc#94cf8318655e5ac66a7475833b0c9516ec0f7ccc"
 dependencies = [
  "windows-link 0.100.0",
 ]
@@ -4716,7 +4716,7 @@ dependencies = [
 [[package]]
 name = "windows-time"
 version = "0.100.0"
-source = "git+https://github.com/TBLgGamin/windows-rs?rev=3830b01a36955806328716783f1ff23daeee65b5#3830b01a36955806328716783f1ff23daeee65b5"
+source = "git+https://github.com/TBLgGamin/windows-rs?rev=94cf8318655e5ac66a7475833b0c9516ec0f7ccc#94cf8318655e5ac66a7475833b0c9516ec0f7ccc"
 dependencies = [
  "windows-core 0.100.0",
 ]
@@ -4724,7 +4724,7 @@ dependencies = [
 [[package]]
 name = "windows-window"
 version = "0.100.0"
-source = "git+https://github.com/TBLgGamin/windows-rs?rev=3830b01a36955806328716783f1ff23daeee65b5#3830b01a36955806328716783f1ff23daeee65b5"
+source = "git+https://github.com/TBLgGamin/windows-rs?rev=94cf8318655e5ac66a7475833b0c9516ec0f7ccc#94cf8318655e5ac66a7475833b0c9516ec0f7ccc"
 dependencies = [
  "windows-core 0.100.0",
 ]
