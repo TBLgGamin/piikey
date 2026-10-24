@@ -2797,7 +2797,7 @@ checksum = "0a6dda33d67c26f0aac90d324ab2eb7239c819fc7b2552fe9faa4fe88441edc8"
 
 [[package]]
 name = "piikey"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "aho-corasick 1.1.5",
  "blake3",
@@ -2828,7 +2828,7 @@ dependencies = [
 
 [[package]]
 name = "piikey-app"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "aho-corasick 1.1.5",
  "clipboard-win",
