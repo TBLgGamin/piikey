@@ -1,139 +1,167 @@
 //! What each request answers: the `result` of the reply's envelope, as types.
 //!
-//! The handlers ([`Local`](super::Local) and the app) build these and the command line reads
+//! The handlers (`Local` and the app) build these and the command line reads
 //! them, so a field is named in one place and a rename is a compile error on both sides. A type
 //! says which requests it answers. Optional fields that are absent are left out of the JSON,
 //! except where a type says it is `null`.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    detect::EntityKind,
     inventory::{Entry, Node},
     policy::Highlight,
     subject::SubjectMatch,
 };
 
 /// `scan_text`: what the detector finds in each text.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Spans {
     /// One list per text, in the order the texts were given.
     pub results: Vec<Vec<Span>>,
 }
 
 /// A value found in a text.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Span {
     /// UTF-8 byte offset of its first byte.
     pub start: usize,
     /// UTF-8 byte offset after its last byte.
     pub end: usize,
-    /// The kind of personal data, as `EntityKind::as_str` names it.
+    /// The type of personal data, by the name `kinds` lists it.
+    #[schemars(with = "EntityKind")]
     pub kind: String,
+    /// The value that was found, as it stands in the text.
     pub value: String,
 }
 
 /// `anonymize` and `deanonymize`: the texts that came out, in the order they were given.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Texts {
+    /// The texts that came out, in the order they were given.
     pub texts: Vec<String>,
 }
 
 /// `scan_files`: what was found in the files and folders named, each file once.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Scanned {
+    /// One entry per file that was read, each file once.
     pub files: Vec<Entry>,
     /// Values found in all of them.
     pub hits: u64,
 }
 
 /// `anonymize_files` and `deanonymize_files`: what became of each file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Written {
+    /// The files that were written.
     pub written: Vec<Moved>,
+    /// The files that could not be written.
     pub failed: Vec<Failed>,
 }
 
 /// A file that was written.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Moved {
+    /// The file that was read.
     pub input: String,
+    /// The file that was written.
     pub output: String,
 }
 
 /// A file that could not be written, and why.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Failed {
+    /// The file that could not be written.
     pub input: String,
+    /// Why it could not be.
     pub error: String,
 }
 
 /// `subject_search`: the files that hold some of the values, the one with the most first.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Found {
+    /// The files that hold some of the values, the one with the most first.
     pub matches: Vec<SubjectMatch>,
 }
 
 /// `vault_list`: one page of the vault's records, the newest first.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Records {
+    /// The records on this page, the newest first.
     pub records: Vec<Record>,
     /// Every record that matched, not only the page.
     pub total: usize,
 }
 
 /// A value and the stand-in piikey issued for it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Record {
-    /// The kind of personal data, as `EntityKind::as_str` names it.
+    /// The type of personal data, by the name `kinds` lists it.
+    #[schemars(with = "EntityKind")]
     pub kind: String,
+    /// The value.
     pub original: String,
+    /// The stand-in piikey issued for it.
     pub proxy: String,
 }
 
 /// `vault_forget` and `vault_wipe`: how many records were removed.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Forgotten {
+    /// How many records were removed.
     pub forgotten: usize,
 }
 
 /// `vault_export`: the file that was written.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Exported {
+    /// How many records were written.
     pub records: usize,
+    /// The file that was written.
     pub path: String,
 }
 
 /// `inventory_report`: the file that was written.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Reported {
+    /// How many rows were written.
     pub rows: usize,
+    /// The file that was written.
     pub path: String,
 }
 
 /// How far a scan or a download is: `done` of `total`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Progress {
+    /// How many are done.
     pub done: u64,
+    /// How many there are in all (files for a scan, bytes for a download).
     pub total: u64,
 }
 
 /// `inventory_status`: the inventory in numbers.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct InventoryStatus {
     /// The folders it scans when asked: the user's locations, none until one is added.
     pub roots: Vec<String>,
     /// The locations whose changes are scanned as they happen.
     pub monitored: Vec<String>,
+    /// Files the inventory knows.
     pub files: u64,
+    /// Of those, the files that hold personal data.
     pub files_with_pii: u64,
+    /// Values found in all of them.
     pub hits: u64,
     /// Files scanned so far, while a scan runs; `null` otherwise.
     pub scanning: Option<Progress>,
 }
 
 /// `inventory_list`: one page of the files that hold personal data, the one with the most first.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Entries {
+    /// The files on this page, the one with the most values first.
     pub entries: Vec<Entry>,
     /// Every file that matched, not only the page.
     pub total: usize,
@@ -141,15 +169,18 @@ pub struct Entries {
 
 /// `inventory_tree`: what lies directly under a folder, or the drives and shares that hold files
 /// with personal data.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Nodes {
+    /// The tiles at this level of the tree.
     pub nodes: Vec<Node>,
 }
 
-/// One kind of personal data, in the reply to `kinds`: the reply is a list of these.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One type of personal data, in the reply to `kinds`: the reply is a list of these.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[schemars(rename = "TypeInfo")]
 pub struct Kind {
-    /// The name the API uses (`EntityKind::as_str`).
+    /// The name the API uses for the type.
+    #[schemars(with = "EntityKind")]
     pub kind: String,
     /// What a person calls it.
     pub label: String,
@@ -160,7 +191,7 @@ pub struct Kind {
 }
 
 /// Where the detection model stands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelState {
     /// Not downloaded.
@@ -174,9 +205,10 @@ pub enum ModelState {
 }
 
 /// What the loaded model runs on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Device {
+    /// The CPU alone.
     Cpu,
     /// The CPU and the GPU together.
     Hybrid,
@@ -194,8 +226,9 @@ impl Device {
 }
 
 /// `model_status`: the detection model.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Model {
+    /// Where the model stands.
     pub state: ModelState,
     /// Present while the model is loaded; `null` otherwise.
     pub device: Option<Device>,
@@ -210,8 +243,9 @@ pub struct Model {
 }
 
 /// `api_token`: what the HTTP API wants as `Authorization: Bearer <token>`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Token {
+    /// The bearer token.
     pub token: String,
 }
 
@@ -220,25 +254,32 @@ pub struct Token {
     clippy::struct_excessive_bools,
     reason = "independent facts of one report, not the states of one machine"
 )]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Status {
     /// Whether the app is running (it answers for itself, and says `true`).
     pub app: bool,
     /// Whether protection is on; `null` when the app is not running, as it is the app's.
     pub protection: Option<bool>,
+    /// piikey's version.
     pub version: String,
+    /// How many records the vault holds.
     pub vault_records: u64,
+    /// Where the detection model stands.
     pub model: Model,
+    /// When the field in focus is outlined if it holds personal data.
     pub highlight: Highlight,
+    /// Whether Explorer's right-click menu offers "Scan for personal data".
     pub explorer_menu: bool,
     /// Whether any location is monitored.
     pub monitoring: bool,
+    /// Whether the local HTTP API is switched on.
     pub http_api: bool,
 }
 
 /// `protection`: how protection stands after the switch. Only the app answers it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Protection {
+    /// Whether protection is on.
     pub protection: bool,
 }
 

@@ -2,3 +2,7 @@
 [alias]
 fmt-check = "fmt --all -- --check"
 lint = "clippy --workspace --all-targets --all-features --locked -- -D warnings"
+# The API reference (docs/api/openapi.json and README.md) is generated from the code. No argument:
+# write both; `--check-prose`: list the hand-written prose that is out of date; `--accept <op>`:
+# say it was reviewed (docs/api/prose.toml).
+api-docs = "run -q -p piikey --example api_docs --"

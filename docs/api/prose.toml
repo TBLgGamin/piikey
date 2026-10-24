@@ -1,0 +1,311 @@
+# The hand-written part of the API reference.
+#
+# Everything else in docs/api is generated from the code and is never hand-edited:
+# docs/api/openapi.json and docs/api/README.md are rewritten by `cargo api-docs`, and a test
+# fails when they differ from what the generator prints. This file is the only prose. Each entry's
+# `text` is merged after the generated description of its op (and of the intro) in both files.
+#
+# The rule: `reviewed` is the fingerprint of the generated contract the entry was written
+# against (the op's request schema, result schema and doc comment; for [intro] the envelope, the
+# error codes, the auth rules and the server). When the code under an op changes, its entry is
+# flagged (test `api_prose_is_reviewed`, and `cargo api-docs --check-prose`, which the pre-commit
+# hook runs) until a person has read the text, fixed it if the change made it wrong, and run
+#
+#   cargo api-docs --accept <op|intro|all>
+#
+# which only re-stamps `reviewed`, never the text. Do not stamp an entry you have not read.
+# Texts are TOML literal strings ('''...'''): no escaping, and they must not contain three
+# single quotes. No headings inside a text; use bold.
+
+[intro]
+reviewed = "1ded56d595d61001"
+text = '''
+**Getting started**
+
+1. Turn on **Local HTTP API** in Settings > Developer access. It listens on `127.0.0.1` only (loopback), on port 7980 unless you change it, and only while the switch is on.
+2. Get the token with `piikey-cli token`, or press **Copy token** in the same place. Send it as `Authorization: Bearer <token>`.
+3. Call an operation with `POST /v1/<op>` and the request's fields as a JSON body. The op is the one in the path: an `op` in the body is ignored. `GET /v1/status` also works.
+
+```powershell
+$token = piikey-cli token
+'{"texts":["mail jan@acme.nl"]}' | curl.exe -s -H "Authorization: Bearer $token" --data-binary '@-' http://127.0.0.1:7980/v1/scan_text
+```
+
+In PowerShell, plain `curl` is an alias of `Invoke-WebRequest`, so the examples use `curl.exe`, and they pass the JSON through stdin so that PowerShell does not mangle its quotes. The reply is the envelope: `{"ok":true,"result":{"results":[[{"start":5,"end":16,"kind":"email","value":"jan@acme.nl"}]]}}`.
+
+**This specification.** `GET /v1/openapi.json` answers this specification as JSON, and it is the one call that needs no token. It is served only while the HTTP API is on, and it still refuses an `Origin` header. Postman, Insomnia and similar tools can import `http://127.0.0.1:7980/v1/openapi.json` (change the port if you changed it in Settings). Other methods get 405.
+
+**The hosted reference cannot send requests.** The page at https://tblggamin.github.io/piikey/ cannot call piikey on your PC, because piikey refuses every request that carries an `Origin` header, which is what a web page sends (403, token or not). Copy the examples into a terminal, or import the specification into a desktop tool.
+
+**Named pipe.** The app also serves the same operations on `\\.\pipe\piikey-<USERNAME>`, where characters other than letters, digits, `.`, `_` and `-` in the name become `_`. Only local clients can connect. A request is the bytes `P`, `2`, `0`, `0`, a `u32` little-endian length, then the request JSON with the op named in the body, for example `{"op":"scan_text","texts":["mail jan@acme.nl"]}`. The reply is a status byte (0 ok, 1 error), three zero bytes, a `u32` little-endian length and the envelope. Version 1 of the framing is no longer accepted.
+
+**The command line.** `piikey-cli` is a client of this same API: one subcommand per operation (`open` is `show_window`), and `--json` prints the result as the JSON shown here. It asks the app over the pipe first. Without the app it runs the operations in its own process (as `--local` does), except `protection`, `explorer_scan` and `show_window`, which answer `app_required`. Each operation below starts with its command line.
+'''
+
+[scan_text]
+reviewed = "687ab53e558861e2"
+text = '''
+CLI: `piikey-cli scan [--fail-on KINDS|any] [--no-record] [PATH...]` (no PATH: the UTF-8 text on stdin is the one text sent)
+
+`start` and `end` are UTF-8 byte offsets into the text as you sent it, not character positions.
+
+Without the detection model only patterns are found (emails, phone numbers, IBANs, cards and so on); names and places need it (`model_status`, `model_download`). Types switched off in Settings are not looked for.
+
+`piikey-cli scan --fail-on` exits 1 when a listed type is found; the API has no such switch, check the result.
+'''
+
+[anonymize]
+reviewed = "43c411a71e50352a"
+text = '''
+CLI: `piikey-cli anonymize [--out DIR] [PATH...]` (no PATH: stdin text, and the masked text goes to stdout)
+
+Unlike `scan_text` this writes to the vault: a value that has no stand-in yet gets one, and `deanonymize` turns it back for as long as the vault holds the record.
+
+Types switched off in Settings > Types of personal data stay in the text. A text that is already masked comes back unchanged for the types that follow a pattern (emails, phone numbers, IBANs and so on).
+
+The texts come back in the order you sent them.
+'''
+
+[deanonymize]
+reviewed = "cc324d8b8348c6fd"
+text = '''
+CLI: `piikey-cli deanonymize [--tolerant] [--out DIR] [PATH...]` (no PATH: stdin text, and the restored text goes to stdout)
+
+It turns back every stand-in the vault holds, whichever text it appears in; text without stand-ins comes back as it was.
+
+A stand-in whose record was forgotten (`vault_forget`, `vault_wipe`) stays as it is.
+'''
+
+[scan_files]
+reviewed = "a321a4e76cb961c2"
+text = '''
+CLI: `piikey-cli scan [--fail-on KINDS|any] [--no-record] [PATH...]`
+
+Every path must be absolute (the CLI makes its arguments absolute for you). Folders are walked recursively and symbolic links are skipped. A file named twice, or inside a folder you also named, is scanned once.
+
+Each call reads every file again; the incremental rule that skips unchanged files belongs to `inventory_rescan`. The result holds counts per type, never the values.
+
+The CLI's `--no-record` is `"record": false`. `piikey-cli scan --fail-on` exits 1 when a listed type is found, and 3 when a file could not be read.
+'''
+
+[anonymize_files]
+reviewed = "00e77360a8d5bb34"
+text = '''
+CLI: `piikey-cli anonymize [--out DIR] [PATH...]` (with PATHs, `--out DIR` is required)
+
+`paths` and `out` must be absolute. Folders are walked recursively and each result keeps its place relative to the folder it was found under. Missing folders under `out` are created and a file already there is overwritten, but a result is never written over an input, and an `out` inside a folder you name is refused with `bad_request`.
+
+A result that is text (from a PDF, an image or a mail) is written as `<name>.txt`.
+
+One file that cannot be read does not stop the others: it is listed under `failed`, and the CLI then exits 3. The files are processed in the app's own scan pool, which leaves half the cores to the PC.
+'''
+
+[deanonymize_files]
+reviewed = "2df3ec4d26323840"
+text = '''
+CLI: `piikey-cli deanonymize [--tolerant] [--out DIR] [PATH...]` (with PATHs, `--out DIR` is required)
+
+The same rules as `anonymize_files` for paths, `out`, results written as `.txt` and files that fail.
+
+With `tolerant` a document is read one piece of text at a time, so typos and lone names are restored within each piece.
+'''
+
+[subject_search]
+reviewed = "99779794f36c6b37"
+text = '''
+CLI: `piikey-cli subject --value V [--value V ...] [PATH...]`
+
+A value matches a file as a whole word in any letter case, or as the same value spelled another way: `+31 6 1234 5678` and `+31612345678` match, `06 1234 5678` does not. Without `paths` it searches the inventory's locations, so with no locations there is nothing to search.
+
+Folders are walked recursively without following links. A blank value is a `bad_request`.
+
+This operation is in the API and the CLI only; the app's window has no subject search.
+'''
+
+[vault_list]
+reviewed = "4f7abdb1b0bd5cae"
+text = '''
+CLI: `piikey-cli vault list [--query Q] [--kind KIND] [--limit N] [--offset N]`
+
+The reply holds the original values: treat it as personal data. The field called `proxy` is the stand-in.
+
+`kind` takes a type name from the `kinds` operation (letter case and surrounding spaces do not matter); any other name is a `bad_request`. `total` counts every record that matched, so page with `offset` until `offset + limit` reaches it.
+'''
+
+[vault_forget]
+reviewed = "170f0db8b2a851a3"
+text = '''
+CLI: `piikey-cli vault forget VALUE...`
+
+The values are matched against the original and the stand-in of each record. `forgotten` counts the records that went, so a value that is not in the vault counts 0 and is no error.
+
+The vault file is rewritten without them: the values are gone from disk. This cannot be undone (`vault_export` first if you need a copy), and stand-ins of forgotten records are no longer turned back. The running app drops what it holds of those values too.
+'''
+
+[vault_export]
+reviewed = "588bce803c113fd5"
+text = '''
+CLI: `piikey-cli vault export --out FILE [--format json|csv]`
+
+`path` must be absolute and must not exist yet. The file holds every original value next to its stand-in in the clear, so keep it where you would keep the personal data itself.
+
+JSON is an array of `{"kind","original","proxy"}` objects, CSV has the header `kind,original,proxy`; the records come in the order they were issued.
+'''
+
+[vault_wipe]
+reviewed = "8dd8d8692ab97bd3"
+text = '''
+CLI: `piikey-cli vault wipe --yes`
+
+Without `"confirm": true` the call is a `bad_request` and nothing changes; the CLI's `--yes` sends it.
+
+Every stand-in piikey issued stops turning back, and this cannot be undone. The key stays, so the vault keeps working. The app's window has no wipe; only the API and the CLI do.
+'''
+
+[inventory_status]
+reviewed = "03630f9ed0f629bf"
+text = '''
+CLI: `piikey-cli inventory status`
+
+`roots` is empty until a location has been added in the app or with `settings_set`. The inventory scans only when asked (`inventory_rescan`, `scan_files`, `explorer_scan`, the app's Scan button) and, for a location with Monitor on, when the app sees it change.
+
+While a scan runs, `scanning` says how far it is; poll this operation to follow `inventory_rescan` called from another client.
+'''
+
+[inventory_list]
+reviewed = "50f327301da8e20d"
+text = '''
+CLI: `piikey-cli inventory list [--under PATH] [--limit N] [--offset N]`
+
+Only files that hold at least one value are listed, the one with the most first and files with equally many by path. `under` must be absolute and limits the list to that file or folder and what is below it.
+
+`total` counts every file that matched, so page with `offset`. The entries hold counts per type, never the values.
+'''
+
+[inventory_tree]
+reviewed = "037c3509d6df5f2f"
+text = '''
+CLI: `piikey-cli inventory tree [--under PATH]`
+
+One level per call, the node with the most values first. Take the `path` of a node whose `is_dir` is true and send it as `under` to open it; a drive's path is `C:\`. `under` must be absolute.
+
+The tree follows the computer's real folders, whichever location or scan a file came from.
+'''
+
+[inventory_rescan]
+reviewed = "ad6919e118289605"
+text = '''
+CLI: `piikey-cli inventory rescan`
+
+It scans the inventory's locations (`inventory_status` lists them) and answers when the scan is over, however long that takes: give your client a long timeout. With no locations there is nothing to scan.
+
+The scan is incremental: a file whose size and write time match its entry is not read, and a changed file that turns out to hold the same content is not detected again.
+
+Progress is visible meanwhile in `inventory_status`.
+'''
+
+[inventory_report]
+reviewed = "73f9c86fa0718ccb"
+text = '''
+CLI: `piikey-cli inventory report --out FILE [--format json|csv]`
+
+`path` must be absolute and must not exist yet. The report covers the whole inventory: every file that holds personal data or could not be checked, in path order.
+
+CSV has one row per file: `path`, `status`, `hits`, a column for each type that occurs, and `scanned` as a UTC time. JSON has the same fields, with `counts` as an object. Never the values.
+'''
+
+[settings_get]
+reviewed = "7d846dc48c53cf5b"
+text = '''
+CLI: `piikey-cli settings get`
+
+The reply has an `enabled` field (protection), but `settings_set` does not take it: switch protection with the `protection` operation. The app answers with the settings it holds at that moment.
+'''
+
+[settings_set]
+reviewed = "7bf1e37fa4ccdac3"
+text = '''
+CLI: `piikey-cli settings set KEY=VALUE...` (the keys are the `guard.cfg` keys, except `enabled`; a list key repeats, `site=a site=b`, and an empty value empties the list)
+
+The body holds the fields under `settings`. A field you leave out is unchanged; a list you send replaces the whole list. The patch is checked as a whole: when one value is invalid, nothing changes and the error names it. A monitored folder must be one of the inventory's folders after the same patch.
+
+Folders must be absolute. `enabled` is refused: protection is switched with `protection`. The CLI's keys are singular (`site`, `program`, `disabled_kind`, `inventory_root`, `monitor_root`), the JSON fields plural (`sites`, `programs`, ...).
+
+In the running app the change takes effect the way a click in Settings does (Explorer menu, highlight, inventory, HTTP API). Changing `http_api` or `http_port` answers first and then restarts the listener, so a new port applies from the next call.
+'''
+
+[kinds]
+reviewed = "0901124f5a148c5e"
+text = '''
+CLI: `piikey-cli kinds`
+
+The `kind` field of each item is the name that `vault_list`, `settings_set` (`disabled_kinds`) and `piikey-cli scan --fail-on` take. `enabled: false` means the type is switched off in Settings, which also applies to the CLI.
+'''
+
+[model_status]
+reviewed = "4160908b623b1d93"
+text = '''
+CLI: `piikey-cli model status`
+
+The app loads the model only while something needs it (protection or highlighting on, a monitored location, a scan running) and frees it afterwards, so `unloaded` is normal for a model that is downloaded.
+
+`downloading` appears only when the app is downloading it.
+'''
+
+[model_download]
+reviewed = "d25284b44f7ac734"
+text = '''
+CLI: `piikey-cli model download` (it always downloads in its own process, and prints the progress in MB on stderr)
+
+The reply comes when the download is finished. Over the pipe or HTTP the app does the download and the call waits until the model is ready, so give your client a long timeout. The model is about 340 MB.
+
+Without the model only patterns are found.
+'''
+
+[api_token]
+reviewed = "1dfe833f86c8fae1"
+text = '''
+CLI: `piikey-cli token [--rotate]`
+
+Without `rotate` the existing token is returned (one is made the first time). The token is in the data folder, so treat it like a password.
+
+With `rotate` a new token replaces the old one, and the app restarts the HTTP API with it: use the new token from then on.
+'''
+
+[status]
+reviewed = "4d5f4465e654b444"
+text = '''
+CLI: `piikey-cli status`
+
+This is the one operation that also answers `GET /v1/status`.
+
+When the app is not running (the CLI in its own process), `app` is false and `protection` is `null`: protection is the app's.
+'''
+
+[protection]
+reviewed = "cef4d2bd80147b0e"
+text = '''
+CLI: `piikey-cli protection on|off` (needs the app)
+
+Without the app the call answers `app_required` (HTTP 409).
+
+The call returns when protection stands as asked. Turning it on can fail for a reason you have to fix (the certificate, the port); the error message says which, with code `internal`.
+'''
+
+[explorer_scan]
+reviewed = "1142a4036905d5b8"
+text = '''
+CLI: none (it is what the Explorer menu "Scan for personal data" uses)
+
+Needs the app: without it the call answers `app_required`. At least one path is required, each must be absolute and exist (`not_found` otherwise).
+
+The call returns when the scan is queued, not when it is over: follow it with `inventory_status`. The result opens in the app's window.
+'''
+
+[show_window]
+reviewed = "d551ffa2446efa4e"
+text = '''
+CLI: `piikey-cli open` (needs the app)
+
+Without the app the call answers `app_required`. It returns at once; the window comes forward on the app's own thread.
+'''

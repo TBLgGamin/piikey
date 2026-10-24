@@ -14,8 +14,8 @@
 //!
 //! Only what the detector can read is searched, so a kind switched off in Settings is not found
 //! the second way, and a file piikey cannot read (binary data, a damaged document) is not
-//! searched at all. Neither is a file that is online only (a `OneDrive` file that is not on this
-//! PC) unless it is named: reading it would download it.
+//! searched at all. Neither is a file that is only in the cloud (a `OneDrive` file that is not on
+//! this PC) and found in a folder, unless it is named: reading it would download it.
 
 use std::{
     borrow::Cow,
@@ -26,6 +26,7 @@ use std::{
 
 use aho_corasick::{AhoCorasick, Input};
 use rayon::prelude::*;
+use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
@@ -77,6 +78,37 @@ impl<'de> Deserialize<'de> for SubjectMatch {
     }
 }
 
+/// The API's view of a match, as `Serialize` writes it.
+impl JsonSchema for SubjectMatch {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("SubjectMatch")
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "type": "object",
+            "description": "A file that holds some of the values searched for.",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The file's path."
+                },
+                "values": {
+                    "type": "array",
+                    "items": {"type": "integer", "minimum": 0},
+                    "description": "Which of the values searched for the file holds, as indexes into them, in order."
+                },
+                "count": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "How many times the file holds them, of all the values it holds added up. A value that stands in the file as it was given and is also found by the detector counts once."
+                }
+            },
+            "required": ["path", "values", "count"]
+        })
+    }
+}
+
 /// The files under `paths` (a file as itself, a folder recursively, no links followed) that hold
 /// any of `values`, the one with the most occurrences first. Files without any are left out, and
 /// so are files over [`MAX_FILE`]. Several files are read at once on the rayon pool the caller
@@ -91,10 +123,9 @@ pub fn search(
     cancel: &AtomicBool,
 ) -> Result<Vec<SubjectMatch>> {
     let needles = Needles::new(values)?;
-    let walked = files::walk(paths, &|_, meta| {
-        cancel.load(Ordering::Relaxed) || files::is_online_only(meta)
-    });
+    let walked = files::walk(paths, &|_, _| cancel.load(Ordering::Relaxed));
     let mut found: Vec<SubjectMatch> = walked
+        .files
         .par_iter()
         .filter(|(_, meta)| meta.len() <= MAX_FILE)
         .filter_map(|(path, _)| {
@@ -485,6 +516,30 @@ mod tests {
             serde_json::json!({"path": r"C:\x\a.txt", "values": [0, 2], "count": 3})
         );
         assert_eq!(serde_json::from_value::<SubjectMatch>(json)?, one);
+        Ok(())
+    }
+
+    #[test]
+    fn the_schema_of_a_match_names_what_it_serializes() -> Res {
+        let schema = SubjectMatch::json_schema(&mut SchemaGenerator::default()).to_value();
+        let one = SubjectMatch {
+            path: PathBuf::from(r"C:\x\a.txt"),
+            values: vec![0, 2],
+            count: 3,
+        };
+        let json = serde_json::to_value(&one)?;
+        let keys = json.as_object().ok_or("not an object")?;
+        let properties = schema["properties"].as_object().ok_or("no properties")?;
+        let required = schema["required"].as_array().ok_or("no required")?;
+        for key in keys.keys() {
+            assert!(properties.contains_key(key), "{key} is not in the schema");
+        }
+        for key in required {
+            let key = key.as_str().ok_or("a required name is no string")?;
+            assert!(keys.contains_key(key), "{key} is required but not written");
+        }
+        assert!(!properties.contains_key("hash"));
+        assert!(!required.iter().any(|key| key.as_str() == Some("hash")));
         Ok(())
     }
 }

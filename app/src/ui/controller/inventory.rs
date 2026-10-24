@@ -63,10 +63,6 @@ pub struct Reveal {
     pub seq: u64,
     /// What was asked to be scanned, as it was given.
     pub paths: Vec<PathBuf>,
-    /// The folder to show in the Inventory: what was scanned, or the folder of the file that was.
-    pub at: PathBuf,
-    /// The file that was scanned, when the first path is one.
-    pub select: Option<PathBuf>,
     /// How far the scan is. Its progress is [`Snapshot::scan`](super::Snapshot::scan).
     pub state: RevealState,
 }
@@ -453,16 +449,11 @@ impl Controller {
 
     /// Makes the [`Reveal`] of a scan that was just asked for, which replaces the last one.
     pub(super) fn begin_reveal(&self, paths: &[PathBuf]) -> u64 {
-        let (at, select) = paths
-            .first()
-            .map_or_else(|| (PathBuf::new(), None), |first| reveal_target(first));
         self.update(|state| {
             let seq = state.reveal.as_ref().map_or(0, |reveal| reveal.seq) + 1;
             state.reveal = Some(Reveal {
                 seq,
                 paths: paths.to_vec(),
-                at,
-                select,
                 state: RevealState::Waiting,
             });
             seq
@@ -588,7 +579,10 @@ impl Controller {
         let outcome = request.reveal.filter(|_| !job.cancelled()).map(|seq| {
             let state = match &result {
                 Err(error) => RevealState::Failed(format!("Could not save the inventory: {error}")),
-                Ok(()) => RevealState::Done(self.inventory.summary(&request.paths)),
+                Ok(()) => RevealState::Done(ScanSummary {
+                    cloud_only: progress.cloud_only.load(Ordering::Relaxed),
+                    ..self.inventory.summary(&request.paths)
+                }),
             };
             (seq, state)
         });
@@ -706,15 +700,6 @@ impl Drop for StopTicker<'_> {
     }
 }
 
-/// Where the window shows the result of scanning `first`: the folder, or for a file its folder
-/// with the file selected.
-fn reveal_target(first: &Path) -> (PathBuf, Option<PathBuf>) {
-    match (first.is_file(), first.parent()) {
-        (true, Some(folder)) => (folder.to_path_buf(), Some(first.to_path_buf())),
-        _ => (first.to_path_buf(), None),
-    }
-}
-
 /// Half the cores, so the PC stays responsive while it scans.
 pub(super) fn scan_pool() -> Option<rayon::ThreadPool> {
     let cores = thread::available_parallelism().map_or(1, NonZeroUsize::get);
@@ -744,25 +729,9 @@ fn scan_loop(controller: &Weak<Controller>, scanner: &Scanner) {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        path::{Path, PathBuf},
-    };
+    use std::path::{Path, PathBuf};
 
-    use super::{FindingFiles, label_under, name_of, pick_files, reveal_target, under};
-    use crate::{Describe, ui::testing::TempDir};
-
-    #[test]
-    fn a_scanned_file_is_shown_in_its_folder() -> Result<(), String> {
-        let dir = TempDir::new()?;
-        let file = dir.0.join("a.txt");
-        fs::write(&file, "x").describe()?;
-        assert_eq!(reveal_target(&file), (dir.0.clone(), Some(file.clone())));
-        assert_eq!(reveal_target(&dir.0), (dir.0.clone(), None));
-        let gone = dir.0.join("gone");
-        assert_eq!(reveal_target(&gone), (gone.clone(), None));
-        Ok(())
-    }
+    use super::{FindingFiles, label_under, name_of, pick_files, under};
 
     #[test]
     fn the_empty_path_means_all_of_an_inventory() {

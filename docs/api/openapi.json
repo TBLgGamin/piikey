@@ -1,0 +1,3611 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "piikey API",
+    "version": "0.3.0",
+    "summary": "One local JSON API for the piikey app, scripts and the command line.",
+    "description": "piikey has one JSON API. The app serves it on a named pipe and, while the local HTTP API is switched on (Settings > Developer access), on a port of this PC. `piikey-cli` is a client of the same API, with one subcommand per operation; without the app it answers in its own process.\n\n**Getting started**\n\n1. Turn on **Local HTTP API** in Settings > Developer access. It listens on `127.0.0.1` only (loopback), on port 7980 unless you change it, and only while the switch is on.\n2. Get the token with `piikey-cli token`, or press **Copy token** in the same place. Send it as `Authorization: Bearer <token>`.\n3. Call an operation with `POST /v1/<op>` and the request's fields as a JSON body. The op is the one in the path: an `op` in the body is ignored. `GET /v1/status` also works.\n\n```powershell\n$token = piikey-cli token\n'{\"texts\":[\"mail jan@acme.nl\"]}' | curl.exe -s -H \"Authorization: Bearer $token\" --data-binary '@-' http://127.0.0.1:7980/v1/scan_text\n```\n\nIn PowerShell, plain `curl` is an alias of `Invoke-WebRequest`, so the examples use `curl.exe`, and they pass the JSON through stdin so that PowerShell does not mangle its quotes. The reply is the envelope: `{\"ok\":true,\"result\":{\"results\":[[{\"start\":5,\"end\":16,\"kind\":\"email\",\"value\":\"jan@acme.nl\"}]]}}`.\n\n**This specification.** `GET /v1/openapi.json` answers this specification as JSON, and it is the one call that needs no token. It is served only while the HTTP API is on, and it still refuses an `Origin` header. Postman, Insomnia and similar tools can import `http://127.0.0.1:7980/v1/openapi.json` (change the port if you changed it in Settings). Other methods get 405.\n\n**The hosted reference cannot send requests.** The page at https://tblggamin.github.io/piikey/ cannot call piikey on your PC, because piikey refuses every request that carries an `Origin` header, which is what a web page sends (403, token or not). Copy the examples into a terminal, or import the specification into a desktop tool.\n\n**Named pipe.** The app also serves the same operations on `\\\\.\\pipe\\piikey-<USERNAME>`, where characters other than letters, digits, `.`, `_` and `-` in the name become `_`. Only local clients can connect. A request is the bytes `P`, `2`, `0`, `0`, a `u32` little-endian length, then the request JSON with the op named in the body, for example `{\"op\":\"scan_text\",\"texts\":[\"mail jan@acme.nl\"]}`. The reply is a status byte (0 ok, 1 error), three zero bytes, a `u32` little-endian length and the envelope. Version 1 of the framing is no longer accepted.\n\n**The command line.** `piikey-cli` is a client of this same API: one subcommand per operation (`open` is `show_window`), and `--json` prints the result as the JSON shown here. It asks the app over the pipe first. Without the app it runs the operations in its own process (as `--local` does), except `protection`, `explorer_scan` and `show_window`, which answer `app_required`. Each operation below starts with its command line.\n\n## Connecting\n\n- **Base URL:** `http://127.0.0.1:7980`, loopback only. The port is the one set in Settings > Developer access, 7980 unless changed.\n- **Token:** every call except `GET /v1/openapi.json` needs the header `Authorization: Bearer <token>`, and is answered with 401 without it. `piikey-cli token` prints the token, and Settings > Developer access copies it.\n- **Web pages are refused:** a request with an `Origin` header comes from a web page and is answered with 403, token or not.\n- **Calls:** `POST /v1/<operation>` with the operation's fields as a JSON object, and `GET /v1/status`. The operation is the path's: an `op` in the body is ignored. An operation refuses fields it does not know, except the ones that take no fields at all. `GET /v1/openapi.json` answers this reference as OpenAPI 3.1, without a token.\n- **Named pipe:** the same operations go over `\\\\.\\pipe\\piikey-<USERNAME>` as JSON objects with the operation in an `op` field, for example `{\"op\":\"scan_text\",\"texts\":[\"a\"]}`. That is what `piikey-cli` uses.\n- **Paths** in a request are absolute, a drive or a share (`C:\\Users\\jan`, `\\\\server\\share`): a relative path is a `bad_request`. Offsets of text spans are UTF-8 byte offsets.\n- **Size:** a request body of more than 64 MiB is refused with 413.\n\n## Replies\n\nEvery reply is an envelope. A call that worked is answered with status 200 and `{\"ok\":true,\"result\":<value>}`; a call that failed with `{\"ok\":false,\"error\":{\"code\":\"<code>\",\"message\":\"...\"}}` and a status that depends on what failed:\n\n| Status | `code` | Meaning |\n|---|---|---|\n| 400 | `bad_request` | The request is wrong. |\n| 401 | `bad_request` | A token is required: there is no `Authorization: Bearer <token>` header, or the token is wrong. |\n| 403 | `bad_request` | The request has an `Origin` header: it comes from a web page, and no page may talk to piikey. |\n| 404 | `not_found` | There is no such op, file or record. |\n| 405 | `bad_request` | The method is not allowed for the path: an operation takes `POST` (`/v1/status` also `GET`), and `/v1/openapi.json` takes `GET` alone. |\n| 409 | `app_required` | The request needs the piikey app to be running. |\n| 409 | `busy` | What the request needs is in use. |\n| 413 | `bad_request` | The body is over 64 MiB. |\n| 500 | `io` | Reading or writing a file failed. |\n| 500 | `vault` | The vault could not be opened, read or written. |\n| 500 | `unsupported` | A file is in a format piikey cannot read. |\n| 500 | `model` | The detection model is missing or failed. |\n| 500 | `internal` | Something went wrong that the request did not cause. |",
+    "license": {
+      "name": "MIT",
+      "identifier": "MIT"
+    }
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:{port}",
+      "description": "The local HTTP API of the app, on this PC only. Settings > Developer access switches it on.",
+      "variables": {
+        "port": {
+          "default": "7980",
+          "description": "The port set in Settings > Developer access."
+        }
+      }
+    }
+  ],
+  "tags": [
+    {
+      "name": "Text",
+      "description": "Find, mask and restore personal data in texts."
+    },
+    {
+      "name": "Files",
+      "description": "The same for files and folders."
+    },
+    {
+      "name": "Subject search",
+      "description": "Find the files that mention a person, for access requests."
+    },
+    {
+      "name": "Vault",
+      "description": "The values piikey swapped, and the stand-ins it issued for them."
+    },
+    {
+      "name": "Inventory",
+      "description": "What the scans found in your locations: counts and paths, never the values."
+    },
+    {
+      "name": "Settings",
+      "description": "What piikey is set to, the types of personal data, and the API token."
+    },
+    {
+      "name": "Model",
+      "description": "The detection model."
+    },
+    {
+      "name": "App",
+      "description": "How piikey is doing, and what only the running app can do."
+    }
+  ],
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ],
+  "paths": {
+    "/v1/scan_text": {
+      "post": {
+        "tags": [
+          "Text"
+        ],
+        "summary": "Scan text",
+        "description": "What the detector finds in each text, without changing anything (the vault is left as it is, and stand-ins piikey issued are not counted).\n\nCLI: `piikey-cli scan [--fail-on KINDS|any] [--no-record] [PATH...]` (no PATH: the UTF-8 text on stdin is the one text sent)\n\n`start` and `end` are UTF-8 byte offsets into the text as you sent it, not character positions.\n\nWithout the detection model only patterns are found (emails, phone numbers, IBANs, cards and so on); names and places need it (`model_status`, `model_download`). Types switched off in Settings are not looked for.\n\n`piikey-cli scan --fail-on` exits 1 when a listed type is found; the API has no such switch, check the result.",
+        "operationId": "scan_text",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "texts": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "The texts to look in.",
+                    "examples": [
+                      [
+                        "mail jan@acme.nl"
+                      ]
+                    ]
+                  }
+                },
+                "required": [
+                  "texts"
+                ]
+              },
+              "example": {
+                "texts": [
+                  "mail jan@acme.nl"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The call worked: `result` is what the operation answers with.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "The reply of a call that worked.",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "const": true,
+                      "description": "Always `true`."
+                    },
+                    "result": {
+                      "$ref": "#/components/schemas/Spans"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "result"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/anonymize": {
+      "post": {
+        "tags": [
+          "Text"
+        ],
+        "summary": "Mask text",
+        "description": "Masks the personal data in each text.\n\nCLI: `piikey-cli anonymize [--out DIR] [PATH...]` (no PATH: stdin text, and the masked text goes to stdout)\n\nUnlike `scan_text` this writes to the vault: a value that has no stand-in yet gets one, and `deanonymize` turns it back for as long as the vault holds the record.\n\nTypes switched off in Settings > Types of personal data stay in the text. A text that is already masked comes back unchanged for the types that follow a pattern (emails, phone numbers, IBANs and so on).\n\nThe texts come back in the order you sent them.",
+        "operationId": "anonymize",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "texts": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "The texts to mask.",
+                    "examples": [
+                      [
+                        "mail jan@acme.nl"
+                      ]
+                    ]
+                  }
+                },
+                "required": [
+                  "texts"
+                ]
+              },
+              "example": {
+                "texts": [
+                  "mail jan@acme.nl"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The call worked: `result` is what the operation answers with.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "The reply of a call that worked.",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "const": true,
+                      "description": "Always `true`."
+                    },
+                    "result": {
+                      "$ref": "#/components/schemas/Texts"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "result"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/deanonymize": {
+      "post": {
+        "tags": [
+          "Text"
+        ],
+        "summary": "Restore text",
+        "description": "Restores the masked values in each text. With `tolerant`, also stand-ins that came back with a typo and names that came back alone.\n\nCLI: `piikey-cli deanonymize [--tolerant] [--out DIR] [PATH...]` (no PATH: stdin text, and the restored text goes to stdout)\n\nIt turns back every stand-in the vault holds, whichever text it appears in; text without stand-ins comes back as it was.\n\nA stand-in whose record was forgotten (`vault_forget`, `vault_wipe`) stays as it is.",
+        "operationId": "deanonymize",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "texts": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "The masked texts to restore.",
+                    "examples": [
+                      [
+                        "mail mila.visser@example.net"
+                      ]
+                    ]
+                  },
+                  "tolerant": {
+                    "type": "boolean",
+                    "description": "Also restore stand-ins that came back with a typo, and names that came back alone.",
+                    "default": false
+                  }
+                },
+                "required": [
+                  "texts"
+                ]
+              },
+              "example": {
+                "texts": [
+                  "mail mila.visser@example.net"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The call worked: `result` is what the operation answers with.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "The reply of a call that worked.",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "const": true,
+                      "description": "Always `true`."
+                    },
+                    "result": {
+                      "$ref": "#/components/schemas/Texts"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "result"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/scan_files": {
+      "post": {
+        "tags": [
+          "Files"
+        ],
+        "summary": "Scan files",
+        "description": "Scans files and folders (recursively). With `record`, what was found is also kept in the inventory.\n\nCLI: `piikey-cli scan [--fail-on KINDS|any] [--no-record] [PATH...]`\n\nEvery path must be absolute (the CLI makes its arguments absolute for you). Folders are walked recursively and symbolic links are skipped. A file named twice, or inside a folder you also named, is scanned once.\n\nEach call reads every file again; the incremental rule that skips unchanged files belongs to `inventory_rescan`. The result holds counts per type, never the values.\n\nThe CLI's `--no-record` is `\"record\": false`. `piikey-cli scan --fail-on` exits 1 when a listed type is found, and 3 when a file could not be read.",
+        "operationId": "scan_files",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "paths": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "The files and folders to scan, as absolute paths.",
+                    "examples": [
+                      [
+                        "C:\\Users\\jan\\Documents"
+                      ]
+                    ]
+                  },
+                  "record": {
+                    "type": "boolean",
+                    "description": "Whether to keep what was found in the inventory.",
+                    "default": true
+                  }
+                },
+                "required": [
+                  "paths"
+                ]
+              },
+              "example": {
+                "paths": [
+                  "C:\\Users\\jan\\Documents"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The call worked: `result` is what the operation answers with.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "The reply of a call that worked.",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "const": true,
+                      "description": "Always `true`."
+                    },
+                    "result": {
+                      "$ref": "#/components/schemas/Scanned"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "result"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/anonymize_files": {
+      "post": {
+        "tags": [
+          "Files"
+        ],
+        "summary": "Mask files",
+        "description": "Masks files and folders into the folder `out`.\n\nCLI: `piikey-cli anonymize [--out DIR] [PATH...]` (with PATHs, `--out DIR` is required)\n\n`paths` and `out` must be absolute. Folders are walked recursively and each result keeps its place relative to the folder it was found under. Missing folders under `out` are created and a file already there is overwritten, but a result is never written over an input, and an `out` inside a folder you name is refused with `bad_request`.\n\nA result that is text (from a PDF, an image or a mail) is written as `<name>.txt`.\n\nOne file that cannot be read does not stop the others: it is listed under `failed`, and the CLI then exits 3. The files are processed in the app's own scan pool, which leaves half the cores to the PC.",
+        "operationId": "anonymize_files",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "paths": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "The files and folders to mask, as absolute paths.",
+                    "examples": [
+                      [
+                        "C:\\Users\\jan\\Documents"
+                      ]
+                    ]
+                  },
+                  "out": {
+                    "type": "string",
+                    "description": "The folder the masked files are written to, as an absolute path.",
+                    "examples": [
+                      "C:\\Users\\jan\\Masked"
+                    ]
+                  }
+                },
+                "required": [
+                  "paths",
+                  "out"
+                ]
+              },
+              "example": {
+                "paths": [
+                  "C:\\Users\\jan\\Documents"
+                ],
+                "out": "C:\\Users\\jan\\Masked"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The call worked: `result` is what the operation answers with.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "The reply of a call that worked.",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "const": true,
+                      "description": "Always `true`."
+                    },
+                    "result": {
+                      "$ref": "#/components/schemas/Written"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "result"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/deanonymize_files": {
+      "post": {
+        "tags": [
+          "Files"
+        ],
+        "summary": "Restore files",
+        "description": "Restores files and folders into the folder `out`.\n\nCLI: `piikey-cli deanonymize [--tolerant] [--out DIR] [PATH...]` (with PATHs, `--out DIR` is required)\n\nThe same rules as `anonymize_files` for paths, `out`, results written as `.txt` and files that fail.\n\nWith `tolerant` a document is read one piece of text at a time, so typos and lone names are restored within each piece.",
+        "operationId": "deanonymize_files",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "paths": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "The files and folders to restore, as absolute paths.",
+                    "examples": [
+                      [
+                        "C:\\Users\\jan\\Documents"
+                      ]
+                    ]
+                  },
+                  "out": {
+                    "type": "string",
+                    "description": "The folder the restored files are written to, as an absolute path.",
+                    "examples": [
+                      "C:\\Users\\jan\\Restored"
+                    ]
+                  },
+                  "tolerant": {
+                    "type": "boolean",
+                    "description": "Also restore stand-ins that came back with a typo, and names that came back alone.",
+                    "default": false
+                  }
+                },
+                "required": [
+                  "paths",
+                  "out"
+                ]
+              },
+              "example": {
+                "paths": [
+                  "C:\\Users\\jan\\Documents"
+                ],
+                "out": "C:\\Users\\jan\\Restored"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The call worked: `result` is what the operation answers with.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "The reply of a call that worked.",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "const": true,
+                      "description": "Always `true`."
+                    },
+                    "result": {
+                      "$ref": "#/components/schemas/Written"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "result"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/subject_search": {
+      "post": {
+        "tags": [
+          "Subject search"
+        ],
+        "summary": "Search for a person",
+        "description": "Which files hold the given values (a name, a phone number, an email address, ...); an empty `paths` means the inventory's folders.\n\nCLI: `piikey-cli subject --value V [--value V ...] [PATH...]`\n\nA value matches a file as a whole word in any letter case, or as the same value spelled another way: `+31 6 1234 5678` and `+31612345678` match, `06 1234 5678` does not. Without `paths` it searches the inventory's locations, so with no locations there is nothing to search.\n\nFolders are walked recursively without following links. A blank value is a `bad_request`.\n\nThis operation is in the API and the CLI only; the app's window has no subject search.",
+        "operationId": "subject_search",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "values": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "The values that identify the person: a name, a phone number, an email address, ...",
+                    "examples": [
+                      [
+                        "Jan Jansen",
+                        "jan@acme.nl"
+                      ]
+                    ]
+                  },
+                  "paths": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "The files and folders to look in, as absolute paths. Empty: the inventory's folders.",
+                    "default": []
+                  }
+                },
+                "required": [
+                  "values"
+                ]
+              },
+              "example": {
+                "values": [
+                  "Jan Jansen",
+                  "jan@acme.nl"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The call worked: `result` is what the operation answers with.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "The reply of a call that worked.",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "const": true,
+                      "description": "Always `true`."
+                    },
+                    "result": {
+                      "$ref": "#/components/schemas/Found"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "result"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/vault_list": {
+      "post": {
+        "tags": [
+          "Vault"
+        ],
+        "summary": "List the vault",
+        "description": "The vault's records, the newest first, whose original or stand-in holds `query` (any letter case; all of them without a query), of one type if `kind` says. `limit` is 100 unless given, at most 10,000.\n\nCLI: `piikey-cli vault list [--query Q] [--kind KIND] [--limit N] [--offset N]`\n\nThe reply holds the original values: treat it as personal data. The field called `proxy` is the stand-in.\n\n`kind` takes a type name from the `kinds` operation (letter case and surrounding spaces do not matter); any other name is a `bad_request`. `total` counts every record that matched, so page with `offset` until `offset + limit` reaches it.",
+        "operationId": "vault_list",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "query": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "description": "Only the records whose original or stand-in holds this text, in any letter case."
+                  },
+                  "kind": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "description": "Only the records of this type: a name that `kinds` lists."
+                  },
+                  "limit": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ],
+                    "format": "uint",
+                    "minimum": 0,
+                    "description": "How many records at most: 100 unless given, at most 10,000."
+                  },
+                  "offset": {
+                    "type": "integer",
+                    "format": "uint",
+                    "minimum": 0,
+                    "description": "How many records to skip, the newest first.",
+                    "default": 0
+                  }
+                }
+              },
+              "example": {}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The call worked: `result` is what the operation answers with.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "The reply of a call that worked.",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "const": true,
+                      "description": "Always `true`."
+                    },
+                    "result": {
+                      "$ref": "#/components/schemas/Records"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "result"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/vault_forget": {
+      "post": {
+        "tags": [
+          "Vault"
+        ],
+        "summary": "Forget values",
+        "description": "Removes the records whose original or stand-in is one of `values`; the vault file is rewritten without them.\n\nCLI: `piikey-cli vault forget VALUE...`\n\nThe values are matched against the original and the stand-in of each record. `forgotten` counts the records that went, so a value that is not in the vault counts 0 and is no error.\n\nThe vault file is rewritten without them: the values are gone from disk. This cannot be undone (`vault_export` first if you need a copy), and stand-ins of forgotten records are no longer turned back. The running app drops what it holds of those values too.",
+        "operationId": "vault_forget",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "values": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "The values to forget: originals or stand-ins.",
+                    "examples": [
+                      [
+                        "jan@acme.nl"
+                      ]
+                    ]
+                  }
+                },
+                "required": [
+                  "values"
+                ]
+              },
+              "example": {
+                "values": [
+                  "jan@acme.nl"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The call worked: `result` is what the operation answers with.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "The reply of a call that worked.",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "const": true,
+                      "description": "Always `true`."
+                    },
+                    "result": {
+                      "$ref": "#/components/schemas/Forgotten"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "result"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/vault_export": {
+      "post": {
+        "tags": [
+          "Vault"
+        ],
+        "summary": "Export the vault",
+        "description": "Writes every record of the vault to a new file `path` (an existing file is an error).\n\nCLI: `piikey-cli vault export --out FILE [--format json|csv]`\n\n`path` must be absolute and must not exist yet. The file holds every original value next to its stand-in in the clear, so keep it where you would keep the personal data itself.\n\nJSON is an array of `{\"kind\",\"original\",\"proxy\"}` objects, CSV has the header `kind,original,proxy`; the records come in the order they were issued.",
+        "operationId": "vault_export",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "path": {
+                    "type": "string",
+                    "description": "The file to write, as an absolute path. It must not exist yet.",
+                    "examples": [
+                      "C:\\Users\\jan\\Downloads\\vault.json"
+                    ]
+                  },
+                  "format": {
+                    "$ref": "#/components/schemas/Format",
+                    "description": "How the file is written.",
+                    "default": "json"
+                  }
+                },
+                "required": [
+                  "path"
+                ]
+              },
+              "example": {
+                "path": "C:\\Users\\jan\\Downloads\\vault.json"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The call worked: `result` is what the operation answers with.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "The reply of a call that worked.",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "const": true,
+                      "description": "Always `true`."
+                    },
+                    "result": {
+                      "$ref": "#/components/schemas/Exported"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "result"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/vault_wipe": {
+      "post": {
+        "tags": [
+          "Vault"
+        ],
+        "summary": "Wipe the vault",
+        "description": "Removes every record of the vault; the key stays. Needs `confirm: true`.\n\nCLI: `piikey-cli vault wipe --yes`\n\nWithout `\"confirm\": true` the call is a `bad_request` and nothing changes; the CLI's `--yes` sends it.\n\nEvery stand-in piikey issued stops turning back, and this cannot be undone. The key stays, so the vault keeps working. The app's window has no wipe; only the API and the CLI do.",
+        "operationId": "vault_wipe",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "confirm": {
+                    "type": "boolean",
+                    "description": "Must be `true`: without it nothing is removed and the call is a `bad_request`.",
+                    "default": false,
+                    "examples": [
+                      true
+                    ]
+                  }
+                }
+              },
+              "example": {
+                "confirm": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The call worked: `result` is what the operation answers with.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "The reply of a call that worked.",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "const": true,
+                      "description": "Always `true`."
+                    },
+                    "result": {
+                      "$ref": "#/components/schemas/Forgotten"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "result"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/inventory_status": {
+      "post": {
+        "tags": [
+          "Inventory"
+        ],
+        "summary": "Inventory status",
+        "description": "The inventory in numbers.\n\nCLI: `piikey-cli inventory status`\n\n`roots` is empty until a location has been added in the app or with `settings_set`. The inventory scans only when asked (`inventory_rescan`, `scan_files`, `explorer_scan`, the app's Scan button) and, for a location with Monitor on, when the app sees it change.\n\nWhile a scan runs, `scanning` says how far it is; poll this operation to follow `inventory_rescan` called from another client.",
+        "operationId": "inventory_status",
+        "responses": {
+          "200": {
+            "description": "The call worked: `result` is what the operation answers with.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "The reply of a call that worked.",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "const": true,
+                      "description": "Always `true`."
+                    },
+                    "result": {
+                      "$ref": "#/components/schemas/InventoryStatus"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "result"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/inventory_list": {
+      "post": {
+        "tags": [
+          "Inventory"
+        ],
+        "summary": "List files with personal data",
+        "description": "The inventory's files that hold personal data, the one with the most first, at and under `under`. `limit` is 100 unless given, at most 10,000.\n\nCLI: `piikey-cli inventory list [--under PATH] [--limit N] [--offset N]`\n\nOnly files that hold at least one value are listed, the one with the most first and files with equally many by path. `under` must be absolute and limits the list to that file or folder and what is below it.\n\n`total` counts every file that matched, so page with `offset`. The entries hold counts per type, never the values.",
+        "operationId": "inventory_list",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "under": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "description": "Only the files at and under this path, an absolute path."
+                  },
+                  "limit": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ],
+                    "format": "uint",
+                    "minimum": 0,
+                    "description": "How many files at most: 100 unless given, at most 10,000."
+                  },
+                  "offset": {
+                    "type": "integer",
+                    "format": "uint",
+                    "minimum": 0,
+                    "description": "How many files to skip, the one with the most values first.",
+                    "default": 0
+                  }
+                }
+              },
+              "example": {}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The call worked: `result` is what the operation answers with.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "The reply of a call that worked.",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "const": true,
+                      "description": "Always `true`."
+                    },
+                    "result": {
+                      "$ref": "#/components/schemas/Entries"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "result"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/inventory_tree": {
+      "post": {
+        "tags": [
+          "Inventory"
+        ],
+        "summary": "Browse the tree",
+        "description": "The tiles of the inventory's tree at one level: what lies directly under `under`, or without it the drives and network shares that hold files with personal data (`C:`, with `C:\\` as the path).\n\nCLI: `piikey-cli inventory tree [--under PATH]`\n\nOne level per call, the node with the most values first. Take the `path` of a node whose `is_dir` is true and send it as `under` to open it; a drive's path is `C:\\`. `under` must be absolute.\n\nThe tree follows the computer's real folders, whichever location or scan a file came from.",
+        "operationId": "inventory_tree",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "under": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "description": "The folder to look under, an absolute path. Without it: the drives and network shares that hold files with personal data."
+                  }
+                }
+              },
+              "example": {}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The call worked: `result` is what the operation answers with.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "The reply of a call that worked.",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "const": true,
+                      "description": "Always `true`."
+                    },
+                    "result": {
+                      "$ref": "#/components/schemas/Nodes"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "result"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/inventory_rescan": {
+      "post": {
+        "tags": [
+          "Inventory"
+        ],
+        "summary": "Scan the locations",
+        "description": "Scans the inventory's folders (the locations it scans) now, and answers when the scan is over: the inventory scans only when it is asked to.\n\nCLI: `piikey-cli inventory rescan`\n\nIt scans the inventory's locations (`inventory_status` lists them) and answers when the scan is over, however long that takes: give your client a long timeout. With no locations there is nothing to scan.\n\nThe scan is incremental: a file whose size and write time match its entry is not read, and a changed file that turns out to hold the same content is not detected again.\n\nProgress is visible meanwhile in `inventory_status`.",
+        "operationId": "inventory_rescan",
+        "responses": {
+          "200": {
+            "description": "The call worked: `result` is what the operation answers with.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "The reply of a call that worked.",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "const": true,
+                      "description": "Always `true`."
+                    },
+                    "result": {
+                      "$ref": "#/components/schemas/Totals"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "result"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/inventory_report": {
+      "post": {
+        "tags": [
+          "Inventory"
+        ],
+        "summary": "Write a report",
+        "description": "Writes the inventory's findings to a new file `path`.\n\nCLI: `piikey-cli inventory report --out FILE [--format json|csv]`\n\n`path` must be absolute and must not exist yet. The report covers the whole inventory: every file that holds personal data or could not be checked, in path order.\n\nCSV has one row per file: `path`, `status`, `hits`, a column for each type that occurs, and `scanned` as a UTC time. JSON has the same fields, with `counts` as an object. Never the values.",
+        "operationId": "inventory_report",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "path": {
+                    "type": "string",
+                    "description": "The file to write, as an absolute path. It must not exist yet.",
+                    "examples": [
+                      "C:\\Users\\jan\\Downloads\\inventory.json"
+                    ]
+                  },
+                  "format": {
+                    "$ref": "#/components/schemas/Format",
+                    "description": "How the file is written.",
+                    "default": "json"
+                  }
+                },
+                "required": [
+                  "path"
+                ]
+              },
+              "example": {
+                "path": "C:\\Users\\jan\\Downloads\\inventory.json"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The call worked: `result` is what the operation answers with.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "The reply of a call that worked.",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "const": true,
+                      "description": "Always `true`."
+                    },
+                    "result": {
+                      "$ref": "#/components/schemas/Reported"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "result"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/settings_get": {
+      "post": {
+        "tags": [
+          "Settings"
+        ],
+        "summary": "Read the settings",
+        "description": "The saved settings.\n\nCLI: `piikey-cli settings get`\n\nThe reply has an `enabled` field (protection), but `settings_set` does not take it: switch protection with the `protection` operation. The app answers with the settings it holds at that moment.",
+        "operationId": "settings_get",
+        "responses": {
+          "200": {
+            "description": "The call worked: `result` is what the operation answers with.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "The reply of a call that worked.",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "const": true,
+                      "description": "Always `true`."
+                    },
+                    "result": {
+                      "$ref": "#/components/schemas/Policy"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "result"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/settings_set": {
+      "post": {
+        "tags": [
+          "Settings"
+        ],
+        "summary": "Change the settings",
+        "description": "Changes the given settings, validated as a whole.\n\nCLI: `piikey-cli settings set KEY=VALUE...` (the keys are the `guard.cfg` keys, except `enabled`; a list key repeats, `site=a site=b`, and an empty value empties the list)\n\nThe body holds the fields under `settings`. A field you leave out is unchanged; a list you send replaces the whole list. The patch is checked as a whole: when one value is invalid, nothing changes and the error names it. A monitored folder must be one of the inventory's folders after the same patch.\n\nFolders must be absolute. `enabled` is refused: protection is switched with `protection`. The CLI's keys are singular (`site`, `program`, `disabled_kind`, `inventory_root`, `monitor_root`), the JSON fields plural (`sites`, `programs`, ...).\n\nIn the running app the change takes effect the way a click in Settings does (Explorer menu, highlight, inventory, HTTP API). Changing `http_api` or `http_port` answers first and then restarts the listener, so a new port applies from the next call.",
+        "operationId": "settings_set",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "settings": {
+                    "$ref": "#/components/schemas/SettingsPatch",
+                    "description": "The settings to change. A setting that is left out stays as it is.",
+                    "examples": [
+                      {
+                        "highlight": "always"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "settings"
+                ]
+              },
+              "example": {
+                "settings": {
+                  "highlight": "always"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The call worked: `result` is what the operation answers with.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "The reply of a call that worked.",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "const": true,
+                      "description": "Always `true`."
+                    },
+                    "result": {
+                      "$ref": "#/components/schemas/Policy"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "result"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/kinds": {
+      "post": {
+        "tags": [
+          "Settings"
+        ],
+        "summary": "List the types of personal data",
+        "description": "Every type of personal data.\n\nCLI: `piikey-cli kinds`\n\nThe `kind` field of each item is the name that `vault_list`, `settings_set` (`disabled_kinds`) and `piikey-cli scan --fail-on` take. `enabled: false` means the type is switched off in Settings, which also applies to the CLI.",
+        "operationId": "kinds",
+        "responses": {
+          "200": {
+            "description": "The call worked: `result` is what the operation answers with.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "The reply of a call that worked.",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "const": true,
+                      "description": "Always `true`."
+                    },
+                    "result": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/TypeInfo"
+                      }
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "result"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/model_status": {
+      "post": {
+        "tags": [
+          "Model"
+        ],
+        "summary": "Detection model status",
+        "description": "Where the detection model stands.\n\nCLI: `piikey-cli model status`\n\nThe app loads the model only while something needs it (protection or highlighting on, a monitored location, a scan running) and frees it afterwards, so `unloaded` is normal for a model that is downloaded.\n\n`downloading` appears only when the app is downloading it.",
+        "operationId": "model_status",
+        "responses": {
+          "200": {
+            "description": "The call worked: `result` is what the operation answers with.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "The reply of a call that worked.",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "const": true,
+                      "description": "Always `true`."
+                    },
+                    "result": {
+                      "$ref": "#/components/schemas/Model"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "result"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/model_download": {
+      "post": {
+        "tags": [
+          "Model"
+        ],
+        "summary": "Download the detection model",
+        "description": "Downloads the detection model.\n\nCLI: `piikey-cli model download` (it always downloads in its own process, and prints the progress in MB on stderr)\n\nThe reply comes when the download is finished. Over the pipe or HTTP the app does the download and the call waits until the model is ready, so give your client a long timeout. The model is about 340 MB.\n\nWithout the model only patterns are found.",
+        "operationId": "model_download",
+        "responses": {
+          "200": {
+            "description": "The call worked: `result` is what the operation answers with.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "The reply of a call that worked.",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "const": true,
+                      "description": "Always `true`."
+                    },
+                    "result": {
+                      "type": "object",
+                      "description": "Nothing to report: an empty object, `{}`.",
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "result"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/api_token": {
+      "post": {
+        "tags": [
+          "Settings"
+        ],
+        "summary": "Get the API token",
+        "description": "The token the HTTP API wants as `Authorization: Bearer <token>`; `rotate` makes a new one first.\n\nCLI: `piikey-cli token [--rotate]`\n\nWithout `rotate` the existing token is returned (one is made the first time). The token is in the data folder, so treat it like a password.\n\nWith `rotate` a new token replaces the old one, and the app restarts the HTTP API with it: use the new token from then on.",
+        "operationId": "api_token",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "rotate": {
+                    "type": "boolean",
+                    "description": "Make a new token first. The old one stops working.",
+                    "default": false
+                  }
+                }
+              },
+              "example": {}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The call worked: `result` is what the operation answers with.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "The reply of a call that worked.",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "const": true,
+                      "description": "Always `true`."
+                    },
+                    "result": {
+                      "$ref": "#/components/schemas/Token"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "result"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/status": {
+      "get": {
+        "tags": [
+          "App"
+        ],
+        "summary": "Status",
+        "description": "How piikey is doing.\n\nCLI: `piikey-cli status`\n\nThis is the one operation that also answers `GET /v1/status`.\n\nWhen the app is not running (the CLI in its own process), `app` is false and `protection` is `null`: protection is the app's.",
+        "operationId": "status_get",
+        "responses": {
+          "200": {
+            "description": "The call worked: `result` is what the operation answers with.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "The reply of a call that worked.",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "const": true,
+                      "description": "Always `true`."
+                    },
+                    "result": {
+                      "$ref": "#/components/schemas/Status"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "result"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "App"
+        ],
+        "summary": "Status",
+        "description": "How piikey is doing.\n\nCLI: `piikey-cli status`\n\nThis is the one operation that also answers `GET /v1/status`.\n\nWhen the app is not running (the CLI in its own process), `app` is false and `protection` is `null`: protection is the app's.",
+        "operationId": "status",
+        "responses": {
+          "200": {
+            "description": "The call worked: `result` is what the operation answers with.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "The reply of a call that worked.",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "const": true,
+                      "description": "Always `true`."
+                    },
+                    "result": {
+                      "$ref": "#/components/schemas/Status"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "result"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/protection": {
+      "post": {
+        "tags": [
+          "App"
+        ],
+        "summary": "Switch protection",
+        "description": "Switches protection (masking what goes to the protected sites and apps) on or off. Needs the app.\n\nCLI: `piikey-cli protection on|off` (needs the app)\n\nWithout the app the call answers `app_required` (HTTP 409).\n\nThe call returns when protection stands as asked. Turning it on can fail for a reason you have to fix (the certificate, the port); the error message says which, with code `internal`.",
+        "operationId": "protection",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "on": {
+                    "type": "boolean",
+                    "description": "`true` switches protection on, `false` switches it off.",
+                    "examples": [
+                      true
+                    ]
+                  }
+                },
+                "required": [
+                  "on"
+                ]
+              },
+              "example": {
+                "on": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The call worked: `result` is what the operation answers with.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "The reply of a call that worked.",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "const": true,
+                      "description": "Always `true`."
+                    },
+                    "result": {
+                      "$ref": "#/components/schemas/Protection"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "result"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/explorer_scan": {
+      "post": {
+        "tags": [
+          "App"
+        ],
+        "summary": "Scan from Explorer",
+        "description": "Scans files and folders into the inventory as Explorer's \"Scan for personal data\" does, and shows the result in a dialog in the app's window, which opens if it is hidden. Needs the app. Answers when the scan is queued, not when it is over.\n\nCLI: none (it is what the Explorer menu \"Scan for personal data\" uses)\n\nNeeds the app: without it the call answers `app_required`. At least one path is required, each must be absolute and exist (`not_found` otherwise).\n\nThe call returns when the scan is queued, not when it is over: follow it with `inventory_status`. The result opens in the app's window.",
+        "operationId": "explorer_scan",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "paths": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "The files and folders to scan, as absolute paths that exist.",
+                    "examples": [
+                      [
+                        "C:\\Users\\jan\\Documents"
+                      ]
+                    ]
+                  }
+                },
+                "required": [
+                  "paths"
+                ]
+              },
+              "example": {
+                "paths": [
+                  "C:\\Users\\jan\\Documents"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The call worked: `result` is what the operation answers with.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "The reply of a call that worked.",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "const": true,
+                      "description": "Always `true`."
+                    },
+                    "result": {
+                      "type": "object",
+                      "description": "Nothing to report: an empty object, `{}`.",
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "result"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/show_window": {
+      "post": {
+        "tags": [
+          "App"
+        ],
+        "summary": "Show the window",
+        "description": "Brings the app's window forward, opening it when it is closed. What a second start of `piikey.exe` asks of the app that runs. Needs the app.\n\nCLI: `piikey-cli open` (needs the app)\n\nWithout the app the call answers `app_required`. It returns at once; the window comes forward on the app's own thread.",
+        "operationId": "show_window",
+        "responses": {
+          "200": {
+            "description": "The call worked: `result` is what the operation answers with.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "The reply of a call that worked.",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "const": true,
+                      "description": "Always `true`."
+                    },
+                    "result": {
+                      "type": "object",
+                      "description": "Nothing to report: an empty object, `{}`.",
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "result"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/openapi.json": {
+      "get": {
+        "tags": [
+          "App"
+        ],
+        "summary": "This reference",
+        "description": "This spec. The only call that needs no token: it holds nothing that is not public.",
+        "operationId": "openapi",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "The OpenAPI 3.1 document, as JSON.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "The token that `piikey-cli token` prints, and that Settings > Developer access copies."
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "`bad_request`: The request is wrong.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Failure"
+            }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "`bad_request`: A token is required: there is no `Authorization: Bearer <token>` header, or the token is wrong.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Failure"
+            }
+          }
+        },
+        "headers": {
+          "WWW-Authenticate": {
+            "description": "`Bearer`.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "`bad_request`: The request has an `Origin` header: it comes from a web page, and no page may talk to piikey.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Failure"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "`not_found`: There is no such op, file or record.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Failure"
+            }
+          }
+        }
+      },
+      "MethodNotAllowed": {
+        "description": "`bad_request`: The method is not allowed for the path: an operation takes `POST` (`/v1/status` also `GET`), and `/v1/openapi.json` takes `GET` alone.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Failure"
+            }
+          }
+        },
+        "headers": {
+          "Allow": {
+            "description": "The methods the path allows.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "Conflict": {
+        "description": "`app_required`: The request needs the piikey app to be running. `busy`: What the request needs is in use.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Failure"
+            }
+          }
+        }
+      },
+      "PayloadTooLarge": {
+        "description": "`bad_request`: The body is over 64 MiB.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Failure"
+            }
+          }
+        }
+      },
+      "InternalError": {
+        "description": "`io`: Reading or writing a file failed. `vault`: The vault could not be opened, read or written. `unsupported`: A file is in a format piikey cannot read. `model`: The detection model is missing or failed. `internal`: Something went wrong that the request did not cause.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Failure"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "Device": {
+        "description": "What the loaded model runs on.",
+        "type": "string",
+        "enum": [
+          "cpu",
+          "hybrid"
+        ],
+        "x-enumDescriptions": {
+          "cpu": "The CPU alone.",
+          "hybrid": "The CPU and the GPU together."
+        }
+      },
+      "Entries": {
+        "type": "object",
+        "properties": {
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Entry"
+            },
+            "description": "The files on this page, the one with the most values first."
+          },
+          "total": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "description": "Every file that matched, not only the page."
+          }
+        },
+        "required": [
+          "entries",
+          "total"
+        ],
+        "description": "`inventory_list`: one page of the files that hold personal data, the one with the most first."
+      },
+      "Entry": {
+        "type": "object",
+        "description": "What a scan found out about one file.",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "The file's path."
+          },
+          "size": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "The file's size in bytes."
+          },
+          "modified": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "The file's write time as Windows keeps it, a FILETIME: 100 ns ticks since 1601. With the size it says whether the file changed since the scan. 0 when it is not known: the file could not be read, so the next scan looks at it again."
+          },
+          "scanned": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "When the scan ran, in seconds since the Unix epoch."
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "unsupported",
+              "too_large",
+              "failed"
+            ],
+            "description": "How far the file got in the scan.",
+            "x-enumDescriptions": {
+              "ok": "Read and scanned.",
+              "unsupported": "Not a format piikey reads: binary data, a zip that is no document.",
+              "too_large": "Over the size limit of 64 MiB: not read.",
+              "failed": "Could not be read or parsed; `error` says why. A file that could not be read has no known write time, so the next scan tries it again: whatever held it may be over. A file that was read but not understood is not read again until it changes: it would cost the same every time."
+            }
+          },
+          "error": {
+            "type": "string",
+            "description": "Why the file failed. Present only when `status` is `failed`."
+          },
+          "hits": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Values found in the file, of every type."
+          },
+          "counts": {
+            "description": "How many values of each type were found, as an object keyed by the type's name, the most first.",
+            "type": "object",
+            "additionalProperties": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "propertyNames": {
+              "$ref": "#/components/schemas/TypeName"
+            }
+          }
+        },
+        "required": [
+          "path",
+          "size",
+          "modified",
+          "scanned",
+          "status",
+          "hits",
+          "counts"
+        ]
+      },
+      "Error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "$ref": "#/components/schemas/ErrorCode",
+            "description": "What failed. The HTTP API answers each code with a status of its own."
+          },
+          "message": {
+            "type": "string",
+            "description": "What went wrong, for a person."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "description": "Why a request failed: a code to act on, and a message for a person."
+      },
+      "ErrorCode": {
+        "description": "What sort of failure an error is. The name is the `code` of the reply's error, and the HTTP API answers each with a status of its own.",
+        "type": "string",
+        "enum": [
+          "bad_request",
+          "app_required",
+          "not_found",
+          "busy",
+          "io",
+          "vault",
+          "unsupported",
+          "model",
+          "internal"
+        ],
+        "x-enumDescriptions": {
+          "bad_request": "The request is wrong.",
+          "app_required": "The request needs the piikey app to be running.",
+          "not_found": "There is no such op, file or record.",
+          "busy": "What the request needs is in use.",
+          "io": "Reading or writing a file failed.",
+          "vault": "The vault could not be opened, read or written.",
+          "unsupported": "A file is in a format piikey cannot read.",
+          "model": "The detection model is missing or failed.",
+          "internal": "Something went wrong that the request did not cause."
+        }
+      },
+      "Exported": {
+        "type": "object",
+        "properties": {
+          "records": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "description": "How many records were written."
+          },
+          "path": {
+            "type": "string",
+            "description": "The file that was written."
+          }
+        },
+        "required": [
+          "records",
+          "path"
+        ],
+        "description": "`vault_export`: the file that was written."
+      },
+      "Failed": {
+        "type": "object",
+        "properties": {
+          "input": {
+            "type": "string",
+            "description": "The file that could not be written."
+          },
+          "error": {
+            "type": "string",
+            "description": "Why it could not be."
+          }
+        },
+        "required": [
+          "input",
+          "error"
+        ],
+        "description": "A file that could not be written, and why."
+      },
+      "Failure": {
+        "type": "object",
+        "description": "The reply of a call that failed.",
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": false,
+            "description": "Always `false`."
+          },
+          "error": {
+            "$ref": "#/components/schemas/Error"
+          }
+        },
+        "required": [
+          "ok",
+          "error"
+        ],
+        "additionalProperties": false
+      },
+      "Forgotten": {
+        "type": "object",
+        "properties": {
+          "forgotten": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "description": "How many records were removed."
+          }
+        },
+        "required": [
+          "forgotten"
+        ],
+        "description": "`vault_forget` and `vault_wipe`: how many records were removed."
+      },
+      "Format": {
+        "description": "How an export or a report is written.",
+        "type": "string",
+        "enum": [
+          "json",
+          "csv"
+        ],
+        "x-enumDescriptions": {
+          "json": "A JSON array with one object per row.",
+          "csv": "RFC 4180 CSV with a header row."
+        }
+      },
+      "Found": {
+        "type": "object",
+        "properties": {
+          "matches": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SubjectMatch"
+            },
+            "description": "The files that hold some of the values, the one with the most first."
+          }
+        },
+        "required": [
+          "matches"
+        ],
+        "description": "`subject_search`: the files that hold some of the values, the one with the most first."
+      },
+      "Highlight": {
+        "description": "When the field you type in is outlined because it holds personal data.",
+        "type": "string",
+        "enum": [
+          "off",
+          "always",
+          "hotkey"
+        ],
+        "x-enumDescriptions": {
+          "off": "Never.",
+          "always": "Whenever the field in focus holds personal data.",
+          "hotkey": "When the hotkey is pressed (Ctrl+Alt+P), for the field in focus."
+        }
+      },
+      "InventoryStatus": {
+        "type": "object",
+        "properties": {
+          "roots": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The folders it scans when asked: the user's locations, none until one is added."
+          },
+          "monitored": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The locations whose changes are scanned as they happen."
+          },
+          "files": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "description": "Files the inventory knows."
+          },
+          "files_with_pii": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "description": "Of those, the files that hold personal data."
+          },
+          "hits": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "description": "Values found in all of them."
+          },
+          "scanning": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Progress"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Files scanned so far, while a scan runs; `null` otherwise."
+          }
+        },
+        "required": [
+          "roots",
+          "monitored",
+          "files",
+          "files_with_pii",
+          "hits",
+          "scanning"
+        ],
+        "description": "`inventory_status`: the inventory in numbers."
+      },
+      "Model": {
+        "type": "object",
+        "properties": {
+          "state": {
+            "$ref": "#/components/schemas/ModelState",
+            "description": "Where the model stands."
+          },
+          "device": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Device"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Present while the model is loaded; `null` otherwise."
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why it failed, when it did."
+          },
+          "downloading": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Progress"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Only the app says it: the download it is running, in bytes."
+          },
+          "dir": {
+            "type": "string",
+            "description": "The folder the model lives in."
+          }
+        },
+        "required": [
+          "state",
+          "device",
+          "dir"
+        ],
+        "description": "`model_status`: the detection model."
+      },
+      "ModelState": {
+        "description": "Where the detection model stands.",
+        "type": "string",
+        "enum": [
+          "missing",
+          "unloaded",
+          "ready",
+          "failed"
+        ],
+        "x-enumDescriptions": {
+          "missing": "Not downloaded.",
+          "unloaded": "Downloaded, loaded when it is needed.",
+          "ready": "Loaded and detecting.",
+          "failed": "Loading or running failed."
+        }
+      },
+      "Moved": {
+        "type": "object",
+        "properties": {
+          "input": {
+            "type": "string",
+            "description": "The file that was read."
+          },
+          "output": {
+            "type": "string",
+            "description": "The file that was written."
+          }
+        },
+        "required": [
+          "input",
+          "output"
+        ],
+        "description": "A file that was written."
+      },
+      "Node": {
+        "type": "object",
+        "description": "A folder or a file of the tree, with what lies under it added up.",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Where it is. For a volume at the top of the tree, its root, such as `C:\\`."
+          },
+          "name": {
+            "type": "string",
+            "description": "The last component of the path, for display. A volume is called what Explorer calls it: the drive (`C:`) or the share (`\\\\server\\share`)."
+          },
+          "is_dir": {
+            "type": "boolean",
+            "description": "Whether it is a folder."
+          },
+          "hits": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Values found in the files under it."
+          },
+          "files": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Files under it that hold any."
+          },
+          "counts": {
+            "description": "How many values of each type were found, as an object keyed by the type's name, the most first.",
+            "type": "object",
+            "additionalProperties": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "propertyNames": {
+              "$ref": "#/components/schemas/TypeName"
+            }
+          }
+        },
+        "required": [
+          "path",
+          "name",
+          "is_dir",
+          "hits",
+          "files",
+          "counts"
+        ]
+      },
+      "Nodes": {
+        "type": "object",
+        "properties": {
+          "nodes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Node"
+            },
+            "description": "The tiles at this level of the tree."
+          }
+        },
+        "required": [
+          "nodes"
+        ],
+        "description": "`inventory_tree`: what lies directly under a folder, or the drives and shares that hold files with personal data."
+      },
+      "Policy": {
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether protection is on: piikey masks what goes to the protected sites and apps below. `settings_set` does not take it; the `protection` operation switches it.",
+            "default": false
+          },
+          "sites": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The protected sites: host patterns, `example.com` or `*.example.com`.",
+            "default": []
+          },
+          "programs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The protected apps, as lowercase exe names, e.g. `chrome.exe`.",
+            "default": []
+          },
+          "disabled_kinds": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TypeName"
+            },
+            "description": "Types of personal data piikey leaves alone in new text; empty means every type is masked.",
+            "default": []
+          },
+          "highlight": {
+            "$ref": "#/components/schemas/Highlight",
+            "description": "When the field in focus is outlined if it holds personal data.",
+            "default": "hotkey"
+          },
+          "explorer_menu": {
+            "type": "boolean",
+            "description": "Whether Explorer's right-click menu offers \"Scan for personal data\".",
+            "default": true
+          },
+          "background": {
+            "type": "boolean",
+            "description": "Whether closing the window leaves piikey running in the tray, with protection, the highlight, monitoring and the API still working. Off: closing the window quits piikey.",
+            "default": true
+          },
+          "inventory_roots": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The inventory's locations: absolute folders it scans when asked. None until the user adds one.",
+            "default": []
+          },
+          "monitored_roots": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Locations (each one of `inventory_roots`) whose file changes are scanned as they happen. None by default.",
+            "default": []
+          },
+          "http_api": {
+            "type": "boolean",
+            "description": "Whether the app serves the local HTTP API on `127.0.0.1`.",
+            "default": false
+          },
+          "http_port": {
+            "type": "integer",
+            "format": "uint16",
+            "minimum": 1,
+            "maximum": 65535,
+            "description": "The port of the local HTTP API, 1 to 65535.",
+            "default": 7980
+          }
+        },
+        "required": [
+          "enabled",
+          "sites",
+          "programs",
+          "disabled_kinds",
+          "highlight",
+          "explorer_menu",
+          "background",
+          "inventory_roots",
+          "monitored_roots",
+          "http_api",
+          "http_port"
+        ],
+        "description": "The settings, as `settings_get` and `settings_set` answer them.\n\nThey are saved in `%LOCALAPPDATA%\\piikey\\guard.cfg`."
+      },
+      "Progress": {
+        "type": "object",
+        "properties": {
+          "done": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "description": "How many are done."
+          },
+          "total": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "description": "How many there are in all (files for a scan, bytes for a download)."
+          }
+        },
+        "required": [
+          "done",
+          "total"
+        ],
+        "description": "How far a scan or a download is: `done` of `total`."
+      },
+      "Protection": {
+        "type": "object",
+        "properties": {
+          "protection": {
+            "type": "boolean",
+            "description": "Whether protection is on."
+          }
+        },
+        "required": [
+          "protection"
+        ],
+        "description": "`protection`: how protection stands after the switch. Only the app answers it."
+      },
+      "Record": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/TypeName",
+            "description": "The type of personal data, by the name `kinds` lists it."
+          },
+          "original": {
+            "type": "string",
+            "description": "The value."
+          },
+          "proxy": {
+            "type": "string",
+            "description": "The stand-in piikey issued for it."
+          }
+        },
+        "required": [
+          "kind",
+          "original",
+          "proxy"
+        ],
+        "description": "A value and the stand-in piikey issued for it."
+      },
+      "Records": {
+        "type": "object",
+        "properties": {
+          "records": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Record"
+            },
+            "description": "The records on this page, the newest first."
+          },
+          "total": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "description": "Every record that matched, not only the page."
+          }
+        },
+        "required": [
+          "records",
+          "total"
+        ],
+        "description": "`vault_list`: one page of the vault's records, the newest first."
+      },
+      "Reported": {
+        "type": "object",
+        "properties": {
+          "rows": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "description": "How many rows were written."
+          },
+          "path": {
+            "type": "string",
+            "description": "The file that was written."
+          }
+        },
+        "required": [
+          "rows",
+          "path"
+        ],
+        "description": "`inventory_report`: the file that was written."
+      },
+      "Scanned": {
+        "type": "object",
+        "properties": {
+          "files": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Entry"
+            },
+            "description": "One entry per file that was read, each file once."
+          },
+          "hits": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "description": "Values found in all of them."
+          }
+        },
+        "required": [
+          "files",
+          "hits"
+        ],
+        "description": "`scan_files`: what was found in the files and folders named, each file once."
+      },
+      "SettingsPatch": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "sites": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Replaces `sites`; each entry is a host (`chat.example.com`), a wildcard (`*.example.com`: any subdomain, not the apex) or a pasted URL of which only the host is kept. Duplicates are dropped."
+          },
+          "programs": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Replaces `programs`; each entry is an exe name: a path stands for its file name, the name is lowercased and gets `.exe` when it has no extension. Duplicates are dropped."
+          },
+          "disabled_kinds": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/TypeName"
+            },
+            "description": "Replaces `disabled_kinds`; each entry is a type name, an empty list clears it."
+          },
+          "highlight": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Highlight"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Replaces `highlight`: `off`, `always` or `hotkey`."
+          },
+          "explorer_menu": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Replaces `explorer_menu`."
+          },
+          "background": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Replaces `background`."
+          },
+          "inventory_roots": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Replaces `inventory_roots`; each entry must be an absolute folder."
+          },
+          "monitored_roots": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Replaces `monitored_roots`; each entry must be one of the `inventory_roots` after this patch."
+          },
+          "http_api": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Replaces `http_api`."
+          },
+          "http_port": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint16",
+            "minimum": 1,
+            "maximum": 65535,
+            "description": "Replaces `http_port`; 1 to 65535."
+          }
+        },
+        "description": "A partial update of the settings, as `settings_set` carries it.\n\nEvery field that is present replaces the saved one, the others stay. All values are validated like typed input, and nothing changes if any of them is invalid. A field that is absent is not written, so a patch serialized and read back is the same patch."
+      },
+      "Span": {
+        "type": "object",
+        "properties": {
+          "start": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "description": "UTF-8 byte offset of its first byte."
+          },
+          "end": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "description": "UTF-8 byte offset after its last byte."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/TypeName",
+            "description": "The type of personal data, by the name `kinds` lists it."
+          },
+          "value": {
+            "type": "string",
+            "description": "The value that was found, as it stands in the text."
+          }
+        },
+        "required": [
+          "start",
+          "end",
+          "kind",
+          "value"
+        ],
+        "description": "A value found in a text."
+      },
+      "Spans": {
+        "type": "object",
+        "properties": {
+          "results": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "$ref": "#/components/schemas/Span"
+              }
+            },
+            "description": "One list per text, in the order the texts were given."
+          }
+        },
+        "required": [
+          "results"
+        ],
+        "description": "`scan_text`: what the detector finds in each text."
+      },
+      "Status": {
+        "type": "object",
+        "properties": {
+          "app": {
+            "type": "boolean",
+            "description": "Whether the app is running (it answers for itself, and says `true`)."
+          },
+          "protection": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether protection is on; `null` when the app is not running, as it is the app's."
+          },
+          "version": {
+            "type": "string",
+            "description": "piikey's version."
+          },
+          "vault_records": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "description": "How many records the vault holds."
+          },
+          "model": {
+            "$ref": "#/components/schemas/Model",
+            "description": "Where the detection model stands."
+          },
+          "highlight": {
+            "$ref": "#/components/schemas/Highlight",
+            "description": "When the field in focus is outlined if it holds personal data."
+          },
+          "explorer_menu": {
+            "type": "boolean",
+            "description": "Whether Explorer's right-click menu offers \"Scan for personal data\"."
+          },
+          "monitoring": {
+            "type": "boolean",
+            "description": "Whether any location is monitored."
+          },
+          "http_api": {
+            "type": "boolean",
+            "description": "Whether the local HTTP API is switched on."
+          }
+        },
+        "required": [
+          "app",
+          "protection",
+          "version",
+          "vault_records",
+          "model",
+          "highlight",
+          "explorer_menu",
+          "monitoring",
+          "http_api"
+        ],
+        "description": "`status`: how piikey is doing."
+      },
+      "SubjectMatch": {
+        "type": "object",
+        "description": "A file that holds some of the values searched for.",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "The file's path."
+          },
+          "values": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "description": "Which of the values searched for the file holds, as indexes into them, in order."
+          },
+          "count": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "How many times the file holds them, of all the values it holds added up. A value that stands in the file as it was given and is also found by the detector counts once."
+          }
+        },
+        "required": [
+          "path",
+          "values",
+          "count"
+        ]
+      },
+      "Texts": {
+        "type": "object",
+        "properties": {
+          "texts": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The texts that came out, in the order they were given."
+          }
+        },
+        "required": [
+          "texts"
+        ],
+        "description": "`anonymize` and `deanonymize`: the texts that came out, in the order they were given."
+      },
+      "Token": {
+        "type": "object",
+        "properties": {
+          "token": {
+            "type": "string",
+            "description": "The bearer token."
+          }
+        },
+        "required": [
+          "token"
+        ],
+        "description": "`api_token`: what the HTTP API wants as `Authorization: Bearer <token>`."
+      },
+      "Totals": {
+        "type": "object",
+        "properties": {
+          "files": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "description": "Files the inventory knows."
+          },
+          "files_with_pii": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "description": "Of those, the ones that hold personal data."
+          },
+          "hits": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "description": "Values found, of every type."
+          }
+        },
+        "required": [
+          "files",
+          "files_with_pii",
+          "hits"
+        ],
+        "description": "The inventory in numbers."
+      },
+      "TypeInfo": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/TypeName",
+            "description": "The name the API uses for the type."
+          },
+          "label": {
+            "type": "string",
+            "description": "What a person calls it."
+          },
+          "group": {
+            "type": "string",
+            "description": "The group it is listed under."
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether scans and masking look for it."
+          }
+        },
+        "required": [
+          "kind",
+          "label",
+          "group",
+          "enabled"
+        ],
+        "description": "One type of personal data, in the reply to `kinds`: the reply is a list of these."
+      },
+      "TypeName": {
+        "type": "string",
+        "description": "A type of personal data, by the name the API uses: the `kind` field of a result, the entries of `disabled_kinds`. The `kinds` operation lists them with their group and whether each is on.",
+        "enum": [
+          "secret",
+          "url_credential",
+          "email",
+          "iban",
+          "credit_card",
+          "ipv6",
+          "mac",
+          "ipv4",
+          "us_ssn",
+          "nl_bsn",
+          "phone",
+          "person",
+          "person_alias",
+          "person_identifier",
+          "person_attribute",
+          "person_role",
+          "date_of_birth",
+          "phone_number",
+          "contact_handle",
+          "postal_address",
+          "location",
+          "geo_location",
+          "device_identifier",
+          "identifying_link",
+          "account_identifier",
+          "auth_secret",
+          "bank_account",
+          "payment_card",
+          "card_security",
+          "financial_amount",
+          "document_identifier",
+          "document_reference",
+          "vehicle_identifier",
+          "organization_name",
+          "organization_identifier",
+          "proper_name",
+          "health_data",
+          "biometric_data",
+          "ethnic_origin",
+          "political_opinion",
+          "religion_or_belief",
+          "sexual_orientation",
+          "trade_union",
+          "criminal_offence"
+        ],
+        "x-enumDescriptions": {
+          "secret": "Secret",
+          "url_credential": "URL password",
+          "email": "Email",
+          "iban": "IBAN",
+          "credit_card": "Card number",
+          "ipv6": "IPv6 address",
+          "mac": "MAC address",
+          "ipv4": "IPv4 address",
+          "us_ssn": "SSN",
+          "nl_bsn": "BSN",
+          "phone": "Phone",
+          "person": "Name",
+          "person_alias": "Alias or nickname",
+          "person_identifier": "Personal ID number",
+          "person_attribute": "Personal trait",
+          "person_role": "Role or title",
+          "date_of_birth": "Date of birth",
+          "phone_number": "Other phone number",
+          "contact_handle": "Social handle",
+          "postal_address": "Postal address",
+          "location": "Place",
+          "geo_location": "Coordinates",
+          "device_identifier": "Device ID",
+          "identifying_link": "Personal link",
+          "account_identifier": "Account ID",
+          "auth_secret": "Password",
+          "bank_account": "Other bank account",
+          "payment_card": "Other card number",
+          "card_security": "Card security code",
+          "financial_amount": "Amount of money",
+          "document_identifier": "Document number",
+          "document_reference": "Document reference",
+          "vehicle_identifier": "Licence plate or VIN",
+          "organization_name": "Organization",
+          "organization_identifier": "Company number",
+          "proper_name": "Other proper name",
+          "health_data": "Health",
+          "biometric_data": "Biometric data",
+          "ethnic_origin": "Ethnic origin",
+          "political_opinion": "Political opinion",
+          "religion_or_belief": "Religion or belief",
+          "sexual_orientation": "Sexual orientation",
+          "trade_union": "Trade union",
+          "criminal_offence": "Criminal record"
+        }
+      },
+      "Written": {
+        "type": "object",
+        "properties": {
+          "written": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Moved"
+            },
+            "description": "The files that were written."
+          },
+          "failed": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Failed"
+            },
+            "description": "The files that could not be written."
+          }
+        },
+        "required": [
+          "written",
+          "failed"
+        ],
+        "description": "`anonymize_files` and `deanonymize_files`: what became of each file."
+      }
+    }
+  }
+}

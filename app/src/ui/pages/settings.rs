@@ -1,6 +1,6 @@
 //! Settings: what changes the app or the engine all the jobs share. One scrolling page.
 
-use piikey::{api::http, detect::KIND_GROUPS};
+use piikey::{api::openapi::REFERENCE_URL, detect::KIND_GROUPS};
 use windows_reactor::{
     Button, Expander, HorizontalAlignment, Image, Orientation, StackPanel, Stretch, TextBlock, View,
 };
@@ -161,9 +161,10 @@ fn developer(window: &MainWindow, context: Context<'_>) -> Vec<View> {
                 context,
             ))
             .build(),
-        Row::new("Address")
-            .description(http::url(policy.http_port))
-            .state(if window.snap.http { "Listening" } else { "Off" })
+        Row::new("API reference")
+            .icon("\u{E8A5}")
+            .description("Every operation, with examples.")
+            .control(web_link("Open", REFERENCE_URL))
             .build(),
         Row::new("Token")
             .icon("\u{E8D7}")

@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>piikey API</title>
+    <!-- The piikey symbol (assets/brand/piikey-logo-kit/web-icons/favicon.svg) in brand purple. -->
+    <link
+      rel="icon"
+      type="image/svg+xml"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 256 256'%3E%3Cg fill='%236f49b1' transform='translate(-38.4 -35.84) scale(1.28) translate(-12 0)'%3E%3Cpath fill-rule='evenodd' d='M146 32a60 60 0 1 0 0 120a60 60 0 1 0 0-120zM146 68a24 24 0 1 1 0 48a24 24 0 1 1 0-48z'/%3E%3Crect x='78' y='32' width='40' height='192' rx='16'/%3E%3Crect x='100' y='172' width='52' height='34' rx='12'/%3E%3C/g%3E%3C/svg%3E"
+    />
+  </head>
+  <body>
+    <noscript>
+      The API reference needs JavaScript. The same content is in
+      <a href="README.md">README.md</a> (Markdown), and the machine-readable spec is
+      <a href="openapi.json">openapi.json</a> (OpenAPI 3.1).
+    </noscript>
+
+    <!--
+      Scalar's script-tag integration: the script finds this element, reads the spec from
+      data-url and the options from data-configuration. The spec path is relative, so the page
+      works from the Pages site root and from any local static server.
+
+      "hideTestRequestButton" is on because piikey refuses requests that come from web pages
+      (an Origin header gets a 403, by design), so a browser can never call the API and the
+      button could only fail. Dark mode is left alone: it follows the visitor's system.
+    -->
+    <script
+      id="api-reference"
+      data-url="./openapi.json"
+      data-configuration='{
+        "hideTestRequestButton": true,
+        "metaData": { "title": "piikey API" }
+      }'
+    ></script>
+
+    <!--
+      Scalar @scalar/api-reference, pinned to an exact version and checked by a Subresource
+      Integrity hash, so a changed or compromised CDN file is refused instead of run.
+      To bump it, change the version in the URL and the integrity hash together:
+        1. Download the new file:
+           https://cdn.jsdelivr.net/npm/@scalar/api-reference@<version>/dist/browser/standalone.js
+        2. Hash it:  openssl dgst -sha384 -binary standalone.js | openssl base64 -A
+           and write the result as "sha384-<hash>".
+        3. Open the page and check the reference still renders.
+      Current: 1.76.0.
+    -->
+    <script
+      src="https://cdn.jsdelivr.net/npm/@scalar/api-reference@1.76.0/dist/browser/standalone.js"
+      integrity="sha384-oH1C0RwqcwbVXkC+r8A+4qRoyEUQdtxAzOwumkxZtQBBcsy61FOoPt7B50OVJYYQ"
+      crossorigin="anonymous"
+    ></script>
+  </body>
+</html>

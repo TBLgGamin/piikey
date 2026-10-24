@@ -419,7 +419,6 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         };
-        assert_eq!(reveal.select, Some(file.clone()));
         assert_eq!(reveal.paths, [file]);
         let RevealState::Done(summary) = reveal.state else {
             return Err(format!("the scan failed: {:?}", reveal.state));

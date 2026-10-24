@@ -124,6 +124,30 @@ tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-
 # Already in the build graph through `tokenizers` and the proxy stack, so they add no new crate.
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
+# JSON Schema of the API types, for the generated OpenAPI reference (`api::openapi`, `docs/api`).
+# `derive` is the `JsonSchema` derive, `std` the impls for `PathBuf`, and `preserve_order` keeps the
+# fields of a schema in the order of the struct, the order the docs list them in.
+schemars = { version = "1.2.3", default-features = false, features = [
+    "derive",
+    "std",
+    "preserve_order",
+] }
+# Reads `docs/api/prose.toml`, the hand-written text of the API reference, with the position of each
+# `reviewed` fingerprint in it (`toml::Spanned`), so `cargo api-docs --accept` changes nothing else.
+# Already in the lockfile through embed-resource's build script, so no new crate is fetched; only
+# the parser and serde support are on.
+toml = { version = "1.1.8", default-features = false, features = ["parse", "serde", "std"] }
+# Cloud accounts (`sources/`): blocking HTTPS to the providers' REST APIs. Already in the build graph
+# (ort-sys's build script downloads the runtime with it), so it adds no new crate. `native-tls` is
+# Windows' own TLS stack (SChannel): it trusts the Windows certificate store, so a company's TLS
+# inspection root works too. Only TLS is on: JSON, form bodies and redirects need no feature.
+ureq = { version = "3.4.2", default-features = false, features = ["native-tls"] }
+# RS256 signing of the JWT assertions (Microsoft client certificates, Google service accounts),
+# SHA-256 of the PKCE challenge and SHA-1 of a certificate's thumbprint. Already in the build graph
+# through the app's certificate generation (rcgen), so no new crate.
+ring = "0.17.14"
+# base64url of those JWTs and the base64 of PEM files. Already in the build graph through ureq.
+base64 = { version = "0.23.1", default-features = false, features = ["std"] }
 
 [build-dependencies]
 embed-resource.workspace = true

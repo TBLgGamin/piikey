@@ -47,6 +47,7 @@ use std::{
 };
 
 use rayon::prelude::*;
+use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 pub use crate::formats::{Busy, Finding, Location, Report};
@@ -58,6 +59,8 @@ use crate::{
     sys::{self, FileLock, io_context},
     vault::{ExportFormat, csv_row},
 };
+
+pub(crate) mod remote;
 
 /// Files bigger than this are not read: they are recorded as [`Status::TooLarge`]. Reading a
 /// file whole and running the detector over it costs time and memory in proportion, which a
@@ -321,6 +324,10 @@ pub struct Summary {
     pub counts: Vec<(EntityKind, u32)>,
     /// Files that could not be read, are too large, or are no format piikey reads.
     pub unread: u64,
+    /// Files that were left out because they are only in the cloud. A scan knows this, not the
+    /// inventory: [`Inventory::summary`] leaves it 0 and the caller of the scan sets it from
+    /// [`Progress::cloud_only`].
+    pub cloud_only: u64,
 }
 
 /// A path the file system said changed: what [`Inventory::refresh`] looks at again.
@@ -340,6 +347,9 @@ pub struct Progress {
     /// Files this scan has to scan: the new and the changed ones. Known once the folders were
     /// walked, 0 before.
     pub total: AtomicU64,
+    /// Files the walk left out because they are only in the cloud (reading one would download
+    /// it). Known once the folders were walked, 0 before.
+    pub cloud_only: AtomicU64,
     /// The files being read now (several at once, one per worker of the pool) and what each is
     /// busy with, in the order they were started.
     reading: Mutex<Vec<Reading>>,
@@ -389,13 +399,13 @@ impl Progress {
 }
 
 /// The inventory in numbers.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Totals {
     /// Files the inventory knows.
     pub files: u64,
     /// Of those, the ones that hold personal data.
     pub files_with_pii: u64,
-    /// Values found, of every kind.
+    /// Values found, of every type.
     pub hits: u64,
 }
 
@@ -614,8 +624,9 @@ impl Inventory {
     /// is detected again.
     ///
     /// The walk leaves out `AppData`, `node_modules`, `.git`, `target`, the recycle bin, hidden
-    /// and system files, and files that are online only (reading them would download them), so
-    /// what a folder of the user's holds is what is scanned. Files over [`MAX_FILE`] are
+    /// and system files, and files that are only in the cloud (reading them would download
+    /// them; [`Progress::cloud_only`] counts them), so what a folder of the user's holds is
+    /// what is scanned. Files over [`MAX_FILE`] are
     /// recorded as too large. Work goes in chunks on the rayon pool the caller runs in, which
     /// is how the app keeps a scan to half the cores; `progress` is updated as files finish, and
     /// `cancel` is looked at between files, so a scan stops within the file it is in. A
@@ -640,7 +651,10 @@ impl Inventory {
         let walked = files::walk(paths, &|path, meta| {
             cancel.load(Ordering::Relaxed) || unwanted(path, meta)
         });
-        self.scan_walked(engine, &walked, paths, progress, cancel)
+        progress
+            .cloud_only
+            .store(walked.cloud_only, Ordering::Relaxed);
+        self.scan_walked(engine, &walked.files, paths, progress, cancel)
     }
 
     /// Brings the inventory up to date with `touched`, the paths the file system said changed
@@ -666,6 +680,7 @@ impl Inventory {
     ) -> Result<()> {
         progress.done.store(0, Ordering::Relaxed);
         progress.total.store(0, Ordering::Relaxed);
+        progress.cloud_only.store(0, Ordering::Relaxed);
         let mut known = HashMap::new();
         let mut gone: Vec<PathBuf> = Vec::new();
         let mut folders: Vec<PathBuf> = Vec::new();
@@ -686,9 +701,13 @@ impl Inventory {
             gone.dedup();
             self.forget_gone(&gone)?;
         }
-        walked.extend(files::walk(&folders, &|path, meta| {
+        let found = files::walk(&folders, &|path, meta| {
             cancel.load(Ordering::Relaxed) || unwanted(path, meta)
-        }));
+        });
+        progress
+            .cloud_only
+            .store(found.cloud_only, Ordering::Relaxed);
+        walked.extend(found.files);
         // A file that was reported and also lies in a folder that was walked is one file.
         walked.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         walked.dedup_by(|a, b| a.0 == b.0);
@@ -1203,12 +1222,9 @@ fn scan_file(
                 (Status::Failed(err.to_string()), Vec::new())
             }
             Ok(Some(bytes)) => {
-                let seen = ContentHash::of(&bytes);
+                let (seen, status, counts) = judge(engine, &bytes, prior, &mut modified, follow)?;
                 hash = Some(seen);
-                match prior.filter(|prior| prior.hash == seen) {
-                    Some(prior) => (prior.status.clone(), prior.counts.clone()),
-                    None => detect(engine, &bytes, &mut modified, follow)?,
-                }
+                (status, counts)
             }
         }
     };
@@ -1221,6 +1237,29 @@ fn scan_file(
         counts,
         hash,
     })
+}
+
+/// How many values of each type a file holds, the most first.
+type KindCounts = Vec<(EntityKind, u32)>;
+
+/// What the detector makes of `bytes`, the contents of a file that was read: their fingerprint,
+/// and the status and counts that go with it. When `prior` has the same fingerprint (the file
+/// changed without its contents changing) its status and counts stand and the detector does not
+/// run. `None` when `follow` stopped the read. A file on this PC and an item of a cloud account
+/// are judged the same way.
+fn judge(
+    engine: &Engine,
+    bytes: &[u8],
+    prior: Option<&Prior>,
+    modified: &mut u64,
+    follow: &(dyn Fn(Busy) -> bool + Sync),
+) -> Option<(ContentHash, Status, KindCounts)> {
+    let seen = ContentHash::of(bytes);
+    let (status, counts) = match prior.filter(|prior| prior.hash == seen) {
+        Some(prior) => (prior.status.clone(), prior.counts.clone()),
+        None => detect(engine, bytes, modified, follow)?,
+    };
+    Some((seen, status, counts))
 }
 
 /// What the detector makes of the contents of a file, `follow` told what it is busy with; `None`
@@ -1337,11 +1376,10 @@ fn unix_now() -> u64 {
         .map_or(0, |since| since.as_secs())
 }
 
-/// Whether a walk leaves `path` out: hidden, system or online-only things, and the folders
-/// nothing of the user's lives in.
+/// Whether a walk leaves `path` out: hidden or system things, and the folders nothing of the
+/// user's lives in. What is only in the cloud is left out by the walk itself.
 fn unwanted(path: &Path, meta: &Metadata) -> bool {
     meta.file_attributes() & HIDDEN_OR_SYSTEM != 0
-        || files::is_online_only(meta)
         || (meta.is_dir()
             && path.file_name().is_some_and(|name| {
                 SKIPPED_DIRS
@@ -1427,7 +1465,10 @@ fn reach(roots: &[PathBuf], path: &Path, known: &mut HashMap<PathBuf, Way>) -> R
             }
             Err(_) => return Reach::Skipped,
         };
-        if meta.file_type().is_symlink() || unwanted(&here, &meta) {
+        if meta.file_type().is_symlink()
+            || unwanted(&here, &meta)
+            || files::is_cloud_only(meta.file_attributes())
+        {
             known.insert(here, Way::Skipped);
             return Reach::Skipped;
         }
@@ -1648,6 +1689,26 @@ impl<'de> Deserialize<'de> for Counts<'_> {
     }
 }
 
+/// The API's view of the counts: an object keyed by type name.
+impl JsonSchema for Counts<'_> {
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("Counts")
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "type": "object",
+            "description": "How many values of each type were found, as an object keyed by the type's name, the most first.",
+            "additionalProperties": {"type": "integer", "minimum": 0},
+            "propertyNames": generator.subschema_for::<EntityKind>()
+        })
+    }
+}
+
 impl Serialize for Entry {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
         Row::of(self, true).serialize(serializer)
@@ -1661,6 +1722,63 @@ impl<'de> Deserialize<'de> for Entry {
         Row::deserialize(deserializer)?
             .into_entry()
             .map_err(|status| de::Error::custom(format_args!("unknown status {status:?}")))
+    }
+}
+
+/// The API's view of an entry, as `Serialize` writes it: no fingerprint.
+impl JsonSchema for Entry {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("Entry")
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "type": "object",
+            "description": "What a scan found out about one file.",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The file's path."
+                },
+                "size": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "The file's size in bytes."
+                },
+                "modified": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "The file's write time as Windows keeps it, a FILETIME: 100 ns ticks since 1601. With the size it says whether the file changed since the scan. 0 when it is not known: the file could not be read, so the next scan looks at it again."
+                },
+                "scanned": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "When the scan ran, in seconds since the Unix epoch."
+                },
+                "status": {
+                    "type": "string",
+                    "enum": ["ok", "unsupported", "too_large", "failed"],
+                    "description": "How far the file got in the scan.",
+                    "x-enumDescriptions": {
+                        "ok": "Read and scanned.",
+                        "unsupported": "Not a format piikey reads: binary data, a zip that is no document.",
+                        "too_large": "Over the size limit of 64 MiB: not read.",
+                        "failed": "Could not be read or parsed; `error` says why. A file that could not be read has no known write time, so the next scan tries it again: whatever held it may be over. A file that was read but not understood is not read again until it changes: it would cost the same every time."
+                    }
+                },
+                "error": {
+                    "type": "string",
+                    "description": "Why the file failed. Present only when `status` is `failed`."
+                },
+                "hits": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Values found in the file, of every type."
+                },
+                "counts": generator.subschema_for::<Counts<'static>>()
+            },
+            "required": ["path", "size", "modified", "scanned", "status", "hits", "counts"]
+        })
     }
 }
 
@@ -1699,6 +1817,46 @@ impl<'de> Deserialize<'de> for Node {
             hits: row.hits,
             files: row.files,
             counts: row.counts.0.into_owned(),
+        })
+    }
+}
+
+/// The API's view of a node, as `Serialize` writes it.
+impl JsonSchema for Node {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("Node")
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "type": "object",
+            "description": "A folder or a file of the tree, with what lies under it added up.",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Where it is. For a volume at the top of the tree, its root, such as `C:\\`."
+                },
+                "name": {
+                    "type": "string",
+                    "description": "The last component of the path, for display. A volume is called what Explorer calls it: the drive (`C:`) or the share (`\\\\server\\share`)."
+                },
+                "is_dir": {
+                    "type": "boolean",
+                    "description": "Whether it is a folder."
+                },
+                "hits": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Values found in the files under it."
+                },
+                "files": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Files under it that hold any."
+                },
+                "counts": generator.subschema_for::<Counts<'static>>()
+            },
+            "required": ["path", "name", "is_dir", "hits", "files", "counts"]
         })
     }
 }
@@ -2416,6 +2574,75 @@ mod tests {
             serde_json::json!({"files": 4, "files_with_pii": 3, "hits": 7})
         );
         assert_eq!(serde_json::from_value::<Totals>(json)?, totals);
+        Ok(())
+    }
+
+    /// Fails unless every key of `json` is a property of `schema`, every required property is a
+    /// key of `json`, and the fingerprint is in neither.
+    fn assert_schema_describes(json: &serde_json::Value, schema: &serde_json::Value) -> Res {
+        let keys = json.as_object().ok_or("not an object")?;
+        let properties = schema["properties"].as_object().ok_or("no properties")?;
+        let required = schema["required"].as_array().ok_or("no required")?;
+        for key in keys.keys() {
+            assert!(properties.contains_key(key), "{key} is not in the schema");
+        }
+        for key in required {
+            let key = key.as_str().ok_or("a required name is no string")?;
+            assert!(keys.contains_key(key), "{key} is required but not written");
+        }
+        assert!(!properties.contains_key("hash"));
+        assert!(!required.iter().any(|key| key.as_str() == Some("hash")));
+        Ok(())
+    }
+
+    #[test]
+    fn the_schema_of_an_entry_names_what_it_serializes() -> Res {
+        let schema = Entry::json_schema(&mut SchemaGenerator::default()).to_value();
+        let mut failed = entry(r"C:\r\f.txt", &[]);
+        failed.status = Status::Failed("a reason".to_owned());
+        failed.hash = Some(ContentHash::of(b"x"));
+        let mut ok = entry(r"C:\r\a.txt", &[(Phone, 3), (Email, 2)]);
+        ok.hash = Some(ContentHash::of(b"y"));
+        for one in [ok, failed] {
+            let json = serde_json::to_value(&one)?;
+            assert_schema_describes(&json, &schema)?;
+        }
+        let failed = serde_json::to_value(Entry {
+            status: Status::Failed(String::new()),
+            ..entry(r"C:\r\f.txt", &[])
+        })?;
+        assert!(failed.get("error").is_some());
+
+        let statuses = schema["properties"]["status"]["enum"]
+            .as_array()
+            .ok_or("no status enum")?;
+        let described = schema["properties"]["status"]["x-enumDescriptions"]
+            .as_object()
+            .ok_or("no status descriptions")?;
+        for status in [
+            Status::Ok,
+            Status::Unsupported,
+            Status::TooLarge,
+            Status::Failed(String::new()),
+        ] {
+            assert!(statuses.contains(&serde_json::Value::from(status.as_str())));
+            assert!(described.contains_key(status.as_str()));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_schema_of_a_node_names_what_it_serializes() -> Res {
+        let schema = Node::json_schema(&mut SchemaGenerator::default()).to_value();
+        let node = Node {
+            path: PathBuf::from(r"C:\r"),
+            name: "r".to_owned(),
+            is_dir: true,
+            hits: 5,
+            files: 2,
+            counts: vec![(Phone, 3), (Email, 2)],
+        };
+        assert_schema_describes(&serde_json::to_value(&node)?, &schema)?;
         Ok(())
     }
 

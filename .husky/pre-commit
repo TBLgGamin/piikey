@@ -1,3 +1,9 @@
 node scripts/release-guard.mjs staged
 cargo fmt-check
 cargo lint
+# The API reference is generated from the code: rewrite it and stage it, so a commit that changes the
+# API carries fresh docs. Then refuse a commit whose hand-written prose (docs/api/prose.toml) is out of
+# date. Nothing here accepts the prose: read it, then `cargo api-docs --accept <op>`.
+cargo api-docs
+git add docs/api/openapi.json docs/api/README.md
+cargo api-docs --check-prose

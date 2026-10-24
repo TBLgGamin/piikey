@@ -102,6 +102,20 @@ pub(super) fn tally(summary: &ScanSummary) -> String {
     }
 }
 
+/// Says how many files were left out because they are only in the cloud (reading one would
+/// download it); `None` when there were none.
+fn cloud_only_note(summary: &ScanSummary) -> Option<String> {
+    let n = summary.cloud_only;
+    match n {
+        0 => None,
+        1 => Some("1 file is only in the cloud and was not scanned.".to_owned()),
+        _ => Some(format!(
+            "{} files are only in the cloud and were not scanned.",
+            thousands(n)
+        )),
+    }
+}
+
 /// How far a scan is: a ring while the files are still being looked for, then a bar and how many
 /// are scanned, and under it a line for each file being read now with what it is busy with.
 fn progress(scan: Option<(u64, u64)>, reading: &[ScanReading]) -> View {
@@ -223,15 +237,18 @@ fn result_content(window: &MainWindow, reveal: &Reveal) -> View {
         RevealState::Done(summary) => {
             parts.push(subtitle(&headline(summary)).into());
             parts.push(caption(tally(summary)).into());
+            if let Some(note) = cloud_only_note(summary) {
+                parts.push(caption(note).into());
+            }
             parts.extend(type_rows(&summary.counts));
         }
     }
     StackPanel::new().spacing(8.0).children(parts).into()
 }
 
-/// The dialog of the scan whose result the user has not put away yet. A result that holds personal
-/// data offers what was found itself (the default), and the Inventory with its map when what was
-/// scanned lies in a location or holds one: the Inventory keeps nothing else.
+/// The dialog of the scan whose result the user has not put away yet: Close on the left, and when
+/// the result holds personal data, "Show what was found" on the right as the default. A dialog
+/// without a Close button still closes on Escape, which counts as Close.
 fn result(window: &MainWindow, reveal: &Reveal, context: Context<'_>) -> ContentDialog {
     let (title, found) = match &reveal.state {
         RevealState::Waiting | RevealState::Scanning => ("Scanning\u{2026}", false),
@@ -241,29 +258,24 @@ fn result(window: &MainWindow, reveal: &Reveal, context: Context<'_>) -> Content
     let dialog = ContentDialog::new()
         .is_open(true)
         .title(title)
-        .content(result_content(window, reveal))
-        .close_button_text("Close")
-        .on_closed(
-            context.callback(|result: ContentDialogResult| match result {
-                ContentDialogResult::Primary => Msg::ReportFound,
-                ContentDialogResult::Secondary => Msg::ReportShow,
-                _ => Msg::ReportClose,
-            }),
-        );
-    let in_inventory = window.snap.policy.inventory_roots.iter().any(|root| {
-        piikey::sys::is_under(&reveal.at, root) || piikey::sys::is_under(root, &reveal.at)
-    });
-    if found && in_inventory {
+        .content(result_content(window, reveal));
+    if found {
+        // WinUI puts the primary button left of the secondary one.
         dialog
-            .primary_button_text("Show what was found")
-            .secondary_button_text("Show in Inventory")
-            .default_button(ContentDialogButton::Primary)
-    } else if found {
-        dialog
-            .primary_button_text("Show what was found")
-            .default_button(ContentDialogButton::Primary)
+            .primary_button_text("Close")
+            .secondary_button_text("Show what was found")
+            .default_button(ContentDialogButton::Secondary)
+            .on_closed(
+                context.callback(|result: ContentDialogResult| match result {
+                    ContentDialogResult::Secondary => Msg::ReportFound,
+                    _ => Msg::ReportClose,
+                }),
+            )
     } else {
-        dialog.default_button(ContentDialogButton::Close)
+        dialog
+            .close_button_text("Close")
+            .default_button(ContentDialogButton::Close)
+            .on_closed(context.callback(|_: ContentDialogResult| Msg::ReportClose))
     }
 }
 
@@ -286,6 +298,7 @@ mod tests {
             hits,
             counts: Vec::new(),
             unread,
+            cloud_only: 0,
         }
     }
 
@@ -304,6 +317,23 @@ mod tests {
     fn the_tally_counts_the_files_and_the_ones_that_could_not_be_read() {
         assert_eq!(tally(&summary(5, 1, 1, 0)), "1 file scanned");
         assert!(tally(&summary(5, 1, 60, 3)).starts_with("60 files scanned \u{b7} 3 could not"));
+    }
+
+    #[test]
+    fn files_that_are_only_in_the_cloud_are_named_when_there_are_any() {
+        let with = |cloud_only| ScanSummary {
+            cloud_only,
+            ..summary(0, 0, 12, 0)
+        };
+        assert_eq!(cloud_only_note(&with(0)), None);
+        assert_eq!(
+            cloud_only_note(&with(1)).as_deref(),
+            Some("1 file is only in the cloud and was not scanned.")
+        );
+        assert_eq!(
+            cloud_only_note(&with(1234)).as_deref(),
+            Some("1,234 files are only in the cloud and were not scanned.")
+        );
     }
 
     #[test]

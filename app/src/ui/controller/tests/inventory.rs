@@ -55,10 +55,7 @@ fn an_explorer_scan_outside_the_locations_shows_its_result_and_is_not_kept() -> 
     assert_eq!(snapshot.inventory_totals, (0, 0));
     assert_eq!(rig.controller.inventory().totals().files, 0);
     let reveal = snapshot.reveal.clone().ok_or("no dialog")?;
-    assert_eq!(
-        (reveal.seq, &reveal.paths, &reveal.at, &reveal.select),
-        (1, &vec![folder.clone()], &folder, &None)
-    );
+    assert_eq!((reveal.seq, &reveal.paths), (1, &vec![folder.clone()]));
     assert_eq!(
         summary_of(&snapshot)?,
         ScanSummary {
@@ -66,7 +63,8 @@ fn an_explorer_scan_outside_the_locations_shows_its_result_and_is_not_kept() -> 
             files_with_data: 1,
             hits: 1,
             counts: vec![(EntityKind::Email, 1)],
-            unread: 0
+            unread: 0,
+            cloud_only: 0
         }
     );
     // The application thread's timer sees the request without a window: the tray state
@@ -112,10 +110,7 @@ fn an_explorer_scan_outside_the_locations_shows_its_result_and_is_not_kept() -> 
             .is_some_and(|reveal| reveal.seq == 2 && matches!(reveal.state, RevealState::Done(_)))
     })?;
     let reveal = snapshot.reveal.clone().ok_or("no dialog")?;
-    assert_eq!(
-        (&reveal.paths, &reveal.at, &reveal.select),
-        (&vec![file.clone()], &folder, &Some(file.clone()))
-    );
+    assert_eq!(&reveal.paths, &vec![file.clone()]);
     assert_eq!(summary_of(&snapshot)?.files, 1);
     assert_eq!(rig.controller.tray().reveal, 2);
     // The model was loaded for the scans and given back.

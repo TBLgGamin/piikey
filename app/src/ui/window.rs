@@ -272,8 +272,6 @@ pub enum Msg {
     FindingsOpened(u32, goto::Outcome),
     /// The result of a scan was closed.
     ReportClose,
-    /// "Show in Inventory" on the result of a scan.
-    ReportShow,
     /// "Show what was found" on the result of a scan.
     ReportFound,
     CopyToken,
@@ -944,7 +942,7 @@ impl Component for MainWindow {
             | Msg::VaultSite(_)
             | Msg::VaultPeriod(_)
             | Msg::VaultLoaded(..) => self.update_vault(message, context),
-            Msg::ReportClose | Msg::ReportShow | Msg::ReportFound => {
+            Msg::ReportClose | Msg::ReportFound => {
                 self.update_report(&message, context);
             }
             Msg::FindingsListed(..)

@@ -26,13 +26,24 @@ use crate::{
 
 /// `FILE_ATTRIBUTE_OFFLINE`, `_RECALL_ON_OPEN` and `_RECALL_ON_DATA_ACCESS`: the attributes a
 /// cloud file that is not on this PC carries.
-const ONLINE_ONLY: u32 = 0x1000 | 0x4_0000 | 0x40_0000;
+const CLOUD_ONLY: u32 = 0x1000 | 0x4_0000 | 0x40_0000;
 
-/// Whether `meta` is of a file or folder that is online only (a `OneDrive` file that is not on
-/// this PC): reading it would download it, so a crawl leaves it alone.
+/// Whether a file or folder with these Windows `attributes` is only in the cloud (a `OneDrive`,
+/// Dropbox or Google Drive placeholder that is not on this PC): reading it would download it,
+/// so a crawl of a folder leaves it alone.
 #[must_use]
-pub fn is_online_only(meta: &Metadata) -> bool {
-    meta.file_attributes() & ONLINE_ONLY != 0
+pub const fn is_cloud_only(attributes: u32) -> bool {
+    attributes & CLOUD_ONLY != 0
+}
+
+/// What [`walk`] found.
+#[derive(Debug)]
+pub struct Walked {
+    /// Every regular file found, with its metadata, each once and in path order.
+    pub files: Vec<(PathBuf, Metadata)>,
+    /// How many files were left out because they are [only in the cloud](is_cloud_only); a
+    /// folder that is only in the cloud is left out whole and counts for none.
+    pub cloud_only: u64,
 }
 
 /// One input file and where its result goes.
@@ -53,7 +64,8 @@ pub struct Job {
 /// input or entry that does not exist or cannot be listed, on an output folder inside an input
 /// directory (the output would be processed in turn), on a result that would be written over an
 /// input, and on two files that would be written to the same file (Windows paths are not case
-/// sensitive). The jobs of one input come in path order.
+/// sensitive). The jobs of one input come in path order. A file that is only in the cloud is
+/// left out when it is found in a folder, as for [`walk`]; one that is named is a job.
 ///
 /// # Errors
 /// `Io` naming the path that cannot be read; `BadRequest` for the output problems above.
@@ -75,7 +87,18 @@ pub fn collect(inputs: &[PathBuf], out: Option<&Path>) -> Result<Vec<Job>> {
     for input in inputs {
         let mut found = Vec::new();
         let mut errors = Vec::new();
-        crawl(input, &|_, _| false, &mut found, &mut errors);
+        let mut cloud_only = Vec::new();
+        let mut crawled = Found {
+            files: &mut found,
+            cloud_only: &mut cloud_only,
+            errors: &mut errors,
+        };
+        crawl(
+            input,
+            &|_, _| false,
+            &|meta| meta.file_attributes(),
+            &mut crawled,
+        );
         found.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         if let Some((path, err)) = errors.first() {
             return Err(io_context(err, "read", path));
@@ -148,48 +171,83 @@ fn refuse_collisions(jobs: &[Job]) -> Result<()> {
 /// with everything below it). The metadata is the directory listing's, so no entry costs a
 /// system call of its own.
 ///
+/// A file that is only in the cloud and is found by walking a folder is never returned,
+/// whatever `skip` says of it: reading it would download it. It is counted in
+/// [`Walked::cloud_only`], unless `skip` left it out. A file that is named as an input is
+/// returned: the caller asked for exactly that file.
+///
 /// This is for crawls that do what they can: an input that does not exist and a directory
 /// that cannot be listed are left out. [`collect`] is the strict one.
 #[must_use]
-pub fn walk(
-    inputs: &[PathBuf],
-    skip: &dyn Fn(&Path, &Metadata) -> bool,
-) -> Vec<(PathBuf, Metadata)> {
-    let mut found = Vec::new();
-    let mut errors = Vec::new();
-    for input in inputs {
-        crawl(input, skip, &mut found, &mut errors);
-    }
-    found.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    // A single input cannot reach a file twice: links are not followed.
-    if inputs.len() > 1 {
-        let mut seen = HashSet::with_capacity(found.len());
-        found.retain(|(path, _)| seen.insert(path_key(path)));
-    }
-    found
+pub fn walk(inputs: &[PathBuf], skip: &dyn Fn(&Path, &Metadata) -> bool) -> Walked {
+    walk_with(inputs, skip, &|meta| meta.file_attributes())
 }
 
-/// Adds every file under `root` to `found`, and what cannot be read to `errors`; both are
-/// unordered. A `root` that is a file is added as itself.
+/// [`walk`] with the attributes of an entry from `attributes`: the seam that lets a test walk
+/// files that are only in the cloud, which a test cannot create.
+fn walk_with(
+    inputs: &[PathBuf],
+    skip: &dyn Fn(&Path, &Metadata) -> bool,
+    attributes: &dyn Fn(&Metadata) -> u32,
+) -> Walked {
+    let mut files = Vec::new();
+    let mut cloud_only = Vec::new();
+    let mut errors = Vec::new();
+    for input in inputs {
+        crawl(
+            input,
+            skip,
+            attributes,
+            &mut Found {
+                files: &mut files,
+                cloud_only: &mut cloud_only,
+                errors: &mut errors,
+            },
+        );
+    }
+    files.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    // A single input cannot reach a file twice: links are not followed.
+    if inputs.len() > 1 {
+        let mut seen = HashSet::with_capacity(files.len());
+        files.retain(|(path, _)| seen.insert(path_key(path)));
+        let mut seen = HashSet::with_capacity(cloud_only.len());
+        cloud_only.retain(|path| seen.insert(path_key(path)));
+    }
+    Walked {
+        files,
+        cloud_only: u64::try_from(cloud_only.len()).unwrap_or(u64::MAX),
+    }
+}
+
+/// Where a crawl adds what it finds, all unordered: the files, the files that are only in the
+/// cloud, and what cannot be read.
+struct Found<'a> {
+    files: &'a mut Vec<(PathBuf, Metadata)>,
+    cloud_only: &'a mut Vec<PathBuf>,
+    errors: &'a mut Vec<(PathBuf, io::Error)>,
+}
+
+/// Adds every file under `root` to `found`. A `root` that is a file is added as itself.
 fn crawl(
     root: &Path,
     skip: &dyn Fn(&Path, &Metadata) -> bool,
-    found: &mut Vec<(PathBuf, Metadata)>,
-    errors: &mut Vec<(PathBuf, io::Error)>,
+    attributes: &dyn Fn(&Metadata) -> u32,
+    found: &mut Found<'_>,
 ) {
     let meta = match fs::metadata(root) {
         Ok(meta) => meta,
         Err(err) => {
-            errors.push((root.to_path_buf(), err));
+            found.errors.push((root.to_path_buf(), err));
             return;
         }
     };
+    // A file that is named is asked for, whatever it is: only what a walk finds is left out.
     if meta.is_file() {
-        found.push((root.to_path_buf(), meta));
+        found.files.push((root.to_path_buf(), meta));
         return;
     }
     if !meta.is_dir() {
-        errors.push((
+        found.errors.push((
             root.to_path_buf(),
             io::Error::new(io::ErrorKind::InvalidInput, "not a file or directory"),
         ));
@@ -200,7 +258,7 @@ fn crawl(
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(err) => {
-                errors.push((dir, err));
+                found.errors.push((dir, err));
                 continue;
             }
         };
@@ -208,7 +266,7 @@ fn crawl(
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(err) => {
-                    errors.push((dir.clone(), err));
+                    found.errors.push((dir.clone(), err));
                     continue;
                 }
             };
@@ -218,17 +276,21 @@ fn crawl(
             {
                 Ok(both) => both,
                 Err(err) => {
-                    errors.push((path, err));
+                    found.errors.push((path, err));
                     continue;
                 }
             };
             if file_type.is_symlink() || skip(&path, &meta) {
                 continue;
             }
-            if file_type.is_dir() {
+            if is_cloud_only(attributes(&meta)) {
+                if file_type.is_file() {
+                    found.cloud_only.push(path);
+                }
+            } else if file_type.is_dir() {
                 stack.push(path);
             } else if file_type.is_file() {
-                found.push((path, meta));
+                found.files.push((path, meta));
             }
         }
     }
@@ -653,8 +715,9 @@ mod tests {
         };
         // The root twice, and a folder of it as well: still once each.
         let walked = walk(&[root.clone(), root.clone(), root.join("keep")], &skip);
+        assert_eq!(walked.cloud_only, 0);
         assert_eq!(
-            names(&walked, &root),
+            names(&walked.files, &root),
             [
                 PathBuf::from("a.txt"),
                 PathBuf::from("b.txt"),
@@ -663,6 +726,7 @@ mod tests {
         );
         assert!(
             walked
+                .files
                 .iter()
                 .all(|(_, meta)| meta.is_file() && meta.len() == 1)
         );
@@ -678,7 +742,7 @@ mod tests {
         // A folder of the root, spelled in capitals: Windows takes it for the same folder.
         let shouted = PathBuf::from(root.join("Sub").to_string_lossy().to_uppercase());
         let walked = walk(&[root, shouted], &|_, _| false);
-        assert_eq!(walked.len(), 2, "{walked:?}");
+        assert_eq!(walked.files.len(), 2, "{walked:?}");
         Ok(())
     }
 
@@ -688,8 +752,122 @@ mod tests {
         let file = tmp.0.join("only.txt");
         write(&file, b"x")?;
         let walked = walk(&[file.clone(), tmp.0.join("gone")], &|_, _| true);
-        assert_eq!(walked.len(), 1);
-        assert_eq!(walked[0].0, file);
+        assert_eq!(walked.files.len(), 1);
+        assert_eq!(walked.files[0].0, file);
+        Ok(())
+    }
+
+    #[test]
+    fn the_attributes_of_a_cloud_only_file_are_each_enough() {
+        let offline = 0x0000_1000;
+        let recall_on_open = 0x0004_0000;
+        let recall_on_data_access = 0x0040_0000;
+        for attributes in [
+            offline,
+            recall_on_open,
+            recall_on_data_access,
+            offline | recall_on_open,
+            offline | recall_on_open | recall_on_data_access,
+            // With others that a placeholder carries too: archive, pinned, unpinned.
+            recall_on_data_access | 0x20 | 0x0008_0000 | 0x0010_0000,
+        ] {
+            assert!(is_cloud_only(attributes), "{attributes:#x}");
+        }
+    }
+
+    #[test]
+    fn the_attributes_of_a_file_on_this_pc_are_not_cloud_only() {
+        let archive = 0x20;
+        let normal = 0x80;
+        let hidden = 0x2;
+        let system = 0x4;
+        let reparse_point = 0x400;
+        let pinned = 0x0008_0000;
+        let unpinned = 0x0010_0000;
+        let sparse = 0x200;
+        for attributes in [
+            0,
+            archive,
+            normal,
+            hidden | system,
+            reparse_point,
+            pinned,
+            unpinned,
+            sparse | archive,
+            // The bits next to the ones that count.
+            0x0000_2000 | 0x0000_0800 | 0x0002_0000 | 0x0008_0000 | 0x0020_0000 | 0x0080_0000,
+        ] {
+            assert!(!is_cloud_only(attributes), "{attributes:#x}");
+        }
+    }
+
+    #[test]
+    fn walking_leaves_out_the_files_that_are_only_in_the_cloud_and_counts_them() -> io::Result<()> {
+        let tmp = TempDir::new()?;
+        let root = tmp.0.join("root");
+        // The size says what a file is: no test can create a real placeholder.
+        for (file, size) in [
+            ("here.txt", 1),
+            ("sub/here.txt", 1),
+            ("offline.txt", 2),
+            ("sub/open.txt", 3),
+            ("sub/deeper/data.txt", 4),
+            ("hidden/skipped.txt", 2),
+        ] {
+            write(&root.join(file), &vec![b'x'; size])?;
+        }
+        let attributes = |meta: &Metadata| match meta.len() {
+            2 => 0x1000,
+            3 => 0x4_0000,
+            4 => 0x40_0000,
+            _ => 0x20,
+        };
+        let skip = |path: &Path, meta: &Metadata| meta.is_dir() && path.ends_with("hidden");
+        // The root twice and a folder of it as well: each placeholder counts once.
+        let inputs = [root.clone(), root.clone(), root.join("sub")];
+        let walked = walk_with(&inputs, &skip, &attributes);
+        assert_eq!(
+            names(&walked.files, &root),
+            [PathBuf::from("here.txt"), Path::new("sub").join("here.txt")]
+        );
+        // `skip` left the other one out before it was asked of the file's attributes.
+        assert_eq!(walked.cloud_only, 3);
+
+        // A file named as an input is asked for: it is listed and not counted, while the same
+        // file found in a walked folder is left out and counted.
+        let named = walk_with(&[root.join("offline.txt")], &|_, _| false, &attributes);
+        assert_eq!(names(&named.files, &root), [PathBuf::from("offline.txt")]);
+        assert_eq!(named.cloud_only, 0);
+        let both = walk_with(
+            &[root.join("offline.txt"), root.join("sub")],
+            &|_, _| false,
+            &attributes,
+        );
+        assert_eq!(both.files.len(), 2, "{both:?}");
+        assert_eq!(both.cloud_only, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn a_folder_that_is_only_in_the_cloud_is_left_out_whole() -> io::Result<()> {
+        let tmp = TempDir::new()?;
+        let root = tmp.0.join("root");
+        write(&root.join("a.txt"), b"x")?;
+        write(&root.join("online/b.txt"), b"x")?;
+        let attributes = |meta: &Metadata| if meta.is_dir() { 0x40_0000 } else { 0x20 };
+        let walked = walk_with(std::slice::from_ref(&root), &|_, _| false, &attributes);
+        assert_eq!(names(&walked.files, &root), [PathBuf::from("a.txt")]);
+        assert_eq!(walked.cloud_only, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn walking_a_real_folder_finds_no_cloud_only_file() -> io::Result<()> {
+        let tmp = TempDir::new()?;
+        write(&tmp.0.join("a.txt"), b"x")?;
+        let walked = walk(std::slice::from_ref(&tmp.0), &|_, _| false);
+        assert_eq!(walked.files.len(), 1);
+        assert_eq!(walked.cloud_only, 0);
         Ok(())
     }
 

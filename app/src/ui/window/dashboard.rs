@@ -19,7 +19,7 @@ use piikey::{
 };
 use windows_reactor::ComponentContext;
 
-use super::{MainWindow, Msg, Page};
+use super::{MainWindow, Msg};
 use crate::ui::{controller::Controller, explorer};
 
 /// Files the map gives a tile of their own; the others are one tile together.
@@ -164,14 +164,6 @@ impl Dashboard {
         self.selected = None;
     }
 
-    /// Shows the folder `at` with `select` chosen in it and the way to it open.
-    pub(in crate::ui) fn reveal(&mut self, at: PathBuf, select: Option<PathBuf>) {
-        self.enter(at);
-        if let Some(file) = select {
-            self.select(file, Origin::Map);
-        }
-    }
-
     /// Takes what load number `load` brought, unless it is older than what is shown or was read for
     /// a folder that is not on show any more; `true` when it was taken.
     fn take(&mut self, load: u64, loaded: Loaded) -> bool {
@@ -294,17 +286,6 @@ impl MainWindow {
             }
         }
     }
-
-    /// Goes to Inventory, at `at`, with `select` chosen: where "Show in Inventory" leads.
-    pub(super) fn show_in_inventory(
-        &mut self,
-        at: PathBuf,
-        select: Option<PathBuf>,
-        context: &ComponentContext<Self>,
-    ) {
-        self.inventory.reveal(at, select);
-        self.navigate(Page::Inventory, context);
-    }
 }
 
 #[cfg(test)]
@@ -406,23 +387,6 @@ mod tests {
         assert!(dash.selected.is_none());
         assert!(dash.open.contains(Path::new(r"C:\Docs\Taxes")));
         assert!(!dash.open.contains(Path::new(r"C:\Mail")));
-    }
-
-    #[test]
-    fn revealing_a_file_shows_its_folder_with_the_file_chosen() {
-        let mut dash = dashboard();
-        dash.reveal(
-            PathBuf::from(r"C:\Docs\Taxes"),
-            Some(PathBuf::from(r"C:\Docs\Taxes\2023.pdf")),
-        );
-        assert_eq!(dash.at, PathBuf::from(r"C:\Docs\Taxes"));
-        assert_eq!(
-            dash.selected,
-            Some(PathBuf::from(r"C:\Docs\Taxes\2023.pdf"))
-        );
-        // A folder is shown without a choice.
-        dash.reveal(PathBuf::from(r"C:\Docs"), None);
-        assert!(dash.selected.is_none());
     }
 
     #[test]

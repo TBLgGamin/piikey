@@ -1,0 +1,39 @@
+name: pages
+
+# Publishes the API reference in docs/api (a Scalar page reading the generated openapi.json) to
+# https://tblggamin.github.io/piikey/. The repository's Pages source must be set to "GitHub Actions"
+# (Settings > Pages > Build and deployment); without it the deploy step is refused.
+on:
+  push:
+    branches: [main]
+    paths: ["docs/api/**", ".github/workflows/pages.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # Both are what actions/deploy-pages needs: it publishes the artifact and proves, with an OIDC
+  # token, that the deploy comes from this workflow.
+  pages: write
+  id-token: write
+
+concurrency:
+  # One deploy at a time, and a running deploy finishes instead of being cancelled halfway.
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Only docs/api is published: index.html, openapi.json and README.md, nothing else of the repo.
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: docs/api
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

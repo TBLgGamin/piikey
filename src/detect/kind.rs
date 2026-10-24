@@ -1,5 +1,10 @@
 //! Entity kinds and detected spans.
 
+use std::borrow::Cow;
+
+use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
+use serde_json::{Map, Value};
+
 /// A PII category. Discriminants are the vault wire format: never renumber.
 /// The vault indexes kinds by `kind as u8 - 1`, so codes stay dense.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -329,6 +334,26 @@ impl EntityKind {
     }
 }
 
+impl JsonSchema for EntityKind {
+    fn schema_name() -> Cow<'static, str> {
+        "TypeName".into()
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        let names: Vec<&str> = Self::ALL.iter().map(|kind| kind.as_str()).collect();
+        let labels: Map<String, Value> = Self::ALL
+            .iter()
+            .map(|kind| (kind.as_str().to_owned(), Value::from(kind.label())))
+            .collect();
+        json_schema!({
+            "type": "string",
+            "description": "A type of personal data, by the name the API uses: the `kind` field of a result, the entries of `disabled_kinds`. The `kinds` operation lists them with their group and whether each is on.",
+            "enum": names,
+            "x-enumDescriptions": labels
+        })
+    }
+}
+
 /// The entity kinds grouped for display, in display order. This is the single source of the apps'
 /// kind filters and switches; every kind appears in exactly one group.
 pub const KIND_GROUPS: [(&str, &[EntityKind]); 9] = [
@@ -483,6 +508,9 @@ pub struct Span {
 
 #[cfg(test)]
 mod tests {
+    use schemars::{JsonSchema, SchemaGenerator};
+    use serde_json::Value;
+
     use super::{EntityKind, KIND_GROUPS, KindSet};
 
     #[test]
@@ -545,6 +573,30 @@ mod tests {
                 .filter(|other| other.label() == kind.label())
                 .count();
             assert_eq!(same, 1, "{kind:?} shares its label");
+        }
+    }
+
+    #[test]
+    fn the_schema_names_every_type_once_as_the_api_does() {
+        let schema = EntityKind::json_schema(&mut SchemaGenerator::default()).to_value();
+        assert_eq!(schema.get("type").and_then(Value::as_str), Some("string"));
+        let Some(names) = schema.get("enum").and_then(Value::as_array) else {
+            panic!("the schema has no enum: {schema}");
+        };
+        assert_eq!(names.len(), EntityKind::ALL.len());
+        for (name, kind) in names.iter().zip(EntityKind::ALL) {
+            assert_eq!(name.as_str(), Some(kind.as_str()), "{kind:?}");
+        }
+        let mut unique: Vec<&str> = names.iter().filter_map(Value::as_str).collect();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len(), "a type name is listed twice");
+        let Some(labels) = schema.get("x-enumDescriptions").and_then(Value::as_object) else {
+            panic!("the schema has no x-enumDescriptions: {schema}");
+        };
+        for kind in EntityKind::ALL {
+            let label = labels.get(kind.as_str()).and_then(Value::as_str);
+            assert!(label.is_some_and(|text| !text.is_empty()), "{kind:?}");
         }
     }
 }

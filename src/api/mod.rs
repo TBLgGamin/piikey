@@ -20,12 +20,16 @@
 //! codes are `bad_request`, `app_required`, `not_found`, `busy`, `io`, `vault`, `unsupported`,
 //! `model` and `internal`.
 //!
+//! The reference of the whole API (every operation, its fields and its result) is generated
+//! from these types and their doc comments: see [`openapi`] and `docs/api`.
+//!
 //! Paths in a request are absolute: the answering process may not be the one the request came
 //! from, and a relative path would mean its working folder. Offsets of text spans are UTF-8
 //! byte offsets.
 
 pub mod http;
 mod local;
+pub mod openapi;
 pub mod reply;
 mod token;
 
@@ -35,6 +39,7 @@ use std::{
     sync::Arc,
 };
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -45,7 +50,7 @@ pub use self::{
 use crate::{Error, policy::SettingsPatch, vault::ExportFormat};
 
 /// How an export or a report is written.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Format {
     /// A JSON array with one object per row.
@@ -73,71 +78,113 @@ fn yes() -> bool {
 ///
 /// `Debug` shows the op and nothing else: texts, values and queries are personal data and must
 /// not end up in a log.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
     /// What the detector finds in each text, without changing anything (the vault is left as it
     /// is, and stand-ins piikey issued are not counted). Result: [`reply::Spans`].
-    ScanText { texts: Vec<String> },
+    ScanText {
+        /// The texts to look in.
+        #[schemars(extend("examples" = [["mail jan@acme.nl"]]))]
+        texts: Vec<String>,
+    },
     /// Masks the personal data in each text. Result: [`reply::Texts`].
-    Anonymize { texts: Vec<String> },
+    Anonymize {
+        /// The texts to mask.
+        #[schemars(extend("examples" = [["mail jan@acme.nl"]]))]
+        texts: Vec<String>,
+    },
     /// Restores the masked values in each text. With `tolerant`, also stand-ins that came back
     /// with a typo and names that came back alone. Result: [`reply::Texts`].
     Deanonymize {
+        /// The masked texts to restore.
+        #[schemars(extend("examples" = [["mail mila.visser@example.net"]]))]
         texts: Vec<String>,
+        /// Also restore stand-ins that came back with a typo, and names that came back alone.
         #[serde(default)]
         tolerant: bool,
     },
     /// Scans files and folders (recursively). With `record`, what was found is also kept in
     /// the inventory. Result: [`reply::Scanned`].
     ScanFiles {
+        /// The files and folders to scan, as absolute paths.
+        #[schemars(extend("examples" = [["C:\\Users\\jan\\Documents"]]))]
         paths: Vec<PathBuf>,
+        /// Whether to keep what was found in the inventory.
         #[serde(default = "yes")]
         record: bool,
     },
     /// Masks files and folders into the folder `out`. Result: [`reply::Written`].
-    AnonymizeFiles { paths: Vec<PathBuf>, out: PathBuf },
+    AnonymizeFiles {
+        /// The files and folders to mask, as absolute paths.
+        #[schemars(extend("examples" = [["C:\\Users\\jan\\Documents"]]))]
+        paths: Vec<PathBuf>,
+        /// The folder the masked files are written to, as an absolute path.
+        #[schemars(extend("examples" = ["C:\\Users\\jan\\Masked"]))]
+        out: PathBuf,
+    },
     /// Restores files and folders into the folder `out`. Result: [`reply::Written`].
     DeanonymizeFiles {
+        /// The files and folders to restore, as absolute paths.
+        #[schemars(extend("examples" = [["C:\\Users\\jan\\Documents"]]))]
         paths: Vec<PathBuf>,
+        /// The folder the restored files are written to, as an absolute path.
+        #[schemars(extend("examples" = ["C:\\Users\\jan\\Restored"]))]
         out: PathBuf,
+        /// Also restore stand-ins that came back with a typo, and names that came back alone.
         #[serde(default)]
         tolerant: bool,
     },
     /// Which files hold the given values (a name, a phone number, an email address, ...); an
     /// empty `paths` means the inventory's folders. Result: [`reply::Found`].
     SubjectSearch {
+        /// The values that identify the person: a name, a phone number, an email address, ...
+        #[schemars(extend("examples" = [["Jan Jansen", "jan@acme.nl"]]))]
         values: Vec<String>,
+        /// The files and folders to look in, as absolute paths. Empty: the inventory's folders.
         #[serde(default)]
         paths: Vec<PathBuf>,
     },
     /// The vault's records, the newest first, whose original or stand-in holds `query` (any
-    /// letter case; all of them without a query), of one kind if `kind` says. `limit` is 100
+    /// letter case; all of them without a query), of one type if `kind` says. `limit` is 100
     /// unless given, at most 10,000. Result: [`reply::Records`].
     VaultList {
+        /// Only the records whose original or stand-in holds this text, in any letter case.
         #[serde(skip_serializing_if = "Option::is_none")]
         query: Option<String>,
+        /// Only the records of this type: a name that `kinds` lists.
         #[serde(skip_serializing_if = "Option::is_none")]
         kind: Option<String>,
+        /// How many records at most: 100 unless given, at most 10,000.
         #[serde(skip_serializing_if = "Option::is_none")]
         limit: Option<usize>,
+        /// How many records to skip, the newest first.
         #[serde(default)]
         offset: usize,
     },
     /// Removes the records whose original or stand-in is one of `values`; the vault file is
     /// rewritten without them. Result: [`reply::Forgotten`].
-    VaultForget { values: Vec<String> },
+    VaultForget {
+        /// The values to forget: originals or stand-ins.
+        #[schemars(extend("examples" = [["jan@acme.nl"]]))]
+        values: Vec<String>,
+    },
     /// Writes every record of the vault to a new file `path` (an existing file is an error).
     /// Result: [`reply::Exported`].
     VaultExport {
+        /// The file to write, as an absolute path. It must not exist yet.
+        #[schemars(extend("examples" = ["C:\\Users\\jan\\Downloads\\vault.json"]))]
         path: PathBuf,
+        /// How the file is written.
         #[serde(default)]
         format: Format,
     },
     /// Removes every record of the vault; the key stays. Needs `confirm: true`. Result:
     /// [`reply::Forgotten`].
     VaultWipe {
+        /// Must be `true`: without it nothing is removed and the call is a `bad_request`.
         #[serde(default)]
+        #[schemars(extend("examples" = [true]))]
         confirm: bool,
     },
     /// The inventory in numbers. Result: [`reply::InventoryStatus`].
@@ -145,10 +192,13 @@ pub enum Request {
     /// The inventory's files that hold personal data, the one with the most first, at and
     /// under `under`. `limit` is 100 unless given, at most 10,000. Result: [`reply::Entries`].
     InventoryList {
+        /// Only the files at and under this path, an absolute path.
         #[serde(skip_serializing_if = "Option::is_none")]
         under: Option<PathBuf>,
+        /// How many files at most: 100 unless given, at most 10,000.
         #[serde(skip_serializing_if = "Option::is_none")]
         limit: Option<usize>,
+        /// How many files to skip, the one with the most values first.
         #[serde(default)]
         offset: usize,
     },
@@ -156,6 +206,8 @@ pub enum Request {
     /// without it the drives and network shares that hold files with personal data (`C:`, with
     /// `C:\` as the path). Result: [`reply::Nodes`].
     InventoryTree {
+        /// The folder to look under, an absolute path. Without it: the drives and network
+        /// shares that hold files with personal data.
         #[serde(skip_serializing_if = "Option::is_none")]
         under: Option<PathBuf>,
     },
@@ -165,7 +217,10 @@ pub enum Request {
     InventoryRescan,
     /// Writes the inventory's findings to a new file `path`. Result: [`reply::Reported`].
     InventoryReport {
+        /// The file to write, as an absolute path. It must not exist yet.
+        #[schemars(extend("examples" = ["C:\\Users\\jan\\Downloads\\inventory.json"]))]
         path: PathBuf,
+        /// How the file is written.
         #[serde(default)]
         format: Format,
     },
@@ -173,8 +228,12 @@ pub enum Request {
     SettingsGet,
     /// Changes the given settings, validated as a whole. Result: the settings as saved, a
     /// [`Policy`](crate::policy::Policy).
-    SettingsSet { settings: SettingsPatch },
-    /// Every kind of personal data. Result: a list of [`reply::Kind`].
+    SettingsSet {
+        /// The settings to change. A setting that is left out stays as it is.
+        #[schemars(extend("examples" = [{"highlight": "always"}]))]
+        settings: SettingsPatch,
+    },
+    /// Every type of personal data. Result: a list of [`reply::Kind`].
     Kinds,
     /// Where the detection model stands. Result: [`reply::Model`].
     ModelStatus,
@@ -183,18 +242,27 @@ pub enum Request {
     /// The token the HTTP API wants as `Authorization: Bearer <token>`; `rotate` makes a new
     /// one first. Result: [`reply::Token`].
     ApiToken {
+        /// Make a new token first. The old one stops working.
         #[serde(default)]
         rotate: bool,
     },
     /// How piikey is doing. Result: [`reply::Status`].
     Status,
-    /// Switches protection (masking what goes to the protected sites and programs) on or off.
+    /// Switches protection (masking what goes to the protected sites and apps) on or off.
     /// Needs the app. Result: [`reply::Protection`].
-    Protection { on: bool },
+    Protection {
+        /// `true` switches protection on, `false` switches it off.
+        #[schemars(extend("examples" = [true]))]
+        on: bool,
+    },
     /// Scans files and folders into the inventory as Explorer's "Scan for personal data" does,
     /// and shows the result in a dialog in the app's window, which opens if it is hidden. Needs
     /// the app. Answers when the scan is queued, not when it is over. Result: `{}`.
-    ExplorerScan { paths: Vec<PathBuf> },
+    ExplorerScan {
+        /// The files and folders to scan, as absolute paths that exist.
+        #[schemars(extend("examples" = [["C:\\Users\\jan\\Documents"]]))]
+        paths: Vec<PathBuf>,
+    },
     /// Brings the app's window forward, opening it when it is closed. What a second start of
     /// `piikey.exe` asks of the app that runs. Needs the app. Result: `{}`.
     ShowWindow,
@@ -274,9 +342,10 @@ impl fmt::Debug for Request {
     }
 }
 
-/// What kind of failure an [`ApiError`] is. The name is the `code` of the reply's error, and the
+/// What sort of failure an error is. The name is the `code` of the reply's error, and the
 /// HTTP API answers each with a status of its own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
+#[schemars(rename = "ErrorCode", rename_all = "snake_case")]
 enum Code {
     /// The request is wrong.
     BadRequest,
@@ -331,10 +400,13 @@ impl Code {
     }
 }
 
-/// Why a request failed: a code a program can act on, and a message for a person.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Why a request failed: a code to act on, and a message for a person.
+#[derive(Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[schemars(rename = "Error")]
 pub struct ApiError {
+    /// What failed. The HTTP API answers each code with a status of its own.
     code: Code,
+    /// What went wrong, for a person.
     message: String,
 }
 

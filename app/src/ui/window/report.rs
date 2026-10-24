@@ -41,15 +41,6 @@ impl MainWindow {
                 }
                 self.put_away_reveal();
             }
-            Msg::ReportShow => {
-                let target: Option<(PathBuf, Option<PathBuf>)> = self
-                    .pending_reveal()
-                    .map(|reveal| (reveal.at.clone(), reveal.select.clone()));
-                self.put_away_reveal();
-                if let Some((at, select)) = target {
-                    self.show_in_inventory(at, select, context);
-                }
-            }
             Msg::ReportFound => {
                 let roots: Option<Vec<PathBuf>> =
                     self.pending_reveal().map(|reveal| reveal.paths.clone());

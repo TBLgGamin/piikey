@@ -37,6 +37,12 @@ Tests that need the downloaded detection model are marked `#[ignore]`. Run
 them with `cargo test --all-targets -- --ignored` after `piikey.exe` has
 downloaded the model once.
 
+The API reference in `docs/api` is generated from the code. The pre-commit hook
+runs `cargo api-docs` and stages `docs/api/openapi.json` and `docs/api/README.md`;
+do not edit them by hand. When an operation changes, the notes for it in
+`docs/api/prose.toml` are flagged (`cargo api-docs --check-prose`): read them,
+then run `cargo api-docs --accept <op>`.
+
 ## Commit messages
 
 Commit messages follow [Conventional Commits](https://www.conventionalcommits.org):

@@ -42,6 +42,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
 use crate::{
@@ -92,7 +93,7 @@ pub const fn valid_port(port: u16) -> bool {
 }
 
 /// When the field you type in is outlined because it holds personal data.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Highlight {
     /// Never.
@@ -124,26 +125,30 @@ impl Highlight {
     }
 }
 
-/// Persisted at `%LOCALAPPDATA%\piikey\guard.cfg`.
+/// The settings, as `settings_get` and `settings_set` answer them.
+///
+/// They are saved in `%LOCALAPPDATA%\piikey\guard.cfg`.
 #[allow(
     clippy::struct_excessive_bools,
     reason = "independent feature switches of a settings file, not the states of one machine"
 )]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 // A reply from another version lacks the keys it does not know: they get their defaults.
 #[serde(default)]
 pub struct Policy {
-    /// Whether the proxy masks the sites and programs below.
+    /// Whether protection is on: piikey masks what goes to the protected sites and apps below.
+    /// `settings_set` does not take it; the `protection` operation switches it.
     pub enabled: bool,
-    /// Host patterns: `example.com` or `*.example.com`.
+    /// The protected sites: host patterns, `example.com` or `*.example.com`.
     pub sites: Vec<String>,
-    /// Lowercase exe names, e.g. `chrome.exe`.
+    /// The protected apps, as lowercase exe names, e.g. `chrome.exe`.
     pub programs: Vec<String>,
-    /// Kinds piikey leaves alone in new text; empty means every kind is masked.
+    /// Types of personal data piikey leaves alone in new text; empty means every type is masked.
     #[serde(
         serialize_with = "serialize_kinds",
         deserialize_with = "deserialize_kinds"
     )]
+    #[schemars(with = "Vec<EntityKind>")]
     pub disabled_kinds: Vec<EntityKind>,
     /// When the field in focus is outlined if it holds personal data.
     pub highlight: Highlight,
@@ -152,8 +157,7 @@ pub struct Policy {
     /// Whether closing the window leaves piikey running in the tray, with protection, the
     /// highlight, monitoring and the API still working. Off: closing the window quits piikey.
     pub background: bool,
-    /// Absolute folders the inventory scans when asked (its locations). None until the user
-    /// adds one.
+    /// The inventory's locations: absolute folders it scans when asked. None until the user adds one.
     pub inventory_roots: Vec<PathBuf>,
     /// Locations (each one of `inventory_roots`) whose file changes are scanned as they happen.
     /// None by default.
@@ -161,6 +165,7 @@ pub struct Policy {
     /// Whether the app serves the local HTTP API on `127.0.0.1`.
     pub http_api: bool,
     /// The port of the local HTTP API, 1 to 65535.
+    #[schemars(range(min = 1, max = 65535))]
     pub http_port: u16,
 }
 
@@ -411,42 +416,48 @@ impl Policy {
     }
 }
 
-/// A partial update of the [`Policy`], as the API's `settings_set` carries it: every field
-/// that is present replaces the saved one, the others stay. Values are validated like typed
-/// input, so a patch cannot leave the policy with something a reload would drop. A field that
-/// is absent is not written, so a patch serialized and read back is the same patch.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// A partial update of the settings, as `settings_set` carries it.
+///
+/// Every field that is present replaces the saved one, the others stay. All values are
+/// validated like typed input, and nothing changes if any of them is invalid. A field that is
+/// absent is not written, so a patch serialized and read back is the same patch.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SettingsPatch {
-    /// Replaces [`Policy::sites`]; each entry goes through [`Policy::parse_site`].
+    /// Replaces `sites`; each entry is a host (`chat.example.com`), a wildcard (`*.example.com`:
+    /// any subdomain, not the apex) or a pasted URL of which only the host is kept. Duplicates
+    /// are dropped.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sites: Option<Vec<String>>,
-    /// Replaces [`Policy::programs`]; each entry goes through [`Policy::parse_program`].
+    /// Replaces `programs`; each entry is an exe name: a path stands for its file name, the name
+    /// is lowercased and gets `.exe` when it has no extension. Duplicates are dropped.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub programs: Option<Vec<String>>,
-    /// Replaces [`Policy::disabled_kinds`]; `EntityKind::as_str` names, empty clears the list.
+    /// Replaces `disabled_kinds`; each entry is a type name, an empty list clears it.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<Vec<EntityKind>>")]
     pub disabled_kinds: Option<Vec<String>>,
-    /// Replaces [`Policy::highlight`]: `off`, `always` or `hotkey`.
+    /// Replaces `highlight`: `off`, `always` or `hotkey`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub highlight: Option<Highlight>,
-    /// Replaces [`Policy::explorer_menu`].
+    /// Replaces `explorer_menu`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub explorer_menu: Option<bool>,
-    /// Replaces [`Policy::background`].
+    /// Replaces `background`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub background: Option<bool>,
-    /// Replaces [`Policy::inventory_roots`]; each entry goes through [`Policy::parse_folder`].
+    /// Replaces `inventory_roots`; each entry must be an absolute folder.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inventory_roots: Option<Vec<PathBuf>>,
-    /// Replaces [`Policy::monitored_roots`]; each must be one of the locations after this patch.
+    /// Replaces `monitored_roots`; each entry must be one of the `inventory_roots` after this patch.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub monitored_roots: Option<Vec<PathBuf>>,
-    /// Replaces [`Policy::http_api`].
+    /// Replaces `http_api`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub http_api: Option<bool>,
-    /// Replaces [`Policy::http_port`]; 1 to 65535.
+    /// Replaces `http_port`; 1 to 65535.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 65535))]
     pub http_port: Option<u16>,
 }
 

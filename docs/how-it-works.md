@@ -111,8 +111,9 @@ what is in it is what was scanned in its locations. A scan of a path outside eve
 buttons that open the Windows folder (or file) picker.
 
 A scan started from the page, the box, a drop or Explorer opens a result dialog in the window
-(scanning, then how much was found, with "Show what was found" when anything was, and "Show in Inventory" when the scanned path lies in a location or holds one). A newer scan replaces an older dialog, and a window the user opens does not replay
-old results.
+(scanning, then how much was found, with Close on the left and "Show what was found" on the right
+when anything was). A newer scan replaces an older dialog, and a window the user opens does not
+replay old results.
 
 "Show what was found" (also a button in the details of a file or a folder) opens the findings view
 in place of the page, with a way back. It runs the detection again on the files of the result (the
@@ -161,10 +162,20 @@ was `true`. The files of the separate store the old Watch kept (`watch.jsonl`, `
 
 The CLI, the app and scripts all use one JSON API. The app serves it on the named pipe
 `\\.\pipe\piikey-<user>` (requests are `P`, 2, a length and the JSON) and, when you switch it on,
-on `http://127.0.0.1:<port>/v1/<op>` with a bearer token that refuses browser origins.
+on `http://127.0.0.1:<port>/v1/<op>` with a bearer token that refuses browser origins. The one call
+that needs no token is `GET /v1/openapi.json`, which answers the OpenAPI spec (it is loopback only
+too, and an `Origin` header is refused there as well).
 `piikey-cli` calls the app's pipe when it answers and otherwise does the same work in its own
-process. The operations, their results and the error codes are in the
-[README](../README.md#api).
+process. The operations, their results and the error codes are in the generated reference
+in `docs/api` ([README](api/README.md), `openapi.json`, and the hosted page at
+https://tblggamin.github.io/piikey/); the [README](../README.md#api) has the transports and
+examples.
+
+The reference is generated from the code (the types carry `schemars` derives), by `cargo api-docs`,
+which the pre-commit hook runs, and a test fails when the files differ from the generator. Only
+`docs/api/prose.toml` is written by hand: each note carries a fingerprint of the contract it
+describes, so it is flagged when that operation changes, until someone reads it and runs
+`cargo api-docs --accept <op>`.
 
 ## Vault management
 
@@ -211,8 +222,8 @@ under it that is a button to Overview.
   default; a value masked earlier still comes back after its type is switched off, and the setting
   applies to masking, the highlight, scans and the inventory. When the detection model was skipped
   or failed, a row above the types says so and has a button to download it or try again; a model
-  that is there needs no row. Developer access has the local HTTP API switch, its address and
-  whether it listens, and the token (copy it or make a new one). Privacy & data shows the data
+  that is there needs no row. Developer access has the local HTTP API switch, the API reference
+  link (it opens the hosted reference) and the token (copy it or make a new one). Privacy & data shows the data
   folder, with Open folder. About has the version, the
   state of the local proxy and links to the source, the issue tracker and the license.
 

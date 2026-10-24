@@ -10,9 +10,22 @@
 //! - a body over 64 MiB is refused with 413;
 //! - an operation that does not exist is 404.
 //!
+//! The one exception to the token is `GET /v1/openapi.json`, which answers the `OpenAPI`
+//! document of this API ([`openapi::spec`](super::openapi::spec)): the spec is published on
+//! GitHub anyway, and a program on this PC can already see piikey running. It is no operation
+//! (it is not in [`Request::OPS`]); like the rest it is served only while the HTTP API is on,
+//! on the loopback address, and an `Origin` header is refused with 403. Any method but `GET` is
+//! 405 with `Allow: GET`.
+//!
 //! It listens on the loopback address and nowhere else.
 
-use std::{convert::Infallible, io, net::Ipv4Addr, sync::Arc, time::Duration};
+use std::{
+    convert::Infallible,
+    io,
+    net::Ipv4Addr,
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::{
@@ -29,11 +42,13 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use serde_json::{Map, Value};
 use tokio::{net::TcpListener, sync::Notify};
 
-use super::{ApiError, Code, Handler, Request, answer, encode};
+use super::{ApiError, Code, Handler, Request, answer, encode, openapi};
 use crate::{Error, Result, service::Server};
 
 /// Largest accepted request body.
-const MAX_BODY: usize = 64 * 1024 * 1024;
+pub(super) const MAX_BODY: usize = 64 * 1024 * 1024;
+/// The path that answers the `OpenAPI` document of the API: the one call that needs no token.
+pub(super) const SPEC_ROUTE: &str = "/v1/openapi.json";
 /// How long a client may take to send the request line and the headers.
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long to wait after a connection could not be accepted (the client was gone already).
@@ -64,6 +79,10 @@ impl Gate {
         if parts.headers.contains_key(ORIGIN) {
             return refuse(StatusCode::FORBIDDEN, "requests from web pages are refused");
         }
+        // The one call that needs no token: the spec holds nothing that is not public.
+        if parts.uri.path() == SPEC_ROUTE {
+            return spec_response(&parts.method);
+        }
         if !self.authorized(&parts.headers) {
             let mut response = refuse(
                 StatusCode::UNAUTHORIZED,
@@ -81,8 +100,8 @@ impl Gate {
         else {
             return failure(ApiError::not_found(format!("no such operation: {path}")));
         };
-        let allowed = if op == "status" { "GET, POST" } else { "POST" };
-        let get = parts.method == Method::GET && op == "status";
+        let allowed = if allows_get(op) { "GET, POST" } else { "POST" };
+        let get = parts.method == Method::GET && allows_get(op);
         if !get && parts.method != Method::POST {
             let mut response = refuse(StatusCode::METHOD_NOT_ALLOWED, "use POST");
             response
@@ -104,6 +123,33 @@ impl Gate {
         json(status, answered.body)
     }
 }
+
+/// Whether the operation `op` can also be called with `GET`: only `status`, which takes no
+/// fields.
+pub(super) fn allows_get(op: &str) -> bool {
+    op == "status"
+}
+
+/// The answer to a request for [`SPEC_ROUTE`]: the document, to `GET` alone.
+fn spec_response(method: &Method) -> Response<Full<Bytes>> {
+    if method != Method::GET {
+        let mut response = refuse(StatusCode::METHOD_NOT_ALLOWED, "use GET");
+        response
+            .headers_mut()
+            .insert(ALLOW, HeaderValue::from_static("GET"));
+        return response;
+    }
+    match &*SPEC_BODY {
+        Ok(body) => json(StatusCode::OK, Bytes::from_static(body.as_bytes())),
+        Err(error) => failure(error.clone()),
+    }
+}
+
+/// The `OpenAPI` document as the text that is served, made when it is first asked for.
+static SPEC_BODY: LazyLock<std::result::Result<String, ApiError>> = LazyLock::new(|| {
+    openapi::spec_json()
+        .map_err(|error| ApiError::internal(format!("the reference cannot be made: {error}")))
+});
 
 /// Reads a request body of at most [`MAX_BODY`] bytes.
 async fn read_body(
@@ -147,7 +193,7 @@ fn parse(op: &str, body: &[u8]) -> std::result::Result<Request, ApiError> {
 }
 
 /// The status an error is answered with.
-fn status_of(error: &ApiError) -> StatusCode {
+pub(super) fn status_of(error: &ApiError) -> StatusCode {
     match error.code {
         Code::BadRequest => StatusCode::BAD_REQUEST,
         Code::NotFound => StatusCode::NOT_FOUND,
@@ -158,9 +204,9 @@ fn status_of(error: &ApiError) -> StatusCode {
     }
 }
 
-/// A response with `body`, the bytes of an envelope, and `status`.
-fn json(status: StatusCode, body: Vec<u8>) -> Response<Full<Bytes>> {
-    let mut response = Response::new(Full::new(Bytes::from(body)));
+/// A response with `body`, the bytes of an envelope or of the spec, and `status`.
+fn json(status: StatusCode, body: impl Into<Bytes>) -> Response<Full<Bytes>> {
+    let mut response = Response::new(Full::new(body.into()));
     *response.status_mut() = status;
     let headers = response.headers_mut();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -713,6 +759,109 @@ mod tests {
             .ok_or("not the address the server listens on")?
             .replace("<op>", "kinds");
         assert_eq!(authed(port, "POST", &path, None)?.status, 200);
+        server.stop();
+        Ok(())
+    }
+
+    #[test]
+    fn the_spec_needs_no_token_and_is_the_spec_of_the_code() -> TestResult {
+        let (server, port) = serve_stub()?;
+        let open = send(port, "GET", SPEC_ROUTE, &[], None)?;
+        assert_eq!(open.status, 200, "{}", open.body);
+        assert!(open.headers.contains("content-type: application/json"));
+        let reference = open.json()?;
+        assert_eq!(reference, openapi::spec()?);
+        assert_eq!(reference["openapi"], "3.1.0");
+
+        // A wrong token does not matter either, and the right one is no worse.
+        let wrong = send(
+            port,
+            "GET",
+            SPEC_ROUTE,
+            &[("Authorization", "Bearer nope")],
+            None,
+        )?;
+        assert_eq!(wrong.status, 200);
+        assert_eq!(wrong.json()?, reference);
+        let authorized = authed(port, "GET", SPEC_ROUTE, None)?;
+        assert_eq!(authorized.status, 200);
+        assert_eq!(authorized.json()?, reference);
+        server.stop();
+        Ok(())
+    }
+
+    #[test]
+    fn the_spec_is_refused_to_web_pages_token_or_not() -> TestResult {
+        let (server, port) = serve_stub()?;
+        let page = send(
+            port,
+            "GET",
+            SPEC_ROUTE,
+            &[("Origin", "https://evil.example")],
+            None,
+        )?;
+        assert_eq!(page.status, 403);
+        assert_eq!(page.code()?, "bad_request");
+        let with_token = send(
+            port,
+            "GET",
+            SPEC_ROUTE,
+            &[
+                ("Origin", "https://evil.example"),
+                ("Authorization", &format!("Bearer {TOKEN}")),
+            ],
+            None,
+        )?;
+        assert_eq!(with_token.status, 403);
+        server.stop();
+        Ok(())
+    }
+
+    #[test]
+    fn the_spec_answers_get_alone() -> TestResult {
+        let (server, port) = serve_stub()?;
+        for method in ["POST", "PUT", "DELETE", "HEAD"] {
+            let body = (method != "HEAD").then_some("{}");
+            let refused = authed(port, method, SPEC_ROUTE, body)?;
+            assert_eq!(refused.status, 405, "{method}");
+            assert!(
+                refused.headers.contains("allow: get"),
+                "{}",
+                refused.headers
+            );
+        }
+        // No token and the wrong method: the method is what is wrong.
+        assert_eq!(send(port, "POST", SPEC_ROUTE, &[], Some("{}"))?.status, 405);
+        server.stop();
+        Ok(())
+    }
+
+    #[test]
+    fn every_other_path_still_needs_the_token() -> TestResult {
+        let (server, port) = serve_stub()?;
+        let paths = [
+            "/v1/status",
+            "/v1/scan_text",
+            "/v1/openapi",
+            "/v1/openapi.json/",
+            "/v1/openapi.jsonx",
+            "/openapi.json",
+            "/v1/",
+            "/",
+        ];
+        for path in paths {
+            for method in ["GET", "POST"] {
+                let none = send(port, method, path, &[], None)?;
+                assert_eq!(none.status, 401, "{method} {path}");
+            }
+        }
+        // With the token these are not found, as before: the spec is no operation.
+        assert_eq!(authed(port, "POST", "/v1/openapi", None)?.status, 404);
+        assert!(
+            Request::OPS
+                .iter()
+                .all(|op| format!("/v1/{op}") != SPEC_ROUTE)
+        );
         server.stop();
         Ok(())
     }

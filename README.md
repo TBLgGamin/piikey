@@ -169,8 +169,8 @@ keeps are described in [docs/how-it-works.md](docs/how-it-works.md).
   and you can drop files and folders from Explorer onto the page.
   - A scan that you start from the page, the box, a drop or Explorer ends in a **result dialog**:
     while it runs, a bar for the whole scan and one for each file being read; afterwards how much
-    was found, by type, with Show what was found and, when the scanned path lies in a location or holds one, Show in Inventory. Closing it while it runs
-    stops the scan.
+    was found, by type, with Close and Show what was found. Closing it while it runs stops the
+    scan.
   - The **dashboard** is a tree of your real folders from the drives down (This PC, `C:`, Users,
     ...) in Explorer's order, with a bar by type on each row and a breadcrumb to go back up; the
     types found (pick one to show only that type); a treemap with a tile for every file; and the
@@ -193,9 +193,9 @@ keeps are described in [docs/how-it-works.md](docs/how-it-works.md).
   so keep it safe.
 - **Settings** is one scrolling page: General (Start piikey when I sign in, Scan for personal data
   in Explorer, which adds the right-click entry, and Keep piikey running in the tray when I close
-  the window), Types of personal data, Developer access (the local HTTP API and its token),
-  Privacy & data (the data folder, with Open folder) and About. A row for the detection model appears only when it
-  was skipped or failed.
+  the window), Types of personal data, Developer access (the local HTTP API switch, a link to the
+  API reference and the token), Privacy & data (the data folder, with Open folder) and About. A
+  row for the detection model appears only when it was skipped or failed.
 
 The tray icon shows the same status as Overview (the key in grey while protection is off, the app
 icon while it is on, with an amber dot when it needs you). Its menu has Open piikey, Turn protection
@@ -252,7 +252,7 @@ piikey starts in the tray at sign-in without a window.
     <td width="50%">
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/result-dark.png">
-        <img alt="The result of a scan: what was found by type, with Show what was found and Show in Inventory" src="docs/assets/screenshots/result-dark.png">
+        <img alt="The result of a scan: what was found by type, with Close and Show what was found" src="docs/assets/screenshots/result-dark.png">
       </picture>
     </td>
   </tr>
@@ -325,32 +325,22 @@ the failure modes and how these numbers compare with published ones.
 
 Everything piikey does is one JSON API. The app serves it on a named pipe, and on an HTTP port at
 127.0.0.1 if you switch that on in Settings > Developer access. `piikey-cli` is a client of the same
-API, so each operation below is also a subcommand. Without the app, `piikey-cli` runs the same
+API, so each operation is also a subcommand. Without the app, `piikey-cli` runs the same
 operations in its own process (`--local`), except `protection`, `explorer_scan` and `show_window`,
 which answer `app_required`.
 
-| Operation (`op`) | Does | CLI |
-|---|---|---|
-| `scan_text` | Finds personal data in texts without changing the vault. Spans are UTF-8 byte offsets. | `scan` (stdin) |
-| `anonymize`, `deanonymize` | Masks or restores texts. `deanonymize` takes `tolerant`. | `anonymize`, `deanonymize` (stdin) |
-| `scan_files` | Scans files and folders, and records the result in the inventory unless `record` is false. | `scan PATH...` |
-| `anonymize_files`, `deanonymize_files` | Rewrites files into `out`. | `anonymize --out DIR PATH...`, `deanonymize ...` |
-| `subject_search` | Finds the files that mention the given `values` (no `paths`: the inventory folders). | `subject --value V` |
-| `vault_list` | Lists the vault, newest first, filtered by `query` and `kind` (the type), paged by `limit` and `offset`. | `vault list` |
-| `vault_forget` | Forgets the records whose value or stand-in is one of `values`. | `vault forget VALUE...` |
-| `vault_export` | Writes the vault to a new file as JSON or CSV. | `vault export --out FILE` |
-| `vault_wipe` | Deletes every record. Needs `"confirm": true`. | `vault wipe --yes` |
-| `inventory_status` | The locations, which of them are monitored, file counts, hits and the scan in progress. | `inventory status` |
-| `inventory_list`, `inventory_tree` | The files with personal data, or the tree's nodes under a path (the drives that hold them without one). | `inventory list`, `inventory tree` |
-| `inventory_rescan`, `inventory_report` | Scans the inventory locations now and answers when the scan is over (the inventory scans only when asked); writes a JSON or CSV report. | `inventory rescan`, `inventory report` |
-| `settings_get`, `settings_set` | Reads or changes the settings (the `guard.cfg` keys). | `settings get`, `settings set KEY=VALUE...` |
-| `kinds` | The types of personal data (the `kind` field), their groups, and whether each is on. | `kinds` |
-| `model_status`, `model_download` | The detection model's state; downloads it. | `model status`, `model download` |
-| `api_token` | The HTTP token; `rotate` makes a new one. | `token [--rotate]` |
-| `status` | Whether the app runs, protection, version, vault size, model and feature switches (including `monitoring`). | `status` |
-| `protection` | Turns masking on or off. App only. | `protection on\|off` |
-| `explorer_scan` | Scans paths into the inventory and shows the result in a dialog in the app, which opens if hidden. App only; answers when the scan is queued; the Explorer menu uses it. | none |
-| `show_window` | Brings the app's window forward. App only; a second start of `piikey.exe` uses it. | `open` |
+The full reference is generated from the code: one section per operation with its fields, its
+result and a PowerShell-friendly curl example. Read it in [`docs/api/README.md`](docs/api/README.md)
+(GitHub renders it), as an interactive page at https://tblggamin.github.io/piikey/, or take the
+OpenAPI 3.1 file [`docs/api/openapi.json`](docs/api/openapi.json). The running app also serves the
+spec itself at `GET http://127.0.0.1:7980/v1/openapi.json` while the local HTTP API is on, with no
+token (the one call that needs none), so Postman, Insomnia and similar tools can import it from
+that URL.
+
+`docs/api/openapi.json` and `docs/api/README.md` are generated by `cargo api-docs`, which the
+pre-commit hook runs, so they are never edited by hand. The notes written by hand live in
+`docs/api/prose.toml` and are flagged when the operation they describe changes: review them, then
+run `cargo api-docs --accept <op>`.
 
 **Replies** share one envelope: `{"ok": true, "result": ...}`, or `{"ok": false, "error": {"code":
 "...", "message": "..."}}`. The codes are `bad_request`, `app_required`, `not_found`, `busy`, `io`,
@@ -365,7 +355,8 @@ accepted.
 
 **HTTP.** Turn on "Local HTTP API" in Settings > Developer access (default port 7980, loopback only). Send
 `POST /v1/<op>` with the request's fields as the JSON body (without `op`; `GET /v1/status` also
-works) and a bearer token from `piikey-cli token`. Requests with an `Origin` header are refused, so
+works) and a bearer token from `piikey-cli token`. `GET /v1/openapi.json` is the one exception: it
+answers the spec without a token. Requests with an `Origin` header are refused, so
 web pages cannot call it. Replies use the envelope, with the HTTP status 200, 400, 401, 403, 404,
 405, 409, 413 or 500.
 

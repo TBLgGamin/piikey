@@ -597,11 +597,16 @@ fn settings_shows_what_the_system_answers() -> Test {
     let drawn = ui.send(Msg::Nav(Page::Settings))?;
     let version = format!("piikey {}", env!("CARGO_PKG_VERSION"));
     let proxy = format!("Local proxy: 127.0.0.1:{PORT}, stopped");
-    let http = piikey::api::http::url(piikey::policy::DEFAULT_HTTP_PORT);
     expect_drawn(
         "Settings",
         &drawn,
-        &[version.as_str(), proxy.as_str(), http.as_str()],
+        &[
+            version.as_str(),
+            proxy.as_str(),
+            "API reference",
+            "Every operation, with examples.",
+            "Open",
+        ],
     )?;
     // The types of personal data sit in one collapsed expander per group.
     let group = KIND_GROUPS[0].0;
@@ -615,6 +620,7 @@ fn settings_shows_what_the_system_answers() -> Test {
         "Settings",
         &drawn,
         &[
+            "Address",
             "Detection",
             "Detection model",
             "Used by Masking, Highlighting and Inventory.",
@@ -1310,8 +1316,6 @@ fn the_dialog_of_a_running_scan_shows_each_file_and_closing_it_stops_the_scan() 
         snap.reveal = Some(Reveal {
             seq: 1,
             paths: vec![folder.clone()],
-            at: folder.clone(),
-            select: None,
             state: RevealState::Scanning,
         });
         snap.scan = Some((3, 12));
@@ -1361,8 +1365,6 @@ fn the_dialog_of_a_running_scan_shows_each_file_and_closing_it_stops_the_scan() 
         snap.reveal = Some(Reveal {
             seq: 1,
             paths: vec![folder.clone()],
-            at: folder.clone(),
-            select: None,
             state: RevealState::Scanning,
         });
     })?;
@@ -1377,16 +1379,9 @@ fn a_scan_that_was_asked_for_shows_its_progress_and_its_result_in_a_dialog() -> 
     let reveal = |state: RevealState| Reveal {
         seq: 1,
         paths: vec![folder.clone()],
-        at: folder.clone(),
-        select: None,
         state,
     };
-    // The scanned folder is a location: its result can be shown in the Inventory.
-    let located = |snap: &mut Snapshot, state: RevealState| {
-        snap.policy.inventory_roots = vec![folder.clone()];
-        snap.reveal = Some(reveal(state));
-    };
-    let scanning = ui.poll_with(|snap| located(snap, RevealState::Scanning))?;
+    let scanning = ui.poll_with(|snap| snap.reveal = Some(reveal(RevealState::Scanning)))?;
     expect_drawn(
         "scanning",
         &scanning,
@@ -1398,8 +1393,10 @@ fn a_scan_that_was_asked_for_shows_its_progress_and_its_result_in_a_dialog() -> 
         hits: 7,
         counts: vec![(piikey::detect::EntityKind::Email, 7)],
         unread: 0,
+        cloud_only: 0,
     };
-    let done = ui.poll_with(|snap| located(snap, RevealState::Done(summary.clone())))?;
+    let done =
+        ui.poll_with(|snap| snap.reveal = Some(reveal(RevealState::Done(summary.clone()))))?;
     expect_drawn(
         "done",
         &done,
@@ -1408,20 +1405,23 @@ fn a_scan_that_was_asked_for_shows_its_progress_and_its_result_in_a_dialog() -> 
             "7 found in 2 files",
             "3 files scanned",
             "Email",
+            "Close",
             "Show what was found",
-            "Show in Inventory",
         ],
     )?;
-    // "Show in Inventory" goes to the page and puts the result away: it is not shown again.
-    let shown = ui.send(Msg::ReportShow)?;
-    expect_drawn("show", &shown, &["Add and scan"])?;
-    let again = ui.poll_with(|snap| located(snap, RevealState::Done(summary.clone())))?;
+    // Nothing leads to the Inventory from here: what was found is the one way on.
+    expect_not_drawn("done", &done, &["Show in Inventory"])?;
+    // Close puts the result away: it is not shown again.
+    ui.send(Msg::ReportClose)?;
+    let again =
+        ui.poll_with(|snap| snap.reveal = Some(reveal(RevealState::Done(summary.clone()))))?;
     expect_not_drawn("put away", &again, &["Scan result"])?;
-    // A scan that found nothing has nothing to show in the inventory.
+    // A scan that found nothing offers only Close.
     let nothing = ScanSummary {
         hits: 0,
         files_with_data: 0,
         counts: Vec::new(),
+        cloud_only: 4,
         ..summary
     };
     let none = ui.poll_with(|snap| {
@@ -1430,23 +1430,16 @@ fn a_scan_that_was_asked_for_shows_its_progress_and_its_result_in_a_dialog() -> 
             ..reveal(RevealState::Done(nothing.clone()))
         });
     })?;
-    expect_drawn("nothing", &none, &["No personal data found", "Close"])?;
-    expect_not_drawn(
+    expect_drawn(
         "nothing",
         &none,
-        &["Show in Inventory", "Show what was found"],
+        &[
+            "No personal data found",
+            "4 files are only in the cloud and were not scanned.",
+            "Close",
+        ],
     )?;
-    // What was found outside the locations is shown, and the Inventory, which keeps only what
-    // lies in its locations, is not offered.
-    let outside = ui.poll_with(|snap| {
-        snap.policy.inventory_roots = vec![PathBuf::from(r"C:\Elsewhere")];
-        snap.reveal = Some(Reveal {
-            seq: 3,
-            ..reveal(RevealState::Done(summary.clone()))
-        });
-    })?;
-    expect_drawn("outside", &outside, &["Show what was found"])?;
-    expect_not_drawn("outside", &outside, &["Show in Inventory"])
+    expect_not_drawn("nothing", &none, &["Show what was found"])
 }
 
 #[test]
@@ -1466,17 +1459,16 @@ fn a_window_that_opens_for_a_scan_shows_its_result_and_one_that_opens_for_the_us
         }
         Ok(controller)
     };
-    // The scanned folder is no location: the result offers what was found, not the Inventory.
     let ui = Headless::open_for(scan, Some(1))?;
     expect_drawn(
         "opened for the scan",
         &ui.everything(),
-        &["Scan result", "1 found in 1 file", "Show what was found"],
-    )?;
-    expect_not_drawn(
-        "opened for the scan",
-        &ui.everything(),
-        &["Show in Inventory"],
+        &[
+            "Scan result",
+            "1 found in 1 file",
+            "Close",
+            "Show what was found",
+        ],
     )?;
     let ui = Headless::open_for(scan, None)?;
     expect_not_drawn("opened by the user", &ui.everything(), &["Scan result"])
@@ -1559,13 +1551,12 @@ fn findings_view(ui: &mut Headless) -> Result<PathBuf, String> {
             (piikey::detect::EntityKind::Iban, 1),
         ],
         unread: 0,
+        cloud_only: 0,
     };
     ui.poll_with(|snap| {
         snap.reveal = Some(Reveal {
             seq: 1,
             paths: vec![folder.clone()],
-            at: folder.clone(),
-            select: None,
             state: RevealState::Done(summary),
         });
     })?;
@@ -1586,13 +1577,12 @@ fn show_what_was_found_opens_the_view_over_the_page_with_every_value_and_back_cl
         hits: 3,
         counts: vec![(piikey::detect::EntityKind::Email, 3)],
         unread: 0,
+        cloud_only: 0,
     };
     ui.poll_with(|snap| {
         snap.reveal = Some(Reveal {
             seq: 1,
             paths: vec![folder.clone()],
-            at: folder.clone(),
-            select: None,
             state: RevealState::Done(summary),
         });
     })?;
