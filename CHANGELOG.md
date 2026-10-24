@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/TBLgGamin/piikey/compare/v0.4.0...v0.5.0) - 2026-10-24
+
+### Added
+
+- connect cloud accounts in the app and scan them from Inventory
+- generated API reference, cloud source connectors, and cloud-only file skipping
+
 ## [0.4.0](https://github.com/TBLgGamin/piikey/compare/v0.3.0...v0.4.0) - 2026-10-24
 
 ### Added
