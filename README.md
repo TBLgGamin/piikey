@@ -1,15 +1,5 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/piikey-logo-kit/horizontal/piikey-horizontal-mono-d6c9f9.svg">
-    <img alt="piikey" src="assets/brand/piikey-logo-kit/horizontal/piikey-horizontal-mono-6f49b1.svg" height="88">
-  </picture>
-</p>
-
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/hero-dark.png">
-    <img alt="piikey: find, flag and mask your personal data, everywhere on your PC. On your screen a ChatGPT message names Mark Jansen and Sanne de Vries; chatgpt.com sees stand-ins (Kevin Wolters, Nancy de Haas), and the reply comes back with your real names." src="docs/assets/hero-light.png" width="100%">
-  </picture>
+  <img src="docs/media/piikey-hero.png" alt="piikey: know your data, keep it yours" width="100%">
 </p>
 
 <p align="center">
@@ -49,6 +39,15 @@ It is a Windows app that lives in the tray, with a command line and a local JSON
 Detection (validated patterns plus an on-device model), the stand-ins and the encrypted vault that
 remembers them all stay on your machine. There is no piikey cloud service, no account and no browser
 extension.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/hero-dark.png">
+  <img alt="Two ChatGPT windows. On your screen a message names Mark Jansen and Sanne de Vries; chatgpt.com sees stand-ins (Kevin Wolters, Nancy de Haas), and the reply comes back with your real names." src="docs/assets/hero-light.png" width="100%">
+</picture>
+
+The masked message above is real `piikey-cli anonymize` output, and the reply is turned back by
+`piikey-cli deanonymize --tolerant`: full names, the lone first name and the phone number all come
+back as yours.
 
 ## Table of contents
 
