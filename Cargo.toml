@@ -101,7 +101,7 @@ http-body-util = "0.1.5"
 # Document formats.
 zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 quick-xml = "0.42.0"
-lopdf = "0.45.0"
+lopdf = "0.46.0"
 mail-parser = "0.11.9"
 cfb = "0.15.0"
 lexopt = "0.3.2"
