@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1](https://github.com/TBLgGamin/piikey/compare/v0.5.0...v0.5.1) - 2026-11-05
+
+### Dependencies
+
+- *(deps)* bump lopdf from 0.45.0 to 0.46.0 ([#11](https://github.com/TBLgGamin/piikey/pull/11))
+- *(deps)* bump global-hotkey from 0.7.0 to 0.9.0 ([#13](https://github.com/TBLgGamin/piikey/pull/13))
+- *(deps)* bump the cargo group across 1 directory with 4 updates ([#14](https://github.com/TBLgGamin/piikey/pull/14))
+- *(deps)* bump the actions group with 4 updates ([#12](https://github.com/TBLgGamin/piikey/pull/12))
+
+### Documentation
+
+- new README hero and social preview; drop Dependabot and CodeQL
+- redesign the README
+
 ## [0.5.0](https://github.com/TBLgGamin/piikey/compare/v0.4.0...v0.5.0) - 2026-10-24
 
 ### Added
